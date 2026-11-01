@@ -23,7 +23,7 @@ libc.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
-atomicwrites.workspace = true
+winsafe.workspace = true
 
 [lints]
 workspace = true

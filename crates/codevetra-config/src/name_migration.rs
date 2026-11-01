@@ -216,32 +216,45 @@ fn remove_alias(path: &Path) -> Result<(), NameMigrationError> {
     result.map_err(|_| NameMigrationError::UnsafePath)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn rename_exclusive(old: &Path, new: &Path) -> Result<(), NameMigrationError> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let result = rustix::fs::renameat_with(
+    rustix::fs::renameat_with(
         rustix::fs::CWD,
         old,
         rustix::fs::CWD,
         new,
         rustix::fs::RenameFlags::NOREPLACE,
     )
-    .map_err(std::io::Error::from);
-    // MoveFileExW without REPLACE_EXISTING preserves a concurrent destination.
-    // std::fs::rename can replace an existing empty directory on current Windows.
-    #[cfg(windows)]
-    let result = atomicwrites::move_atomic(old, new);
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    let result = {
-        let _ = (old, new);
-        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
-    };
-    result.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
+    .map_err(|error| {
+        if error == rustix::io::Errno::EXIST {
             NameMigrationError::Conflict
         } else {
             NameMigrationError::UnsafePath
         }
     })
+}
+
+#[cfg(windows)]
+fn rename_exclusive(old: &Path, new: &Path) -> Result<(), NameMigrationError> {
+    let old = old.to_str().ok_or(NameMigrationError::UnsafePath)?;
+    let new = new.to_str().ok_or(NameMigrationError::UnsafePath)?;
+    // Unlike std::fs::rename, this cannot replace an existing empty directory.
+    // Keep both original lock handles open throughout the native move.
+    winsafe::MoveFileEx(old, Some(new), winsafe::co::MOVEFILE::WRITE_THROUGH).map_err(|error| {
+        if matches!(
+            error,
+            winsafe::co::ERROR::ALREADY_EXISTS | winsafe::co::ERROR::FILE_EXISTS
+        ) {
+            NameMigrationError::Conflict
+        } else {
+            NameMigrationError::UnsafePath
+        }
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn rename_exclusive(_old: &Path, _new: &Path) -> Result<(), NameMigrationError> {
+    Err(NameMigrationError::UnsafePath)
 }
 
 #[cfg(unix)]
