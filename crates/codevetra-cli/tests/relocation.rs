@@ -49,7 +49,7 @@ fn physical_relocation_preserves_identity_generation_notes_and_configuration() -
     let database_identity = fs::read(old.join(".codevetra/data/IDENTITY"))?;
     assert!(!note.is_null());
     // Exercise the same physical legacy layout as an existing Cartograph project.
-    fs::remove_file(old.join(".cartograph"))?;
+    assert!(!old.join(".cartograph").exists());
     fs::rename(old.join(".codevetra"), old.join(".cartograph"))?;
     fs::rename(&old, &new)?;
     json(&new, &["migrate-name", "--format", "json"])?;
