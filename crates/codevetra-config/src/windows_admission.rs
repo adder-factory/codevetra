@@ -91,14 +91,17 @@ mod tests {
             writers.push(thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..10 {
-                    crate::update_project_config(&root, |previous| {
-                        let count = previous
-                            .as_ref()
-                            .and_then(|value| value.get("count"))
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0);
-                        Ok((serde_json::json!({"count":count + 1}), ()))
-                    })?;
+                    crate::update_project_config::<_, crate::ProjectConfigError>(
+                        &root,
+                        |previous| {
+                            let count = previous
+                                .as_ref()
+                                .and_then(|value| value.get("count"))
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0);
+                            Ok((serde_json::json!({"count":count + 1}), ()))
+                        },
+                    )?;
                 }
                 Ok::<_, crate::ProjectConfigError>(())
             }));

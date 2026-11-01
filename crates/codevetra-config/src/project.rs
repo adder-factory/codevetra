@@ -849,13 +849,13 @@ fn write_config_value_at(
         .map_err(|_| ProjectConfigError::WriteFailed)?;
     #[cfg(windows)]
     {
-        let temporary = temporary.into_temp_path();
-        winsafe::MoveFileEx(
-            temporary.to_str().ok_or(ProjectConfigError::WriteFailed)?,
-            Some(path.to_str().ok_or(ProjectConfigError::WriteFailed)?),
-            winsafe::co::MOVEFILE::REPLACE_EXISTING | winsafe::co::MOVEFILE::WRITE_THROUGH,
-        )
-        .map_err(|_| ProjectConfigError::WriteFailed)
+        // Windows has no portable directory fsync. Keep the atomic replacement
+        // handle and flush its data/metadata again after publication.
+        temporary
+            .persist(path)
+            .map_err(|_| ProjectConfigError::WriteFailed)?
+            .sync_all()
+            .map_err(|_| ProjectConfigError::WriteFailed)
     }
     #[cfg(not(windows))]
     {
