@@ -122,6 +122,7 @@ pub fn migrate_project_name(root: &Path) -> Result<NameMigrationReport, NameMigr
     let Some(meta) = metadata(&state)? else {
         IgnoreMigration::inspect(&root)?.finish(&root)?;
         retire_marker(&legacy)?;
+        #[cfg(unix)]
         sync_directory(&root)?;
         return Ok(report());
     };
@@ -145,6 +146,7 @@ pub fn migrate_project_name(root: &Path) -> Result<NameMigrationReport, NameMigr
         retire_marker(&legacy)?;
     }
     ignore.finish(&root)?;
+    #[cfg(unix)]
     sync_directory(&root)?;
     Ok(report())
 }
@@ -241,14 +243,11 @@ fn rename_exclusive(old: &Path, new: &Path) -> Result<(), NameMigrationError> {
     })
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), NameMigrationError> {
-    #[cfg(unix)]
     File::open(path)
         .and_then(|directory| directory.sync_all())
-        .map_err(|_| NameMigrationError::UnsafePath)?;
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+        .map_err(|_| NameMigrationError::UnsafePath)
 }
 fn metadata(path: &Path) -> Result<Option<fs::Metadata>, NameMigrationError> {
     match fs::symlink_metadata(path) {
