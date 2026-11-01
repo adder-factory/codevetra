@@ -4,8 +4,8 @@ set -euo pipefail
 
 IMAGE="${1:-}"
 MAX_ATTEMPTS="${2:-4}"
-DOCKER_BIN="${CARTOGRAPH_DOCKER_BIN:-docker}"
-RETRY_DELAY_SECONDS="${CARTOGRAPH_IMAGE_PULL_RETRY_DELAY_SECONDS:-5}"
+DOCKER_BIN="${CODEVETRA_DOCKER_BIN:-docker}"
+RETRY_DELAY_SECONDS="${CODEVETRA_IMAGE_PULL_RETRY_DELAY_SECONDS:-5}"
 
 if [[ ! "$IMAGE" =~ ^[^[:space:]]+@sha256:[0-9a-f]{64}$ ]]; then
   echo 'usage: pull-pinned-image.sh <image@sha256:digest> [maximum-attempts]' >&2
@@ -16,7 +16,7 @@ if [[ ! "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ || "$MAX_ATTEMPTS" -gt 10 ]]; then
   exit 2
 fi
 if [[ ! "$RETRY_DELAY_SECONDS" =~ ^[0-9]+$ || "$RETRY_DELAY_SECONDS" -gt 60 ]]; then
-  echo 'CARTOGRAPH_IMAGE_PULL_RETRY_DELAY_SECONDS must be from 0 through 60' >&2
+  echo 'CODEVETRA_IMAGE_PULL_RETRY_DELAY_SECONDS must be from 0 through 60' >&2
   exit 2
 fi
 if ! command -v "$DOCKER_BIN" >/dev/null 2>&1; then

@@ -1,6 +1,6 @@
 # ABAP grammar compatibility with Tree-sitter 0.27
 
-Cartograph uses the published Tree-sitter **0.27.1** native runtime. The current
+CodeVetra uses the published Tree-sitter **0.27.1** native runtime. The current
 `tree-sitter-abap-sqry` 33.0.1 and `sqry-tree-sitter-support` 33.0.1 releases still
 request 0.26. Both bindings need only `Language` and the two language ABI constants.
 
@@ -9,7 +9,7 @@ exact 0.27 types. It has no native library, build script, parser, FFI, or conver
 code. The grammar and its validation support remain unchanged registry packages.
 The workspace dependency gate verifies the sole native Tree-sitter runtime and
 this facade's ownership and lack of a native build. Every grammar still passes
-Cartograph's extraction corpus and publication/determinism gates.
+CodeVetra's extraction corpus and publication/determinism gates.
 
 The Cargo lockfile therefore contains two package versions named `tree-sitter`;
 only the registry 0.27.1 package owns the native `links = "tree-sitter"` library.

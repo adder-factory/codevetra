@@ -103,7 +103,7 @@ jobs:
             target/
           # Old compiler targets take minutes to restore and are invalidated
           # on a toolchain update. This bounded job restores exact matches only.
-          key: cartograph-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
 
       - name: Install native C++ binding prerequisites
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
@@ -148,9 +148,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cartograph-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
-            cartograph-rust-${{ runner.os }}-v2-ubuntu-
+            codevetra-rust-${{ runner.os }}-v2-ubuntu-
 
       - name: Install native C++ binding prerequisites
         if: needs.classify.outputs.full == 'true'
@@ -169,7 +169,7 @@ jobs:
       - name: Documentation contract
         if: needs.classify.outputs.docs_only == 'true'
         run: >-
-          cargo test --locked -p cartograph-cli --bin cartograph
+          cargo test --locked -p codevetra-cli --bin codevetra
           tests::documentation_contract:: -- --nocapture
 
       - name: Formatting
@@ -201,7 +201,7 @@ jobs:
           set -euo pipefail
           tree="$(cargo tree --locked --workspace --all-features -e normal)"
           if grep -Eiq 'sqlite|libsqlite' <<<"$tree"; then
-            echo 'Cartograph v2 must not contain a SQLite runtime dependency.' >&2
+            echo 'CodeVetra v2 must not contain a SQLite runtime dependency.' >&2
             grep -Ei 'sqlite|libsqlite' <<<"$tree" >&2
             exit 1
           fi
@@ -211,19 +211,19 @@ jobs:
             exit 1
           fi
           if grep -Eq 'aws-lc-(rs|sys) v[0-9]' <<<"$tree"; then
-            echo 'Cartograph must not compile the duplicate AWS-LC Rustls provider.' >&2
+            echo 'CodeVetra must not compile the duplicate AWS-LC Rustls provider.' >&2
             grep -E 'aws-lc-(rs|sys) v[0-9]' <<<"$tree" >&2
             exit 1
           fi
           if ! grep -Eq 'ring v[0-9]' <<<"$tree"; then
-            echo 'Cartograph requires ring as its single Rustls cryptography provider.' >&2
+            echo 'CodeVetra requires ring as its single Rustls cryptography provider.' >&2
             exit 1
           fi
           if grep -Eq '(sqlx|tokio-postgres|postgres-protocol) v[0-9]' <<<"$tree"; then
             echo 'Native runtime must not contain PostgreSQL/SQLX dependencies.' >&2
             exit 1
           fi
-          grep -Eq 'rust-rocksdb v0\.53\.0' <<<"$tree"
+          grep -Eq 'rust-rocksdb v0\.54\.0' <<<"$tree"
           echo 'Native dependency graph is RocksDB-only and standardized on ring.'
 
       - name: No SQLite runtime source
@@ -255,9 +255,9 @@ jobs:
             trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
 
             # This exact URL is test-only rejection coverage, never a runtime adapter.
-            if [[ "$path" == 'crates/cartograph-config/src/lib.rs' ]]; then
+            if [[ "$path" == 'crates/codevetra-config/src/lib.rs' ]]; then
               case "$trimmed" in
-                'let input = "sqlite:///tmp/private-cartograph.db?password=should-not-leak";')
+                'let input = "sqlite:///tmp/private-codevetra.db?password=should-not-leak";')
                   continue
                   ;;
               esac
@@ -267,7 +267,7 @@ jobs:
           done <<<"$matches"
 
           if [[ -n "$unexpected" ]]; then
-            echo 'Cartograph v2 contains forbidden SQLite runtime source:' >&2
+            echo 'CodeVetra v2 contains forbidden SQLite runtime source:' >&2
             printf '%s' "$unexpected" >&2
             exit 1
           fi
@@ -280,20 +280,20 @@ jobs:
           set -euo pipefail
           unexpected="$({
             git ls-files '*.ts' '*.tsx' '*.js' '*.jsx' '*.mts' '*.cts' '*.mjs' '*.cjs'
-          } | grep -Ev '^(crates/cartograph-indexer/tests/fixtures/native_corpus_v1/|crates/cartograph-extract/tests/fixtures/v1_1_33/|crates/cartograph-extract/tests/fixtures/v1_parity/|docs/test-beds/)' || true)"
+          } | grep -Ev '^(crates/codevetra-indexer/tests/fixtures/native_corpus_v1/|crates/codevetra-extract/tests/fixtures/v1_1_33/|crates/codevetra-extract/tests/fixtures/v1_parity/|docs/test-beds/)' || true)"
           if [[ -n "$unexpected" ]]; then
-            echo 'Cartograph v2 contains executable legacy runtime source outside frozen fixtures:' >&2
+            echo 'CodeVetra v2 contains executable legacy runtime source outside frozen fixtures:' >&2
             printf '%s\n' "$unexpected" >&2
             exit 1
           fi
           for legacy in package.json package-lock.json bun.lock bunfig.toml tsconfig.json biome.json; do
             if git ls-files --error-unmatch "$legacy" >/dev/null 2>&1; then
-              echo "Cartograph v2 still tracks legacy runtime manifest $legacy" >&2
+              echo "CodeVetra v2 still tracks legacy runtime manifest $legacy" >&2
               exit 1
             fi
           done
           if git ls-files 'src/**' '__tests__/**' 'bench/**' | grep -q .; then
-            echo 'Cartograph v2 still tracks the executable v1 source/test/bench tree.' >&2
+            echo 'CodeVetra v2 still tracks the executable v1 source/test/bench tree.' >&2
             git ls-files 'src/**' '__tests__/**' 'bench/**' >&2
             exit 1
           fi
@@ -335,9 +335,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cartograph-rust-${{ runner.os }}-v2-windows-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-windows-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
-            cartograph-rust-${{ runner.os }}-v2-windows-
+            codevetra-rust-${{ runner.os }}-v2-windows-
 
       - name: Resolve native binding library
         shell: pwsh
@@ -390,9 +390,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cartograph-rust-${{ runner.os }}-v2-macos-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-macos-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
-            cartograph-rust-${{ runner.os }}-v2-macos-
+            codevetra-rust-${{ runner.os }}-v2-macos-
 
       - name: macOS all-target, all-feature Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -426,8 +426,8 @@ jobs:
           scripts/build-linux-rust-release.sh
           x86_64-unknown-linux-gnu
           linux-x64
-          rust:1.99.1-trixie@sha256:c3d8fc865b8bee83c7894fb833c2c78c8cac5e865d45afc9d05ed026a6301c14
-          debian:13-slim@sha256:4876fdea29cac1a33a3195f1eb1952feb1fca7dd6dd00be3e2f1879cf20d34d2
+          rust:1.99.1-trixie@sha256:d841af61827b29b3efa46f5363e8f2e972b379cc0463c319e8f320d9f0c8eb0c
+          debian:13-slim@sha256:1e1a22175fbf1b32157ddaf0219e1db4e5401fab2b94ed285add64d18587cd2d
 
   rocksdb:
     name: RocksDB native (${{ matrix.shard }})
@@ -443,8 +443,8 @@ jobs:
     timeout-minutes: 60
     env:
       # Invalid legacy endpoints prove this suite has no SQL/Docker runtime.
-      CARTOGRAPH_DATABASE_URL: postgresql://unused.invalid/cartograph
-      DOCKER_HOST: unix:///nonexistent-cartograph-docker.sock
+      CODEVETRA_DATABASE_URL: postgresql://unused.invalid/codevetra
+      DOCKER_HOST: unix:///nonexistent-codevetra-docker.sock
     steps:
       - name: Documentation-only required-check fast path
         if: needs.classify.outputs.docs_only == 'true'
@@ -471,39 +471,39 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cartograph-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
-            cartograph-rust-${{ runner.os }}-v2-ubuntu-
+            codevetra-rust-${{ runner.os }}-v2-ubuntu-
 
       - name: Native database transactions, snapshots, retention, and fault paths
         if: needs.classify.outputs.full == 'true' && matrix.shard == 'database'
         run: |
-          cargo test --locked --all-features -p cartograph-db --lib
-          cargo test --locked --all-features -p cartograph-db --test rocks_state --test rocks_project --test rocks_graph -- --include-ignored --nocapture
+          cargo test --locked --all-features -p codevetra-db --lib
+          cargo test --locked --all-features -p codevetra-db --test rocks_state --test rocks_project --test rocks_graph -- --include-ignored --nocapture
 
       - name: Frozen native corpus worker matrix and supervisor faults
         if: needs.classify.outputs.full == 'true' && matrix.shard == 'runtime'
         run: |
-          cargo test --locked --all-features -p cartograph-indexer --test live_supervisor -- --include-ignored --nocapture
-          cargo test --locked --all-features -p cartograph-agent --test live_project --test patch_task_evaluation -- --nocapture
-          cargo bench --locked -p cartograph-indexer --bench index_scaling
+          cargo test --locked --all-features -p codevetra-indexer --test live_supervisor -- --include-ignored --nocapture
+          cargo test --locked --all-features -p codevetra-agent --test live_project --test patch_task_evaluation -- --nocapture
+          cargo bench --locked -p codevetra-indexer --bench index_scaling
 
       - name: Native owner IPC, CLI lifecycle, and process faults
         if: needs.classify.outputs.full == 'true' && matrix.shard == 'operations'
         run: |
-          cargo test --locked --all-features -p cartograph-cli --test rocks_cli --test rocks_owner --test live_cli_surface --test live_supervised_index --test index_startup -- --nocapture
-          cargo test --locked --all-features -p cartograph-cli --test rocks_owner -- --ignored --nocapture --test-threads=1
+          cargo test --locked --all-features -p codevetra-cli --test rocks_cli --test rocks_owner --test live_cli_surface --test live_supervised_index --test index_startup -- --nocapture
+          cargo test --locked --all-features -p codevetra-cli --test rocks_owner -- --ignored --nocapture --test-threads=1
 
       - name: Candidate self-index and current context evidence
         if: needs.classify.outputs.full == 'true' && matrix.shard == 'operations'
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked -p cartograph-cli
-          target/debug/cartograph index . --format json > "$RUNNER_TEMP/native-index.json"
-          target/debug/cartograph doctor . --format json > "$RUNNER_TEMP/native-doctor.json"
+          cargo build --locked -p codevetra-cli
+          target/debug/codevetra index . --format json > "$RUNNER_TEMP/native-index.json"
+          target/debug/codevetra doctor . --format json > "$RUNNER_TEMP/native-doctor.json"
           jq -e '.capabilitiesReady == true' "$RUNNER_TEMP/native-doctor.json"
-          target/debug/cartograph context 'explain project runtime indexing and graph publication' --project-path . --format json > "$RUNNER_TEMP/native-context.json"
+          target/debug/codevetra context 'explain project runtime indexing and graph publication' --project-path . --format json > "$RUNNER_TEMP/native-context.json"
           jq -e '.freshness == "current"
             and .evidence.packet.abstention == null
             and (.evidence.packet.evidence | type == "array")

@@ -1,13 +1,13 @@
 <div align="center">
 
-# Cartograph
+# CodeVetra
 
-**Cartograph 3.0 — current code intelligence, stored with your project.**
+**CodeVetra 3.0 — current code intelligence, stored with your project.**
 
 Native Rust CLI and MCP server · per-project RocksDB · code-aware BM25 · typed code graph
 
-[![Release](https://img.shields.io/github/v/release/adder-factory/cartograph?display_name=tag&sort=semver)](https://github.com/adder-factory/cartograph/releases/latest)
-[![v2 Rust](https://github.com/adder-factory/cartograph/actions/workflows/v2-rust.yml/badge.svg?branch=main)](https://github.com/adder-factory/cartograph/actions/workflows/v2-rust.yml)
+[![Release](https://img.shields.io/github/v/release/adder-factory/codevetra?display_name=tag&sort=semver)](https://github.com/adder-factory/codevetra/releases/latest)
+[![v2 Rust](https://github.com/adder-factory/codevetra/actions/workflows/v2-rust.yml/badge.svg?branch=main)](https://github.com/adder-factory/codevetra/actions/workflows/v2-rust.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f855a.svg)](LICENSE)
 [![Runtime: Rust](https://img.shields.io/badge/runtime-Rust-b7410e.svg?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
@@ -19,7 +19,7 @@ Native Rust CLI and MCP server · per-project RocksDB · code-aware BM25 · type
 
 ---
 
-Cartograph turns a source checkout into a searchable, immutable-generation code
+CodeVetra turns a source checkout into a searchable, immutable-generation code
 graph. It gives coding agents compact evidence about declarations, references,
 call flow, change impact, affected tests, and source freshness through one native
 CLI and the [Model Context Protocol](https://modelcontextprotocol.io/).
@@ -37,7 +37,7 @@ abstention instead of presenting stale or incomplete data as certainty.
 
 | I want to… | Go to |
 | --- | --- |
-| Install Cartograph and build a first graph | [Quick start](#quick-start) |
+| Install CodeVetra and build a first graph | [Quick start](#quick-start) |
 | Hand setup to a coding agent | [Agent-assisted installation](docs/AGENT-INSTALL.md) |
 | Connect Codex, Claude Code, Cursor, or another host | [MCP usage](docs/MCP-USAGE.md) |
 | Look up a command, flag, or JSON field | [CLI reference](docs/CLI-REFERENCE.md) |
@@ -47,7 +47,7 @@ abstention instead of presenting stale or incomplete data as certainty.
 | See what changed in each release | [Changelog](docs/RELEASES.md) |
 | Browse every guide by task | [Documentation home](docs/README.md) |
 
-## What Cartograph gives an agent
+## What CodeVetra gives an agent
 
 | Question | Evidence |
 | --- | --- |
@@ -60,7 +60,7 @@ abstention instead of presenting stale or incomplete data as certainty.
 | What changed in the working tree? | Separately labeled live overlay and Git-ref review packets |
 | Is an LLM required? | No for exact, lexical, graph, review, freshness, or affected-test workflows |
 
-Cartograph also supports standard SCIP export, persistent per-file SCIP overlays,
+CodeVetra also supports standard SCIP export, persistent per-file SCIP overlays,
 model-scoped semantic retrieval, generated artifacts with explicit provenance,
 and deterministic task-intent routing.
 
@@ -75,54 +75,54 @@ and deterministic task-intent routing.
 macOS (Apple Silicon, macOS 26+) or Linux (ARM64/x64, glibc 2.41+):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/adder-factory/cartograph/main/install.sh | sh
-cartograph --version
+curl -fsSL https://raw.githubusercontent.com/adder-factory/codevetra/main/install.sh | sh
+codevetra --version
 ```
 
 Windows (x64), in PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/adder-factory/cartograph/main/install.ps1 | iex
-cartograph --version
+irm https://raw.githubusercontent.com/adder-factory/codevetra/main/install.ps1 | iex
+codevetra --version
 ```
 
 The installer verifies the archive against the release's `SHA256SUMS`. To build
 from source, use the pinned Rust toolchain, a C/C++ compiler, and libclang:
 
 ```sh
-cargo build --locked --release -p cartograph-cli
+cargo build --locked --release -p codevetra-cli
 ```
 
 ### 2. Build the first graph
 
 ```sh
 cd /path/to/project
-cartograph index .
-cartograph doctor . --format json
-cartograph status . --format json
-cartograph context 'explain the primary request flow' --project-path .
+codevetra index .
+codevetra doctor . --format json
+codevetra status . --format json
+codevetra context 'explain the primary request flow' --project-path .
 ```
 
-Each project owns `.cartograph/data`; no server or Docker bootstrap is needed.
+Each project owns `.codevetra/data`; no server or Docker bootstrap is needed.
 An unchanged second index skips publication. Require a fresh generation and
 real retrieval evidence before calling setup ready. Doctor reports native
 capabilities separately from freshness, models, registration, and transport.
 
 For a previously indexed PostgreSQL project, run
-`cartograph db migrate --to rocksdb --project-path .` to rebuild and verify the
+`codevetra db migrate --to rocksdb --project-path .` to rebuild and verify the
 native destination while preserving legacy data. See the
 [migration guide](docs/v2/ROCKSDB-MIGRATION.md) for the scope of that rebuild.
 
 ### 3. Connect a coding agent
 
-Cartograph writes project-scoped MCP configuration and pins the absolute native
+CodeVetra writes project-scoped MCP configuration and pins the absolute native
 executable path. For Claude Code the project entry lives under
 `projects.<path>.mcpServers` in `~/.claude.json`, Claude's local scope.
 
 ```sh
-cartograph install --yes --target codex  --location local --project-path .  # OpenAI Codex
-cartograph install --yes --target claude --location local --project-path .  # Claude Code
-cartograph install --yes --target cursor --location local --project-path .  # Cursor
+codevetra install --yes --target codex  --location local --project-path .  # OpenAI Codex
+codevetra install --yes --target claude --location local --project-path .  # Claude Code
+codevetra install --yes --target cursor --location local --project-path .  # Cursor
 ```
 
 The installer supports 19 hosts in total; see the
@@ -135,9 +135,9 @@ target ID.
 
 A setup is ready only after all four signals pass:
 
-1. `cartograph doctor` proves database capabilities.
-2. `cartograph index` publishes one complete generation.
-3. `cartograph status` reports that generation as fresh.
+1. `codevetra doctor` proves database capabilities.
+2. `codevetra index` publishes one complete generation.
+3. `codevetra status` reports that generation as fresh.
 4. A real `find` or `context` query returns generation-scoped evidence.
 
 A CLI request proves the executable and database path. After restarting an
@@ -152,8 +152,8 @@ On macOS, start a project service that stays alive when an MCP client
 disconnects:
 
 ```sh
-cartograph service start --project-path . --format json
-cartograph service status --project-path . --format json
+codevetra service start --project-path . --format json
+codevetra service status --project-path . --format json
 ```
 
 Filesystem events use a 150 ms quiet window and incremental file parsing.
@@ -161,7 +161,7 @@ Continuous edits are coalesced for at most two seconds, and a periodic source
 check catches missed events. These are scheduling bounds; end-to-end freshness
 also includes extraction, publication, and the query. Check `autoSync` and
 generation freshness instead of assuming every repository updates in a second.
-On Linux, run `cartograph watch --project-path .` under your user service
+On Linux, run `codevetra watch --project-path .` under your user service
 manager, or in the foreground. Automatic service registration currently uses
 macOS launchd. On Windows, the serving MCP primary owns the watcher.
 
@@ -171,8 +171,8 @@ For an existing v2 installation, install v3 with the installer above, then run
 the v3 executable:
 
 ```sh
-cartograph db migrate --to rocksdb --project-path . --format json
-cartograph upgrade --apply --project-path . --json
+codevetra db migrate --to rocksdb --project-path . --format json
+codevetra upgrade --apply --project-path . --json
 ```
 
 Migration rebuilds the graph from current source and verifies retrieval before
@@ -184,10 +184,10 @@ status and a real query. Future native upgrades use the same `upgrade --apply`
 command after stopping the existing owner. For a macOS native service:
 
 ```sh
-cartograph service stop --project-path . --format json
-cartograph upgrade --apply --project-path . --json
-cartograph service start --project-path . --format json
-cartograph status . --format json
+codevetra service stop --project-path . --format json
+codevetra upgrade --apply --project-path . --json
+codevetra service start --project-path . --format json
+codevetra status . --format json
 ```
 
 For a manually managed owner, stop that project's `watch` or serving process
@@ -213,15 +213,15 @@ A reliable coding loop starts with freshness, narrows with structural evidence,
 and closes with impact-aware verification:
 
 ```sh
-cartograph status .                                              # 1. is the graph fresh?
-cartograph context 'fix authentication token validation' --project-path .   # 2. task evidence
-cartograph find 'validateToken' --by name --project-path .       # 3. exact anchor
-cartograph graph <symbol-id> --direction impact --project-path . # 4. blast radius
-cartograph affected --symbol-id <symbol-id> --project-path .     # 5. tests to run
-cartograph review --ref main --project-path .                    # 6. review the diff
+codevetra status .                                              # 1. is the graph fresh?
+codevetra context 'fix authentication token validation' --project-path .   # 2. task evidence
+codevetra find 'validateToken' --by name --project-path .       # 3. exact anchor
+codevetra graph <symbol-id> --direction impact --project-path . # 4. blast radius
+codevetra affected --symbol-id <symbol-id> --project-path .     # 5. tests to run
+codevetra review --ref main --project-path .                    # 6. review the diff
 ```
 
-If status is stale, run `cartograph index .` or use the bounded MCP admin action.
+If status is stale, run `codevetra index .` or use the bounded MCP admin action.
 Indexing unchanged source is a no-op; changed source publishes a complete new
 generation atomically.
 
@@ -229,19 +229,19 @@ generation atomically.
 
 | Tool | Purpose |
 | --- | --- |
-| `cartograph_status` | Current generation, counts, capability readiness, and freshness |
-| `cartograph_find` | Exact name/path/reference lookup or code-aware BM25 |
-| `cartograph_context` | Intent-aware evidence, graph context, and edit candidates |
-| `cartograph_entry_points` | Routes, commands, MCP tools, exports, and API boundaries |
-| `cartograph_graph` | Callers, callees, reverse impact, paths, and symbol similarity |
-| `cartograph_affected` | Bounded affected-test selection |
-| `cartograph_numerical` | Generation-scoped static numerical hazards, coverage, explanations, and non-executing probe plans |
-| `cartograph_review` | Git-ref plus staged, unstaged, and untracked evidence |
-| `cartograph_admin` | Explicit index, sync, embedding, and maintenance jobs |
+| `codevetra_status` | Current generation, counts, capability readiness, and freshness |
+| `codevetra_find` | Exact name/path/reference lookup or code-aware BM25 |
+| `codevetra_context` | Intent-aware evidence, graph context, and edit candidates |
+| `codevetra_entry_points` | Routes, commands, MCP tools, exports, and API boundaries |
+| `codevetra_graph` | Callers, callees, reverse impact, paths, and symbol similarity |
+| `codevetra_affected` | Bounded affected-test selection |
+| `codevetra_numerical` | Generation-scoped static numerical hazards, coverage, explanations, and non-executing probe plans |
+| `codevetra_review` | Git-ref plus staged, unstaged, and untracked evidence |
+| `codevetra_admin` | Explicit index, sync, embedding, and maintenance jobs |
 
 MCP profiles are `coding`, `core`, `full`, `read-only`, and `review`. Profiles
 are immutable authorization ceilings with deterministic tool lists; a narrower
-profile cannot call hidden tools. Cartograph supports modern stateless MCP
+profile cannot call hidden tools. CodeVetra supports modern stateless MCP
 `2026-07-28` plus the legacy `2024-11-05` initialize path. Modern hosts should
 cache the stable complete catalog and dynamically place only task-relevant
 schemas in the model context; the server does not mutate tools per connection.
@@ -251,27 +251,27 @@ See [MCP usage](docs/MCP-USAGE.md#modern-protocol-and-dynamic-tool-selection).
 <summary>CLI surface — selected high-use forms</summary>
 
 These are selected high-use forms, not the complete command inventory. Run
-`cartograph --help` for the installed binary or see the
+`codevetra --help` for the installed binary or see the
 [CLI reference](docs/CLI-REFERENCE.md) for every top-level command.
 
 ```text
-cartograph index [PROJECT]
-cartograph status [PROJECT]
-cartograph find <QUERY> --by auto|name|content|env|sql|build|path|reference|bm25|hybrid \
+codevetra index [PROJECT]
+codevetra status [PROJECT]
+codevetra find <QUERY> --by auto|name|content|env|sql|build|path|reference|bm25|hybrid \
   [--format text|json]
-cartograph context <TASK> [--exact-name NAME] [--exact-path PATH] [--exact-reference TEXT]
-cartograph entry-points [--bucket public-exports] [--limit 20]
-cartograph graph <SYMBOL_ID> --direction callers|callees|both|impact
-cartograph graph <SYMBOL_ID> --direction path --to <TARGET_SYMBOL_ID>
-cartograph graph <SYMBOL_ID> --direction similar --k 5 --min-score 0.3
-cartograph affected [CHANGED_FILE ...] --max-nodes 40
-cartograph affected --symbol-id <SYMBOL_ID> --max-nodes 40
-cartograph review --ref <GIT_REF>
-cartograph serve --mcp [--profile coding|core|full|read-only|review]
-cartograph doctor [PROJECT]
-cartograph db <COMMAND>
-cartograph install --yes --target <HOST>
-cartograph uninstall --target <HOST> [--location local]
+codevetra context <TASK> [--exact-name NAME] [--exact-path PATH] [--exact-reference TEXT]
+codevetra entry-points [--bucket public-exports] [--limit 20]
+codevetra graph <SYMBOL_ID> --direction callers|callees|both|impact
+codevetra graph <SYMBOL_ID> --direction path --to <TARGET_SYMBOL_ID>
+codevetra graph <SYMBOL_ID> --direction similar --k 5 --min-score 0.3
+codevetra affected [CHANGED_FILE ...] --max-nodes 40
+codevetra affected --symbol-id <SYMBOL_ID> --max-nodes 40
+codevetra review --ref <GIT_REF>
+codevetra serve --mcp [--profile coding|core|full|read-only|review]
+codevetra doctor [PROJECT]
+codevetra db <COMMAND>
+codevetra install --yes --target <HOST>
+codevetra uninstall --target <HOST> [--location local]
 ```
 
 Text output is optimized for concise human diagnostics. JSON is the stable
@@ -351,8 +351,8 @@ a pending or intentional ledger entry.
 ## Native database operations
 
 ```sh
-cartograph db usage --project-path . --format json
-cartograph db prune --project-path . --keep-superseded 2 \
+codevetra db usage --project-path . --format json
+codevetra db prune --project-path . --keep-superseded 2 \
   --maximum-deletions 4 --confirm prune-old-generations --format json
 ```
 
@@ -362,7 +362,7 @@ can lag logical deletions. See [storage operations](docs/STORAGE-BACKENDS.md).
 
 ## Migrating earlier graphs
 
-`cartograph db migrate --to rocksdb --project-path .` rebuilds source facts and
+`codevetra db migrate --to rocksdb --project-path .` rebuilds source facts and
 verifies the current native graph before recording completion. It preserves
 legacy PostgreSQL data but does not copy notes, sessions, embeddings, or other
 legacy-only state. See the [migration guide](docs/v2/ROCKSDB-MIGRATION.md).
@@ -396,9 +396,9 @@ audience.
 The repository pins Rust 1.99.1 in `rust-toolchain.toml` and uses edition 2024.
 
 ```sh
-git clone https://github.com/adder-factory/cartograph.git
-cd cartograph
-cargo build --locked --release -p cartograph-cli
+git clone https://github.com/adder-factory/codevetra.git
+cd codevetra
+cargo build --locked --release -p codevetra-cli
 
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -429,6 +429,6 @@ validation.
 
 ## License
 
-Cartograph is licensed under the [MIT License](LICENSE). Third-party components
+CodeVetra is licensed under the [MIT License](LICENSE). Third-party components
 retain their own licenses; see [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) and the
 [native library distribution notices](docs/v2/LICENSING.md).

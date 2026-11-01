@@ -1,4 +1,4 @@
-# Cartograph documentation
+# CodeVetra documentation
 
 [Project overview](../README.md) · [Quick start](../README.md#quick-start) ·
 [CLI reference](CLI-REFERENCE.md) · [Troubleshooting](TROUBLESHOOTING.md) ·
@@ -10,7 +10,7 @@ guides below own the detailed operational and implementation contracts.
 
 > [!TIP]
 > Installed command help is authoritative for exact flags, defaults, and
-> bounds: `cartograph <command> --help`. Confirmation phrases for destructive
+> bounds: `codevetra <command> --help`. Confirmation phrases for destructive
 > operations are listed in
 > [Storage and operations](STORAGE-BACKENDS.md#destructive-operations-and-confirmation-phrases).
 
@@ -18,7 +18,7 @@ guides below own the detailed operational and implementation contracts.
 
 | I want to… | Start here |
 | --- | --- |
-| Install Cartograph myself | [Quick start](../README.md#quick-start) |
+| Install CodeVetra myself | [Quick start](../README.md#quick-start) |
 | Ask a coding agent to install and verify it | [Agent-assisted installation](AGENT-INSTALL.md) |
 | Upgrade an existing installation | [Upgrade an existing installation](AGENT-INSTALL.md#upgrade-an-existing-installation) |
 | Look up a command or JSON behavior | [CLI reference](CLI-REFERENCE.md) |
@@ -32,7 +32,7 @@ guides below own the detailed operational and implementation contracts.
 | Understand code-health findings | [Native code-health detectors](BIOMARKER-DETECTORS.md) |
 | Export the graph to another tool | [Graph export formats](GRAPH-EXPORT-FORMATS.md) |
 | Add a language, grammar, resolver, or framework bridge | [Extending extraction and resolution](EXTENDING-EXTRACTORS-RESOLVERS.md) |
-| Understand architecture and trust boundaries | [Cartograph v2 architecture](v2/ARCHITECTURE.md) |
+| Understand architecture and trust boundaries | [CodeVetra v2 architecture](v2/ARCHITECTURE.md) |
 | Inspect scaling and task-quality evidence | [Verification and benchmarks](v2/benchmarks/README.md) |
 | See what changed between releases | [Changelog](RELEASES.md) |
 
@@ -131,7 +131,7 @@ guides below own the detailed operational and implementation contracts.
 
 | Guide | What it covers |
 | --- | --- |
-| [Cartograph v2 architecture](v2/ARCHITECTURE.md) | Implemented crate, database, generation, retrieval, lease, MCP, and release architecture |
+| [CodeVetra v2 architecture](v2/ARCHITECTURE.md) | Implemented crate, database, generation, retrieval, lease, MCP, and release architecture |
 | [Native extraction contract](v2/EXTRACTION.md) | Discovery, parsing, facts, resolution, publication, and test routing |
 | [Extending extraction and resolution](EXTENDING-EXTRACTORS-RESOLVERS.md) | Implementation checklist and required gates |
 | [Adding a language](ADDING-A-LANGUAGE.md) | Concise entry point for selecting an extension mechanism |
@@ -143,7 +143,7 @@ guides below own the detailed operational and implementation contracts.
 | Record | What it covers |
 | --- | --- |
 | [Changelog](RELEASES.md) | Compact summary of every stable release, with links to full notes |
-| [GitHub releases](https://github.com/adder-factory/cartograph/releases) | Signed tags, native archives, checksums, and provenance |
+| [GitHub releases](https://github.com/adder-factory/codevetra/releases) | Signed tags, native archives, checksums, and provenance |
 | [Verification and benchmarks](v2/benchmarks/README.md) | What each benchmark proves, its status, and how to reproduce it |
 | [Dependency audits](RELEASES.md#dependency-audits) | Dated dependency selection and maintenance reviews |
 | [Architecture improvement record](v2/ARCHITECTURE-IMPROVEMENTS.md) | Scope and acceptance evidence for the 2026-09-08 architecture review |

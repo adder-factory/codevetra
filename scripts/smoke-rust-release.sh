@@ -4,12 +4,12 @@ set -euo pipefail
 
 BINARY="${1:-}"
 if [[ -z "$BINARY" || ! -x "$BINARY" ]]; then
-  echo "usage: $0 <cartograph-binary>" >&2
+  echo "usage: $0 <codevetra-binary>" >&2
   exit 2
 fi
 
 VERSION="$("$BINARY" --version)"
-EXPECTED_VERSION="cartograph $(cargo metadata --no-deps --format-version 1 | sed -n 's/.*\"name\":\"cartograph-cli\",\"version\":\"\([^\"]*\)\".*/\1/p' | head -n 1)"
+EXPECTED_VERSION="codevetra $(cargo metadata --no-deps --format-version 1 | sed -n 's/.*\"name\":\"codevetra-cli\",\"version\":\"\([^\"]*\)\".*/\1/p' | head -n 1)"
 if [[ "$VERSION" != "$EXPECTED_VERSION" ]]; then
   echo "release binary version mismatch: expected '$EXPECTED_VERSION', got '$VERSION'" >&2
   exit 1
@@ -23,7 +23,7 @@ for COMMAND in index status find context graph affected review install uninstall
   fi
 done
 
-SMOKE_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/cartograph-release-smoke.XXXXXX")"
+SMOKE_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/codevetra-release-smoke.XXXXXX")"
 SMOKE_STDOUT="$SMOKE_TEMP/stdout"
 SMOKE_STDERR="$SMOKE_TEMP/stderr"
 cleanup() {

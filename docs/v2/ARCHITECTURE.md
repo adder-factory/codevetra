@@ -1,12 +1,12 @@
-# Cartograph v3 architecture
+# CodeVetra v3 architecture
 
 [Documentation home](../README.md) · [Project overview](../../README.md) ·
 [Native extraction](EXTRACTION.md) · [Language matrix](../SUPPORT-MATRIX.md)
 
-Last release audit: 2026-10-26 (`v3.0.6`).
+Last release audit: 2026-11-01 (`v4.0.0`).
 
-Cartograph v3 is a native Rust code-intelligence server for AI coding agents.
-Each project owns an embedded RocksDB 11.8.1 store. Rust implements
+CodeVetra v3 is a native Rust code-intelligence server for AI coding agents.
+Each project owns an embedded RocksDB 11.12.0 store. Rust implements
 code-aware BM25 and model-scoped exact cosine retrieval. Exact,
 lexical, graph, review, freshness, and affected-test workflows require no LLM.
 
@@ -18,7 +18,7 @@ and the [storage guide](../STORAGE-BACKENDS.md).
 
 - Native Rust owns extraction, storage, retrieval, and transport. No PostgreSQL,
   SQLX, SQLite, Bun, or Node runtime is retained.
-- One project primary owns `.cartograph/data`; every typed feature service
+- One project primary owns `.codevetra/data`; every typed feature service
   shares it. Unix owner IPC routes additional CLI/MCP processes to the primary.
   Windows cross-process proxying is not implemented yet.
 - External input and source evidence have task/item/byte/deadline admission.
@@ -46,17 +46,17 @@ surface while keeping the tier configured.
 
 | Crate | Responsibility |
 | --- | --- |
-| `cartograph-domain` | Branded IDs, enums, source language/path/digest contracts, project identity, canonical manifest digest |
-| `cartograph-config` | Project source/capacity policy, native migration markers, bounded atomic configuration I/O |
-| `cartograph-extract` | Bounded discovery/read/hash, native tree-sitter parsing, declarations/references, deterministic resolution |
-| `cartograph-db` | Native engine, worker admission, writer fences, atomic revisions, snapshots, typed feature state/retrieval, retention |
-| `cartograph-indexer` | Bounded parallel stages, deterministic reduction, supervisor/cancellation/reaping, corpus-aware workers |
-| `cartograph-search` | Exact/BM25/hybrid evidence, typed intent, graph traversal, RRF, affected tests, trust/abstention |
-| `cartograph-scip` | Bounded zero-runtime protobuf codec, exact typed-edge extension, deterministic export, per-file replacement overlay |
-| `cartograph-llm` | Bounded redacted embedding/reranker/chat/decision clients, provider config, shell-free `apiKeyCommand` credential sources, model identity, and local backend supervision contracts |
-| `cartograph-agent` | Project runtime, freshness, indexing, structural summaries, embedding sweeps, optional decision-guided navigation, Git review, source excerpts, working-tree overlay |
-| `cartograph-mcp` | Bounded stdio JSON-RPC/MCP protocol, profiles, cancellation, stable errors |
-| `cartograph-cli` | Native command routing, database operations, MCP adapter, project-local agent installation |
+| `codevetra-domain` | Branded IDs, enums, source language/path/digest contracts, project identity, canonical manifest digest |
+| `codevetra-config` | Project source/capacity policy, native migration markers, bounded atomic configuration I/O |
+| `codevetra-extract` | Bounded discovery/read/hash, native tree-sitter parsing, declarations/references, deterministic resolution |
+| `codevetra-db` | Native engine, worker admission, writer fences, atomic revisions, snapshots, typed feature state/retrieval, retention |
+| `codevetra-indexer` | Bounded parallel stages, deterministic reduction, supervisor/cancellation/reaping, corpus-aware workers |
+| `codevetra-search` | Exact/BM25/hybrid evidence, typed intent, graph traversal, RRF, affected tests, trust/abstention |
+| `codevetra-scip` | Bounded zero-runtime protobuf codec, exact typed-edge extension, deterministic export, per-file replacement overlay |
+| `codevetra-llm` | Bounded redacted embedding/reranker/chat/decision clients, provider config, shell-free `apiKeyCommand` credential sources, model identity, and local backend supervision contracts |
+| `codevetra-agent` | Project runtime, freshness, indexing, structural summaries, embedding sweeps, optional decision-guided navigation, Git review, source excerpts, working-tree overlay |
+| `codevetra-mcp` | Bounded stdio JSON-RPC/MCP protocol, profiles, cancellation, stable errors |
+| `codevetra-cli` | Native command routing, database operations, MCP adapter, project-local agent installation |
 
 ### Dependency direction
 
@@ -66,7 +66,7 @@ about persistence or transport.
 
 `scripts/test-workspace-dependencies.sh` enforces the reviewed production/build
 dependency directions, rejects cycles and forbidden production dependencies, and requires an explicit boundary decision for a new workspace crate.
-Neutral project configuration is owned by `cartograph-config`; the LLM crate
+Neutral project configuration is owned by `codevetra-config`; the LLM crate
 retains provider interpretation and compatibility wrappers. Structural symbol
 summary sweeps expose a typed agent service used by the CLI/MCP adapter.
 
@@ -169,7 +169,7 @@ remains fail-closed. Framework and cross-language resolver parity is tracked as
 a distinct release gate rather than being inferred from language admission.
 
 Each mode has exactly one extraction strategy, registered in
-`crates/cartograph-extract/src/language.rs`:
+`crates/codevetra-extract/src/language.rs`:
 
 - grammar-backed dedicated families: JavaScript/TypeScript, Rust/Python/Go,
   C-family, shader, Ada/VHDL, shell, managed (Java/C#), JVM-dynamic, and the
@@ -215,7 +215,7 @@ site identity/span plus bounded operation, hazard, precision, expression
 digest, confidence, provenance, evidence level, and facts that syntax could
 not prove. It never stores the source expression or literal. Static heuristic
 evidence is not relabeled as a runtime observation or formal proof;
-`cartograph_numerical`, status, and numerical review report observation and
+`codevetra_numerical`, status, and numerical review report observation and
 formal adapters as `not_configured`. Generations recorded under an older digest
 contract (anything before the current V26) remain explicitly stale until an
 ordinary index republishes them; for generations older than V7, which predate
@@ -299,13 +299,13 @@ the live project bytes to match every stored file hash before writing an atomic
 project-local artifact. Standard SCIP definitions, relationships, occurrences,
 UTF-8 byte ranges, documentation, and readable stable symbols are emitted. A
 protobuf-compatible private field on `SymbolInformation` additionally carries
-every Cartograph edge kind and exact site count; foreign SCIP consumers ignore
-the field, while Cartograph round-trips calls, imports, tests, containment,
+every CodeVetra edge kind and exact site count; foreign SCIP consumers ignore
+the field, while CodeVetra round-trips calls, imports, tests, containment,
 type/use, framework, and cross-language edges without degrading them to generic
 references.
 
 Import is a persistent overlay, not a direct database mutation. The validated
-artifact is atomically installed at `.cartograph/scip/overlay.scip`; its digest
+artifact is atomically installed at `.codevetra/scip/overlay.scip`; its digest
 is part of source freshness. During every subsequent index:
 
 - matching documents replace native non-file facts for those files;
@@ -537,7 +537,7 @@ before that public boundary.
 
 ## Storage operations, durability, and distribution
 
-RocksDB 11.8.1 is compiled into the executable with LZ4/Zstandard support.
+RocksDB 11.12.0 is compiled into the executable with LZ4/Zstandard support.
 There is no database server/container lifecycle. Native WAL sync, atomic batch
 publication, and snapshot readers provide local crash-consistent revisions;
 physical reclamation follows LSM compaction after logical deletion.
@@ -590,10 +590,10 @@ attestation for the local Sonar or independent-review requirements.
 
 Before it publishes, the tag workflow requires:
 
-- the tag to equal `v` plus the `cartograph-cli` Cargo version;
+- the tag to equal `v` plus the `codevetra-cli` Cargo version;
 - the tag commit to equal both the built SHA and the published `main` head;
 - tracked, non-empty release notes at `docs/releases/<tag>.md` that name the
-  tag in their `# Cartograph <tag>` heading and contain no placeholder markers;
+  tag in their `# CodeVetra <tag>` heading and contain no placeholder markers;
 - any existing release for the tag to still be a draft; it refuses to replace
   assets on a published release.
 

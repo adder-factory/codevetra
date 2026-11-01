@@ -1,7 +1,7 @@
 doc-valid-idents = [
     "BLAKE3",
     "BM25",
-    "Cartograph",
+    "CodeVetra",
     "JSON-RPC",
     "MCP",
     "Postgres",

@@ -1,29 +1,29 @@
-# Install and use Cartograph v3
+# Install and use CodeVetra v3
 
-Cartograph `v3.0.3` stores each project in embedded RocksDB. Install the native
+CodeVetra `v3.0.3` stores each project in embedded RocksDB. Install the native
 release with the [quick start](../README.md#quick-start), or build from source
 with the pinned toolchain. No database server or Docker bootstrap is needed.
 
 ## Copy-paste task
 
-> Install Cartograph v3, initialize the project's
+> Install CodeVetra v3, initialize the project's
 > native graph, run doctor and status, prove one real current context query,
 > and register the built executable with my coding host. Preserve old database
 > files, containers, and user configuration.
 
 ## Build and index
 
-Rust, a C/C++ compiler, and libclang are build prerequisites. RocksDB 11.8.1,
+Rust, a C/C++ compiler, and libclang are build prerequisites. RocksDB 11.12.0,
 LZ4, and Zstandard compile into the executable; no database server is needed.
 
 ```sh
-cargo build --locked --release -p cartograph-cli
+cargo build --locked --release -p codevetra-cli
 export PATH="$PWD/target/release:$PATH"
-cartograph --version
-cartograph index /absolute/path/to/project
-cartograph doctor /absolute/path/to/project --format json
-cartograph status /absolute/path/to/project --format json
-cartograph context 'explain the primary request flow' \
+codevetra --version
+codevetra index /absolute/path/to/project
+codevetra doctor /absolute/path/to/project --format json
+codevetra status /absolute/path/to/project --format json
+codevetra context 'explain the primary request flow' \
   --project-path /absolute/path/to/project
 ```
 
@@ -34,7 +34,7 @@ registration, and transport. A skipped/no-op second publication is expected.
 ## Migrate an existing project
 
 ```sh
-cartograph db migrate --to rocksdb --project-path /absolute/path/to/project
+codevetra db migrate --to rocksdb --project-path /absolute/path/to/project
 ```
 
 The source rebuild verifies destination freshness and retrieval before writing
@@ -45,9 +45,9 @@ copy legacy-only notes, sessions, embeddings, or artifacts. See
 ## Register an agent host
 
 ```sh
-cartograph install --yes --target codex --location local --project-path .
-cartograph install --yes --target claude --location local --project-path .
-cartograph install --yes --target cursor --location local --project-path .
+codevetra install --yes --target codex --location local --project-path .
+codevetra install --yes --target claude --location local --project-path .
+codevetra install --yes --target cursor --location local --project-path .
 ```
 
 The installer pins the absolute executable and preserves unrelated MCP entries.
@@ -58,7 +58,7 @@ indexing or live transport readiness.
 The stdio server command is:
 
 ```sh
-cartograph serve --mcp --project-path /absolute/path/to/project
+codevetra serve --mcp --project-path /absolute/path/to/project
 ```
 
 Profiles are `coding`, `core`, `full`, `read-only`, and `review`. One native
@@ -69,7 +69,7 @@ Do not delete lock files or state to bypass ownership.
 ## Keep the graph current
 
 Use the owner's watcher and check status after edits. Explicitly reconcile with
-`cartograph index .` or `cartograph sync-if-dirty --project-path .`. Report stale
+`codevetra index .` or `codevetra sync-if-dirty --project-path .`. Report stale
 or incomplete evidence plainly. Graph storage uses bounded multithreaded async
 Rust calls; this does not imply RocksDB native AsyncIO.
 

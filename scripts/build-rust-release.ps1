@@ -14,11 +14,11 @@ $OriginalAlternateTemporaryDirectory = $env:TMP
 $env:CARGO_TARGET_DIR = Join-Path $Root 'target'
 $ReleaseDir = Join-Path $Root 'release'
 $StagingRoot = Join-Path $ReleaseDir '.staging'
-$StageName = "cartograph-$AssetTarget"
+$StageName = "codevetra-$AssetTarget"
 $Stage = Join-Path $StagingRoot $StageName
 $Archive = Join-Path $ReleaseDir "$StageName.zip"
 $Direct = Join-Path $ReleaseDir "$StageName.exe"
-$Binary = Join-Path $env:CARGO_TARGET_DIR 'release/cartograph.exe'
+$Binary = Join-Path $env:CARGO_TARGET_DIR 'release/codevetra.exe'
 
 $HostTarget = Get-RustHostTarget
 if ($HostTarget -cne $Target) {
@@ -78,7 +78,7 @@ if ([string]::IsNullOrWhiteSpace($env:LIBCLANG_PATH)) {
   $env:LIBCLANG_PATH = $NativeClangDirectory
 }
 
-cargo build --locked --release --package cartograph-cli
+cargo build --locked --release --package codevetra-cli
 if ($LASTEXITCODE -ne 0) { throw 'cargo release build failed' }
 
 # Audit the exact tag-built executable before either published artifact is made.
@@ -88,19 +88,19 @@ Assert-NoReleaseBuildRoots -Path $Binary -Roots @($AuditedEnvironmentRoots + $St
 
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Stage, $Archive, $Direct
 New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'bin') | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'share/cartograph') | Out-Null
-Copy-Item $Binary (Join-Path $Stage 'bin/cartograph.exe')
+New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'share/codevetra') | Out-Null
+Copy-Item $Binary (Join-Path $Stage 'bin/codevetra.exe')
 Copy-Item (Join-Path $Root 'LICENSE') (Join-Path $Stage 'LICENSE')
 Copy-Item (Join-Path $Root 'README.md') (Join-Path $Stage 'README.md')
 Copy-Item (Join-Path $Root 'ACKNOWLEDGEMENTS.md') (Join-Path $Stage 'ACKNOWLEDGEMENTS.md')
-Copy-Item (Join-Path $Root 'docs/v2/LICENSING.md') (Join-Path $Stage 'share/cartograph/NATIVE-STORAGE-NOTICE.md')
-Copy-Item (Join-Path $Root 'docs/v2/THIRD-PARTY-STORAGE-LICENSES.txt') (Join-Path $Stage 'share/cartograph/THIRD-PARTY-STORAGE-LICENSES.txt')
+Copy-Item (Join-Path $Root 'docs/v2/LICENSING.md') (Join-Path $Stage 'share/codevetra/NATIVE-STORAGE-NOTICE.md')
+Copy-Item (Join-Path $Root 'docs/v2/THIRD-PARTY-STORAGE-LICENSES.txt') (Join-Path $Stage 'share/codevetra/THIRD-PARTY-STORAGE-LICENSES.txt')
 
 $Version = (& $Binary --version).Trim()
 $Metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-$ExpectedPackage = $Metadata.packages | Where-Object { $_.name -eq 'cartograph-cli' } | Select-Object -First 1
-if (-not $ExpectedPackage) { throw 'cartograph-cli package missing from cargo metadata' }
-$ExpectedVersion = "cartograph $($ExpectedPackage.version)"
+$ExpectedPackage = $Metadata.packages | Where-Object { $_.name -eq 'codevetra-cli' } | Select-Object -First 1
+if (-not $ExpectedPackage) { throw 'codevetra-cli package missing from cargo metadata' }
+$ExpectedVersion = "codevetra $($ExpectedPackage.version)"
 if ($Version -ne $ExpectedVersion) {
   throw "release binary version mismatch: expected '$ExpectedVersion', got '$Version'"
 }
@@ -116,9 +116,9 @@ $ExpectedFiles = @(
   'ACKNOWLEDGEMENTS.md',
   'LICENSE',
   'README.md',
-  'bin/cartograph.exe',
-  'share/cartograph/NATIVE-STORAGE-NOTICE.md',
-  'share/cartograph/THIRD-PARTY-STORAGE-LICENSES.txt'
+  'bin/codevetra.exe',
+  'share/codevetra/NATIVE-STORAGE-NOTICE.md',
+  'share/codevetra/THIRD-PARTY-STORAGE-LICENSES.txt'
 )
 $ActualFiles = Get-ChildItem -Recurse -File $Stage |
   ForEach-Object { $_.FullName.Substring($Stage.Length + 1).Replace('\', '/') } |
@@ -139,13 +139,13 @@ foreach ($DocumentationFile in $DocumentationFiles) {
 $Tree = cargo tree --locked --workspace --all-features -e normal
 $TreeText = $Tree -join "`n"
 if ($TreeText -match '(?i)(^|[-_ ])(sqlite|libsqlite)') {
-  throw 'Cartograph v2 release dependency graph contains SQLite'
+  throw 'CodeVetra v2 release dependency graph contains SQLite'
 }
 if ($TreeText -match 'aws-lc-(?:rs|sys) v[0-9]') {
-  throw 'Cartograph release dependency graph contains the duplicate AWS-LC Rustls provider'
+  throw 'CodeVetra release dependency graph contains the duplicate AWS-LC Rustls provider'
 }
 if ($TreeText -notmatch 'ring v[0-9]') {
-  throw 'Cartograph release dependency graph does not contain the required ring Rustls provider'
+  throw 'CodeVetra release dependency graph does not contain the required ring Rustls provider'
 }
 
 Compress-Archive -Path $Stage -DestinationPath $Archive -Force

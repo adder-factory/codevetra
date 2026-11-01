@@ -10,7 +10,7 @@ visible after the original review context is gone.
 
 | Record | Status | Last reviewed |
 | --- | --- | --- |
-| [0001 — Keep llama.cpp as the managed local default; keep other providers external](0001-mlx-vs-llama-cpp-backends.md) | Accepted for Cartograph v2 | 2026-10-04 |
+| [0001 — Keep llama.cpp as the managed local default; keep other providers external](0001-mlx-vs-llama-cpp-backends.md) | Accepted for CodeVetra v2 | 2026-10-04 |
 
 ## When to add one
 

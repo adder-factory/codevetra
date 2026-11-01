@@ -1,5 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
+& (Join-Path $PSScriptRoot 'test-windows-installer-compatibility.ps1')
+
 . (Join-Path $PSScriptRoot 'windows-rust-release-paths.ps1')
 
 function Assert-ContainsExactlyOnce {
@@ -56,11 +58,11 @@ Get-RustHostTarget | Out-Null
 $ReleaseBuildRoot = Get-NonPrivateReleaseBuildRoot `
   -TemporaryPath 'D:\a\_temp' `
   -AssetTarget 'windows-x64'
-if ($ReleaseBuildRoot -cne 'D:\cartograph-release-build-windows-x64') {
+if ($ReleaseBuildRoot -cne 'D:\codevetra-release-build-windows-x64') {
   throw 'release tool state was not moved outside the private runner tree'
 }
 
-$TestDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "cartograph-path-audit-$([guid]::NewGuid())"
+$TestDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "codevetra-path-audit-$([guid]::NewGuid())"
 [System.IO.Directory]::CreateDirectory($TestDirectory) | Out-Null
 $ReleaseBuildEnvironment = $null
 
@@ -116,7 +118,7 @@ try {
 
   $UserRoot = 'C:\Users\build-user'
   $CargoRoot = 'C:\Users\build-user\.cargo'
-  $WorkspaceRoot = 'D:\a\cartograph\cartograph'
+  $WorkspaceRoot = 'D:\a\codevetra\codevetra'
   Set-ReleaseBuildPathRemapping -Roots @($WorkspaceRoot, $UserRoot, $CargoRoot)
 
   $Flags = $env:CARGO_ENCODED_RUSTFLAGS -split [char]0x1f
@@ -127,10 +129,10 @@ try {
 
   foreach ($Expected in @(
     '--cfg=preserved_release_flag',
-    '--remap-path-prefix=D:\a\cartograph\cartograph=.',
-    '--remap-path-prefix=D:/a/cartograph/cartograph=.',
-    '--remap-path-prefix=d:\a\cartograph\cartograph=.',
-    '--remap-path-prefix=d:/a/cartograph/cartograph=.',
+    '--remap-path-prefix=D:\a\codevetra\codevetra=.',
+    '--remap-path-prefix=D:/a/codevetra/codevetra=.',
+    '--remap-path-prefix=d:\a\codevetra\codevetra=.',
+    '--remap-path-prefix=d:/a/codevetra/codevetra=.',
     $UserBackslashFlag,
     $UserForwardFlag,
     '--remap-path-prefix=c:\Users\build-user=.',
@@ -185,7 +187,7 @@ try {
     [PSCustomObject]@{
       Name = 'ascii-isolated-build-root'
       Bytes = [System.Text.Encoding]::ASCII.GetBytes(
-        'D:\cartograph-release-build-windows-x64\cargo-home\registry\src\ring-0.17.14\crypto\fipsmodule\bn\montgomery.c'
+        'D:\codevetra-release-build-windows-x64\cargo-home\registry\src\ring-0.17.14\crypto\fipsmodule\bn\montgomery.c'
       )
     }
   )
@@ -202,7 +204,7 @@ try {
         throw
       }
       if ($_.Exception.Message.Contains('build-user') -or
-          $_.Exception.Message.Contains('cartograph-release-build')) {
+          $_.Exception.Message.Contains('codevetra-release-build')) {
         throw 'build-root audit diagnostics exposed the matched path'
       }
     }
@@ -212,7 +214,7 @@ try {
   }
 
   $CleanPath = Join-Path $TestDirectory 'clean.bin'
-  [System.IO.File]::WriteAllBytes($CleanPath, [System.Text.Encoding]::UTF8.GetBytes('cartograph release'))
+  [System.IO.File]::WriteAllBytes($CleanPath, [System.Text.Encoding]::UTF8.GetBytes('codevetra release'))
   Assert-NoReleaseBuildRoots -Path $CleanPath -Roots $ForbiddenRoots
 
   Write-Host '[rust-release] Windows path-remapping and complete build-root regressions passed'

@@ -4,7 +4,7 @@
 [CLI reference](CLI-REFERENCE.md) · [Architecture](v2/ARCHITECTURE.md)
 
 The browser visual-graph viewer is not part of v2, but graph data and diagram
-interchange remain first-class. `cartograph export` reads one current-generation
+interchange remain first-class. `codevetra export` reads one current-generation
 snapshot, applies filters, caps nodes, and removes edges whose endpoints are not
 in the exported set.
 
@@ -15,15 +15,15 @@ in the exported set.
 ## Usage
 
 ```sh
-cartograph export --format json --limit 1000
-cartograph export --format dot --kind class,method --edge-kind calls --out graph.dot
-cartograph export --format mermaid --file src/billing --out billing.mmd
-cartograph export --format cytoscape --language typescript --out graph.cy.json
+codevetra export --format json --limit 1000
+codevetra export --format dot --kind class,method --edge-kind calls --out graph.dot
+codevetra export --format mermaid --file src/billing --out billing.mmd
+codevetra export --format cytoscape --language typescript --out graph.cy.json
 ```
 
 > [!IMPORTANT]
 > `export` requires a fresh current generation and has no `--allow-stale`
-> override: a stale index fails with "synchronize it with `cartograph index`
+> override: a stale index fails with "synchronize it with `codevetra index`
 > and retry". Index the project first.
 
 ## Versioned JSON
@@ -105,7 +105,7 @@ downstream interpretation explicit.
 
 ## SCIP interchange
 
-For standardized code-intelligence interchange, use `cartograph admin
+For standardized code-intelligence interchange, use `codevetra admin
 scip-export`/`scip-import`. SCIP retains definitions, occurrences,
-documentation, relationships, and Cartograph's forward-compatible exact typed
+documentation, relationships, and CodeVetra's forward-compatible exact typed
 edge/site-count extension.

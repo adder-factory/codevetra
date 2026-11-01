@@ -1,0 +1,412 @@
+//! Merge rules for rewriting an existing `codevetra` host registration.
+//!
+//! CodeVetra owns only what it writes for a target: `command`, its own
+//! server flags inside `args`, and that target's transport keys. Every other
+//! key of an existing entry (`env`, `cwd`, host-specific keys) and every extra
+//! server argument is preserved. An entry that launches CodeVetra through a
+//! wrapper (a non-CodeVetra `command` whose arguments name a CodeVetra
+//! executable followed by `serve`) retains its wrapper. The embedded executable
+//! is repinned only when absolute; retired database options are removed only
+//! from the CodeVetra server suffix.
+
+use std::path::Path;
+
+use serde_json::{Map, Value};
+use toml_edit::{Array, Item, TableLike, value};
+
+use crate::host::{is_codevetra_executable, wrapped_executable_index};
+
+/// Server arguments CodeVetra writes and therefore replaces on rewrite.
+const OWNED_FLAGS: [&str; 2] = ["serve", "--mcp"];
+/// Server options whose value CodeVetra writes and therefore replaces.
+const OWNED_OPTIONS: [&str; 2] = ["--project-path", "--managed-database-port"];
+/// Entry key holding the launched program.
+const COMMAND_KEY: &str = "command";
+/// Entry key holding the program arguments.
+const ARGS_KEY: &str = "args";
+
+/// The `command` and `args` CodeVetra wants a Codex server table to hold.
+pub(super) struct DesiredServer<'request> {
+    pub(super) command: &'request str,
+    pub(super) args: &'request [String],
+}
+
+/// Returns the JSON entry to write: `desired` merged over `existing`, or
+/// `existing` with only its wrapped executable repinned to `command`.
+pub(super) fn merge_json_entry(existing: Option<&Value>, desired: Value, command: &str) -> Value {
+    let Some(existing) = existing.and_then(Value::as_object) else {
+        return desired;
+    };
+    if let Some(index) = json_wrapped_index(existing) {
+        return Value::Object(repin_json_wrapper(existing, index, command));
+    }
+    match desired {
+        Value::Object(desired) => Value::Object(merge_json_direct(existing, desired)),
+        other => other,
+    }
+}
+
+fn json_wrapped_index(entry: &Map<String, Value>) -> Option<usize> {
+    let command = entry.get(COMMAND_KEY).and_then(Value::as_str)?;
+    if is_codevetra_executable(command) {
+        return None;
+    }
+    let args = entry.get(ARGS_KEY).and_then(Value::as_array)?;
+    wrapped_executable_index(args.iter().map(Value::as_str))
+}
+
+fn repin_json_wrapper(
+    existing: &Map<String, Value>,
+    index: usize,
+    command: &str,
+) -> Map<String, Value> {
+    let mut entry = existing.clone();
+    if let Some(args) = entry.get_mut(ARGS_KEY).and_then(Value::as_array_mut) {
+        if let Some(argument) = args.get_mut(index)
+            && argument.as_str().is_some_and(is_repinnable)
+        {
+            *argument = Value::String(command.to_owned());
+        }
+        let values = args.iter().map(Value::as_str).collect::<Vec<_>>();
+        for retired in retired_database_argument_indices(&values, index + 1)
+            .into_iter()
+            .rev()
+        {
+            args.remove(retired);
+        }
+    }
+    entry
+}
+
+fn merge_json_direct(
+    existing: &Map<String, Value>,
+    desired: Map<String, Value>,
+) -> Map<String, Value> {
+    let mut entry = existing.clone();
+    for (key, desired_value) in desired {
+        let merged = if key == ARGS_KEY {
+            merge_json_args(existing.get(ARGS_KEY), desired_value)
+        } else {
+            desired_value
+        };
+        entry.insert(key, merged);
+    }
+    entry
+}
+
+fn merge_json_args(existing: Option<&Value>, desired: Value) -> Value {
+    let Value::Array(mut merged) = desired else {
+        return desired;
+    };
+    let existing = existing
+        .and_then(Value::as_array)
+        .and_then(|args| args.iter().map(Value::as_str).collect::<Option<Vec<_>>>());
+    if let Some(existing) = existing {
+        merged.extend(
+            extra_server_args(&existing)
+                .into_iter()
+                .map(|argument| Value::String(argument.to_owned())),
+        );
+    }
+    Value::Array(merged)
+}
+
+/// Writes `desired` into an existing Codex server table, keeping every key
+/// CodeVetra does not own, or repins only the wrapped executable argument.
+pub(super) fn merge_codex_server(server: &mut dyn TableLike, desired: &DesiredServer<'_>) {
+    if let Some(index) = toml_wrapped_index(server) {
+        repin_toml_wrapper(server, index, desired.command);
+        return;
+    }
+    let existing_args = server
+        .get(ARGS_KEY)
+        .and_then(Item::as_array)
+        .and_then(|args| {
+            args.iter()
+                .map(|argument| argument.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        });
+    let mut merged = desired.args.to_vec();
+    if let Some(existing) = existing_args.as_deref() {
+        let existing = existing.iter().map(String::as_str).collect::<Vec<_>>();
+        merged.extend(extra_server_args(&existing).into_iter().map(str::to_owned));
+    }
+    if server.get(COMMAND_KEY).and_then(Item::as_str) != Some(desired.command) {
+        server.insert(COMMAND_KEY, value(desired.command));
+    }
+    if existing_args.as_ref() != Some(&merged) {
+        let mut args = Array::new();
+        for argument in &merged {
+            args.push(argument.as_str());
+        }
+        server.insert(ARGS_KEY, Item::Value(toml_edit::Value::Array(args)));
+    }
+}
+
+fn toml_wrapped_index(server: &dyn TableLike) -> Option<usize> {
+    let command = server.get(COMMAND_KEY).and_then(Item::as_str)?;
+    if is_codevetra_executable(command) {
+        return None;
+    }
+    let args = server.get(ARGS_KEY).and_then(Item::as_array)?;
+    wrapped_executable_index(args.iter().map(toml_edit::Value::as_str))
+}
+
+fn repin_toml_wrapper(server: &mut dyn TableLike, index: usize, command: &str) {
+    if let Some(args) = server.get_mut(ARGS_KEY).and_then(Item::as_array_mut) {
+        if args
+            .get(index)
+            .and_then(toml_edit::Value::as_str)
+            .is_some_and(is_repinnable)
+        {
+            args.replace(index, command);
+        }
+        let values = args
+            .iter()
+            .map(toml_edit::Value::as_str)
+            .collect::<Vec<_>>();
+        for retired in retired_database_argument_indices(&values, index + 1)
+            .into_iter()
+            .rev()
+        {
+            args.remove(retired);
+        }
+    }
+}
+
+/// Only the recognized server suffix belongs to CodeVetra. Identically named
+/// wrapper options before the executable are outside this migration boundary.
+fn retired_database_argument_indices(args: &[Option<&str>], start: usize) -> Vec<usize> {
+    let mut retired = Vec::new();
+    let mut index = start;
+    while index < args.len() {
+        match args[index] {
+            Some("--managed-database-port") => {
+                retired.push(index);
+                if args
+                    .get(index + 1)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|arg| !arg.starts_with('-'))
+                {
+                    index += 1;
+                    retired.push(index);
+                }
+            }
+            Some(arg) if arg.starts_with("--managed-database-port=") => retired.push(index),
+            _ => {}
+        }
+        index += 1;
+    }
+    retired
+}
+
+/// A wrapped executable is repinned only when it is an absolute path; a
+/// `PATH` lookup through the wrapper is the operator's choice and stays.
+fn is_repinnable(executable: &str) -> bool {
+    Path::new(executable).is_absolute() || matches!(executable, "cartograph" | "cartograph.exe")
+}
+
+/// Existing server arguments that CodeVetra does not write, in order.
+fn extra_server_args<'arg>(args: &[&'arg str]) -> Vec<&'arg str> {
+    let mut extras = Vec::new();
+    let mut arguments = args.iter().copied().peekable();
+    while let Some(argument) = arguments.next() {
+        if OWNED_OPTIONS.contains(&argument) {
+            if arguments.peek().is_some_and(|next| !next.starts_with('-')) {
+                arguments.next();
+            }
+        } else if !OWNED_FLAGS.contains(&argument) && !is_owned_inline_option(argument) {
+            extras.push(argument);
+        }
+    }
+    extras
+}
+
+fn is_owned_inline_option(argument: &str) -> bool {
+    OWNED_OPTIONS.iter().any(|option| {
+        argument
+            .strip_prefix(option)
+            .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapped_json_cutover_removes_only_retired_server_options() {
+        for executable in ["/old/bin/codevetra", "codevetra"] {
+            let existing = serde_json::json!({
+                "command": "credential-helper",
+                "args": ["--managed-database-port", "wrapper-value", "--", executable,
+                    "serve", "--mcp", "--managed-database-port", "55435",
+                    "--profile", "coding", "--managed-database-port=55436", "--no-auto-sync"],
+                "env": {"FIXTURE_FLAG": "preserved"}
+            });
+            let merged = merge_json_entry(Some(&existing), Value::Null, "/new/bin/codevetra");
+            let chosen = if executable == "codevetra" {
+                executable
+            } else {
+                "/new/bin/codevetra"
+            };
+            assert_eq!(
+                merged,
+                serde_json::json!({
+                    "command": "credential-helper",
+                    "args": ["--managed-database-port", "wrapper-value", "--", chosen,
+                        "serve", "--mcp", "--profile", "coding", "--no-auto-sync"],
+                    "env": {"FIXTURE_FLAG": "preserved"}
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_toml_cutover_preserves_path_lookup_and_other_server_flags() {
+        let mut server = toml_edit::Table::new();
+        server.insert("command", value("credential-helper"));
+        let mut args = Array::new();
+        for argument in [
+            "--managed-database-port=wrapper-value",
+            "--",
+            "codevetra",
+            "serve",
+            "--mcp",
+            "--managed-database-port=55433",
+            "--managed-database-port",
+            "--profile",
+            "coding",
+            "--no-auto-sync",
+        ] {
+            args.push(argument);
+        }
+        server.insert("args", value(args));
+        server.insert("cwd", value("preserved"));
+        merge_codex_server(
+            &mut server,
+            &DesiredServer {
+                command: "/new/bin/codevetra",
+                args: &[],
+            },
+        );
+        let actual = server.get("args").and_then(Item::as_array).map(|args| {
+            args.iter()
+                .filter_map(toml_edit::Value::as_str)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            actual,
+            Some(vec![
+                "--managed-database-port=wrapper-value",
+                "--",
+                "codevetra",
+                "serve",
+                "--mcp",
+                "--profile",
+                "coding",
+                "--no-auto-sync"
+            ])
+        );
+        assert_eq!(
+            server.get("command").and_then(Item::as_str),
+            Some("credential-helper")
+        );
+        assert_eq!(server.get("cwd").and_then(Item::as_str), Some("preserved"));
+    }
+
+    #[test]
+    fn extra_server_arguments_drop_only_owned_flags_and_option_values() {
+        assert_eq!(
+            extra_server_args(&[
+                "serve",
+                "--mcp",
+                "--project-path",
+                "/old",
+                "--profile",
+                "coding",
+                "--managed-database-port=55433",
+                "--no-auto-sync",
+            ]),
+            vec!["--profile", "coding", "--no-auto-sync"]
+        );
+    }
+
+    #[test]
+    fn direct_cutover_keeps_options_after_a_bare_retired_flag() {
+        assert_eq!(
+            extra_server_args(&[
+                "serve",
+                "--mcp",
+                "--managed-database-port",
+                "--no-auto-sync",
+                "--profile",
+                "coding"
+            ]),
+            vec!["--no-auto-sync", "--profile", "coding"]
+        );
+        let existing = serde_json::json!({
+            "command": "/old/bin/codevetra",
+            "args": ["serve", "--mcp", "--managed-database-port", "--no-auto-sync", "--profile", "coding"],
+            "env": {"FIXTURE_FLAG": "preserved"}
+        });
+        let desired =
+            serde_json::json!({"command": "/new/bin/codevetra", "args": ["serve", "--mcp"]});
+        let migrated = merge_json_entry(Some(&existing), desired.clone(), "/new/bin/codevetra");
+        assert_eq!(
+            migrated,
+            serde_json::json!({
+                "command": "/new/bin/codevetra",
+                "args": ["serve", "--mcp", "--no-auto-sync", "--profile", "coding"],
+                "env": {"FIXTURE_FLAG": "preserved"}
+            })
+        );
+        assert_eq!(
+            merge_json_entry(Some(&migrated), desired, "/new/bin/codevetra"),
+            migrated
+        );
+    }
+
+    #[test]
+    fn direct_toml_cutover_keeps_following_flags_and_is_idempotent() {
+        let mut server = toml_edit::Table::new();
+        server.insert("command", value("/old/bin/codevetra"));
+        let mut args = Array::new();
+        for argument in [
+            "serve",
+            "--mcp",
+            "--managed-database-port",
+            "--no-auto-sync",
+            "--profile",
+            "coding",
+        ] {
+            args.push(argument);
+        }
+        server.insert("args", value(args));
+        server.insert("cwd", value("preserved"));
+        let desired_args = vec!["serve".to_owned(), "--mcp".to_owned()];
+        let desired = DesiredServer {
+            command: "/new/bin/codevetra",
+            args: &desired_args,
+        };
+        merge_codex_server(&mut server, &desired);
+        assert_eq!(
+            server.get("args").and_then(Item::as_array).map(|args| args
+                .iter()
+                .filter_map(toml_edit::Value::as_str)
+                .collect::<Vec<_>>()),
+            Some(vec![
+                "serve",
+                "--mcp",
+                "--no-auto-sync",
+                "--profile",
+                "coding"
+            ])
+        );
+        assert_eq!(server.get("cwd").and_then(Item::as_str), Some("preserved"));
+        let migrated = server.to_string();
+        merge_codex_server(&mut server, &desired);
+        assert_eq!(server.to_string(), migrated);
+    }
+}

@@ -46,39 +46,39 @@ fi
 docker run --rm --pull never \
   --volume "$ROOT:/workspace" \
   --workdir /workspace \
-  --env HOME=/tmp/cartograph-home \
-  --env CARTOGRAPH_BUILD_UID="$(id -u)" \
-  --env CARTOGRAPH_BUILD_GID="$(id -g)" \
-  --env CARGO_HOME=/tmp/cartograph-cargo \
-  --env RUSTUP_HOME=/tmp/cartograph-rustup \
-  --env CARTOGRAPH_RELEASE_TOOLCHAIN="$BUILD_TOOLCHAIN" \
-  --env CARGO_TARGET_DIR=/tmp/cartograph-target \
-  --env CARTOGRAPH_RELEASE_TARGET="$TARGET" \
-  --env CARTOGRAPH_RELEASE_ASSET_TARGET="$ASSET_TARGET" \
-  --env CARTOGRAPH_RELEASE_MACHINE="$EXPECTED_MACHINE" \
+  --env HOME=/tmp/codevetra-home \
+  --env CODEVETRA_BUILD_UID="$(id -u)" \
+  --env CODEVETRA_BUILD_GID="$(id -g)" \
+  --env CARGO_HOME=/tmp/codevetra-cargo \
+  --env RUSTUP_HOME=/tmp/codevetra-rustup \
+  --env CODEVETRA_RELEASE_TOOLCHAIN="$BUILD_TOOLCHAIN" \
+  --env CARGO_TARGET_DIR=/tmp/codevetra-target \
+  --env CODEVETRA_RELEASE_TARGET="$TARGET" \
+  --env CODEVETRA_RELEASE_ASSET_TARGET="$ASSET_TARGET" \
+  --env CODEVETRA_RELEASE_MACHINE="$EXPECTED_MACHINE" \
   "$BUILD_IMAGE" \
   bash -c '
     set -euo pipefail
     apt-get update
     apt-get install -y --no-install-recommends clang libclang-dev util-linux
-    exec setpriv --reuid "$CARTOGRAPH_BUILD_UID" --regid "$CARTOGRAPH_BUILD_GID" --clear-groups bash -c '\''
+    exec setpriv --reuid "$CODEVETRA_BUILD_UID" --regid "$CODEVETRA_BUILD_GID" --clear-groups bash -c '\''
     set -euo pipefail
     mkdir -p "$HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR" "$RUSTUP_HOME"
     machine="$(uname -m)"
-    if [[ "$machine" != "$CARTOGRAPH_RELEASE_MACHINE" ]]; then
-      echo "release container architecture mismatch: expected $CARTOGRAPH_RELEASE_MACHINE, got $machine" >&2
+    if [[ "$machine" != "$CODEVETRA_RELEASE_MACHINE" ]]; then
+      echo "release container architecture mismatch: expected $CODEVETRA_RELEASE_MACHINE, got $machine" >&2
       exit 1
     fi
     # The pinned image supplies Debian/build utilities. Install and verify the
     # exact reviewed compiler in the writable container-local Rustup directory.
-    rustup toolchain install "$CARTOGRAPH_RELEASE_TOOLCHAIN" --profile minimal \
+    rustup toolchain install "$CODEVETRA_RELEASE_TOOLCHAIN" --profile minimal \
       --component clippy,rustfmt --no-self-update
-    if [[ "$(rustc --version)" != "rustc $CARTOGRAPH_RELEASE_TOOLCHAIN "* ]]; then
+    if [[ "$(rustc --version)" != "rustc $CODEVETRA_RELEASE_TOOLCHAIN "* ]]; then
       echo "release container did not provide the pinned Rust compiler" >&2
       rustc --version >&2
       exit 1
     fi
-    scripts/build-rust-release.sh "$CARTOGRAPH_RELEASE_TARGET" "$CARTOGRAPH_RELEASE_ASSET_TARGET"
+    scripts/build-rust-release.sh "$CODEVETRA_RELEASE_TARGET" "$CODEVETRA_RELEASE_ASSET_TARGET"
   '\'''
 
 VERSION="$(
@@ -93,15 +93,15 @@ fi
 
 docker run --rm --pull never \
   --volume "$ROOT/release:/release:ro" \
-  --env CARTOGRAPH_EXPECTED_MACHINE="$EXPECTED_MACHINE" \
-  --env CARTOGRAPH_EXPECTED_VERSION="cartograph $VERSION" \
-  --env CARTOGRAPH_RUNTIME_BINARY="/release/cartograph-$ASSET_TARGET" \
+  --env CODEVETRA_EXPECTED_MACHINE="$EXPECTED_MACHINE" \
+  --env CODEVETRA_EXPECTED_VERSION="codevetra $VERSION" \
+  --env CODEVETRA_RUNTIME_BINARY="/release/codevetra-$ASSET_TARGET" \
   "$RUNTIME_IMAGE" \
   sh -c '
     set -eu
     machine="$(uname -m)"
-    if [ "$machine" != "$CARTOGRAPH_EXPECTED_MACHINE" ]; then
-      echo "runtime container architecture mismatch: expected $CARTOGRAPH_EXPECTED_MACHINE, got $machine" >&2
+    if [ "$machine" != "$CODEVETRA_EXPECTED_MACHINE" ]; then
+      echo "runtime container architecture mismatch: expected $CODEVETRA_EXPECTED_MACHINE, got $machine" >&2
       exit 1
     fi
     glibc="$(ldd --version 2>&1 | head -n 1)"
@@ -112,9 +112,9 @@ docker run --rm --pull never \
         exit 1
         ;;
     esac
-    version="$($CARTOGRAPH_RUNTIME_BINARY --version)"
-    if [ "$version" != "$CARTOGRAPH_EXPECTED_VERSION" ]; then
-      echo "runtime smoke version mismatch: expected $CARTOGRAPH_EXPECTED_VERSION, got $version" >&2
+    version="$($CODEVETRA_RUNTIME_BINARY --version)"
+    if [ "$version" != "$CODEVETRA_EXPECTED_VERSION" ]; then
+      echo "runtime smoke version mismatch: expected $CODEVETRA_EXPECTED_VERSION, got $version" >&2
       exit 1
     fi
   '

@@ -4,7 +4,7 @@
 [V2 architecture](v2/ARCHITECTURE.md) · [Decision records](decisions/README.md)
 
 The current implementation architecture is maintained in
-[Cartograph v2 architecture](v2/ARCHITECTURE.md). This file records the standing
+[CodeVetra v2 architecture](v2/ARCHITECTURE.md). This file records the standing
 repository rules for contributors.
 
 - Rust owns every executable product path. Do not introduce a Bun, Node,

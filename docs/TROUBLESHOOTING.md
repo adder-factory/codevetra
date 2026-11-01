@@ -1,4 +1,4 @@
-# Troubleshooting Cartograph v3
+# Troubleshooting CodeVetra v3
 
 [Documentation home](README.md) · [CLI reference](CLI-REFERENCE.md) ·
 [Native storage](STORAGE-BACKENDS.md)
@@ -12,10 +12,10 @@ the native commands below.
 Use the same absolute executable and checkout as the failing host:
 
 ```sh
-/absolute/path/to/cartograph --version
-/absolute/path/to/cartograph doctor /absolute/path/to/project --json
-/absolute/path/to/cartograph status /absolute/path/to/project --json
-/absolute/path/to/cartograph db usage --project-path /absolute/path/to/project --format json
+/absolute/path/to/codevetra --version
+/absolute/path/to/codevetra doctor /absolute/path/to/project --json
+/absolute/path/to/codevetra status /absolute/path/to/project --json
+/absolute/path/to/codevetra db usage --project-path /absolute/path/to/project --format json
 ```
 
 Capability readiness, a published graph, current source, model readiness, and
@@ -32,7 +32,7 @@ failure, generation, freshness, truncation, and cleanup fields.
 | Owner changed during job polling | The previous job outcome is unverified; inspect current status with the new owner before starting new work |
 | Missing `CURRENT` or no published generation | Run the explicit native migration or first index |
 | `operation_deadline` or byte/row budget reached | Inspect the specific bound and reduce the requested work; never remove all bounds |
-| Native ownership or format check fails | Preserve `.cartograph`; use the matching binary and inspect the safe error. Do not remove locks or edit RocksDB files |
+| Native ownership or format check fails | Preserve `.codevetra`; use the matching binary and inspect the safe error. Do not remove locks or edit RocksDB files |
 | Vectors are unavailable | Configure the intended model and run an explicit embedding sweep; structural retrieval remains useful |
 
 ## Doctor works in a shell but MCP cannot connect
@@ -44,7 +44,7 @@ real query. A successful CLI call alone does not prove an attached host loaded
 this source cutover.
 
 ```sh
-/absolute/path/to/cartograph install --yes --target codex --location local \
+/absolute/path/to/codevetra install --yes --target codex --location local \
   --project-path /absolute/path/to/project
 ```
 
@@ -58,7 +58,7 @@ Install v3 with the release installer before migrating a v2 project. The
 Compare status with the actual source. A complete manifest includes supported
 source and source-admission policy; edits to either make a previous generation
 stale. A new extractor contract can also require a new publication on unchanged
-source. Run `cartograph index <project>` and require `live_source: matched`,
+source. Run `codevetra index <project>` and require `live_source: matched`,
 then a fresh status and generation-scoped query.
 
 A serving MCP owner watches edits and periodically reconciles missed events.
@@ -134,15 +134,15 @@ including an automatic sync, would use it.
 
 1. Handle the job's `failure`, or its `cancelled` status, and any
    `cleanupFailure` as described above; they still describe the forced index.
-2. Fix the directory or path, for example because `.cartograph/scip/` is not
+2. Fix the directory or path, for example because `.codevetra/scip/` is not
    writable or `overlay.scip` is no longer a regular file.
-3. Restore the overlay you want, delete `.cartograph/scip/overlay.scip` to
+3. Restore the overlay you want, delete `.codevetra/scip/overlay.scip` to
    return to native extraction, or run `scip-import` again.
 
 <details>
 <summary>Details: how the overlay is installed and rolled back</summary>
 
-`scip-import` installs the requested artifact at `.cartograph/scip/overlay.scip`
+`scip-import` installs the requested artifact at `.codevetra/scip/overlay.scip`
 before its forced index. When that index fails or is cancelled, the import puts
 the previous overlay back, or removes the new one if there was none.
 `overlayRollbackFailure` means that restore failed too.
@@ -160,7 +160,7 @@ queryable throughout.
 1. For automation, request structured stderr (the text form is concise):
 
    ```sh
-   cartograph index /absolute/path/to/project --format json
+   codevetra index /absolute/path/to/project --format json
    ```
 
 2. For `source_changed_during_parse`, let rapid writes settle and retry.
@@ -210,7 +210,7 @@ tree.
 
 ## Source excerpt is omitted
 
-**What it means:** `cartograph node/show` returns source only when the complete
+**What it means:** `codevetra node/show` returns source only when the complete
 live manifest still matches the generation owning the symbol's line range. On
 stale or racing source, metadata remains but the excerpt is omitted rather than
 slicing the wrong bytes.
@@ -244,11 +244,11 @@ environment. A variable that is unset in doctor's shell is reported as
 1. Confirm that the MCP server's own environment supplies the named variable;
    doctor's shell can differ from it.
 2. To supply the key to the server without a plaintext secret in a host
-   configuration and without wrapping `cartograph serve` in a secret-manager
+   configuration and without wrapping `codevetra serve` in a secret-manager
    launcher, configure a [credential command](CONFIGURATION.md#credential-sources):
 
    ```sh
-   cartograph llm setup . --preset jev \
+   codevetra llm setup . --preset jev \
      --api-key-command /path/to/secret-helper --api-key-arg get --api-key-arg typesafe-api-key
    ```
 

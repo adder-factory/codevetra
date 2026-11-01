@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Language matrix](SUPPORT-MATRIX.md) ·
 [Native extraction](v2/EXTRACTION.md) · [Grammar provenance](GRAMMAR-ASSETS.md)
 
-Cartograph v2 extracts code in Rust and publishes typed, generation-scoped facts
+CodeVetra v2 extracts code in Rust and publishes typed, generation-scoped facts
 to PostgreSQL. This guide covers the registration points and failure modes for
 adding a language, resolver, framework fact, or cross-language bridge.
 
@@ -45,13 +45,13 @@ digest.
 Work through these steps in order. Each links to the detailed rules below.
 
 1. **Identity.** Add a row to the `source_languages!` table in
-   `crates/cartograph-domain/src/source.rs`. A game-scripting mode is also
+   `crates/codevetra-domain/src/source.rs`. A game-scripting mode is also
    added to `SourceLanguage::is_game_scripting` in the same file.
    See [§1](#1-stable-language-identity).
 2. **Detection.** Resolve shared or ambiguous extensions in the `detect_*`
-   helpers of `crates/cartograph-domain/src/source.rs`, and route
+   helpers of `crates/codevetra-domain/src/source.rs`, and route
    language-specific test filenames in
-   `crates/cartograph-domain/src/source/test_paths.rs` (shared by extraction and retrieval).
+   `crates/codevetra-domain/src/source/test_paths.rs` (shared by extraction and retrieval).
    See [§2](#2-discovery-and-snapshot-admission).
 3. **Registry tests.** In the `source.rs` tests, update the count assertions
    (134 modes / 73 v1 modes / 52 game modes), the frozen
@@ -59,23 +59,23 @@ Work through these steps in order. Each links to the detailed rules below.
    `representative_source` when the default sample path does not route to the
    new mode. See [§1](#1-stable-language-identity).
 4. **Grammar.** Pin the crate in the workspace `Cargo.toml`, add it to
-   `crates/cartograph-extract/Cargo.toml`, and register it in
-   `crates/cartograph-extract/src/grammars.rs`. Custom-scanner modes skip this
+   `crates/codevetra-extract/Cargo.toml`, and register it in
+   `crates/codevetra-extract/src/grammars.rs`. Custom-scanner modes skip this
    step. See [§3](#3-grammar-registration).
 5. **Extraction strategy.** Register the language in
-   `crates/cartograph-extract/src/language.rs` (`grammar_strategy` or
+   `crates/codevetra-extract/src/language.rs` (`grammar_strategy` or
    `fallback_strategy`). See [§3](#3-grammar-registration).
-6. **Walker or scanner.** Extend `crates/cartograph-extract/src/walk.rs` and
-   `walk/`, or add a bounded scanner in `crates/cartograph-extract/src/custom.rs`
+6. **Walker or scanner.** Extend `crates/codevetra-extract/src/walk.rs` and
+   `walk/`, or add a bounded scanner in `crates/codevetra-extract/src/custom.rs`
    / `custom/`. A language that needs its own walker gets a
    [dedicated extraction family](#dedicated-extraction-families). See
    [§4](#4-declarations-and-references).
 7. **Resolution.** Add deterministic module/name rules in
-   `crates/cartograph-indexer/src/native_pipeline.rs`.
+   `crates/codevetra-indexer/src/native_pipeline.rs`.
    See [§5](#5-resolution).
 8. **Search documents.** Prove a live BM25 hit. See [§6](#6-search-documents).
 9. **Import and freshness.** Update importer preflight in
-   `crates/cartograph-db/src/v1_import.rs` and the live cutover tests.
+   `crates/codevetra-db/src/v1_import.rs` and the live cutover tests.
    See [§7](#7-import-and-freshness-boundary).
 10. **v1 parity.** For a v1.1.33 mode, keep the v1 parity oracle green: fix
     dropped facts, pin verified shape differences, or ledger missing facts as
@@ -91,9 +91,9 @@ Work through these steps in order. Each links to the detailed rules below.
 
 ### 1. Stable language identity
 
-Add the language to `cartograph-domain::SourceLanguage` with a stable serialized
+Add the language to `codevetra-domain::SourceLanguage` with a stable serialized
 and database value: a row in the `source_languages!` table in
-`crates/cartograph-domain/src/source.rs` gives the variant, its `stable` id, its
+`crates/codevetra-domain/src/source.rs` gives the variant, its `stable` id, its
 `v1_extensions`, its additive `additions`, and its `native` flag. Update the
 domain round-trip tests. These values are part of generation facts and
 migration compatibility; renaming one is a schema change.
@@ -114,11 +114,11 @@ is in neither `grammar_strategy` nor `fallback_strategy` panics with
 ### 2. Discovery and snapshot admission
 
 Extension ownership comes from the `source_languages!` table in
-`crates/cartograph-domain/src/source.rs`. Shared or ambiguous extensions are
+`crates/codevetra-domain/src/source.rs`. Shared or ambiguous extensions are
 resolved by its `detect_*` helpers (for example `detect_source_language`,
 `detect_content_gated_language`, `detect_colliding_game_extension`, and
 `detect_header_language`), which gate a mode by path or content without
-changing the frozen v1 classifier. `crates/cartograph-domain/src/source/test_paths.rs`
+changing the frozen v1 classifier. `crates/codevetra-domain/src/source/test_paths.rs`
 owns the shared language-aware test-path policy used by extraction and retrieval.
 
 - map canonical extensions to the language (`source.rs`);
@@ -134,8 +134,8 @@ arbitrary path directly.
 ### 3. Grammar registration
 
 Pin the tree-sitter crate in the workspace `Cargo.toml` and add it to
-`crates/cartograph-extract/Cargo.toml`. Then select its grammar in
-`crates/cartograph-extract/src/grammars.rs`:
+`crates/codevetra-extract/Cargo.toml`. Then select its grammar in
+`crates/codevetra-extract/src/grammars.rs`:
 
 - add a `NativeGrammar` variant;
 - add its stable id to `NATIVE_GRAMMAR_IDS`, its constructor to
@@ -147,10 +147,10 @@ Pin the tree-sitter crate in the workspace `Cargo.toml` and add it to
   pins the v1 grammar/custom split (61/12) and requires that a mode has a
   grammar exactly when its strategy is not `CustomStructural`.
 
-Register the extraction strategy in `crates/cartograph-extract/src/language.rs`:
+Register the extraction strategy in `crates/codevetra-extract/src/language.rs`:
 a dedicated family in `grammar_strategy`, or `GenericStructural` /
 `CustomStructural` in `fallback_strategy`. `NativeExtractor`
-(`crates/cartograph-extract/src/native.rs`) loads the grammar and strategy from
+(`crates/codevetra-extract/src/native.rs`) loads the grammar and strategy from
 that registration.
 
 Create a fresh parser per bounded operation or use the established worker-local
@@ -205,10 +205,10 @@ Pascal, Objective-C, Swift, Dart, F#, ArkTS, Ruby, Lua, R, Nix, Lisp, Lean,
 ReScript, Solidity, VB.NET, Apex, HCL, Astro) follow it:
 
 1. **Strategy.** Add an `ExtractionStrategy` variant in
-   `crates/cartograph-extract/src/language.rs`, list it in `is_executable`, and
+   `crates/codevetra-extract/src/language.rs`, list it in `is_executable`, and
    register the language for it in the `GRAMMAR_STRATEGIES` table (removing it
    from `fallback_strategy`).
-2. **Walker family.** In `crates/cartograph-extract/src/walk.rs`, give the
+2. **Walker family.** In `crates/codevetra-extract/src/walk.rs`, give the
    family a language list such as `ADA_LANGUAGES` and remove the language from
    `GENERIC_LANGUAGES`. Language lists are disjoint: a language selects at most
    one family.
@@ -229,7 +229,7 @@ ReScript, Solidity, VB.NET, Apex, HCL, Astro) follow it:
    Solidity) and `walk/script_support.rs` for load-style imports (Ruby, Lua,
    R, Nix). Per-walk family state belongs in one builder slot (the scripting
    families share `ScriptState`), not in globals.
-5. **Tests.** Add a focused suite under `crates/cartograph-extract/tests/`
+5. **Tests.** Add a focused suite under `crates/codevetra-extract/tests/`
    (for example `ada_family.rs`), keep the [v1 parity oracle](#8-v1-parity-oracle)
    green for a v1 mode, and update any frozen indexer digest the new facts
    move.
@@ -272,7 +272,7 @@ appear fresh while unsupported files change or disappear on the next index.
 ### 8. v1 parity oracle
 
 Every v1.1.33 mode has a fixture corpus and the facts the real v1.1.33 binary
-extracted from it, and `crates/cartograph-extract/tests/v1_parity_oracle.rs`
+extracted from it, and `crates/codevetra-extract/tests/v1_parity_oracle.rs`
 (part of `cargo test`) requires one disposition for every frozen fact:
 
 - **Identity:** a unique exact per-file key, including qualified names, kinds
@@ -290,7 +290,7 @@ satisfy the gate. Delete stale or redundant rows and unused reason definitions.
 same gate; reference pins always retain the owner's kind and declaration site.
 
 ```sh
-cargo test --locked -p cartograph-extract --test v1_parity_oracle
+cargo test --locked -p codevetra-extract --test v1_parity_oracle
 ```
 
 Keep the corpus and captured `expected/<mode>.json` unchanged when resolving a
@@ -310,9 +310,9 @@ facts and V24 shared test-path classification. Native
 RocksDB generations carry this contract directly:
 
 - add the `GenerationDigestVersion` variant and move `CURRENT` in
-  `crates/cartograph-domain/src/lib.rs`;
-- add its digest domain in `crates/cartograph-db/src/ingest/digest.rs`;
-- update the frozen digests in `crates/cartograph-indexer/src/native_pipeline.rs`
+  `crates/codevetra-domain/src/lib.rs`;
+- add its digest domain in `crates/codevetra-db/src/ingest/digest.rs`;
+- update the frozen digests in `crates/codevetra-indexer/src/native_pipeline.rs`
   and corresponding fact-restoration proofs without changing the frozen corpus;
 - record the contract in the
   [native extraction contract history](v2/EXTRACTION.md#complete-source-revision)
@@ -362,10 +362,10 @@ At minimum:
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo test --locked -p cartograph-domain -p cartograph-extract -p cartograph-indexer
+cargo test --locked -p codevetra-domain -p codevetra-extract -p codevetra-indexer
 ```
 
-The `cartograph-extract` tests include the
+The `codevetra-extract` tests include the
 [v1 parity oracle](#8-v1-parity-oracle).
 
 Then run the live native-corpus supervisor and 1/2/4/8/16-worker benchmark from

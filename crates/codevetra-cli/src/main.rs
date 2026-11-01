@@ -1,0 +1,5656 @@
+#![recursion_limit = "256"]
+//! Native 64-bit command-line and MCP entry point for CodeVetra v4.
+
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("CodeVetra v4 supports only 64-bit operating systems.");
+
+use std::{
+    collections::BTreeMap,
+    env,
+    fmt::Write as _,
+    fs,
+    io::{IsTerminal as _, Write as _},
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use codevetra_agent::{
+    IndexFailure, IndexOptions, IndexReport, ProjectCancellation, ProjectError, ProjectRuntime,
+    RetrievalOptions, RetrievalRequest, ReviewOptions, ReviewReport, SourceContextOptions,
+    SourceContextRequest, WorkingTreeOverlayRequest, semantic_readiness_from_database,
+};
+use codevetra_db::{GenerationStorageSummary, SemanticReadinessState};
+use codevetra_domain::{EdgeKind, ModelId, NormalizedPath, ProjectId, SourceLanguage, SymbolId};
+use codevetra_llm::{
+    CredentialCommand, CredentialCommandError, JevError, JevSettings, ProjectLlmConfigError,
+    ProjectLlmCredentialSource, ProjectLlmTier, ProjectLlmTierConfig, load_exact_project_llm_tier,
+    load_project_llm_credential_environment, probe_openai_compatible_endpoint,
+};
+use codevetra_mcp::{ServerConfig, ServerLimits, ServerMetadata, ToolProfile};
+use codevetra_search::{
+    ContextAnchor, ContextBudget, ContextRequest, ContextRequestOptions, DeterministicRetriever,
+    EntryPointBucket, EntryPointsQuery, ExactPathQuery, ExactTextQuery, FileInventoryQuery,
+    GraphPathRequest, GraphPathRequestInput, IndexFreshness, LexicalQuery, SearchMode,
+    SemanticReadiness as RetrievalSemanticReadiness, SimilarRequest, SourceRangeQuery,
+    SourceRangeQueryInput, TaskIntent, TraversalBudget, TraversalRequest,
+};
+use futures_util::{StreamExt as _, stream};
+use install::{
+    InstallLocation as AgentInstallLocation, InstallReport, InstallRequest, InstallRequestInput,
+    InstallTarget,
+};
+use mcp_handler::AGENT_PLAYBOOK;
+use serde::Serialize;
+use serde_json::{Map, Value};
+use url::Url;
+
+mod auto_sync;
+mod backend;
+mod byte_format;
+mod completions;
+mod error_codes;
+mod generated_cli;
+mod git_hooks;
+mod graph_export;
+mod host;
+mod install;
+mod llm_commands;
+mod mcp_budget;
+mod mcp_handler;
+mod rocks_cli;
+mod supervised_index;
+mod upgrade;
+
+use byte_format::format_binary_bytes;
+use graph_export::{DEFAULT_NODE_LIMIT, GraphExportFormat};
+use supervised_index::{CancellableIndex, IndexSupervision, InterruptForwarding};
+
+const RETENTION_CONFIRMATION: &str = "prune-old-generations";
+/// Longest `sync-if-dirty` waits for other project writers' leases in total.
+const SYNC_IF_DIRTY_LEASE_WAIT: Duration = Duration::from_mins(5);
+/// Bound on the post-failure lookup of whether a generation is still current.
+const FAILURE_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAXIMUM_TRANSIENT_FILE_BYTES: usize = 10 * 1024 * 1024;
+const KIBIBYTE: usize = 1_024;
+const MEBIBYTE: usize = KIBIBYTE * KIBIBYTE;
+const GIBIBYTE_U64: u64 = 1_024 * 1_024 * 1_024;
+const RETAINED_BYTE_WARNING: u64 = 4 * GIBIBYTE_U64;
+const MAXIMUM_SUPERSEDED_GENERATIONS_WITHOUT_ATTENTION: u64 = 34;
+const MAXIMUM_FAILED_GENERATIONS_WITHOUT_ATTENTION: u64 = 32;
+const MCP_SERVER_INSTRUCTIONS: &str = "Start with codevetra_status and do not treat stale or unknown-freshness graph evidence as current. Use codevetra_context for the concrete coding task, then narrow with entry_points, files, at_range, find, node, graph, or affected. Read live source before editing. After changes, use codevetra_review against the intended base and run the repository's real quality gates. Preserve generation, freshness, confidence, abstention, provenance, multiplicity, and truncation in your reasoning. Use codevetra_admin only for explicit bounded lifecycle work. Call codevetra_playbook when you need the full workflow and tool-routing guide.";
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "codevetra",
+    version,
+    about = "Native Rust/RocksDB code intelligence for coding agents"
+)]
+struct Cli {
+    /// Disable ANSI color output. Retained for v1 command-line compatibility.
+    #[arg(long = "no-color", global = true)]
+    _no_color: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Explicitly migrate legacy project names while preserving the existing data and owner lock.
+    MigrateName {
+        /// Initialized project root. Stop its existing host before migration.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Manage configured local llama-server processes without owning external providers.
+    Backend {
+        #[command(subcommand)]
+        command: backend::BackendCommand,
+    },
+    /// Build and atomically publish a complete native source generation.
+    #[command(alias = "quickstart")]
+    Index {
+        /// Existing project root to index.
+        #[arg(default_value = ".")]
+        project_path: PathBuf,
+        /// Maximum native workers; the corpus-aware selector may use fewer.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=16))]
+        workers: Option<u16>,
+        /// Publish a new generation even when the live source digest is unchanged.
+        #[arg(long)]
+        force: bool,
+        /// Skip paths matching a glob for this generation, repeatable. A
+        /// leading `!` re-includes a path an earlier exclusion matched. The
+        /// generation records this admission policy for freshness; persist a
+        /// shared project default in .codevetra/config.json or .codevetraignore.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude: Vec<String>,
+        /// Inherit the current generation's run-scoped exclusions when this
+        /// reconciliation call does not supply replacements.
+        #[arg(long, hide = true)]
+        preserve_current_excludes: bool,
+        /// Run as the supervised child of `upgrade --apply`: stdin EOF requests
+        /// cooperative cancellation, changed progress is written as JSON lines
+        /// on stderr, other live project writers are awaited within a bound, a
+        /// checkout change after publication is reported instead of rebuilt,
+        /// and the optional Git history refresh is left to the next index.
+        #[arg(long, hide = true)]
+        supervised: bool,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Report current generation counts and live-source freshness.
+    Status {
+        /// Existing project root whose state should be inspected.
+        #[arg(default_value = ".")]
+        project_path: PathBuf,
+        /// Existing project root, as an alternative to the positional path.
+        #[arg(short = 'p', long = "project-path", conflicts_with = "project_path")]
+        project_path_flag: Option<PathBuf>,
+        /// Output the complete structured status as JSON.
+        #[arg(short = 'j', long)]
+        json: bool,
+        /// Include default hotspot, biomarker, and summary-provenance rollups.
+        #[arg(long)]
+        verbose: bool,
+        /// Inline the top-N hotspots; invalid or sub-one values suppress the rollup.
+        #[arg(long)]
+        top_hotspots: Option<String>,
+        /// Inline the top-N warning-or-worse biomarker findings.
+        #[arg(long)]
+        top_biomarkers: Option<String>,
+        /// Include summary coverage grouped by durable model provenance.
+        #[arg(long)]
+        summary_breakdown: bool,
+        /// Additive v2 output selector; --json takes precedence.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Embed missing current-generation documents through the configured endpoint.
+    Embed {
+        /// Existing indexed project whose search documents should be embedded.
+        #[arg(default_value = ".")]
+        project_path: PathBuf,
+        /// Maximum concurrent endpoint/database batches.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=16))]
+        workers: Option<u16>,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Probe the configured embedding model and report native semantic readiness.
+    EmbeddingStatus {
+        /// Existing indexed project whose semantic coverage should be checked.
+        #[arg(default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Find exact, lexical, or hybrid evidence in the current generation.
+    #[command(name = "find-native", hide = true)]
+    Find {
+        /// Name, project-relative path, reference text, or natural-language query.
+        query: String,
+        /// Retrieval channel to execute.
+        #[arg(long, value_enum, default_value_t = FindBy::Auto)]
+        by: FindBy,
+        /// Maximum result rows.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Explicitly permit cached evidence when the live source revision is stale.
+        #[arg(long)]
+        allow_stale: bool,
+        /// Existing project root whose current generation should be searched.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Build an intent-routed evidence packet with provenance, graph policy, and live overlay.
+    #[command(name = "context-native", hide = true)]
+    Context {
+        /// Coding task or investigation question.
+        task: String,
+        /// Optional exact declaration-name seed.
+        #[arg(long)]
+        exact_name: Option<String>,
+        /// Optional exact project-relative path seed.
+        #[arg(long)]
+        exact_path: Option<String>,
+        /// Optional exact source-reference seed.
+        #[arg(long)]
+        exact_reference: Option<String>,
+        /// Natural-language retrieval policy; auto falls back to deterministic BM25.
+        #[arg(long, value_enum, default_value_t = RetrievalMode::Auto)]
+        mode: RetrievalMode,
+        /// Existing project root whose evidence should be assembled.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// List a bounded current-generation source-file inventory.
+    #[command(name = "files-native", hide = true)]
+    Files {
+        /// Optional exact project-relative directory subtree.
+        #[arg(long)]
+        dir: Option<String>,
+        /// Optional stable language identifier.
+        #[arg(long)]
+        language: Option<String>,
+        /// Maximum file rows.
+        #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u16).range(1..=500))]
+        limit: u16,
+        /// Explicitly permit cached evidence when the live source revision is stale.
+        #[arg(long)]
+        allow_stale: bool,
+        /// Existing project root whose current generation should be listed.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Discover typed top-of-stack routes, commands, MCP tools, CLI declarations, and public APIs.
+    #[command(name = "entry-points-native", hide = true)]
+    EntryPoints {
+        /// Optional category; omit to return every category in stable order.
+        #[arg(long, value_enum)]
+        bucket: Option<EntryPointBucketArg>,
+        /// Maximum symbols returned per category.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=200))]
+        limit: u16,
+        /// Explicitly permit cached evidence when the live source revision is stale.
+        #[arg(long)]
+        allow_stale: bool,
+        /// Existing project root whose public boundary should be inspected.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Resolve indexed symbols overlapping one exact inclusive source range.
+    #[command(name = "at-range-native", hide = true)]
+    AtRange {
+        /// Exact project-relative source path.
+        file: String,
+        /// First one-based source line.
+        #[arg(value_parser = clap::value_parser!(u32).range(1..=10_000_000))]
+        start_line: u32,
+        /// Last one-based source line.
+        #[arg(value_parser = clap::value_parser!(u32).range(1..=10_000_000))]
+        end_line: u32,
+        /// Maximum overlapping symbols.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=200))]
+        limit: u16,
+        /// Explicitly permit cached evidence when the live source revision is stale.
+        #[arg(long)]
+        allow_stale: bool,
+        /// Existing project root whose current generation should be queried.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Traverse or find a shortest dependency path from an exact symbol ID.
+    #[command(name = "graph-native", hide = true)]
+    Graph {
+        /// Exact UUID returned by `codevetra find` or `codevetra context`.
+        symbol_id: String,
+        /// Traversal orientation.
+        #[arg(long, value_enum, default_value_t = GraphAxis::Impact)]
+        direction: GraphAxis,
+        /// Exact target UUID required by `--direction path`.
+        #[arg(long)]
+        to: Option<String>,
+        /// Restrict traversal or path search to one exact edge kind.
+        #[arg(long, value_enum)]
+        edge_kind: Option<GraphEdgeKind>,
+        /// Semantic neighbor count for `--direction similar` (default 5, maximum 50).
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=50))]
+        k: Option<u16>,
+        /// Minimum cosine similarity for `--direction similar` (default 0.3).
+        #[arg(long)]
+        min_score: Option<f64>,
+        /// Restrict semantic neighbors to the source symbol's language.
+        #[arg(long)]
+        same_language: bool,
+        /// Exact active embedding-model UUID when multiple models are ready.
+        #[arg(long)]
+        model_id: Option<String>,
+        /// Maximum graph depth.
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=8))]
+        depth: u8,
+        /// Maximum non-root symbols.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=500))]
+        max_nodes: u16,
+        /// Explicitly permit cached evidence when the live source revision is stale.
+        #[arg(long)]
+        allow_stale: bool,
+        /// Existing project root whose graph should be traversed.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Read bounded source context for one exact current-generation symbol ID.
+    Show {
+        /// Exact UUID returned by `codevetra find`, `context`, or `graph`.
+        symbol_id: String,
+        /// Symmetric source lines included before and after the declaration.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(0..=200))]
+        context_lines: u16,
+        /// Hard UTF-8 source payload ceiling.
+        #[arg(long, default_value_t = 65_536, value_parser = clap::value_parser!(u32).range(1024..=262144))]
+        max_bytes: u32,
+        /// Explicitly permit stale metadata with source omitted.
+        #[arg(long)]
+        allow_stale: bool,
+        /// Existing project root whose current symbol should be read.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Select bounded affected tests from reverse graph impact.
+    #[command(name = "affected-native", hide = true)]
+    Affected {
+        /// Exact changed symbol UUID.
+        symbol_id: String,
+        /// Maximum graph depth.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=8))]
+        depth: u8,
+        /// Maximum graph nodes inspected.
+        #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u16).range(1..=500))]
+        max_nodes: u16,
+        /// Maximum test results.
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Explicitly permit cached evidence when the live source revision is stale.
+        #[arg(long)]
+        allow_stale: bool,
+        /// Existing project root whose graph should be traversed.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Compare the live checkout to a Git ref and assemble deterministic review evidence.
+    #[command(name = "review-native", hide = true)]
+    Review {
+        /// Git revision to compare with the live index and working tree.
+        #[arg(long = "ref", default_value = "HEAD")]
+        base_ref: String,
+        /// Maximum changed files retained after stable path ordering.
+        #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u16).range(1..=512))]
+        max_changed_files: u16,
+        /// Existing project root whose Git checkout and graph should be reviewed.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Export a capped graph snapshot as JSON, DOT, Mermaid, or Cytoscape JSON.
+    Export {
+        /// Existing indexed project to export.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Explicit project path (overrides the positional path).
+        #[arg(short = 'p', long)]
+        project_path: Option<PathBuf>,
+        /// Graph artifact format.
+        #[arg(short = 'f', long, value_enum, default_value_t = GraphExportFormat::Json)]
+        format: GraphExportFormat,
+        /// Write the artifact to a file instead of stdout.
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+        /// Maximum exported nodes; edges are retained only between exported nodes.
+        #[arg(long, default_value_t = DEFAULT_NODE_LIMIT, value_parser = clap::value_parser!(u16).range(1..=50_000))]
+        limit: u16,
+        /// Comma-separated symbol kinds to include.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Comma-separated edge kinds to include.
+        #[arg(long)]
+        edge_kind: Option<String>,
+        /// Comma-separated languages to include.
+        #[arg(long)]
+        language: Option<String>,
+        /// Only include symbols whose project-relative file starts with this prefix.
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Find embedding-cosine peers of an exact symbol name or UUID.
+    Similar {
+        /// Exact symbol name or UUID.
+        symbol: String,
+        /// Maximum semantic neighbors.
+        #[arg(short = 'k', long = "top-k", visible_alias = "k", default_value_t = 5, value_parser = clap::value_parser!(u16).range(1..=50))]
+        k: u16,
+        /// Minimum cosine similarity.
+        #[arg(long, default_value_t = 0.3)]
+        min_score: f64,
+        /// Restrict results to the source symbol's language.
+        #[arg(long)]
+        same_language: bool,
+        /// Exact active embedding-model UUID when more than one model is ready.
+        #[arg(long)]
+        model_id: Option<String>,
+        /// Explicitly permit cached evidence when the live source is stale.
+        #[arg(long)]
+        allow_stale: bool,
+        /// Existing indexed project.
+        #[arg(short = 'p', long, default_value = ".")]
+        project_path: PathBuf,
+    },
+    /// Re-index only when source state is dirty or the current generation is stale.
+    SyncIfDirty {
+        /// Existing indexed project.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Suppress hook-friendly output.
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// Transient maximum source-file size (bytes, kb, or mb; maximum 10mb).
+        #[arg(long)]
+        max_file_size: Option<String>,
+    },
+    /// Install managed Git hooks that keep the CodeVetra index fresh.
+    InstallHooks {
+        /// Existing Git working tree.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Comma-separated hooks: post-merge, post-checkout, post-rewrite.
+        #[arg(long)]
+        hooks: Option<String>,
+        /// CodeVetra executable name or path embedded in the managed block.
+        #[arg(long)]
+        command: Option<String>,
+        /// Remove only CodeVetra's managed hook blocks.
+        #[arg(long)]
+        remove: bool,
+        /// Print planned changes without writing hook files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Measure MCP startup payload size and its largest schema contributors.
+    McpBudget {
+        /// Advertised tool profile.
+        #[arg(long, value_enum, default_value_t = McpProfile::Core)]
+        profile: McpProfile,
+        /// Measure with only explicitly read-only tool contracts.
+        #[arg(long = "no-write-tools")]
+        no_write_tools: bool,
+        /// Exact tool names to omit; repeat the option or pass several names.
+        #[arg(long, num_args = 1.., action = clap::ArgAction::Append)]
+        disable_tool: Vec<String>,
+        /// Number of largest tool schemas to list.
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(0..=100))]
+        top: u16,
+        /// Print structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print shell completion setup.
+    #[command(alias = "completion")]
+    Completions {
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: completions::CompletionShell,
+    },
+    /// Internal dynamic shell-completion helper.
+    #[command(name = "__complete", hide = true, trailing_var_arg = true)]
+    CompleteInternal {
+        #[arg(allow_hyphen_values = true)]
+        words: Vec<String>,
+    },
+    /// Print the complete coding-agent workflow and tool-routing guide.
+    Guide,
+    /// Configure, install, and exercise optional OpenAI-compatible LLM tiers.
+    Llm {
+        #[command(subcommand)]
+        command: llm_commands::LlmCommand,
+    },
+    /// Deprecated alias of `codevetra llm install`.
+    #[command(name = "setup", hide = true)]
+    Setup(llm_commands::InstallArguments),
+    /// Check for a release or complete the safe project upgrade sequence.
+    #[command(alias = "update")]
+    Upgrade {
+        /// Install, reconcile the project, repair owned MCP pins, and verify freshness.
+        #[arg(long)]
+        apply: bool,
+        /// Output structured JSON.
+        #[arg(short = 'j', long)]
+        json: bool,
+        /// Existing project to audit or reconcile with the installed release.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+    },
+    /// Configure CodeVetra for one or more coding-agent hosts.
+    Install {
+        /// Comma-separated target ids, or auto, all, or none.
+        #[arg(short = 't', long)]
+        target: Option<String>,
+        /// Install globally for all projects or privately in this project.
+        #[arg(short = 'l', long, value_enum, default_value_t = InstallLocation::Global)]
+        location: InstallLocation,
+        /// Existing project root to expose through the MCP server.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Use non-interactive defaults: global, auto-detected targets, permissions enabled.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Skip Claude/Qoder MCP auto-allow entries.
+        #[arg(long)]
+        no_permissions: bool,
+        /// Skip managed Git hooks for project-local installation.
+        #[arg(long)]
+        no_hooks: bool,
+        /// Command or absolute executable path written into host configuration.
+        #[arg(long)]
+        command: Option<String>,
+        /// Print one target's MCP configuration without writing files.
+        #[arg(long)]
+        print_config: Option<String>,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Remove CodeVetra-owned MCP entries and guidance from agent hosts.
+    Uninstall {
+        /// Optional comma-separated target ids; defaults to every known target.
+        #[arg(short = 't', long)]
+        target: Option<String>,
+        /// Remove global or project-local entries.
+        #[arg(short = 'l', long, value_enum, default_value_t = InstallLocation::Global)]
+        location: InstallLocation,
+        /// Existing project root containing the registration.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Keep this project's graph current independently of an MCP connection.
+    Watch {
+        /// Existing project root owned by this foreground process.
+        #[arg(short = 'p', long, default_value = ".")]
+        project_path: PathBuf,
+    },
+    /// Manage the project-scoped autosync login service (macOS).
+    Service(rocks_cli::service::ServiceArguments),
+    /// Serve CodeVetra's bounded Model Context Protocol connection over stdio.
+    Serve {
+        /// Confirm stdio MCP transport (the only v2 transport in this release).
+        #[arg(long)]
+        mcp: bool,
+        /// Existing project root exposed to this MCP process.
+        #[arg(short = 'p', long, default_value = ".")]
+        project_path: PathBuf,
+        /// Advertised MCP tool profile.
+        #[arg(long, value_enum, default_value_t = McpProfile::Core)]
+        profile: McpProfile,
+        /// Compatibility flag; native project ownership replaces the v1 writer daemon.
+        #[arg(long, conflicts_with = "no_daemon")]
+        daemon: bool,
+        /// Run this MCP connection directly (the native v2 default).
+        #[arg(long = "no-daemon", conflicts_with = "daemon")]
+        no_daemon: bool,
+        /// Internal v1 compatibility flag; native v2 still serves this connection directly.
+        #[arg(long, hide = true)]
+        daemon_child: bool,
+        /// Advertise only explicitly read-only tool contracts.
+        #[arg(long = "no-write-tools")]
+        no_write_tools: bool,
+        /// Default allowStale to true when a supporting tool omits it.
+        #[arg(long)]
+        allow_stale_default: bool,
+        /// Default lowTokens to true when a supporting tool omits it.
+        #[arg(long)]
+        low_tokens_default: bool,
+        /// Exact tool names to omit from the advertised and callable surface.
+        #[arg(long, num_args = 1.., action = clap::ArgAction::Append)]
+        disable_tool: Vec<String>,
+        /// Skip the default one-time source catch-up before serving.
+        #[arg(long)]
+        no_startup_sync: bool,
+        /// Disable native filesystem watching and periodic source reconciliation.
+        #[arg(long)]
+        no_auto_sync: bool,
+    },
+    /// Verify native storage, the current graph, and retrieval readiness.
+    Doctor {
+        /// Existing project root whose native storage and readiness should be checked.
+        #[arg(default_value = ".")]
+        project_path: PathBuf,
+        /// Repair safe local gaps: create private state and install/configure missing minimal LLM tiers.
+        #[arg(long)]
+        fix: bool,
+        /// Skip project state, index, and LLM checks for fresh-install verification.
+        #[arg(long, visible_alias = "skip-project-checks")]
+        no_project_checks: bool,
+        /// Print structured JSON (alias of --format json).
+        #[arg(short = 'j', long)]
+        json: bool,
+        /// Output format for humans or automation.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Inspect and maintain this project's native `RocksDB` storage.
+    Db {
+        #[command(subcommand)]
+        command: DatabaseCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DatabaseCommand {
+    /// Rebuild this project in `RocksDB` and verify exact source freshness.
+    Migrate(rocks_cli::MigrationArguments),
+    /// Report native files, WAL, memtables and compaction backlog.
+    Usage(DatabaseUsageArguments),
+    /// Collect one bounded batch of obsolete graph versions while preserving readers.
+    Prune(PruneArguments),
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum McpProfile {
+    Full,
+    #[default]
+    Core,
+    Coding,
+    ReadOnly,
+    Review,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum FindBy {
+    #[default]
+    Auto,
+    Name,
+    Path,
+    Reference,
+    Bm25,
+    Hybrid,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum RetrievalMode {
+    #[default]
+    Auto,
+    Deterministic,
+    Hybrid,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EntryPointBucketArg {
+    Routes,
+    Cli,
+    CliCommands,
+    McpTools,
+    CliFiles,
+    PublicExports,
+}
+
+impl From<EntryPointBucketArg> for EntryPointBucket {
+    fn from(value: EntryPointBucketArg) -> Self {
+        match value {
+            EntryPointBucketArg::Routes => Self::Routes,
+            EntryPointBucketArg::Cli | EntryPointBucketArg::CliCommands => Self::CliCommands,
+            EntryPointBucketArg::McpTools => Self::McpTools,
+            EntryPointBucketArg::CliFiles => Self::CliFiles,
+            EntryPointBucketArg::PublicExports => Self::PublicExports,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum GraphAxis {
+    Callers,
+    Callees,
+    Both,
+    Path,
+    Similar,
+    #[default]
+    Impact,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum GraphEdgeKind {
+    Calls,
+    Imports,
+    References,
+    Implements,
+    Extends,
+    Tests,
+    TypeOf,
+    Returns,
+    Instantiates,
+    Overrides,
+    Decorates,
+    FieldAccess,
+    DefUse,
+    Exports,
+    Contains,
+}
+
+impl From<GraphEdgeKind> for EdgeKind {
+    fn from(value: GraphEdgeKind) -> Self {
+        match value {
+            GraphEdgeKind::Calls => Self::Calls,
+            GraphEdgeKind::Imports => Self::Imports,
+            GraphEdgeKind::References => Self::References,
+            GraphEdgeKind::Implements => Self::Implements,
+            GraphEdgeKind::Extends => Self::Extends,
+            GraphEdgeKind::Tests => Self::Tests,
+            GraphEdgeKind::TypeOf => Self::TypeOf,
+            GraphEdgeKind::Returns => Self::Returns,
+            remaining => graph_edge_kind_tail(remaining),
+        }
+    }
+}
+
+const fn graph_edge_kind_tail(value: GraphEdgeKind) -> EdgeKind {
+    match value {
+        GraphEdgeKind::Instantiates => EdgeKind::Instantiates,
+        GraphEdgeKind::Overrides => EdgeKind::Overrides,
+        GraphEdgeKind::Decorates => EdgeKind::Decorates,
+        GraphEdgeKind::FieldAccess => EdgeKind::FieldAccess,
+        GraphEdgeKind::DefUse => EdgeKind::DefUse,
+        GraphEdgeKind::Exports => EdgeKind::Exports,
+        GraphEdgeKind::Contains => EdgeKind::Contains,
+        GraphEdgeKind::Calls
+        | GraphEdgeKind::Imports
+        | GraphEdgeKind::References
+        | GraphEdgeKind::Implements
+        | GraphEdgeKind::Extends
+        | GraphEdgeKind::Tests
+        | GraphEdgeKind::TypeOf
+        | GraphEdgeKind::Returns => unreachable!(),
+    }
+}
+
+struct FindArguments {
+    project_path: PathBuf,
+    query: String,
+    by: FindBy,
+    limit: u16,
+    allow_stale: bool,
+    format: OutputFormat,
+}
+
+struct FindCommandContext<'runtime, 'retrieval> {
+    runtime: &'runtime ProjectRuntime,
+    retrieval: &'retrieval DeterministicRetriever,
+    project_id: ProjectId,
+    freshness: IndexFreshness,
+    limit: u16,
+    format: OutputFormat,
+}
+
+struct FilesArguments {
+    project_path: PathBuf,
+    directory: Option<String>,
+    language: Option<String>,
+    limit: u16,
+    allow_stale: bool,
+    format: OutputFormat,
+}
+
+struct EntryPointsArguments {
+    project_path: PathBuf,
+    bucket: Option<EntryPointBucket>,
+    limit: u16,
+    allow_stale: bool,
+    format: OutputFormat,
+}
+
+struct AtRangeArguments {
+    project_path: PathBuf,
+    file: String,
+    start_line: u32,
+    end_line: u32,
+    limit: u16,
+    allow_stale: bool,
+    format: OutputFormat,
+}
+
+struct ContextArguments {
+    project_path: PathBuf,
+    task: String,
+    exact_name: Option<String>,
+    exact_path: Option<String>,
+    exact_reference: Option<String>,
+    mode: RetrievalMode,
+    format: OutputFormat,
+}
+
+impl From<RetrievalMode> for SearchMode {
+    fn from(value: RetrievalMode) -> Self {
+        match value {
+            RetrievalMode::Auto => Self::Auto,
+            RetrievalMode::Deterministic => Self::Deterministic,
+            RetrievalMode::Hybrid => Self::Hybrid,
+        }
+    }
+}
+
+struct GraphArguments {
+    project_path: PathBuf,
+    symbol_id: String,
+    direction: GraphAxis,
+    target_symbol_id: Option<String>,
+    edge_kind: Option<EdgeKind>,
+    similar_limit: Option<u16>,
+    minimum_score: Option<f64>,
+    same_language: bool,
+    model_id: Option<String>,
+    depth: u8,
+    max_nodes: u16,
+    allow_stale: bool,
+    format: OutputFormat,
+}
+
+struct AffectedArguments {
+    project_path: PathBuf,
+    symbol_id: String,
+    depth: u8,
+    max_nodes: u16,
+    limit: u16,
+    allow_stale: bool,
+    format: OutputFormat,
+}
+
+struct ShowArguments {
+    project_path: PathBuf,
+    symbol_id: String,
+    context_lines: u16,
+    max_bytes: u32,
+    allow_stale: bool,
+    format: OutputFormat,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CliFreshEvidence<'evidence, Evidence> {
+    freshness: IndexFreshness,
+    evidence: &'evidence Evidence,
+}
+
+struct ReviewArguments {
+    project_path: PathBuf,
+    base_ref: String,
+    max_changed_files: u16,
+    format: OutputFormat,
+}
+
+struct IndexArguments {
+    project_path: PathBuf,
+    workers: Option<u16>,
+    force: bool,
+    exclude: Vec<String>,
+    preserve_current_excludes: bool,
+    supervised: bool,
+    format: OutputFormat,
+}
+
+struct AgentInstallArguments {
+    target: Option<String>,
+    location: InstallLocation,
+    project_path: PathBuf,
+    behavior: AgentInstallBehavior,
+    command: Option<String>,
+    print_config: Option<String>,
+    format: OutputFormat,
+    remove: bool,
+}
+
+struct AgentInstallBehavior {
+    yes: bool,
+    permissions: bool,
+    hooks: bool,
+}
+
+struct McpServeArguments {
+    mcp: bool,
+    project_path: PathBuf,
+    profile: McpProfile,
+    no_write_tools: bool,
+    defaults: McpServeDefaults,
+    disable_tool: Vec<String>,
+    sync: McpServeSync,
+}
+
+struct McpServeDefaults {
+    allow_stale: bool,
+    low_tokens: bool,
+}
+
+#[derive(Clone, Copy)]
+enum McpServeSync {
+    Enabled { startup_reconciliation: bool },
+    Disabled,
+}
+
+#[derive(Debug, Args)]
+struct PruneArguments {
+    #[arg(long, default_value = ".")]
+    project_path: PathBuf,
+    #[arg(long, default_value_t = 2, value_parser=clap::value_parser!(u8).range(0..=32))]
+    keep_superseded: u8,
+    #[arg(long, default_value_t = 4, value_parser=clap::value_parser!(u16).range(1..=100))]
+    maximum_deletions: u16,
+    #[arg(long, default_value_t = 10_000, value_parser=clap::value_parser!(u32).range(1..=10_000))]
+    maximum_cascade_rows: u32,
+    /// Exact acknowledgement: prune-old-generations.
+    #[arg(long)]
+    confirm: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct DatabaseUsageArguments {
+    #[arg(long, default_value = ".")]
+    project_path: PathBuf,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+struct TraversalArguments<'a> {
+    project_id: ProjectId,
+    symbol_id: &'a str,
+    depth: u8,
+    max_nodes: u16,
+    edge_kind: Option<EdgeKind>,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum InstallLocation {
+    #[default]
+    Global,
+    Local,
+}
+
+impl From<InstallLocation> for AgentInstallLocation {
+    fn from(value: InstallLocation) -> Self {
+        match value {
+            InstallLocation::Global => Self::Global,
+            InstallLocation::Local => Self::Local,
+        }
+    }
+}
+
+impl From<McpProfile> for ToolProfile {
+    fn from(value: McpProfile) -> Self {
+        match value {
+            McpProfile::Full => Self::Full,
+            McpProfile::Core => Self::Core,
+            McpProfile::Coding => Self::Coding,
+            McpProfile::ReadOnly => Self::ReadOnly,
+            McpProfile::Review => Self::Review,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let parsed = match generated_cli::parse() {
+        Ok(parsed) => parsed,
+        Err(generated_cli::ParseFailure::Clap(error)) => {
+            let exit_code = if error.use_stderr() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            };
+            if error.print().is_err() {
+                return ExitCode::FAILURE;
+            }
+            return exit_code;
+        }
+        Err(generated_cli::ParseFailure::Contract(message)) => {
+            eprintln!("codevetra: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = match parsed {
+        generated_cli::ParsedCli::Static(cli) => run(cli).await,
+        generated_cli::ParsedCli::Tool(invocation) => generated_cli::run(invocation).await,
+    };
+    match result {
+        Ok(exit_code) => exit_code,
+        Err(message) => {
+            eprintln!("codevetra: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(cli: Cli) -> Result<ExitCode, String> {
+    let command = cli.command;
+    match command {
+        Command::MigrateName {
+            project_path,
+            format,
+        } => {
+            let report = tokio::task::spawn_blocking(move || {
+                codevetra_config::migrate_project_name(&project_path)
+            })
+            .await
+            .map_err(|_| "name migration worker failed".to_owned())?
+            .map_err(|error| error.to_string())?;
+            print_serialized(&report, format)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        command @ (Command::Index { .. }
+        | Command::Status { .. }
+        | Command::Embed { .. }
+        | Command::EmbeddingStatus { .. }) => run_index_command(command).await,
+        command @ (Command::Find { .. }
+        | Command::Context { .. }
+        | Command::Files { .. }
+        | Command::EntryPoints { .. }
+        | Command::AtRange { .. }) => run_search_command(command).await,
+        command @ (Command::Graph { .. }
+        | Command::Show { .. }
+        | Command::Affected { .. }
+        | Command::Review { .. }) => run_graph_command(command).await,
+        command => Box::pin(run_operator_command(command)).await,
+    }
+}
+
+async fn run_index_command(command: Command) -> Result<ExitCode, String> {
+    match command {
+        Command::Index {
+            project_path,
+            workers,
+            force,
+            exclude,
+            preserve_current_excludes,
+            supervised,
+            format,
+        } => {
+            run_index(IndexArguments {
+                project_path,
+                workers,
+                force,
+                exclude,
+                preserve_current_excludes,
+                supervised,
+                format,
+            })
+            .await
+        }
+        Command::Status {
+            project_path,
+            project_path_flag,
+            json,
+            verbose,
+            top_hotspots,
+            top_biomarkers,
+            summary_breakdown,
+            format,
+        } => {
+            run_status(StatusRunInput {
+                project_path: project_path_flag.unwrap_or(project_path),
+                json: json || matches!(format, OutputFormat::Json),
+                verbose,
+                top_hotspots,
+                top_biomarkers,
+                summary_breakdown,
+            })
+            .await
+        }
+        Command::Embed {
+            project_path,
+            workers,
+            format,
+        } => run_embed(project_path, workers, format).await,
+        Command::EmbeddingStatus {
+            project_path,
+            format,
+        } => run_embedding_status(project_path, format).await,
+        _ => Err("internal index command routing failed".to_owned()),
+    }
+}
+
+async fn run_search_command(command: Command) -> Result<ExitCode, String> {
+    match command {
+        Command::Find {
+            query,
+            by,
+            limit,
+            allow_stale,
+            project_path,
+            format,
+        } => {
+            run_find(FindArguments {
+                project_path,
+                query,
+                by,
+                limit,
+                allow_stale,
+                format,
+            })
+            .await
+        }
+        Command::Context {
+            task,
+            exact_name,
+            exact_path,
+            exact_reference,
+            mode,
+            project_path,
+            format,
+        } => {
+            run_context(ContextArguments {
+                project_path,
+                task,
+                exact_name,
+                exact_path,
+                exact_reference,
+                mode,
+                format,
+            })
+            .await
+        }
+        Command::Files {
+            dir,
+            language,
+            limit,
+            allow_stale,
+            project_path,
+            format,
+        } => {
+            run_files(FilesArguments {
+                project_path,
+                directory: dir,
+                language,
+                limit,
+                allow_stale,
+                format,
+            })
+            .await
+        }
+        Command::EntryPoints {
+            bucket,
+            limit,
+            allow_stale,
+            project_path,
+            format,
+        } => {
+            run_entry_points(EntryPointsArguments {
+                project_path,
+                bucket: bucket.map(Into::into),
+                limit,
+                allow_stale,
+                format,
+            })
+            .await
+        }
+        Command::AtRange {
+            file,
+            start_line,
+            end_line,
+            limit,
+            allow_stale,
+            project_path,
+            format,
+        } => {
+            run_at_range(AtRangeArguments {
+                project_path,
+                file,
+                start_line,
+                end_line,
+                limit,
+                allow_stale,
+                format,
+            })
+            .await
+        }
+        _ => Err("internal search command routing failed".to_owned()),
+    }
+}
+
+async fn run_graph_command(command: Command) -> Result<ExitCode, String> {
+    match command {
+        Command::Graph {
+            symbol_id,
+            direction,
+            to,
+            edge_kind,
+            k,
+            min_score,
+            same_language,
+            model_id,
+            depth,
+            max_nodes,
+            allow_stale,
+            project_path,
+            format,
+        } => {
+            run_graph(GraphArguments {
+                project_path,
+                symbol_id,
+                direction,
+                target_symbol_id: to,
+                edge_kind: edge_kind.map(Into::into),
+                similar_limit: k,
+                minimum_score: min_score,
+                same_language,
+                model_id,
+                depth,
+                max_nodes,
+                allow_stale,
+                format,
+            })
+            .await
+        }
+        Command::Show {
+            symbol_id,
+            context_lines,
+            max_bytes,
+            allow_stale,
+            project_path,
+            format,
+        } => {
+            run_show(ShowArguments {
+                project_path,
+                symbol_id,
+                context_lines,
+                max_bytes,
+                allow_stale,
+                format,
+            })
+            .await
+        }
+        Command::Affected {
+            symbol_id,
+            depth,
+            max_nodes,
+            limit,
+            allow_stale,
+            project_path,
+            format,
+        } => {
+            run_affected(AffectedArguments {
+                project_path,
+                symbol_id,
+                depth,
+                max_nodes,
+                limit,
+                allow_stale,
+                format,
+            })
+            .await
+        }
+        Command::Review {
+            base_ref,
+            max_changed_files,
+            project_path,
+            format,
+        } => {
+            run_review(ReviewArguments {
+                project_path,
+                base_ref,
+                max_changed_files,
+                format,
+            })
+            .await
+        }
+        _ => Err("internal graph command routing failed".to_owned()),
+    }
+}
+
+async fn run_operator_command(command: Command) -> Result<ExitCode, String> {
+    match command {
+        Command::Backend { command } => backend::run(command).await,
+        Command::Setup(arguments) => {
+            llm_commands::run(llm_commands::LlmCommand::Install(arguments)).await
+        }
+        Command::Install {
+            target,
+            location,
+            project_path,
+            yes,
+            no_permissions,
+            no_hooks,
+            command,
+            print_config,
+            format,
+        } => {
+            run_agent_install(AgentInstallArguments {
+                target,
+                location,
+                project_path,
+                behavior: AgentInstallBehavior {
+                    yes,
+                    permissions: !no_permissions,
+                    hooks: !no_hooks,
+                },
+                command,
+                print_config,
+                format,
+                remove: false,
+            })
+            .await
+        }
+        Command::Uninstall {
+            target,
+            location,
+            project_path,
+            format,
+        } => {
+            run_agent_install(AgentInstallArguments {
+                target,
+                location,
+                project_path,
+                behavior: AgentInstallBehavior {
+                    yes: true,
+                    permissions: false,
+                    hooks: false,
+                },
+                command: None,
+                print_config: None,
+                format,
+                remove: true,
+            })
+            .await
+        }
+        command => run_runtime_operator_command(command).await,
+    }
+}
+
+async fn run_runtime_operator_command(command: Command) -> Result<ExitCode, String> {
+    match command {
+        Command::Watch { project_path } => rocks_cli::watch(&project_path).await,
+        Command::Service(arguments) => rocks_cli::service::run(arguments).await,
+        Command::Serve {
+            mcp,
+            project_path,
+            profile,
+            daemon: _,
+            no_daemon: _,
+            daemon_child: _,
+            no_write_tools,
+            allow_stale_default,
+            low_tokens_default,
+            disable_tool,
+            no_startup_sync,
+            no_auto_sync,
+        } => {
+            run_mcp_server(McpServeArguments {
+                mcp,
+                project_path,
+                profile,
+                no_write_tools,
+                defaults: McpServeDefaults {
+                    allow_stale: allow_stale_default,
+                    low_tokens: low_tokens_default,
+                },
+                disable_tool,
+                sync: if no_auto_sync {
+                    McpServeSync::Disabled
+                } else {
+                    McpServeSync::Enabled {
+                        startup_reconciliation: !no_startup_sync,
+                    }
+                },
+            })
+            .await
+        }
+        Command::Doctor {
+            project_path,
+            fix,
+            no_project_checks,
+            json,
+            format,
+        } => {
+            run_doctor(DoctorRunInput {
+                project_path,
+                fix,
+                skip_project_checks: no_project_checks,
+                format: if json { OutputFormat::Json } else { format },
+            })
+            .await
+        }
+        Command::Db { command } => run_database_command(command).await,
+        Command::Upgrade {
+            apply,
+            json,
+            project_path,
+        } => run_upgrade_command(apply, json, project_path).await,
+        command => run_auxiliary_operator_command(command).await,
+    }
+}
+
+async fn run_auxiliary_operator_command(command: Command) -> Result<ExitCode, String> {
+    match command {
+        Command::Export {
+            path,
+            project_path,
+            format,
+            out,
+            limit,
+            kind,
+            edge_kind,
+            language,
+            file,
+        } => {
+            let project_path = project_path.unwrap_or(path);
+            run_graph_export_command(
+                project_path,
+                GraphExportCommandInput {
+                    format,
+                    output: out,
+                    limit,
+                    kinds: kind,
+                    edge_kinds: edge_kind,
+                    languages: language,
+                    file_prefix: file,
+                },
+            )
+            .await
+        }
+        Command::Similar {
+            symbol,
+            k,
+            min_score,
+            same_language,
+            model_id,
+            allow_stale,
+            project_path,
+        } => {
+            run_similar_command(SimilarCommandInput {
+                symbol,
+                k,
+                min_score,
+                same_language,
+                model_id,
+                allow_stale,
+                project_path,
+            })
+            .await
+        }
+        Command::SyncIfDirty {
+            path,
+            quiet,
+            max_file_size,
+        } => run_sync_if_dirty(path, quiet, max_file_size.as_deref()).await,
+        Command::InstallHooks {
+            path,
+            hooks,
+            command,
+            remove,
+            dry_run,
+        } => run_install_hooks_command(&git_hooks::InstallHooksRequest {
+            project_path: path,
+            hooks,
+            command,
+            remove,
+            dry_run,
+        }),
+        Command::McpBudget {
+            profile,
+            no_write_tools,
+            disable_tool,
+            top,
+            json,
+        } => run_mcp_budget_command(&McpBudgetCommandInput {
+            profile,
+            no_write_tools,
+            disable_tool,
+            top,
+            json,
+        }),
+        Command::Completions { shell } => {
+            print!("{}", completions::render_script(shell));
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::CompleteInternal { words } => {
+            let command = generated_cli::command()?;
+            for candidate in completions::complete(&command, &words) {
+                println!("{candidate}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Guide => {
+            print!("{AGENT_PLAYBOOK}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Llm { command } => llm_commands::run(command).await,
+        _ => Err("internal operator command routing failed".to_owned()),
+    }
+}
+
+struct GraphExportCommandInput {
+    format: GraphExportFormat,
+    output: Option<PathBuf>,
+    limit: u16,
+    kinds: Option<String>,
+    edge_kinds: Option<String>,
+    languages: Option<String>,
+    file_prefix: Option<String>,
+}
+
+struct SimilarCommandInput {
+    symbol: String,
+    k: u16,
+    min_score: f64,
+    same_language: bool,
+    model_id: Option<String>,
+    allow_stale: bool,
+    project_path: PathBuf,
+}
+
+struct McpBudgetCommandInput {
+    profile: McpProfile,
+    no_write_tools: bool,
+    disable_tool: Vec<String>,
+    top: u16,
+    json: bool,
+}
+
+async fn run_graph_export_command(
+    project_path: PathBuf,
+    input: GraphExportCommandInput,
+) -> Result<ExitCode, String> {
+    let mut arguments = Map::from_iter([
+        (
+            "action".to_owned(),
+            Value::String("graph-export".to_owned()),
+        ),
+        ("limit".to_owned(), Value::from(input.limit)),
+        (
+            "exportFormat".to_owned(),
+            Value::String(
+                match input.format {
+                    graph_export::GraphExportFormat::Json => "json",
+                    graph_export::GraphExportFormat::Dot => "dot",
+                    graph_export::GraphExportFormat::Mermaid => "mermaid",
+                    graph_export::GraphExportFormat::Cytoscape => "cytoscape",
+                }
+                .to_owned(),
+            ),
+        ),
+    ]);
+    for (field, value) in [
+        ("kinds", input.kinds),
+        ("edgeKinds", input.edge_kinds),
+        ("languages", input.languages),
+        ("filePrefix", input.file_prefix),
+    ] {
+        if let Some(value) = value {
+            arguments.insert(field.to_owned(), Value::String(value));
+        }
+    }
+    let result =
+        generated_cli::run_direct_result("codevetra_admin", project_path, arguments).await?;
+    let report: Value = serde_json::from_str(
+        result
+            .primary_text()
+            .ok_or("Native export returned no report")?,
+    )
+    .map_err(|_| "Native export returned a malformed report")?;
+    let artifact = report["artifact"]
+        .as_str()
+        .ok_or("Native export returned no artifact")?;
+    if let Some(output) = input.output {
+        graph_export::write_artifact(&output, artifact.as_bytes())?;
+        println!("Exported graph snapshot");
+    } else {
+        print!("{artifact}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_similar_command(input: SimilarCommandInput) -> Result<ExitCode, String> {
+    if !input.min_score.is_finite() || !(0.0..=1.0).contains(&input.min_score) {
+        return Err("--min-score must be between 0 and 1".to_owned());
+    }
+    let mut arguments = Map::from_iter([
+        ("start".to_owned(), Value::String(input.symbol)),
+        ("direction".to_owned(), Value::String("similar".to_owned())),
+        ("k".to_owned(), Value::from(input.k)),
+        ("minScore".to_owned(), Value::from(input.min_score)),
+        ("sameLanguage".to_owned(), Value::Bool(input.same_language)),
+        ("allowStale".to_owned(), Value::Bool(input.allow_stale)),
+    ]);
+    if let Some(model_id) = input.model_id {
+        arguments.insert("modelId".to_owned(), Value::String(model_id));
+    }
+    generated_cli::run_direct("codevetra_graph", input.project_path, arguments).await
+}
+
+fn run_install_hooks_command(request: &git_hooks::InstallHooksRequest) -> Result<ExitCode, String> {
+    let output = git_hooks::run_install_hooks(request)?;
+    print!("{output}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_mcp_budget_command(input: &McpBudgetCommandInput) -> Result<ExitCode, String> {
+    let definitions =
+        mcp_handler::tool_definitions().map_err(|_| "MCP tool contracts are invalid".to_owned())?;
+    let registered = definitions
+        .iter()
+        .map(codevetra_mcp::ToolDefinition::name)
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(unknown) = input
+        .disable_tool
+        .iter()
+        .find(|name| !registered.contains(name.as_str()))
+    {
+        return Err(format!("--disable-tool names an unknown tool: {unknown}"));
+    }
+    let report = mcp_budget::measure(mcp_budget::McpBudgetInput {
+        definitions,
+        profile: input.profile.into(),
+        read_only_only: input.no_write_tools,
+        disabled: &input.disable_tool,
+        top: usize::from(input.top),
+        instructions: MCP_SERVER_INSTRUCTIONS,
+        playbook: AGENT_PLAYBOOK,
+    })?;
+    if input.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|_| "could not serialize MCP budget".to_owned())?
+        );
+    } else {
+        print!("{}", mcp_budget::render(&report));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_upgrade_command(
+    apply: bool,
+    json: bool,
+    project_path: PathBuf,
+) -> Result<ExitCode, String> {
+    let report = upgrade::run_upgrade(apply, &project_path).await;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|_| "could not serialize upgrade report".to_owned())?
+        );
+    } else {
+        print!("{}", upgrade::render(&report));
+    }
+    Ok(if upgrade::succeeded(&report) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+async fn run_find(arguments: FindArguments) -> Result<ExitCode, String> {
+    let FindArguments {
+        project_path,
+        query,
+        by,
+        limit,
+        allow_stale,
+        format,
+    } = arguments;
+    let runtime = open_runtime(&project_path).await?;
+    let (project_id, freshness) = current_project(&runtime).await?;
+    require_freshness(freshness, allow_stale)?;
+    let retrieval = DeterministicRetriever::new(runtime.database().clone());
+    let result = {
+        let context = FindCommandContext {
+            runtime: &runtime,
+            retrieval: &retrieval,
+            project_id,
+            freshness,
+            limit,
+            format,
+        };
+        match by {
+            FindBy::Auto | FindBy::Hybrid => run_semantic_find(&context, by, query).await,
+            FindBy::Name | FindBy::Path | FindBy::Reference => {
+                run_exact_find(&context, by, &query).await
+            }
+            FindBy::Bm25 => run_bm25_find(&context, query).await,
+        }
+    };
+    runtime.close().await.map_err(|error| error.to_string())?;
+    result?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_semantic_find(
+    context: &FindCommandContext<'_, '_>,
+    by: FindBy,
+    query: String,
+) -> Result<(), String> {
+    let mode = if matches!(by, FindBy::Hybrid) {
+        SearchMode::Hybrid
+    } else {
+        SearchMode::Auto
+    };
+    let options = RetrievalOptions::new(mode, context.limit).map_err(|error| error.to_string())?;
+    let result = context
+        .runtime
+        .search(RetrievalRequest::new(
+            context.project_id.clone(),
+            query,
+            options,
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+    print_fresh_evidence(context.freshness, &result, context.format)
+}
+
+async fn run_exact_find(
+    context: &FindCommandContext<'_, '_>,
+    by: FindBy,
+    query: &str,
+) -> Result<(), String> {
+    match by {
+        FindBy::Name => {
+            let query =
+                ExactTextQuery::new(query, context.limit).map_err(|error| error.to_string())?;
+            let result = context
+                .retrieval
+                .exact_name(&context.project_id, query)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_fresh_evidence(context.freshness, &result, context.format)
+        }
+        FindBy::Path => {
+            let path = NormalizedPath::parse(query)
+                .map_err(|_| "source path must be project-relative".to_owned())?;
+            let query =
+                ExactPathQuery::new(&path, context.limit).map_err(|error| error.to_string())?;
+            let result = context
+                .retrieval
+                .exact_path(&context.project_id, query)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_fresh_evidence(context.freshness, &result, context.format)
+        }
+        FindBy::Reference => {
+            let query =
+                ExactTextQuery::new(query, context.limit).map_err(|error| error.to_string())?;
+            let result = context
+                .retrieval
+                .exact_reference(&context.project_id, query)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_fresh_evidence(context.freshness, &result, context.format)
+        }
+        FindBy::Auto | FindBy::Bm25 | FindBy::Hybrid => {
+            Err("exact find received a non-exact mode".to_owned())
+        }
+    }
+}
+
+async fn run_bm25_find(context: &FindCommandContext<'_, '_>, query: String) -> Result<(), String> {
+    let query = LexicalQuery::new(query, context.limit).map_err(|error| error.to_string())?;
+    let result = context
+        .retrieval
+        .bm25(context.project_id.clone(), query)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_fresh_evidence(context.freshness, &result, context.format)
+}
+
+async fn run_files(arguments: FilesArguments) -> Result<ExitCode, String> {
+    let runtime = open_runtime(&arguments.project_path).await?;
+    let (project_id, freshness) = current_project(&runtime).await?;
+    require_freshness(freshness, arguments.allow_stale)?;
+    let mut query = FileInventoryQuery::new(arguments.limit).map_err(|error| error.to_string())?;
+    if let Some(directory) = arguments.directory {
+        query = query.within_directory(
+            NormalizedPath::parse(&directory)
+                .map_err(|_| "source directory must be project-relative".to_owned())?,
+        );
+    }
+    if let Some(language) = arguments.language {
+        query = query.with_language(
+            SourceLanguage::from_stable_str(&language)
+                .ok_or_else(|| "language must be a registered stable identifier".to_owned())?,
+        );
+    }
+    let result = DeterministicRetriever::new(runtime.database().clone())
+        .files(&project_id, &query)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_fresh_evidence(freshness, &result, arguments.format)?;
+    runtime.close().await.map_err(|error| error.to_string())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_entry_points(arguments: EntryPointsArguments) -> Result<ExitCode, String> {
+    let runtime = open_runtime(&arguments.project_path).await?;
+    let (project_id, freshness) = current_project(&runtime).await?;
+    require_freshness(freshness, arguments.allow_stale)?;
+    let mut query = EntryPointsQuery::new(arguments.limit).map_err(|error| error.to_string())?;
+    if let Some(bucket) = arguments.bucket {
+        query = query.with_bucket(bucket);
+    }
+    let result = DeterministicRetriever::new(runtime.database().clone())
+        .entry_points(&project_id, query)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_fresh_evidence(freshness, &result, arguments.format)?;
+    runtime.close().await.map_err(|error| error.to_string())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_at_range(arguments: AtRangeArguments) -> Result<ExitCode, String> {
+    let runtime = open_runtime(&arguments.project_path).await?;
+    let (project_id, freshness) = current_project(&runtime).await?;
+    require_freshness(freshness, arguments.allow_stale)?;
+    let path = NormalizedPath::parse(&arguments.file)
+        .map_err(|_| "source file must be project-relative".to_owned())?;
+    let query = SourceRangeQuery::new(SourceRangeQueryInput {
+        path,
+        start_line: arguments.start_line,
+        end_line: arguments.end_line,
+        limit: arguments.limit,
+    })
+    .map_err(|error| error.to_string())?;
+    let result = DeterministicRetriever::new(runtime.database().clone())
+        .symbols_at_range(&project_id, &query)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "source file was not found in the current generation".to_owned())?;
+    print_fresh_evidence(freshness, &result, arguments.format)?;
+    runtime.close().await.map_err(|error| error.to_string())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_context(arguments: ContextArguments) -> Result<ExitCode, String> {
+    let ContextArguments {
+        project_path,
+        task,
+        exact_name,
+        exact_path,
+        exact_reference,
+        mode,
+        format,
+    } = arguments;
+    let runtime = open_runtime(&project_path).await?;
+    let (project_id, freshness) = current_project(&runtime).await?;
+    let mode = SearchMode::from(mode);
+    let overlay_task = task.clone();
+    let intent = TaskIntent::classify(&task);
+    let budget = ContextBudget::for_intent(intent);
+    let retrieval_options =
+        RetrievalOptions::new(mode, budget.candidate_limit()).map_err(|error| error.to_string())?;
+    let prepared = runtime
+        .prepare_retrieval(RetrievalRequest::new(
+            project_id.clone(),
+            task.clone(),
+            retrieval_options,
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut request = ContextRequest::new(
+        project_id,
+        task,
+        ContextRequestOptions::new(freshness, budget)
+            .with_search(mode, prepared.semantic_readiness()),
+    )
+    .map_err(|error| error.to_string())?
+    .with_intent(intent);
+    if let Some(name) = exact_name {
+        request = request
+            .with_anchor(ContextAnchor::ExactName(name))
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(path) = exact_path {
+        request = request
+            .with_anchor(ContextAnchor::ExactPath(
+                NormalizedPath::parse(&path)
+                    .map_err(|_| "source path must be project-relative".to_owned())?,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(reference) = exact_reference {
+        request = request
+            .with_anchor(ContextAnchor::ExactReference(reference))
+            .map_err(|error| error.to_string())?;
+    }
+    let result = DeterministicRetriever::new(runtime.database().clone())
+        .context_packet_with_channels(&request, prepared.into_channels())
+        .await
+        .map_err(|error| error.to_string())?;
+    let result = if freshness == IndexFreshness::Current {
+        result
+    } else {
+        let overlay = runtime
+            .working_tree_overlay(WorkingTreeOverlayRequest::new(
+                overlay_task,
+                codevetra_agent::ProjectCancellation::new(),
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        result.with_working_tree_overlay(overlay)
+    };
+    print_serialized(&result, format)?;
+    runtime.close().await.map_err(|error| error.to_string())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_graph(arguments: GraphArguments) -> Result<ExitCode, String> {
+    validate_graph_arguments(&arguments)?;
+    let GraphArguments {
+        project_path,
+        symbol_id,
+        direction,
+        target_symbol_id,
+        edge_kind,
+        similar_limit,
+        minimum_score,
+        same_language,
+        model_id,
+        depth,
+        max_nodes,
+        allow_stale,
+        format,
+    } = arguments;
+    let runtime = open_runtime(&project_path).await?;
+    let (project_id, freshness) = current_project(&runtime).await?;
+    require_freshness(freshness, allow_stale)?;
+    let retrieval = DeterministicRetriever::new(runtime.database().clone());
+    let execution = GraphExecution {
+        retrieval: &retrieval,
+        freshness,
+        format,
+    };
+    if direction == GraphAxis::Similar {
+        run_similar_graph(
+            execution,
+            SimilarGraphInput {
+                project_id,
+                symbol_id,
+                limit: similar_limit.unwrap_or(5),
+                minimum_score: minimum_score.unwrap_or(0.3),
+                same_language,
+                model_id,
+            },
+        )
+        .await?;
+    } else {
+        run_structural_graph(
+            execution,
+            StructuralGraphInput {
+                project_id,
+                symbol_id,
+                direction,
+                target_symbol_id,
+                edge_kind,
+                depth,
+                max_nodes,
+            },
+        )
+        .await?;
+    }
+    runtime.close().await.map_err(|error| error.to_string())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn validate_graph_arguments(arguments: &GraphArguments) -> Result<(), String> {
+    if arguments.direction != GraphAxis::Path && arguments.target_symbol_id.is_some() {
+        return Err("--to is only valid with --direction path".to_owned());
+    }
+    if arguments.direction == GraphAxis::Path && arguments.target_symbol_id.is_none() {
+        return Err("--to is required with --direction path".to_owned());
+    }
+    let has_similar_options = arguments.similar_limit.is_some()
+        || arguments.minimum_score.is_some()
+        || arguments.same_language
+        || arguments.model_id.is_some();
+    if arguments.direction != GraphAxis::Similar && has_similar_options {
+        return Err("--k, --min-score, --same-language, and --model-id are only valid with --direction similar".to_owned());
+    }
+    if arguments.direction == GraphAxis::Similar && arguments.edge_kind.is_some() {
+        return Err("--edge-kind is not valid with --direction similar".to_owned());
+    }
+    Ok(())
+}
+
+struct GraphExecution<'retriever> {
+    retrieval: &'retriever DeterministicRetriever,
+    freshness: IndexFreshness,
+    format: OutputFormat,
+}
+
+struct SimilarGraphInput {
+    project_id: ProjectId,
+    symbol_id: String,
+    limit: u16,
+    minimum_score: f64,
+    same_language: bool,
+    model_id: Option<String>,
+}
+
+async fn run_similar_graph(
+    execution: GraphExecution<'_>,
+    input: SimilarGraphInput,
+) -> Result<(), String> {
+    let symbol = SymbolId::parse(&input.symbol_id)
+        .map_err(|_| "symbol ID must be a non-nil UUID".to_owned())?;
+    let mut request = SimilarRequest::new(input.project_id, symbol, input.limit)
+        .and_then(|request| request.with_minimum_score(input.minimum_score))
+        .map_err(|error| error.to_string())?
+        .with_same_language(input.same_language);
+    if let Some(model_id) = input.model_id {
+        request = request.with_model_id(
+            ModelId::parse(&model_id).map_err(|_| "model ID must be a non-nil UUID".to_owned())?,
+        );
+    }
+    let result = execution
+        .retrieval
+        .similar(&request)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_fresh_evidence(execution.freshness, &result, execution.format)
+}
+
+struct StructuralGraphInput {
+    project_id: ProjectId,
+    symbol_id: String,
+    direction: GraphAxis,
+    target_symbol_id: Option<String>,
+    edge_kind: Option<EdgeKind>,
+    depth: u8,
+    max_nodes: u16,
+}
+
+async fn run_structural_graph(
+    execution: GraphExecution<'_>,
+    input: StructuralGraphInput,
+) -> Result<(), String> {
+    let request = traversal_request(TraversalArguments {
+        project_id: input.project_id.clone(),
+        symbol_id: &input.symbol_id,
+        depth: input.depth,
+        max_nodes: input.max_nodes,
+        edge_kind: input.edge_kind,
+    })?;
+    match input.direction {
+        GraphAxis::Callers => print_fresh_evidence(
+            execution.freshness,
+            &execution
+                .retrieval
+                .callers(&request)
+                .await
+                .map_err(|error| error.to_string())?,
+            execution.format,
+        ),
+        GraphAxis::Callees => print_fresh_evidence(
+            execution.freshness,
+            &execution
+                .retrieval
+                .callees(&request)
+                .await
+                .map_err(|error| error.to_string())?,
+            execution.format,
+        ),
+        GraphAxis::Both => print_fresh_evidence(
+            execution.freshness,
+            &execution
+                .retrieval
+                .both(&request)
+                .await
+                .map_err(|error| error.to_string())?,
+            execution.format,
+        ),
+        GraphAxis::Path => run_graph_path(execution, input, &request).await,
+        GraphAxis::Impact => print_fresh_evidence(
+            execution.freshness,
+            &execution
+                .retrieval
+                .impact(&request)
+                .await
+                .map_err(|error| error.to_string())?,
+            execution.format,
+        ),
+        GraphAxis::Similar => unreachable!("similar is handled before structural traversal"),
+    }
+}
+
+async fn run_graph_path(
+    execution: GraphExecution<'_>,
+    input: StructuralGraphInput,
+    request: &TraversalRequest,
+) -> Result<(), String> {
+    let target_symbol_id = input
+        .target_symbol_id
+        .as_deref()
+        .ok_or_else(|| "--to is required with --direction path".to_owned())?;
+    let target = SymbolId::parse(target_symbol_id)
+        .map_err(|_| "target symbol ID must be a non-nil UUID".to_owned())?;
+    let mut path = GraphPathRequest::new(GraphPathRequestInput {
+        project_id: input.project_id,
+        start: request.roots()[0].clone(),
+        target,
+        budget: TraversalBudget::new(input.depth, input.max_nodes)
+            .map_err(|error| error.to_string())?,
+    });
+    if let Some(edge_kind) = input.edge_kind {
+        path = path.with_edge_kind(edge_kind);
+    }
+    let result = execution
+        .retrieval
+        .path(&path)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_fresh_evidence(execution.freshness, &result, execution.format)
+}
+
+async fn run_affected(arguments: AffectedArguments) -> Result<ExitCode, String> {
+    let AffectedArguments {
+        project_path,
+        symbol_id,
+        depth,
+        max_nodes,
+        limit,
+        allow_stale,
+        format,
+    } = arguments;
+    let runtime = open_runtime(&project_path).await?;
+    let (project_id, freshness) = current_project(&runtime).await?;
+    require_freshness(freshness, allow_stale)?;
+    let request = traversal_request(TraversalArguments {
+        project_id,
+        symbol_id: &symbol_id,
+        depth,
+        max_nodes,
+        edge_kind: None,
+    })?;
+    let result = DeterministicRetriever::new(runtime.database().clone())
+        .affected_tests(&request, limit)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_fresh_evidence(freshness, &result, format)?;
+    runtime.close().await.map_err(|error| error.to_string())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_show(arguments: ShowArguments) -> Result<ExitCode, String> {
+    let symbol_id = SymbolId::parse(&arguments.symbol_id)
+        .map_err(|_| "symbol ID must be a non-nil UUID".to_owned())?;
+    let maximum_bytes = usize::try_from(arguments.max_bytes)
+        .map_err(|_| "source-context byte limit is invalid".to_owned())?;
+    let options = SourceContextOptions::new(arguments.context_lines, maximum_bytes)
+        .map_err(|error| error.to_string())?;
+    let runtime = open_runtime(&arguments.project_path).await?;
+    let result = runtime
+        .source_context(SourceContextRequest::new(symbol_id, options))
+        .await;
+    runtime.close().await.map_err(|error| error.to_string())?;
+    let result = result.map_err(|error| error.to_string())?;
+    if !result.fresh() && !arguments.allow_stale {
+        return Err(stale_index_message());
+    }
+    print_serialized(&result, arguments.format)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_review(arguments: ReviewArguments) -> Result<ExitCode, String> {
+    let ReviewArguments {
+        project_path,
+        base_ref,
+        max_changed_files,
+        format,
+    } = arguments;
+    let options = ReviewOptions::new(base_ref)
+        .and_then(|options| options.with_max_changed_files(max_changed_files))
+        .map_err(|error| error.to_string())?;
+    let runtime = open_runtime(&project_path).await?;
+    let report = runtime
+        .review(&options)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_review_report(&report, format)?;
+    runtime.close().await.map_err(|error| error.to_string())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn open_runtime(project_path: &PathBuf) -> Result<ProjectRuntime, String> {
+    ProjectRuntime::open(project_path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn current_project(runtime: &ProjectRuntime) -> Result<(ProjectId, IndexFreshness), String> {
+    let status = runtime.status().await.map_err(|error| error.to_string())?;
+    let snapshot = status
+        .snapshot
+        .ok_or_else(|| "project has no index; run `codevetra index`".to_owned())?;
+    Ok((
+        snapshot.project_id,
+        if status.fresh {
+            IndexFreshness::Current
+        } else {
+            IndexFreshness::Stale
+        },
+    ))
+}
+
+/// Stale-index failure for a command that cannot be told to accept stale evidence.
+#[cfg(test)]
+const STALE_WITHOUT_OVERRIDE_MESSAGE: &str =
+    "CodeVetra index is stale; synchronize it with `codevetra index` and retry";
+
+fn require_freshness(freshness: IndexFreshness, allow_stale: bool) -> Result<(), String> {
+    if freshness == IndexFreshness::Current || allow_stale {
+        Ok(())
+    } else {
+        Err(stale_index_message())
+    }
+}
+
+fn stale_index_message() -> String {
+    "CodeVetra index is stale; synchronize it or explicitly pass --allow-stale".to_owned()
+}
+
+/// Freshness gate for commands that offer no `--allow-stale` override.
+#[cfg(test)]
+fn require_current(freshness: IndexFreshness) -> Result<(), String> {
+    if freshness == IndexFreshness::Current {
+        Ok(())
+    } else {
+        Err(STALE_WITHOUT_OVERRIDE_MESSAGE.to_owned())
+    }
+}
+
+fn traversal_request(arguments: TraversalArguments<'_>) -> Result<TraversalRequest, String> {
+    let TraversalArguments {
+        project_id,
+        symbol_id,
+        depth,
+        max_nodes,
+        edge_kind,
+    } = arguments;
+    let symbol_id =
+        SymbolId::parse(symbol_id).map_err(|_| "symbol ID must be a non-nil UUID".to_owned())?;
+    let budget = TraversalBudget::new(depth, max_nodes).map_err(|error| error.to_string())?;
+    let request = TraversalRequest::new(project_id, [symbol_id], budget)
+        .map_err(|error| error.to_string())?;
+    Ok(match edge_kind {
+        Some(edge_kind) => request.with_edge_kind(edge_kind),
+        None => request,
+    })
+}
+
+fn print_serialized(value: &impl Serialize, format: OutputFormat) -> Result<(), String> {
+    let rendered = match format {
+        OutputFormat::Text | OutputFormat::Json => serde_json::to_string_pretty(value)
+            .map_err(|_| "could not serialize CodeVetra result".to_owned())?,
+    };
+    println!("{rendered}");
+    Ok(())
+}
+
+fn print_fresh_evidence(
+    freshness: IndexFreshness,
+    evidence: &impl Serialize,
+    format: OutputFormat,
+) -> Result<(), String> {
+    print_serialized(
+        &CliFreshEvidence {
+            freshness,
+            evidence,
+        },
+        format,
+    )
+}
+
+fn print_review_report(report: &ReviewReport, format: OutputFormat) -> Result<(), String> {
+    if matches!(format, OutputFormat::Json) {
+        return print_serialized(report, format);
+    }
+    let comparison = report.comparison();
+    let packet = report.packet();
+    println!(
+        "Review against {} ({}): {} worktree, {} changed file(s){}",
+        comparison.base_ref(),
+        comparison
+            .base_commit()
+            .chars()
+            .take(12)
+            .collect::<String>(),
+        if comparison.worktree_dirty() {
+            "dirty"
+        } else {
+            "clean"
+        },
+        comparison.files().len(),
+        if comparison.truncated() {
+            " (truncated)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "Index evidence: {:?} freshness, {:?} confidence, abstention {:?}",
+        packet.freshness(),
+        packet.confidence(),
+        packet.abstention()
+    );
+    for file in comparison.files() {
+        println!("- {} {}", file.kind().as_str(), file.path());
+    }
+    println!(
+        "Context: {} indexed changed file(s), {} evidence item(s), {} affected test(s)",
+        packet.indexed_changed_files().len(),
+        packet.evidence().len(),
+        packet.affected_tests().len()
+    );
+    if packet.truncation().any() {
+        println!(
+            "Truncation: changed_files={} symbol_roots={} graph={} affected_tests={} evidence={}",
+            packet.truncation().changed_files(),
+            packet.truncation().symbol_roots(),
+            packet.truncation().graph(),
+            packet.truncation().affected_tests(),
+            packet.truncation().evidence()
+        );
+    }
+    Ok(())
+}
+
+struct AgentInstallContext {
+    project_path: PathBuf,
+    executable: PathBuf,
+    location: AgentInstallLocation,
+    command: Option<String>,
+    permissions: bool,
+    format: OutputFormat,
+}
+
+impl AgentInstallContext {
+    fn request(&self, target: InstallTarget) -> Result<InstallRequest, String> {
+        let request = InstallRequest::new(&InstallRequestInput {
+            project_root: &self.project_path,
+            executable: &self.executable,
+            target,
+            location: self.location,
+            command_override: self.command.as_deref(),
+            permissions: self.permissions,
+        })
+        .map_err(|error| error.to_string())?;
+        Ok(request)
+    }
+
+    fn print_config(&self, target: &str) -> Result<(), String> {
+        let target = InstallTarget::parse(target).ok_or_else(|| unknown_target(target))?;
+        print!(
+            "{}",
+            install::print_config(&self.request(target)?).map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    fn apply_targets(
+        &self,
+        targets: Vec<InstallTarget>,
+        remove: bool,
+    ) -> Result<Vec<install::InstallReport>, String> {
+        let mut reports = Vec::with_capacity(targets.len());
+        for target in targets {
+            if !target.supports(self.location) {
+                if matches!(self.format, OutputFormat::Text) {
+                    eprintln!(
+                        "{}: skipped because it has no project-local MCP configuration",
+                        target.label()
+                    );
+                }
+                continue;
+            }
+            let request = self.request(target)?;
+            let report = if remove {
+                install::uninstall(&request)
+            } else {
+                install::install(&request)
+            }
+            .map_err(|error| format!("{}: {error}", target.label()))?;
+            reports.push(report);
+        }
+        Ok(reports)
+    }
+
+    async fn initialize_local_project(&self) -> Result<(), String> {
+        rocks_cli::initialize_project(&self.project_path, self.format)
+            .await
+            .and_then(local_index_outcome)
+    }
+
+    fn install_hooks(&self) {
+        let hook_command = self
+            .command
+            .clone()
+            .or_else(|| self.executable.to_str().map(str::to_owned));
+        match git_hooks::run_install_hooks(&git_hooks::InstallHooksRequest {
+            project_path: self.project_path.clone(),
+            hooks: None,
+            command: hook_command,
+            remove: false,
+            dry_run: false,
+        }) {
+            Ok(output) if matches!(self.format, OutputFormat::Text) => print!("{output}"),
+            Err(error) if matches!(self.format, OutputFormat::Text) => {
+                eprintln!("Git hooks were not installed: {error}");
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+}
+
+async fn run_agent_install(arguments: AgentInstallArguments) -> Result<ExitCode, String> {
+    let AgentInstallArguments {
+        target,
+        location,
+        project_path,
+        behavior:
+            AgentInstallBehavior {
+                yes,
+                permissions,
+                hooks,
+            },
+        command,
+        print_config,
+        format,
+        remove,
+    } = arguments;
+    let executable = env::current_exe()
+        .map_err(|_| "could not resolve the current CodeVetra executable".to_owned())?;
+    let location = AgentInstallLocation::from(location);
+    let context = AgentInstallContext {
+        project_path,
+        executable,
+        location,
+        command,
+        permissions,
+        format,
+    };
+    if let Some(target) = print_config {
+        if remove {
+            return Err("--print-config is only available for install".to_owned());
+        }
+        context.print_config(&target)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let selector = target
+        .as_deref()
+        .unwrap_or(if remove { "all" } else { "auto" });
+    let targets = resolve_install_targets(selector, &context)?;
+    if !remove && !yes {
+        confirm_agent_install(context.location, &targets)?;
+    }
+
+    let reports = context.apply_targets(targets, remove)?;
+    print_install_reports(&reports, context.format, remove)?;
+
+    if !remove && context.location == AgentInstallLocation::Local {
+        context.initialize_local_project().await?;
+    }
+
+    if !remove && context.location == AgentInstallLocation::Local && hooks {
+        context.install_hooks();
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn resolve_install_targets(
+    selector: &str,
+    context: &AgentInstallContext,
+) -> Result<Vec<InstallTarget>, String> {
+    match selector.trim().to_ascii_lowercase().as_str() {
+        "none" => return Ok(Vec::new()),
+        "all" => return Ok(InstallTarget::ALL.to_vec()),
+        "auto" => {
+            let mut detected = Vec::new();
+            for target in InstallTarget::ALL {
+                if !target.supports(context.location) {
+                    continue;
+                }
+                let request = InstallRequest::new(&InstallRequestInput {
+                    project_root: &context.project_path,
+                    executable: &context.executable,
+                    target,
+                    location: context.location,
+                    command_override: context.command.as_deref(),
+                    permissions: context.permissions,
+                })
+                .map_err(|error| error.to_string())?;
+                if request.detected() {
+                    detected.push(target);
+                }
+            }
+            if detected.is_empty() {
+                detected.push(InstallTarget::Claude);
+            }
+            return Ok(detected);
+        }
+        _ => {}
+    }
+    let mut targets = Vec::new();
+    for value in selector
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let target = InstallTarget::parse(value).ok_or_else(|| unknown_target(value))?;
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    if targets.is_empty() {
+        return Err("--target must name at least one agent, or auto, all, or none".to_owned());
+    }
+    Ok(targets)
+}
+
+fn unknown_target(value: &str) -> String {
+    let known = InstallTarget::ALL
+        .iter()
+        .map(|target| target.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("unknown target {value:?}; known targets: {known}, plus auto, all, none")
+}
+
+fn confirm_agent_install(
+    location: AgentInstallLocation,
+    targets: &[InstallTarget],
+) -> Result<(), String> {
+    if !std::io::stdin().is_terminal() {
+        return Err("install needs --yes when stdin is not interactive".to_owned());
+    }
+    let target_list = targets
+        .iter()
+        .map(|target| target.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    print!(
+        "Install CodeVetra for {target_list} at {} scope? [Y/n] ",
+        match location {
+            AgentInstallLocation::Global => "global",
+            AgentInstallLocation::Local => "project-local",
+        }
+    );
+    std::io::stdout()
+        .flush()
+        .map_err(|_| "could not write the install prompt".to_owned())?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|_| "could not read the install confirmation".to_owned())?;
+    if answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("y") {
+        Ok(())
+    } else {
+        Err("installation cancelled".to_owned())
+    }
+}
+
+fn print_install_reports(
+    reports: &[InstallReport],
+    format: OutputFormat,
+    removed: bool,
+) -> Result<(), String> {
+    if matches!(format, OutputFormat::Json) {
+        return print_serialized(&reports, format);
+    }
+    if reports.is_empty() {
+        println!("No agent targets selected.");
+        return Ok(());
+    }
+    for report in reports {
+        println!(
+            "{} ({}): {}",
+            report.target().label(),
+            match report.location() {
+                AgentInstallLocation::Global => "global",
+                AgentInstallLocation::Local => "local",
+            },
+            if report.changed() {
+                if removed { "removed" } else { "installed" }
+            } else if removed {
+                "already absent"
+            } else {
+                "already current"
+            }
+        );
+        for file in report.files() {
+            println!("- {} {}", file.action().label(), file.path().display());
+        }
+        println!("  executable: {}", report.executable());
+        println!("  project: {}", report.project_root().display());
+    }
+    if reports.iter().any(InstallReport::changed) {
+        println!("Restart changed agent hosts to load the CodeVetra MCP server.");
+    }
+    Ok(())
+}
+
+async fn run_mcp_server(arguments: McpServeArguments) -> Result<ExitCode, String> {
+    if !arguments.mcp {
+        return Err("serve requires --mcp; CodeVetra uses stdio MCP transport".to_owned());
+    }
+    rocks_cli::serve(arguments).await
+}
+
+/// Stdio server configuration for the selected profile, after checking that every
+/// `--disable-tool` name is a registered tool.
+fn mcp_server_config(
+    profile: McpProfile,
+    disable_tool: &[String],
+    read_only_mode: bool,
+) -> Result<ServerConfig, String> {
+    // Retain managed legacy disable rules through the 4.x naming transition.
+    let disable_tool = canonical_disabled_tools(disable_tool);
+    let definitions =
+        mcp_handler::tool_definitions().map_err(|_| "MCP tool contracts are invalid".to_owned())?;
+    let registered = definitions
+        .iter()
+        .map(codevetra_mcp::ToolDefinition::name)
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(unknown) = disable_tool
+        .iter()
+        .find(|name| !registered.contains(name.as_str()))
+    {
+        return Err(format!("--disable-tool names an unknown tool: {unknown}"));
+    }
+    ServerConfig::new(
+        ServerMetadata::codevetra(),
+        profile.into(),
+        ServerLimits::default(),
+    )
+    .with_instructions(MCP_SERVER_INSTRUCTIONS)
+    .and_then(|config| config.with_disabled_tools(disable_tool))
+    .map(|config| config.with_read_only_tools_only(read_only_mode))
+    .map_err(|error| error.to_string())
+}
+
+fn canonical_disabled_tools(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .map(|name| {
+            name.strip_prefix("cartograph_")
+                .map_or_else(|| name.clone(), |suffix| format!("codevetra_{suffix}"))
+        })
+        .collect()
+}
+
+/// Message when `install`'s initial index failed after reporting its own
+/// failure (JSON format) or was cancelled.
+const LOCAL_INDEX_INCOMPLETE: &str = "the initial project index did not complete (see the index failure above); install stopped before Git hooks. Rerun `codevetra index <path>`, then rerun install";
+
+/// `install` continues only after its initial index succeeded. A JSON-format
+/// index reports its failure itself and returns a failing exit code instead
+/// of an error, which must stop `install` too.
+fn local_index_outcome(code: ExitCode) -> Result<(), String> {
+    (code == ExitCode::SUCCESS).ok_or_else(|| LOCAL_INDEX_INCOMPLETE.to_owned())
+}
+
+/// Run one `codevetra index` request.
+///
+/// An interrupt during the startup (settings, connection, schema migrations),
+/// when nothing could act on a cooperative stop yet, ends the process; only
+/// the cancellable request turns one into a cooperative stop (see
+/// [`supervised_index::run_cancellable_index`]).
+async fn run_index(arguments: IndexArguments) -> Result<ExitCode, String> {
+    let IndexArguments {
+        project_path,
+        workers,
+        force,
+        exclude,
+        preserve_current_excludes,
+        supervised,
+        format,
+    } = arguments;
+    let cancellation = ProjectCancellation::new();
+    // Installed before any work and kept for the rest of the process: tokio
+    // never restores a signal's default disposition, and the listener also
+    // replaces a SIGINT disposition inherited as ignored, so every interrupt
+    // is acted on.
+    let interrupts = InterruptForwarding::install(
+        cancellation.clone(),
+        !supervised && matches!(format, OutputFormat::Text),
+    );
+    let supervision = if supervised {
+        supervised_index::cancel_on_stdin_eof(cancellation.clone())?;
+        IndexSupervision::Supervised
+    } else {
+        IndexSupervision::Direct
+    };
+    if rocks_cli::owner::OwnerClient::connect(&project_path)
+        .await?
+        .is_some()
+    {
+        return run_owner_index(
+            IndexArguments {
+                project_path,
+                workers,
+                force,
+                exclude,
+                preserve_current_excludes,
+                supervised,
+                format,
+            },
+            cancellation,
+            &interrupts,
+        )
+        .await;
+    }
+    let runtime =
+        match supervised_index::start_up(supervision, connect_index_runtime(&project_path)).await {
+            Ok(runtime) => runtime,
+            Err(error) => return index_startup_failure(error, format),
+        };
+    let mut options = if preserve_current_excludes {
+        IndexOptions::reconciliation()
+    } else {
+        IndexOptions::default()
+    }
+    .with_force(force)
+    .with_additional_excludes(exclude)
+    .with_single_publication(supervised);
+    if supervised {
+        // Upgrade reconciliation leaves the optional Git history passes to the
+        // next explicit index, as automatic sync does: their persistence is
+        // unsupervised work that would otherwise extend the supervised run.
+        options = options.with_history_refresh(false);
+    }
+    if let Some(workers) = workers {
+        options = options
+            .with_max_workers(workers)
+            .map_err(|error| error.to_string())?;
+    }
+    let result = supervised_index::run_cancellable_index(CancellableIndex {
+        runtime: &runtime,
+        options,
+        cancellation,
+        supervision,
+        interrupts: Some(&interrupts),
+    })
+    .await;
+    match result {
+        Ok(report) => {
+            let rendered = print_index_report(&report, format);
+            runtime.close().await.map_err(|error| error.to_string())?;
+            rendered?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(failure) if matches!(format, OutputFormat::Json) => {
+            let previous_generation_visible = observed_generation_visibility(&runtime).await;
+            let rendered =
+                error_codes::direct_index_failure_json(error_codes::DirectIndexFailureInput {
+                    failure: &failure,
+                    previous_generation_visible,
+                })
+                .map_err(|_| "could not serialize the index failure".to_owned())?;
+            runtime.close().await.map_err(|error| error.to_string())?;
+            eprintln!("{rendered}");
+            Ok(ExitCode::FAILURE)
+        }
+        Err(failure) => {
+            let rendered = error_codes::direct_index_attempt_failure_message(&failure);
+            runtime.close().await.map_err(|error| error.to_string())?;
+            Err(rendered)
+        }
+    }
+}
+
+/// Why one index request could not start.
+enum IndexStartupError {
+    /// The database settings could not be resolved.
+    /// Connecting or applying the append-only schema migrations failed.
+    Connect(ProjectError),
+}
+
+async fn connect_index_runtime(
+    project_path: &PathBuf,
+) -> Result<ProjectRuntime, IndexStartupError> {
+    let deadline = tokio::time::Instant::now() + supervised_index::SUPERVISED_STARTUP_ALLOWANCE;
+    let mut reported_busy = false;
+    loop {
+        match ProjectRuntime::open(project_path).await {
+            Err(ProjectError::IndexLeaseBusy) if tokio::time::Instant::now() < deadline => {
+                if !reported_busy {
+                    eprintln!(
+                        "codevetra: native project owner is active; waiting for storage admission"
+                    );
+                    reported_busy = true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            result => return result.map_err(IndexStartupError::Connect),
+        }
+    }
+}
+
+/// Report an index request that could not start. A schema that another
+/// process kept busy is retryable contention, so `--format json` reports it
+/// like any other retryable index failure, with its stable `schema_busy` code
+/// on stderr, for a parent such as `upgrade --apply` to read; every other
+/// startup failure stays an error message.
+fn index_startup_failure(
+    error: IndexStartupError,
+    format: OutputFormat,
+) -> Result<ExitCode, String> {
+    match error {
+        IndexStartupError::Connect(error @ ProjectError::SchemaBusy)
+            if matches!(format, OutputFormat::Json) =>
+        {
+            let rendered =
+                error_codes::direct_index_failure_json(error_codes::DirectIndexFailureInput {
+                    failure: &IndexFailure::from(error),
+                    previous_generation_visible: None,
+                })
+                .map_err(|_| "could not serialize the index failure".to_owned())?;
+            eprintln!("{rendered}");
+            Ok(ExitCode::FAILURE)
+        }
+        IndexStartupError::Connect(error) => Err(error_codes::direct_index_failure_message(&error)),
+    }
+}
+
+/// Whether readers still see a published generation after a failed index.
+///
+/// `None` means the lookup failed or missed its deadline, so the report says
+/// unknown instead of guessing from the failure kind. The client deadline also
+/// covers connection acquisition, which the statement timeout cannot bound, so
+/// this diagnostic never holds back the already-known primary failure.
+async fn run_owner_index(
+    arguments: IndexArguments,
+    cancellation: ProjectCancellation,
+    interrupts: &InterruptForwarding,
+) -> Result<ExitCode, String> {
+    let IndexArguments {
+        project_path,
+        workers,
+        force,
+        exclude,
+        preserve_current_excludes,
+        supervised,
+        format,
+    } = arguments;
+    interrupts.request_started();
+    let context = codevetra_mcp::ToolCallContext::local(Duration::from_secs(300));
+    let call=codevetra_mcp::ToolCall {name:"codevetra_admin".to_owned(),arguments:serde_json::json!({"action":"index","workers":workers.unwrap_or(16),"force":force,"exclude":exclude,"preserveCurrentExcludes":preserve_current_excludes,"singlePublication":supervised,"refreshHistory":!supervised,"enrich":false,"baseOnly":true}).as_object().cloned().ok_or_else(||"native index request is malformed".to_owned())?};
+    let operation = rocks_cli::remote_job::run(&project_path, call, context.clone(), |progress| {
+        if supervised {
+            eprintln!("{}", serde_json::json!({"progress":progress}));
+        }
+    });
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        biased;
+        ()=cancellation.cancelled()=>{context.cancellation().cancel();operation.await},
+        result=&mut operation=>result,
+    };
+    interrupts.request_finished();
+    let result = result?;
+    let value: Value = serde_json::from_str(
+        result
+            .primary_text()
+            .ok_or_else(|| "native index returned no report".to_owned())?,
+    )
+    .map_err(|_| "native index returned malformed report".to_owned())?;
+    if value["status"] == "succeeded" {
+        print_serialized(completed_owner_index_report(&value)?, format)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    eprintln!("{value}");
+    Ok(ExitCode::FAILURE)
+}
+
+fn completed_owner_index_report(value: &Value) -> Result<&Value, String> {
+    if value["report"]["enrichment"]["optionalPhaseFailures"] == true {
+        return Err("native owner published the base graph but optional enrichment failed; inspect codevetra admin status".to_owned());
+    }
+    let report = &value["report"]["report"];
+    if !report.is_object() {
+        return Err("native owner returned malformed completed index".to_owned());
+    }
+    Ok(report)
+}
+
+async fn observed_generation_visibility(runtime: &ProjectRuntime) -> Option<bool> {
+    let lookup = runtime
+        .database()
+        .root_has_current_generation(runtime.root_identity(), FAILURE_VISIBILITY_TIMEOUT);
+    tokio::time::timeout(FAILURE_VISIBILITY_TIMEOUT, lookup)
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
+
+async fn run_sync_if_dirty(
+    project_path: PathBuf,
+    quiet: bool,
+    max_file_size: Option<&str>,
+) -> Result<ExitCode, String> {
+    let maximum_source_bytes = max_file_size.map(parse_max_file_size).transpose()?;
+    if rocks_cli::owner::OwnerClient::connect(&project_path)
+        .await?
+        .is_some()
+    {
+        return run_owner_sync_if_dirty(&project_path, quiet, maximum_source_bytes).await;
+    }
+    let runtime = open_runtime(&project_path).await?;
+    let status = runtime.status().await.map_err(|error| error.to_string())?;
+    let dirty = runtime.git_worktree_is_dirty().await;
+    if !dirty && status.fresh {
+        if !quiet {
+            println!("No source changes and index is current; skipping sync");
+        }
+        runtime.close().await.map_err(|error| error.to_string())?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut options = IndexOptions::reconciliation();
+    if let Some(maximum_source_bytes) = maximum_source_bytes {
+        options = options
+            .with_max_source_bytes(maximum_source_bytes)
+            .map_err(|error| error.to_string())?;
+    }
+    let project_id = match status.snapshot.as_ref() {
+        Some(snapshot) => snapshot.project_id.clone(),
+        None => runtime
+            .register_agent_state_project()
+            .await
+            .map_err(|error| error_codes::direct_index_failure_message(&error))?,
+    };
+    let outcome = sync_if_dirty_index(&runtime, project_id, options)
+        .await
+        .map_err(|failure| error_codes::direct_index_attempt_failure_message(&failure))?;
+    if !quiet {
+        match outcome {
+            SyncIfDirtyIndexOutcome::Indexed { published: true } => {
+                println!("Synced changed source into a new generation");
+            }
+            SyncIfDirtyIndexOutcome::Indexed { published: false } => {
+                println!("Source manifest is unchanged; existing generation retained");
+            }
+            SyncIfDirtyIndexOutcome::JoinedCurrentGeneration => {
+                println!(
+                    "Another sync published the current generation; no additional index was needed"
+                );
+            }
+        }
+    }
+    runtime.close().await.map_err(|error| error.to_string())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_owner_sync_if_dirty(
+    project_path: &std::path::Path,
+    quiet: bool,
+    maximum_source_bytes: Option<usize>,
+) -> Result<ExitCode, String> {
+    let mut arguments = Map::from_iter([
+        ("action".to_owned(), Value::from("sync")),
+        ("refreshHistory".to_owned(), Value::from(false)),
+        ("enrich".to_owned(), Value::from(false)),
+        ("baseOnly".to_owned(), Value::from(true)),
+    ]);
+    if let Some(bytes) = maximum_source_bytes {
+        arguments.insert("maxFileSize".to_owned(), Value::from(bytes.to_string()));
+    }
+    let cancellation = ProjectCancellation::new();
+    let interrupts = InterruptForwarding::install(cancellation.clone(), !quiet);
+    interrupts.request_started();
+    let context = codevetra_mcp::ToolCallContext::local(Duration::from_secs(300));
+    let operation = rocks_cli::remote_job::run(
+        project_path,
+        codevetra_mcp::ToolCall {
+            name: "codevetra_admin".to_owned(),
+            arguments,
+        },
+        context.clone(),
+        |_| {},
+    );
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => { context.cancellation().cancel(); operation.await },
+        result = &mut operation => result,
+    };
+    interrupts.request_finished();
+    let result = result?;
+    if rocks_cli::remote_job::failed(&result) {
+        if let Some(report) = result.primary_text() {
+            eprintln!("{report}");
+        }
+        return Ok(ExitCode::FAILURE);
+    }
+    let job: Value = serde_json::from_str(
+        result
+            .primary_text()
+            .ok_or_else(|| "native sync returned no report".to_owned())?,
+    )
+    .map_err(|_| "native sync returned malformed report".to_owned())?;
+    completed_owner_index_report(&job)?;
+    if !quiet {
+        println!("Source reconciled by the running project owner");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+enum SyncIfDirtyIndexOutcome {
+    Indexed { published: bool },
+    JoinedCurrentGeneration,
+}
+
+/// Index until an attempt is not refused by another project writer.
+///
+/// After a `lease_busy` attempt it waits, within one bound of
+/// [`SYNC_IF_DIRTY_LEASE_WAIT`] across all attempts, for every live operation
+/// lease on the project to end, then joins a generation that writer already
+/// made current or retries its own index. A bound that expires first reports
+/// that last collision: the retryable `lease_busy`, plus its cleanup failure
+/// if one followed it. An index failure keeps its secondary cleanup failure.
+async fn sync_if_dirty_index(
+    runtime: &ProjectRuntime,
+    project_id: ProjectId,
+    options: IndexOptions,
+) -> Result<SyncIfDirtyIndexOutcome, IndexFailure> {
+    let mut writer_wait = None;
+    loop {
+        let collision = match runtime.index_with_failure_detail(options.clone()).await {
+            Ok(report) => {
+                return Ok(SyncIfDirtyIndexOutcome::Indexed {
+                    published: report.published,
+                });
+            }
+            Err(failure) if matches!(failure.error(), ProjectError::IndexLeaseBusy) => failure,
+            Err(failure) => return Err(failure),
+        };
+
+        let wait = writer_wait.get_or_insert_with(|| {
+            supervised_index::WriterCollisionWait::until(
+                tokio::time::Instant::now() + SYNC_IF_DIRTY_LEASE_WAIT,
+            )
+        });
+        if wait.after_collision(runtime, &project_id).await.is_err() {
+            return Err(collision);
+        }
+        let Ok(status) = tokio::time::timeout_at(wait.deadline(), runtime.status()).await else {
+            return Err(collision);
+        };
+        if status?.fresh {
+            return Ok(SyncIfDirtyIndexOutcome::JoinedCurrentGeneration);
+        }
+    }
+}
+
+fn parse_max_file_size(raw: &str) -> Result<usize, String> {
+    let value = raw.trim().to_ascii_lowercase();
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (quantity, unit) = value.split_at(split);
+    let unit = unit.trim();
+    let multiplier = match unit {
+        "" | "b" | "byte" | "bytes" => 1_usize,
+        "k" | "kb" | "kib" => KIBIBYTE,
+        "m" | "mb" | "mib" => MEBIBYTE,
+        _ => return Err(max_file_size_error(raw)),
+    };
+    let bytes = quantity
+        .parse::<usize>()
+        .ok()
+        .and_then(|quantity| quantity.checked_mul(multiplier))
+        .filter(|bytes| (1..=MAXIMUM_TRANSIENT_FILE_BYTES).contains(bytes))
+        .ok_or_else(|| max_file_size_error(raw))?;
+    Ok(bytes)
+}
+
+fn max_file_size_error(raw: &str) -> String {
+    format!("--max-file-size must be between 1 byte and 10mb (got {raw:?})")
+}
+
+struct StatusRunInput {
+    project_path: PathBuf,
+    json: bool,
+    verbose: bool,
+    top_hotspots: Option<String>,
+    top_biomarkers: Option<String>,
+    summary_breakdown: bool,
+}
+
+async fn run_status(input: StatusRunInput) -> Result<ExitCode, String> {
+    let mut arguments = Map::new();
+    if input.verbose {
+        arguments.insert("verbose".to_owned(), Value::Bool(true));
+    }
+    if input.summary_breakdown {
+        arguments.insert("summaryBreakdown".to_owned(), Value::Bool(true));
+    }
+    if let Some(value) = normalize_status_rollup(input.top_hotspots.as_deref()) {
+        arguments.insert("topHotspots".to_owned(), Value::from(value));
+    }
+    if let Some(value) = normalize_status_rollup(input.top_biomarkers.as_deref()) {
+        arguments.insert("topBiomarkers".to_owned(), Value::from(value));
+    }
+    let result =
+        generated_cli::run_direct_result("codevetra_status", input.project_path, arguments).await?;
+    if result.is_error() {
+        return Ok(ExitCode::FAILURE);
+    }
+    let text = result
+        .primary_text()
+        .ok_or_else(|| "status returned no structured payload".to_owned())?;
+    if input.json {
+        println!("{text}");
+    } else {
+        let value: Value = serde_json::from_str(text)
+            .map_err(|_| "status returned malformed structured payload".to_owned())?;
+        render_status_text(&value);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn normalize_status_rollup(raw: Option<&str>) -> Option<f64> {
+    raw.map(|value| {
+        value
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 1.0)
+            .unwrap_or(0.0)
+    })
+}
+
+fn render_status_text(value: &Value) {
+    let version = value
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let storage = value
+        .get("storage")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    println!("CodeVetra {version} — {storage}");
+    render_database_storage(value);
+    let current = value
+        .pointer("/project/snapshot/current")
+        .filter(|current| current.is_object());
+    if let Some(current) = current {
+        let generation = current
+            .get("generation_id")
+            .or_else(|| current.get("generationId"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let counts = current.get("counts").unwrap_or(&Value::Null);
+        println!(
+            "Generation {generation}: {} files, {} symbols, {} edges; source {}",
+            counts.get("files").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("symbols").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("edges").and_then(Value::as_u64).unwrap_or(0),
+            if value
+                .pointer("/project/fresh")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "fresh"
+            } else {
+                "stale"
+            }
+        );
+    } else {
+        println!("Project has no published generation; run `codevetra index`.");
+    }
+    if let Some(generations) = value
+        .pointer("/project/snapshot/generation_storage")
+        .and_then(Value::as_object)
+    {
+        render_generation_storage(generations);
+    }
+    if let Some(state) = value
+        .pointer("/featureReadiness/state")
+        .and_then(Value::as_str)
+    {
+        println!("Feature readiness: {state}");
+    }
+    let hotspots = value
+        .pointer("/rollups/hotspots")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let biomarkers = value
+        .pointer("/rollups/biomarkers")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if hotspots > 0 || biomarkers > 0 {
+        println!("Inline rollups: {hotspots} hotspots, {biomarkers} biomarkers");
+    }
+    println!("Graph queries: retained; browser visualizer: intentionally removed");
+}
+
+fn render_database_storage(value: &Value) {
+    if let Some(text) = database_storage_text(value) {
+        println!("{text}");
+    }
+}
+
+fn database_storage_text(value: &Value) -> Option<String> {
+    match value
+        .pointer("/databaseStorage/state")
+        .and_then(Value::as_str)
+    {
+        Some("ready") => {
+            let usage = value.pointer("/databaseStorage/native")?;
+            let bytes = |name| {
+                usage
+                    .get(name)
+                    .and_then(Value::as_u64)
+                    .map_or_else(|| "unavailable".to_owned(), format_binary_bytes)
+            };
+            Some(format!(
+                "RocksDB storage: {} files; {} allocated; {} WAL.\nEngine allocation: {} SST, {} memtables; estimated pending compaction {}; details: `codevetra db usage --project-path <path>`",
+                bytes("fileBytes"),
+                bytes("allocatedBytes"),
+                bytes("walBytes"),
+                bytes("sstBytes"),
+                bytes("memtableBytes"),
+                bytes("estimatedPendingCompactionBytes")
+            ))
+        }
+        Some("unavailable") => Some(format!(
+            "Database storage: unavailable ({}) — run `codevetra db usage --project-path <path>` for the detailed report",
+            value
+                .pointer("/databaseStorage/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("database_error")
+        )),
+        _ => None,
+    }
+}
+
+fn render_generation_storage(generations: &Map<String, Value>) {
+    let staging = status_count(generations, "staging");
+    let ready = status_count(generations, "ready");
+    let current = status_count(generations, "current");
+    let superseded = status_count(generations, "superseded");
+    let failed = status_count(generations, "failed");
+    let retiring = status_count(generations, "retiring");
+    let retained_bytes = status_count(generations, "estimated_retained_bytes");
+    let generation_storage = GenerationStorageSummary {
+        staging,
+        ready,
+        current,
+        superseded,
+        failed,
+        retiring,
+        estimated_retained_bytes: retained_bytes,
+        ..GenerationStorageSummary::default()
+    };
+    println!(
+        "Retained generations: {staging} staging, {ready} ready, {current} current, \
+         {superseded} superseded, {failed} failed, {retiring} retiring; source plus generation-local BM25 \
+         lower bound {}",
+        render_byte_count(retained_bytes)
+    );
+    if generation_storage_needs_attention(generation_storage) {
+        println!(
+            "WARNING: generation retention needs attention; run `codevetra index` to trigger \
+             automatic bounded cleanup, then inspect `codevetra db prune --help` if the backlog remains."
+        );
+    }
+}
+
+fn status_count(values: &Map<String, Value>, field: &str) -> u64 {
+    values.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+const fn generation_storage_needs_attention(storage: GenerationStorageSummary) -> bool {
+    storage.staging > 1
+        || storage.ready > 1
+        || storage.retiring > 0
+        || storage.superseded > MAXIMUM_SUPERSEDED_GENERATIONS_WITHOUT_ATTENTION
+        || storage.failed > MAXIMUM_FAILED_GENERATIONS_WITHOUT_ATTENTION
+        || storage.estimated_retained_bytes > RETAINED_BYTE_WARNING
+}
+
+fn render_byte_count(bytes: u64) -> String {
+    format!("{} ({} bytes)", format_binary_bytes(bytes), bytes)
+}
+
+async fn run_embed(
+    project_path: PathBuf,
+    workers: Option<u16>,
+    format: OutputFormat,
+) -> Result<ExitCode, String> {
+    let mut arguments = Map::from_iter([("action".to_owned(), Value::String("embed".to_owned()))]);
+    if let Some(workers) = workers {
+        arguments.insert("workers".to_owned(), Value::from(workers));
+    }
+    print_admin_report(project_path, arguments, format).await
+}
+
+async fn run_embedding_status(
+    project_path: PathBuf,
+    format: OutputFormat,
+) -> Result<ExitCode, String> {
+    print_admin_report(
+        project_path,
+        Map::from_iter([(
+            "action".to_owned(),
+            Value::String("embedding-status".to_owned()),
+        )]),
+        format,
+    )
+    .await
+}
+
+async fn print_admin_report(
+    project_path: PathBuf,
+    arguments: Map<String, Value>,
+    format: OutputFormat,
+) -> Result<ExitCode, String> {
+    let result =
+        generated_cli::run_direct_result("codevetra_admin", project_path, arguments).await?;
+    let report: Value = serde_json::from_str(
+        result
+            .primary_text()
+            .ok_or("Native admin returned no report")?,
+    )
+    .map_err(|_| "Native admin returned a malformed report")?;
+    if rocks_cli::remote_job::failed(&result) {
+        eprintln!("{report}");
+        return Ok(ExitCode::FAILURE);
+    }
+    print_serialized(report.get("report").unwrap_or(&report), format)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_index_report(report: &IndexReport, format: OutputFormat) -> Result<(), String> {
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(report)
+                .map_err(|_| "could not serialize the index report".to_owned())?
+        ),
+        OutputFormat::Text => {
+            println!(
+                "Index generation: {} ({})",
+                report.generation_id,
+                if report.published {
+                    "published"
+                } else {
+                    "already current"
+                }
+            );
+            println!("Workers: {}", report.workers);
+            println!("Source revision: {}", report.source_revision);
+            println!("Logical digest: {}", report.content_digest);
+            if let Some(native) = &report.native {
+                println!(
+                    "Native facts: {} files, {} symbols, {} numerical sites, {} resolved and {} unresolved references",
+                    native.files,
+                    native.symbols,
+                    native.numerical_sites,
+                    native.resolved_references,
+                    native.unresolved_references
+                );
+                for degraded in &native.degraded_files {
+                    println!("Degraded source: {} ({})", degraded.path, degraded.reason);
+                }
+                if native.degraded_files_truncated > 0 {
+                    println!(
+                        "Degraded source paths omitted: {}",
+                        native.degraded_files_truncated
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_database_command(command: DatabaseCommand) -> Result<ExitCode, String> {
+    match command {
+        DatabaseCommand::Migrate(arguments) => rocks_cli::migrate(arguments).await,
+        DatabaseCommand::Usage(arguments) => {
+            if !arguments
+                .project_path
+                .join(".codevetra/data/CURRENT")
+                .try_exists()
+                .map_err(|_| "native storage inventory is unavailable".to_owned())?
+            {
+                print_serialized(
+                    &serde_json::json!({"storage":"rocksdb","initialized":false,"native":null}),
+                    arguments.format,
+                )?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            let result = generated_cli::run_direct_result(
+                "codevetra_status",
+                arguments.project_path,
+                Map::new(),
+            )
+            .await?;
+            if result.is_error() {
+                return Err("native storage inventory failed".to_owned());
+            }
+            let value: Value = serde_json::from_str(
+                result
+                    .primary_text()
+                    .ok_or_else(|| "native status returned no inventory".to_owned())?,
+            )
+            .map_err(|_| "native status inventory is malformed".to_owned())?;
+            print_serialized(&value["databaseStorage"], arguments.format)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        DatabaseCommand::Prune(arguments) => {
+            if arguments.confirm != RETENTION_CONFIRMATION {
+                return Err(
+                    "generation pruning requires --confirm prune-old-generations".to_owned(),
+                );
+            }
+            let input = serde_json::json!({"action":"prune-generations","keepSuperseded":arguments.keep_superseded,"maximumDeletions":arguments.maximum_deletions,"maximumCascadeRows":arguments.maximum_cascade_rows,"confirm":true});
+            let result = generated_cli::run_direct_result(
+                "codevetra_admin",
+                arguments.project_path,
+                input
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| "native retention request is malformed".to_owned())?,
+            )
+            .await?;
+            let value: Value = serde_json::from_str(
+                result
+                    .primary_text()
+                    .ok_or_else(|| "native retention returned no report".to_owned())?,
+            )
+            .map_err(|_| "native retention report is malformed".to_owned())?;
+            print_serialized(&value, arguments.format)?;
+            Ok(if result.is_error() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DoctorCheck {
+    id: String,
+    status: DoctorStatus,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remediation: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DatabaseReadinessState {
+    Ready,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum IndexReadinessState {
+    Ready,
+    NotIndexed,
+    Unavailable,
+    NotChecked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FreshnessReadinessState {
+    Current,
+    Stale,
+    Unavailable,
+    NotChecked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DeterministicRetrievalReadinessState {
+    Ready,
+    Unavailable,
+    NotChecked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SemanticRetrievalReadinessState {
+    Ready,
+    NotConfigured,
+    NotIndexed,
+    Stale,
+    Unavailable,
+    NotChecked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HostVerificationReadinessState {
+    Ready,
+    NotChecked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OverallOnboardingReadinessState {
+    Ready,
+    Incomplete,
+    Blocked,
+    NotChecked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectReadiness {
+    database: DatabaseReadinessState,
+    index: IndexReadinessState,
+    freshness: FreshnessReadinessState,
+    deterministic_retrieval: DeterministicRetrievalReadinessState,
+    semantic_retrieval: SemanticRetrievalReadinessState,
+    registration: HostVerificationReadinessState,
+    live_transport: HostVerificationReadinessState,
+    overall: OverallOnboardingReadinessState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectIndexObservation {
+    index: IndexReadinessState,
+    freshness: FreshnessReadinessState,
+    deterministic_retrieval: DeterministicRetrievalReadinessState,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectReadinessInput {
+    capabilities_ready: bool,
+    database: DatabaseReadinessState,
+    project_index: ProjectIndexObservation,
+    semantic_retrieval: SemanticRetrievalReadinessState,
+    project_checks_skipped: bool,
+    registration: HostVerificationReadinessState,
+    live_transport: HostVerificationReadinessState,
+}
+
+impl ProjectIndexObservation {
+    const fn not_checked() -> Self {
+        Self {
+            index: IndexReadinessState::NotChecked,
+            freshness: FreshnessReadinessState::NotChecked,
+            deterministic_retrieval: DeterministicRetrievalReadinessState::NotChecked,
+        }
+    }
+
+    const fn unavailable() -> Self {
+        Self {
+            index: IndexReadinessState::Unavailable,
+            freshness: FreshnessReadinessState::Unavailable,
+            deterministic_retrieval: DeterministicRetrievalReadinessState::Unavailable,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmbeddingConfigurationState {
+    Configured,
+    NotConfigured,
+    Unavailable,
+    NotChecked,
+}
+
+#[derive(Clone, Copy)]
+struct DoctorLlmTier {
+    tier: ProjectLlmTier,
+    label: &'static str,
+    required: bool,
+    embedding: bool,
+}
+
+struct LlmDoctorContext<'input> {
+    project_path: &'input Path,
+    checks: &'input mut Vec<DoctorCheck>,
+    loopback: &'input mut BTreeMap<String, Vec<&'static str>>,
+    /// Credential commands to run once every tier has been read.
+    credential_commands: &'input mut Vec<(DoctorLlmTier, CredentialCommand)>,
+}
+
+/// Credential commands doctor runs at once; each is bounded by its own deadline.
+const DOCTOR_CREDENTIAL_COMMAND_CONCURRENCY: usize = 4;
+
+trait ReadinessLabel {
+    fn label(self) -> &'static str;
+}
+
+impl ReadinessLabel for DatabaseReadinessState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl ReadinessLabel for IndexReadinessState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NotIndexed => "not_indexed",
+            Self::Unavailable => "unavailable",
+            Self::NotChecked => "not_checked",
+        }
+    }
+}
+
+impl ReadinessLabel for FreshnessReadinessState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+            Self::NotChecked => "not_checked",
+        }
+    }
+}
+
+impl ReadinessLabel for DeterministicRetrievalReadinessState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unavailable => "unavailable",
+            Self::NotChecked => "not_checked",
+        }
+    }
+}
+
+impl ReadinessLabel for SemanticRetrievalReadinessState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NotConfigured => "not_configured",
+            Self::NotIndexed => "not_indexed",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+            Self::NotChecked => "not_checked",
+        }
+    }
+}
+
+impl ReadinessLabel for HostVerificationReadinessState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NotChecked => "not_checked",
+        }
+    }
+}
+
+impl ReadinessLabel for OverallOnboardingReadinessState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Incomplete => "incomplete",
+            Self::Blocked => "blocked",
+            Self::NotChecked => "not_checked",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DoctorReport {
+    ready: bool,
+    capabilities_ready: bool,
+    project_readiness: ProjectReadiness,
+    next_actions: Vec<String>,
+    fixes_applied: Vec<String>,
+    checks: Vec<DoctorCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    database: Option<Value>,
+}
+
+struct DoctorRunInput {
+    project_path: PathBuf,
+    fix: bool,
+    skip_project_checks: bool,
+    format: OutputFormat,
+}
+
+pub(crate) struct DoctorReportInput {
+    pub(crate) project_path: PathBuf,
+    pub(crate) fix: bool,
+    pub(crate) skip_project_checks: bool,
+}
+
+pub(crate) struct ProjectStateCheckInput<'input> {
+    pub(crate) project_path: &'input Path,
+    pub(crate) fix: bool,
+    pub(crate) fixes: &'input mut Vec<String>,
+    pub(crate) checks: &'input mut Vec<DoctorCheck>,
+}
+
+async fn run_doctor(input: DoctorRunInput) -> Result<ExitCode, String> {
+    let report =
+        build_doctor_report(input.project_path, input.fix, input.skip_project_checks).await?;
+    match input.format {
+        OutputFormat::Text => print!("{}", render_doctor_report(&report)),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|_| "could not serialize the doctor report".to_owned())?
+        ),
+    }
+    Ok(if report.ready {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+async fn build_doctor_report(
+    project_path: PathBuf,
+    fix: bool,
+    skip_project_checks: bool,
+) -> Result<DoctorReport, String> {
+    build_doctor_report_with_settings(DoctorReportInput {
+        project_path,
+        fix,
+        skip_project_checks,
+    })
+    .await
+}
+
+async fn apply_llm_doctor_fix(
+    project_path: &Path,
+    fixes_applied: &mut Vec<String>,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    match llm_commands::doctor_fix_missing_tiers(project_path).await {
+        Ok(fixes) => fixes_applied.extend(fixes),
+        Err(error) => checks.push(doctor_fail(
+            "llm-fix",
+            error,
+            "Run `codevetra llm setup` or `codevetra llm install --minimal`.".to_owned(),
+        )),
+    }
+}
+
+fn canonical_doctor_project_path(project_path: &Path) -> Result<PathBuf, String> {
+    let project_path = project_path
+        .canonicalize()
+        .map_err(|_| "doctor project path must be an existing directory".to_owned())?;
+    if project_path.is_dir() {
+        Ok(project_path)
+    } else {
+        Err("doctor project path must be an existing directory".to_owned())
+    }
+}
+
+async fn build_doctor_report_with_settings(
+    input: DoctorReportInput,
+) -> Result<DoctorReport, String> {
+    let project_path = canonical_doctor_project_path(&input.project_path)?;
+    let mut checks = Vec::new();
+    let mut fixes_applied = Vec::new();
+    check_native_executable(&mut checks);
+    if !input.skip_project_checks {
+        check_or_fix_project_state(&mut ProjectStateCheckInput {
+            project_path: &project_path,
+            fix: input.fix,
+            fixes: &mut fixes_applied,
+            checks: &mut checks,
+        })?;
+        if input.fix {
+            apply_llm_doctor_fix(&project_path, &mut fixes_applied, &mut checks).await;
+        }
+    }
+    let arguments = Map::from_iter([
+        ("action".to_owned(), Value::from("doctor")),
+        (
+            "skipProjectChecks".to_owned(),
+            Value::Bool(input.skip_project_checks),
+        ),
+    ]);
+    let observation =
+        generated_cli::run_direct_result("codevetra_admin", project_path.clone(), arguments).await;
+    let mut project_index = if input.skip_project_checks {
+        ProjectIndexObservation::not_checked()
+    } else {
+        ProjectIndexObservation::unavailable()
+    };
+    let mut semantic = if input.skip_project_checks {
+        SemanticRetrievalReadinessState::NotChecked
+    } else {
+        SemanticRetrievalReadinessState::Unavailable
+    };
+    if input.skip_project_checks {
+        semantic = semantic_readiness_without_probe(
+            EmbeddingConfigurationState::NotChecked,
+            project_index,
+        )
+        .unwrap_or(SemanticRetrievalReadinessState::Unavailable);
+    }
+    let database = match observation {
+        Ok(result) if !result.is_error() => {
+            let value: Value = serde_json::from_str(
+                result
+                    .primary_text()
+                    .ok_or_else(|| "native doctor returned no report".to_owned())?,
+            )
+            .map_err(|_| "native doctor report is malformed".to_owned())?;
+            checks.push(doctor_pass(
+                "database-native",
+                "RocksDB format, project identity and owned worker access passed.",
+            ));
+            if !input.skip_project_checks {
+                (project_index, semantic) = observe_native_doctor_project(&value, &mut checks)?;
+            }
+            Some(value["capabilities"].clone())
+        }
+        _ => {
+            checks.push(doctor_fail(
+                "database-native",
+                "Native project storage could not be opened or read.",
+                "Inspect the owning CodeVetra process and project state, then retry doctor."
+                    .to_owned(),
+            ));
+            None
+        }
+    };
+    if !input.skip_project_checks {
+        check_llm_configuration(&project_path, &mut checks).await;
+    }
+    let capabilities_ready = !checks
+        .iter()
+        .any(|check| check.status == DoctorStatus::Fail);
+    let project_readiness = build_project_readiness(ProjectReadinessInput {
+        capabilities_ready,
+        database: if database.is_some() {
+            DatabaseReadinessState::Ready
+        } else {
+            DatabaseReadinessState::Unavailable
+        },
+        project_index,
+        semantic_retrieval: semantic,
+        project_checks_skipped: input.skip_project_checks,
+        registration: HostVerificationReadinessState::NotChecked,
+        live_transport: HostVerificationReadinessState::NotChecked,
+    });
+    Ok(DoctorReport {
+        ready: capabilities_ready,
+        capabilities_ready,
+        project_readiness,
+        next_actions: doctor_next_actions(project_readiness, input.skip_project_checks),
+        fixes_applied,
+        checks,
+        database,
+    })
+}
+
+fn observe_native_doctor_project(
+    value: &Value,
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<(ProjectIndexObservation, SemanticRetrievalReadinessState), String> {
+    let status = &value["project"];
+    let fresh = status["fresh"]
+        .as_bool()
+        .ok_or_else(|| "native doctor project status is malformed".to_owned())?;
+    let project_index = project_index_observation(status);
+    checks.push(if project_index.index == IndexReadinessState::NotIndexed {
+        doctor_warn(
+            "project-index",
+            "No complete native generation is published.",
+            "Run codevetra index <project>.".to_owned(),
+        )
+    } else if !fresh {
+        doctor_warn(
+            "project-index",
+            "The current graph differs from live source.",
+            "Run codevetra index <project>.".to_owned(),
+        )
+    } else {
+        doctor_pass(
+            "project-index",
+            "A complete current native generation matches live source.",
+        )
+    });
+    let semantic = match value["embedding"]["state"].as_str() {
+        Some("not_configured") => SemanticRetrievalReadinessState::NotConfigured,
+        Some("ready") => serde_json::from_value::<SemanticReadinessState>(
+            value["embedding"]["report"]["readiness"]["state"].clone(),
+        )
+        .map_or(
+            SemanticRetrievalReadinessState::Unavailable,
+            map_semantic_readiness,
+        ),
+        _ => SemanticRetrievalReadinessState::Unavailable,
+    };
+    Ok((project_index, semantic))
+}
+
+fn check_native_executable(checks: &mut Vec<DoctorCheck>) {
+    let healthy = env::current_exe().is_ok_and(|path| native_executable_path_is_safe(&path));
+    checks.push(if healthy {
+        doctor_pass(
+            "native-runtime",
+            concat!(
+                "Native Rust executable is available (",
+                env!("CARGO_PKG_VERSION"),
+                ")."
+            ),
+        )
+    } else {
+        doctor_fail(
+            "native-runtime",
+            "The running CodeVetra executable could not be resolved safely.".to_owned(),
+            "Reinstall the native CodeVetra release binary.".to_owned(),
+        )
+    });
+}
+
+fn native_executable_path_is_safe(path: &Path) -> bool {
+    path.canonicalize()
+        .ok()
+        .and_then(|canonical| fs::symlink_metadata(canonical).ok())
+        .is_some_and(|metadata| metadata.file_type().is_file())
+}
+
+fn check_or_fix_project_state(input: &mut ProjectStateCheckInput<'_>) -> Result<(), String> {
+    let state = if input.fix {
+        codevetra_config::prepare_project_state(input.project_path)
+    } else {
+        codevetra_config::project_state_directory(input.project_path)
+    }
+    .map_err(|error| error.to_string())?;
+    match fs::symlink_metadata(&state) {
+        Ok(metadata) if metadata.file_type().is_dir() => input.checks.push(doctor_pass(
+            "project-state",
+            "The project has a real .codevetra state directory.",
+        )),
+        Ok(_) => input.checks.push(doctor_fail(
+            "project-state",
+            "The .codevetra state entry is not a real directory.".to_owned(),
+            "Replace it with a private directory after preserving any intentional contents."
+                .to_owned(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && input.fix => {
+            fs::create_dir(&state)
+                .map_err(|_| "doctor could not create the .codevetra state directory".to_owned())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).map_err(|_| {
+                    "doctor could not make the .codevetra state directory private".to_owned()
+                })?;
+            }
+            input
+                .fixes
+                .push("created the private .codevetra state directory".to_owned());
+            input.checks.push(doctor_pass(
+                "project-state",
+                "The project has a real .codevetra state directory.",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            input.checks.push(doctor_warn(
+                "project-state",
+                "The project is not initialized yet.",
+                "Run `codevetra doctor --fix` or `codevetra index .`.".to_owned(),
+            ));
+        }
+        Err(_) => input.checks.push(doctor_fail(
+            "project-state",
+            "The .codevetra state entry could not be inspected.".to_owned(),
+            "Check project-directory permissions.".to_owned(),
+        )),
+    }
+    Ok(())
+}
+
+fn project_index_observation(status: &Value) -> ProjectIndexObservation {
+    let indexed = status["snapshot"]["current"].is_object();
+    ProjectIndexObservation {
+        index: if indexed {
+            IndexReadinessState::Ready
+        } else {
+            IndexReadinessState::NotIndexed
+        },
+        freshness: if !indexed {
+            FreshnessReadinessState::Unavailable
+        } else if status["fresh"] == true {
+            FreshnessReadinessState::Current
+        } else {
+            FreshnessReadinessState::Stale
+        },
+        deterministic_retrieval: if indexed {
+            DeterministicRetrievalReadinessState::Ready
+        } else {
+            DeterministicRetrievalReadinessState::Unavailable
+        },
+    }
+}
+
+fn build_project_readiness(input: ProjectReadinessInput) -> ProjectReadiness {
+    let core_project_ready = input.database == DatabaseReadinessState::Ready
+        && input.project_index.index == IndexReadinessState::Ready
+        && input.project_index.freshness == FreshnessReadinessState::Current
+        && input.project_index.deterministic_retrieval
+            == DeterministicRetrievalReadinessState::Ready;
+    let host_ready = input.registration == HostVerificationReadinessState::Ready
+        && input.live_transport == HostVerificationReadinessState::Ready;
+    let overall = if !input.capabilities_ready {
+        OverallOnboardingReadinessState::Blocked
+    } else if input.project_checks_skipped {
+        OverallOnboardingReadinessState::NotChecked
+    } else if core_project_ready && host_ready {
+        OverallOnboardingReadinessState::Ready
+    } else {
+        OverallOnboardingReadinessState::Incomplete
+    };
+    ProjectReadiness {
+        database: input.database,
+        index: input.project_index.index,
+        freshness: input.project_index.freshness,
+        deterministic_retrieval: input.project_index.deterministic_retrieval,
+        semantic_retrieval: input.semantic_retrieval,
+        registration: input.registration,
+        live_transport: input.live_transport,
+        overall,
+    }
+}
+
+fn doctor_next_actions(readiness: ProjectReadiness, project_checks_skipped: bool) -> Vec<String> {
+    let mut actions = Vec::new();
+    if readiness.overall == OverallOnboardingReadinessState::Blocked {
+        actions.push(
+            "Resolve the failing hard requirements above, then rerun `codevetra doctor <path>`."
+                .to_owned(),
+        );
+    }
+    if project_checks_skipped {
+        actions.push(
+            "Rerun `codevetra doctor <path>` without `--no-project-checks` to inspect project readiness."
+                .to_owned(),
+        );
+    } else {
+        match readiness.index {
+            IndexReadinessState::NotIndexed => {
+                actions.push("Run `codevetra index <path>`.".to_owned());
+            }
+            IndexReadinessState::Unavailable => actions.push(
+                "Run `codevetra status <path>` and resolve its project-index error.".to_owned(),
+            ),
+            IndexReadinessState::Ready | IndexReadinessState::NotChecked => {}
+        }
+        if readiness.freshness == FreshnessReadinessState::Stale {
+            actions.push(
+                "Run `codevetra index <path>` or `codevetra sync-if-dirty <path>` to publish current source."
+                    .to_owned(),
+            );
+        }
+        if readiness.index == IndexReadinessState::Ready
+            && readiness.deterministic_retrieval != DeterministicRetrievalReadinessState::Ready
+        {
+            actions.push(
+                "Run one real deterministic `find` or `context` query and resolve any retrieval error."
+                    .to_owned(),
+            );
+        }
+        if matches!(
+            readiness.semantic_retrieval,
+            SemanticRetrievalReadinessState::NotIndexed
+                | SemanticRetrievalReadinessState::Stale
+                | SemanticRetrievalReadinessState::Unavailable
+        ) {
+            actions.push(
+                "Optional semantic retrieval: run `codevetra embedding-status <path>` and follow its generation-scoped remediation."
+                    .to_owned(),
+            );
+        }
+    }
+    if readiness.registration == HostVerificationReadinessState::NotChecked {
+        actions.push("Inspect or install the project-local MCP registration.".to_owned());
+    }
+    if readiness.live_transport == HostVerificationReadinessState::NotChecked {
+        actions.push(
+            "Restart the agent host if registration changed, then run a fresh MCP status and query probe."
+                .to_owned(),
+        );
+    }
+    actions
+}
+
+fn semantic_readiness_without_probe(
+    configuration: EmbeddingConfigurationState,
+    project_index: ProjectIndexObservation,
+) -> Option<SemanticRetrievalReadinessState> {
+    match configuration {
+        EmbeddingConfigurationState::NotChecked => {
+            return Some(SemanticRetrievalReadinessState::NotChecked);
+        }
+        EmbeddingConfigurationState::NotConfigured => {
+            return Some(SemanticRetrievalReadinessState::NotConfigured);
+        }
+        EmbeddingConfigurationState::Unavailable => {
+            return Some(SemanticRetrievalReadinessState::Unavailable);
+        }
+        EmbeddingConfigurationState::Configured => {}
+    }
+    match project_index.index {
+        IndexReadinessState::NotIndexed => {
+            return Some(SemanticRetrievalReadinessState::NotIndexed);
+        }
+        IndexReadinessState::Unavailable => {
+            return Some(SemanticRetrievalReadinessState::Unavailable);
+        }
+        IndexReadinessState::NotChecked => {
+            return Some(SemanticRetrievalReadinessState::NotChecked);
+        }
+        IndexReadinessState::Ready => {}
+    }
+    if project_index.freshness == FreshnessReadinessState::Stale {
+        return Some(SemanticRetrievalReadinessState::Stale);
+    }
+    None
+}
+
+const fn map_semantic_readiness(state: SemanticReadinessState) -> SemanticRetrievalReadinessState {
+    match semantic_readiness_from_database(state) {
+        RetrievalSemanticReadiness::Ready => SemanticRetrievalReadinessState::Ready,
+        RetrievalSemanticReadiness::NotConfigured => SemanticRetrievalReadinessState::NotConfigured,
+        RetrievalSemanticReadiness::NotIndexed => SemanticRetrievalReadinessState::NotIndexed,
+        RetrievalSemanticReadiness::Stale => SemanticRetrievalReadinessState::Stale,
+        RetrievalSemanticReadiness::Unavailable => SemanticRetrievalReadinessState::Unavailable,
+    }
+}
+
+async fn check_llm_configuration(
+    project_path: &Path,
+    checks: &mut Vec<DoctorCheck>,
+) -> EmbeddingConfigurationState {
+    let tiers = [
+        DoctorLlmTier {
+            tier: ProjectLlmTier::Embedding,
+            label: "embedding",
+            required: true,
+            embedding: true,
+        },
+        DoctorLlmTier {
+            tier: ProjectLlmTier::Summarize,
+            label: "summarize",
+            required: false,
+            embedding: false,
+        },
+        DoctorLlmTier {
+            tier: ProjectLlmTier::Local,
+            label: "local",
+            required: false,
+            embedding: false,
+        },
+        DoctorLlmTier {
+            tier: ProjectLlmTier::Ask,
+            label: "ask",
+            required: false,
+            embedding: false,
+        },
+        DoctorLlmTier {
+            tier: ProjectLlmTier::Classify,
+            label: "classify",
+            required: false,
+            embedding: false,
+        },
+        DoctorLlmTier {
+            tier: ProjectLlmTier::Reranker,
+            label: "reranker",
+            required: false,
+            embedding: false,
+        },
+        DoctorLlmTier {
+            tier: ProjectLlmTier::Decision,
+            label: "decision",
+            required: false,
+            embedding: false,
+        },
+    ];
+    let mut loopback = BTreeMap::<String, Vec<&'static str>>::new();
+    let mut credential_commands = Vec::new();
+    let mut embedding_configuration = EmbeddingConfigurationState::NotConfigured;
+    for tier in tiers {
+        let mut context = LlmDoctorContext {
+            project_path,
+            checks,
+            loopback: &mut loopback,
+            credential_commands: &mut credential_commands,
+        };
+        if let Some(state) = check_llm_tier_configuration(&mut context, tier) {
+            embedding_configuration = state;
+        }
+    }
+
+    check_llm_credential_commands(credential_commands, checks).await;
+    check_loopback_llm_endpoints(loopback, checks).await;
+    embedding_configuration
+}
+
+fn check_llm_tier_configuration(
+    context: &mut LlmDoctorContext<'_>,
+    tier: DoctorLlmTier,
+) -> Option<EmbeddingConfigurationState> {
+    let config = match load_doctor_llm_tier(context, tier) {
+        Ok(config) => config,
+        Err(state) => return state,
+    };
+    if config.credential_source() == ProjectLlmCredentialSource::InlineLegacy {
+        context.checks.push(doctor_warn(
+            format!("llm-{}-credential", tier.label),
+            "A legacy inline LLM credential is configured.",
+            "Move the credential to an environment variable (apiKeyEnv) or a credential command (apiKeyCommand).".to_owned(),
+        ));
+    }
+    if let Some(command) = config.api_key_command() {
+        context.credential_commands.push((tier, command.clone()));
+    }
+    if tier.tier == ProjectLlmTier::Decision && !check_decision_tier(context.checks, tier, &config)
+    {
+        return None;
+    }
+    check_local_model(tier.label, config.model(), context.checks);
+    if endpoint_is_loopback(config.endpoint()) {
+        context
+            .loopback
+            .entry(config.endpoint().to_owned())
+            .or_default()
+            .push(tier.label);
+    } else {
+        context.checks.push(doctor_pass(
+            format!("llm-{}-config", tier.label),
+            format!(
+                "The {} remote tier is valid; use `codevetra llm smoke` for an authenticated request.",
+                tier.label
+            ),
+        ));
+    }
+    tier.embedding
+        .then_some(EmbeddingConfigurationState::Configured)
+}
+
+/// Load one exact tier. When doctor cannot inspect it further, the check
+/// explaining why is recorded and the embedding readiness state is returned.
+fn load_doctor_llm_tier(
+    context: &mut LlmDoctorContext<'_>,
+    tier: DoctorLlmTier,
+) -> Result<ProjectLlmTierConfig, Option<EmbeddingConfigurationState>> {
+    let unavailable = tier
+        .embedding
+        .then_some(EmbeddingConfigurationState::Unavailable);
+    match load_exact_project_llm_tier(context.project_path, tier.tier) {
+        Ok(Some(config)) => return Ok(config),
+        Ok(None) => {
+            if tier.required {
+                context.checks.push(doctor_warn(
+                    format!("llm-{}", tier.label),
+                    format!(
+                        "The {} LLM tier is not configured; deterministic graph/BM25 retrieval remains available.",
+                        tier.label
+                    ),
+                    "Run `codevetra llm setup` or `codevetra llm install --minimal`.".to_owned(),
+                ));
+            }
+            return Err(tier
+                .embedding
+                .then_some(EmbeddingConfigurationState::NotConfigured));
+        }
+        Err(ProjectLlmConfigError::CredentialUnavailable) => {
+            let variable = load_project_llm_credential_environment(context.project_path, tier.tier)
+                .ok()
+                .flatten();
+            context.checks.push(missing_credential_check(
+                tier,
+                variable
+                    .as_deref()
+                    .unwrap_or("The configured credential variable"),
+            ));
+        }
+        Err(error) => context.checks.push(doctor_fail(
+            format!("llm-{}", tier.label),
+            error.to_string(),
+            "Repair .codevetra/config.json with `codevetra llm setup`.".to_owned(),
+        )),
+    }
+    Err(unavailable)
+}
+
+/// Classify the optional Jev tier. A credential variable missing from this
+/// shell warns, because the MCP server reads its own environment; only a tier
+/// CodeVetra cannot use fails. Returns whether the generic remote checks apply.
+fn check_decision_tier(
+    checks: &mut Vec<DoctorCheck>,
+    tier: DoctorLlmTier,
+    config: &ProjectLlmTierConfig,
+) -> bool {
+    match JevSettings::from_config(config) {
+        Ok(_) | Err(JevError::CredentialUnavailable(_)) => true,
+        Err(JevError::CredentialMissing {
+            environment_variable,
+        }) => {
+            checks.push(missing_credential_check(tier, &environment_variable));
+            false
+        }
+        Err(_) => {
+            checks.push(doctor_fail(
+                "llm-decision-config",
+                "The Jev decision tier is invalid (unexpected provider, model, endpoint or timeout); exploration uses native retrieval.",
+                format!(
+                    "Run `codevetra llm setup --preset jev {}` to restore the pinned model and endpoint.",
+                    decision_credential_flags(config)
+                ),
+            ));
+            false
+        }
+    }
+}
+
+/// The setup flags that keep the decision tier's configured credential source.
+fn decision_credential_flags(config: &ProjectLlmTierConfig) -> String {
+    config.api_key_command().map_or_else(
+        || {
+            format!(
+                "--api-key-env {}",
+                config.api_key_env().unwrap_or("TYPESAFE_API_KEY")
+            )
+        },
+        |command| {
+            format!(
+                "--api-key-command <{}> --api-key-arg <arg>",
+                command.program_name()
+            )
+        },
+    )
+}
+
+/// What a tier without its credential means for retrieval.
+fn unavailable_tier_consequence(tier: DoctorLlmTier) -> String {
+    if tier.tier == ProjectLlmTier::Decision {
+        "Explore uses native retrieval until then.".to_owned()
+    } else {
+        format!("The {} tier is unavailable until then.", tier.label)
+    }
+}
+
+/// Doctor's own shell lacks a configured credential variable. That blocks
+/// readiness only for a required tier; optional tiers warn.
+fn missing_credential_check(tier: DoctorLlmTier, variable: &str) -> DoctorCheck {
+    let message = format!(
+        "{variable} is not set in this shell; the MCP server needs it in its own environment. {}",
+        unavailable_tier_consequence(tier)
+    );
+    let preset = if tier.tier == ProjectLlmTier::Decision {
+        "--preset jev "
+    } else {
+        ""
+    };
+    let remediation = format!(
+        "Supply {variable} to the MCP server process (its host `env` block or secret-manager launcher), or let CodeVetra resolve the key on first use: `codevetra llm setup {preset}--api-key-command <exe> --api-key-arg <arg>`."
+    );
+    let id = format!("llm-{}-credential", tier.label);
+    if tier.required {
+        doctor_fail(id, message, remediation)
+    } else {
+        doctor_warn(id, message, remediation)
+    }
+}
+
+/// Run each configured credential command once, bounded, and report only
+/// whether it produced a credential; the value is discarded.
+async fn check_llm_credential_commands(
+    commands: Vec<(DoctorLlmTier, CredentialCommand)>,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    let results = stream::iter(commands)
+        .map(|(tier, command)| async move {
+            let result = command.verify().await;
+            (tier, command, result)
+        })
+        .buffered(DOCTOR_CREDENTIAL_COMMAND_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for (tier, command, result) in results {
+        checks.push(credential_command_check(tier, &command, result));
+    }
+}
+
+fn credential_command_check(
+    tier: DoctorLlmTier,
+    command: &CredentialCommand,
+    result: Result<(), CredentialCommandError>,
+) -> DoctorCheck {
+    let id = format!("llm-{}-credential", tier.label);
+    let Err(error) = result else {
+        return doctor_pass(
+            id,
+            format!(
+                "The {} credential command `{}` produced a credential; the MCP server runs it on first use.",
+                tier.label,
+                command.program_name()
+            ),
+        );
+    };
+    let message = format!(
+        "The {} tier's {error}. {}",
+        tier.label,
+        unavailable_tier_consequence(tier)
+    );
+    let remediation = "Run the configured command where the MCP server runs and fix it (for example, unlock its secret store); the server retries it on a later use without a restart.".to_owned();
+    if tier.required {
+        doctor_fail(id, message, remediation)
+    } else {
+        doctor_warn(id, message, remediation)
+    }
+}
+
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+}
+
+async fn check_loopback_llm_endpoints(
+    loopback: BTreeMap<String, Vec<&'static str>>,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    let probes = stream::iter(loopback)
+        .map(|(endpoint, labels)| async move {
+            let result = probe_openai_compatible_endpoint(&endpoint, Duration::from_secs(2)).await;
+            (labels, result)
+        })
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+    for (labels, result) in probes {
+        for label in labels {
+            match &result {
+                Ok(probe) if probe.openai_compatible => checks.push(doctor_pass(
+                    format!("llm-{label}-endpoint"),
+                    format!("The {label} loopback endpoint is OpenAI-compatible."),
+                )),
+                Ok(probe) if probe.reachable => checks.push(doctor_warn(
+                    format!("llm-{label}-endpoint"),
+                    format!("The {label} loopback endpoint is reachable but did not expose a compatible model catalog."),
+                    "Start the configured OpenAI-compatible backend and run `codevetra llm smoke`.".to_owned(),
+                )),
+                Ok(_) | Err(_) => checks.push(doctor_warn(
+                    format!("llm-{label}-endpoint"),
+                    format!("The {label} loopback endpoint is not responding."),
+                    "Run `codevetra backend start` or start the externally managed provider.".to_owned(),
+                )),
+            }
+        }
+    }
+}
+
+fn check_local_model(label: &str, model: &str, checks: &mut Vec<DoctorCheck>) {
+    let path = Path::new(model);
+    if !path.is_absolute() || path.extension().and_then(|value| value.to_str()) != Some("gguf") {
+        return;
+    }
+    let valid = fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 0);
+    checks.push(if valid {
+        doctor_pass(
+            format!("llm-{label}-model"),
+            format!("The {label} GGUF model is a non-empty regular file."),
+        )
+    } else {
+        doctor_warn(
+            format!("llm-{label}-model"),
+            format!("The configured {label} GGUF model is missing or unsafe."),
+            "Run `codevetra llm install --minimal` or repair the model path.".to_owned(),
+        )
+    });
+}
+
+fn doctor_pass(id: impl Into<String>, message: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        id: id.into(),
+        status: DoctorStatus::Pass,
+        message: message.into(),
+        remediation: None,
+    }
+}
+
+fn doctor_warn(
+    id: impl Into<String>,
+    message: impl Into<String>,
+    remediation: String,
+) -> DoctorCheck {
+    DoctorCheck {
+        id: id.into(),
+        status: DoctorStatus::Warn,
+        message: message.into(),
+        remediation: Some(remediation),
+    }
+}
+
+fn doctor_fail(
+    id: impl Into<String>,
+    message: impl Into<String>,
+    remediation: String,
+) -> DoctorCheck {
+    let mut check = doctor_warn(id, message, remediation);
+    check.status = DoctorStatus::Fail;
+    check
+}
+
+fn render_doctor_report(report: &DoctorReport) -> String {
+    let mut output = "# CodeVetra v4 doctor\n".to_owned();
+    if !report.fixes_applied.is_empty() {
+        output.push_str("\nRepairs applied:\n");
+        for fix in &report.fixes_applied {
+            let _ = writeln!(output, "- {fix}");
+        }
+    }
+    for check in &report.checks {
+        let marker = match check.status {
+            DoctorStatus::Pass => "✓",
+            DoctorStatus::Warn => "⚠",
+            DoctorStatus::Fail => "✗",
+        };
+        let _ = write!(output, "\n{marker} {} — {}\n", check.id, check.message);
+        if let Some(remediation) = &check.remediation {
+            let _ = writeln!(output, "  Fix: {remediation}");
+        }
+    }
+    let _ = write!(
+        output,
+        "\nReadiness layers:\n\
+         - database: {}\n\
+         - index: {}\n\
+         - freshness: {}\n\
+         - deterministic retrieval: {}\n\
+         - semantic retrieval: {}\n\
+         - registration: {}\n\
+         - live MCP transport: {}\n\
+         - overall onboarding: {}\n",
+        report.project_readiness.database.label(),
+        report.project_readiness.index.label(),
+        report.project_readiness.freshness.label(),
+        report.project_readiness.deterministic_retrieval.label(),
+        report.project_readiness.semantic_retrieval.label(),
+        report.project_readiness.registration.label(),
+        report.project_readiness.live_transport.label(),
+        report.project_readiness.overall.label(),
+    );
+    if !report.next_actions.is_empty() {
+        output.push_str("\nNext actions:\n");
+        for action in &report.next_actions {
+            let _ = writeln!(output, "- {action}");
+        }
+    }
+    output.push_str(if report.capabilities_ready {
+        "\nAll hard requirements passed. Capability readiness is ready; overall onboarding remains independently layered above.\n"
+    } else {
+        "\nOne or more hard requirements failed. CodeVetra v4 is not ready.\n"
+    });
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn owner_index_reports_optional_failure_instead_of_discarding_it() {
+        let base = serde_json::json!({"published":false});
+        let mut value = serde_json::json!({"status":"succeeded", "report":{"report":base,"enrichment":{"optionalPhaseFailures":true}}});
+        assert!(super::completed_owner_index_report(&value).is_err());
+        value["report"]["enrichment"] = serde_json::json!({"state":"not_requested","reason":"base_only","optionalPhaseFailures":false});
+        assert_eq!(super::completed_owner_index_report(&value), Ok(&base));
+    }
+
+    use std::assert_matches;
+
+    use super::*;
+    use clap::Parser;
+
+    mod doctor_llm;
+    mod documentation_contract;
+
+    fn walk_cli_contract(
+        command: &clap::Command,
+        parent: &[String],
+        rows: &mut BTreeMap<String, Value>,
+    ) {
+        let mut path = parent.to_vec();
+        path.push(command.get_name().to_owned());
+        let path_key = path.join(" ");
+        let mut aliases = command
+            .get_all_aliases()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        aliases.sort();
+        let mut options = command
+            .get_arguments()
+            .flat_map(|argument| {
+                argument
+                    .get_long()
+                    .into_iter()
+                    .chain(argument.get_all_aliases().unwrap_or_default())
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        options.sort();
+        let mut positionals = command
+            .get_positionals()
+            .map(|argument| {
+                let id = match argument.get_id().as_str() {
+                    "__compat_ask_path" | "project_path" => "path",
+                    "__compat_files_target" => "target",
+                    value => value,
+                };
+                (argument.get_index().unwrap_or(usize::MAX), id.to_owned())
+            })
+            .collect::<Vec<_>>();
+        positionals.sort_by_key(|(index, _)| *index);
+        rows.insert(
+            path_key.clone(),
+            serde_json::json!({
+                "path": path_key,
+                "aliases": aliases,
+                "options": options,
+                "positionals": positionals
+                    .into_iter()
+                    .map(|(_, positional)| positional)
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        for child in command.get_subcommands() {
+            walk_cli_contract(child, &path, rows);
+        }
+    }
+
+    #[test]
+    fn v1_1_33_cli_tree_remains_available_except_browser_viewer() {
+        let mut command = generated_cli::command()
+            .unwrap_or_else(|error| panic!("generated CLI command failed: {error}"));
+        command.build();
+        let mut current = BTreeMap::new();
+        walk_cli_contract(&command, &[], &mut current);
+        let tool_contracts = mcp_handler::tool_definitions()
+            .unwrap_or_else(|error| panic!("MCP definitions failed: {error}"))
+            .into_iter()
+            .map(|definition| (definition.name().to_owned(), definition))
+            .collect::<BTreeMap<_, _>>();
+        let legacy = serde_json::from_str::<Vec<Value>>(include_str!("v1_1_33_cli_contract.json"))
+            .unwrap_or_else(|error| panic!("v1.1.33 CLI fixture failed to parse: {error}"));
+
+        for command in &legacy {
+            assert_legacy_cli_command(command, &current, &tool_contracts);
+        }
+    }
+
+    fn assert_legacy_cli_command(
+        command: &Value,
+        current: &BTreeMap<String, Value>,
+        tool_contracts: &BTreeMap<String, codevetra_mcp::ToolDefinition>,
+    ) {
+        let path = command["path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("legacy CLI path was invalid"));
+        if [
+            "codevetra viewer",
+            "codevetra sql",
+            "codevetra db start",
+            "codevetra db stop",
+            "codevetra db logs",
+            "codevetra db backup",
+            "codevetra db restore",
+            "codevetra db remove",
+            "codevetra db upgrade",
+            "codevetra db import-v1",
+            "codevetra db derived-index",
+            "codevetra db compact",
+            "codevetra admin uninit",
+            "codevetra admin unlock",
+            "codevetra admin migrate",
+            "codevetra admin storage-migrate",
+            "codevetra admin prune-store",
+        ]
+        .iter()
+        .any(|retired| path == *retired || path.starts_with(&format!("{retired} ")))
+        {
+            return;
+        }
+        let segments = path.split_whitespace().collect::<Vec<_>>();
+        let collapsed = collapsed_cli_path(path, &segments, current, tool_contracts);
+        let actual_path = collapsed.as_deref().unwrap_or(path);
+        let actual = current
+            .get(actual_path)
+            .unwrap_or_else(|| panic!("v2 dropped the v1.1.33 command `{actual_path}`"));
+        for field in ["aliases", "options", "positionals"] {
+            assert_legacy_cli_field(LegacyCliField {
+                legacy: command,
+                actual,
+                path,
+                segments: &segments,
+                collapsed: collapsed.is_some(),
+                field,
+            });
+        }
+    }
+
+    fn collapsed_cli_path(
+        path: &str,
+        segments: &[&str],
+        current: &BTreeMap<String, Value>,
+        tool_contracts: &BTreeMap<String, codevetra_mcp::ToolDefinition>,
+    ) -> Option<String> {
+        if current.contains_key(path) {
+            return None;
+        }
+        assert_eq!(segments.len(), 3, "v2 dropped the v1.1.33 command `{path}`");
+        let family = segments[1];
+        let value = segments[2];
+        let property = match family {
+            "admin" | "summaries" | "session" => "action",
+            "review" => "mode",
+            _ => panic!("v2 dropped the v1.1.33 command `{path}`"),
+        };
+        let tool_name = format!("codevetra_{}", family.replace('-', "_"));
+        let definition = tool_contracts
+            .get(&tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} contract was missing"));
+        let accepted = definition.input_schema()["properties"][property]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool_name}.{property} enum was missing"));
+        assert!(
+            accepted.iter().any(|candidate| candidate == value),
+            "v2 dropped the v1.1.33 action `{path}`"
+        );
+        Some(format!("codevetra {family}"))
+    }
+
+    #[derive(Clone, Copy)]
+    struct LegacyCliField<'a> {
+        legacy: &'a Value,
+        actual: &'a Value,
+        path: &'a str,
+        segments: &'a [&'a str],
+        collapsed: bool,
+        field: &'a str,
+    }
+
+    fn assert_legacy_cli_field(input: LegacyCliField<'_>) {
+        let LegacyCliField {
+            legacy,
+            actual,
+            path,
+            segments,
+            collapsed,
+            field,
+        } = input;
+        let mut legacy_values = cli_contract_values(legacy, path, field, "legacy");
+        if field == "options" {
+            legacy_values.retain(|value| {
+                !matches!(
+                    *value,
+                    "database-provider"
+                        | "database-url"
+                        | "database-schema"
+                        | "database-pgvector"
+                        | "database-ssl"
+                        | "database-pool-max"
+                        | "database-max-connections"
+                        | "database-require-ssl"
+                        | "database-acquire-timeout-ms"
+                        | "database-query-timeout-ms"
+                        | "database-connection-timeout-seconds"
+                        | "managed-database-port"
+                        | "source-schema"
+                        | "maximum-search-relation-bytes"
+                )
+            });
+        }
+        let actual_values = cli_contract_values(actual, path, field, "current");
+        if collapsed && field == "aliases" {
+            assert!(
+                legacy_values
+                    .iter()
+                    .all(|alias| *alias == segments[2].replace('_', "-")),
+                "collapsed action aliases drifted for `{path}`: {legacy_values:?}"
+            );
+            return;
+        }
+        if collapsed && field == "positionals" {
+            assert!(
+                legacy_values.len() <= actual_values.len().saturating_sub(1),
+                "v2 dropped v1.1.33 positional capacity on `{path}`; legacy={legacy_values:?}, current={actual_values:?}"
+            );
+            return;
+        }
+        assert_ordered_cli_values(&legacy_values, &actual_values, path, field);
+    }
+
+    fn cli_contract_values<'a>(
+        contract: &'a Value,
+        path: &str,
+        field: &str,
+        label: &str,
+    ) -> Vec<&'a str> {
+        contract[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label} `{path}` {field} were invalid"))
+            .iter()
+            .filter_map(Value::as_str)
+            .collect()
+    }
+
+    fn assert_ordered_cli_values(legacy: &[&str], actual: &[&str], path: &str, field: &str) {
+        let mut cursor = 0_usize;
+        for legacy_value in legacy {
+            let Some(relative) = actual[cursor..]
+                .iter()
+                .position(|actual| actual == legacy_value)
+            else {
+                panic!(
+                    "v2 dropped or reordered v1.1.33 {field} `{legacy_value}` on `{path}`; current={actual:?}"
+                );
+            };
+            cursor = cursor.saturating_add(relative).saturating_add(1);
+        }
+    }
+
+    #[test]
+    fn text_report_includes_actionable_failure_and_terminal_state() {
+        let report = DoctorReport {
+            ready: false,
+            capabilities_ready: false,
+            project_readiness: build_project_readiness(ProjectReadinessInput {
+                capabilities_ready: false,
+                database: DatabaseReadinessState::Unavailable,
+                project_index: ProjectIndexObservation::unavailable(),
+                semantic_retrieval: SemanticRetrievalReadinessState::Unavailable,
+                project_checks_skipped: false,
+                registration: HostVerificationReadinessState::NotChecked,
+                live_transport: HostVerificationReadinessState::NotChecked,
+            }),
+            next_actions: Vec::new(),
+            fixes_applied: Vec::new(),
+            checks: vec![DoctorCheck {
+                id: "database-postgres-18".to_owned(),
+                status: DoctorStatus::Fail,
+                message: "PostgreSQL server reports version number 170009".to_owned(),
+                remediation: Some("Upgrade PostgreSQL.".to_owned()),
+            }],
+            database: None,
+        };
+
+        let rendered = render_doctor_report(&report);
+
+        assert!(rendered.contains("✗ database-postgres-18"));
+        assert!(rendered.contains("Fix: Upgrade PostgreSQL."));
+        assert!(rendered.contains("is not ready"));
+    }
+
+    #[test]
+    fn doctor_json_distinguishes_capability_success_from_incomplete_onboarding() {
+        let project_readiness = build_project_readiness(ProjectReadinessInput {
+            capabilities_ready: true,
+            database: DatabaseReadinessState::Ready,
+            project_index: ProjectIndexObservation {
+                index: IndexReadinessState::NotIndexed,
+                freshness: FreshnessReadinessState::Unavailable,
+                deterministic_retrieval: DeterministicRetrievalReadinessState::Unavailable,
+            },
+            semantic_retrieval: SemanticRetrievalReadinessState::NotIndexed,
+            project_checks_skipped: false,
+            registration: HostVerificationReadinessState::NotChecked,
+            live_transport: HostVerificationReadinessState::NotChecked,
+        });
+        let report = DoctorReport {
+            ready: true,
+            capabilities_ready: true,
+            project_readiness,
+            next_actions: doctor_next_actions(project_readiness, false),
+            fixes_applied: Vec::new(),
+            checks: vec![doctor_warn(
+                "project-index",
+                "No published graph generation exists yet.",
+                "Run `codevetra index`.".to_owned(),
+            )],
+            database: None,
+        };
+
+        let value = serde_json::to_value(&report)
+            .unwrap_or_else(|error| panic!("doctor report serialization failed: {error}"));
+
+        assert_eq!(value["ready"], true);
+        assert_eq!(value["capabilitiesReady"], true);
+        assert_eq!(value["projectReadiness"]["database"], "ready");
+        assert_eq!(value["projectReadiness"]["index"], "not_indexed");
+        assert_eq!(value["projectReadiness"]["freshness"], "unavailable");
+        assert_eq!(
+            value["projectReadiness"]["deterministicRetrieval"],
+            "unavailable"
+        );
+        assert_eq!(
+            value["projectReadiness"]["semanticRetrieval"],
+            "not_indexed"
+        );
+        assert_eq!(value["projectReadiness"]["registration"], "not_checked");
+        assert_eq!(value["projectReadiness"]["liveTransport"], "not_checked");
+        assert_eq!(value["projectReadiness"]["overall"], "incomplete");
+        assert!(
+            value["nextActions"]
+                .as_array()
+                .is_some_and(|actions| actions.iter().any(|action| {
+                    action
+                        .as_str()
+                        .is_some_and(|action| action.contains("codevetra index <path>"))
+                }))
+        );
+    }
+
+    #[test]
+    fn deterministic_readiness_does_not_require_optional_semantic_configuration() {
+        let project_index = ProjectIndexObservation {
+            index: IndexReadinessState::Ready,
+            freshness: FreshnessReadinessState::Current,
+            deterministic_retrieval: DeterministicRetrievalReadinessState::Ready,
+        };
+        let complete = build_project_readiness(ProjectReadinessInput {
+            capabilities_ready: true,
+            database: DatabaseReadinessState::Ready,
+            project_index,
+            semantic_retrieval: SemanticRetrievalReadinessState::NotConfigured,
+            project_checks_skipped: false,
+            registration: HostVerificationReadinessState::Ready,
+            live_transport: HostVerificationReadinessState::Ready,
+        });
+        let skipped = build_project_readiness(ProjectReadinessInput {
+            capabilities_ready: true,
+            database: DatabaseReadinessState::Ready,
+            project_index: ProjectIndexObservation::not_checked(),
+            semantic_retrieval: SemanticRetrievalReadinessState::NotChecked,
+            project_checks_skipped: true,
+            registration: HostVerificationReadinessState::NotChecked,
+            live_transport: HostVerificationReadinessState::NotChecked,
+        });
+
+        assert_eq!(
+            complete.deterministic_retrieval,
+            DeterministicRetrievalReadinessState::Ready
+        );
+        assert_eq!(
+            complete.semantic_retrieval,
+            SemanticRetrievalReadinessState::NotConfigured
+        );
+        assert_eq!(complete.overall, OverallOnboardingReadinessState::Ready);
+        assert_eq!(skipped.index, IndexReadinessState::NotChecked);
+        assert_eq!(skipped.freshness, FreshnessReadinessState::NotChecked);
+        assert_eq!(skipped.overall, OverallOnboardingReadinessState::NotChecked);
+    }
+
+    #[test]
+    fn readiness_labels_and_semantic_mapping_cover_every_public_state() {
+        assert_eq!(DatabaseReadinessState::Ready.label(), "ready");
+        assert_eq!(DatabaseReadinessState::Unavailable.label(), "unavailable");
+
+        for (state, label) in [
+            (IndexReadinessState::Ready, "ready"),
+            (IndexReadinessState::NotIndexed, "not_indexed"),
+            (IndexReadinessState::Unavailable, "unavailable"),
+            (IndexReadinessState::NotChecked, "not_checked"),
+        ] {
+            assert_eq!(state.label(), label);
+        }
+        for (state, label) in [
+            (FreshnessReadinessState::Current, "current"),
+            (FreshnessReadinessState::Stale, "stale"),
+            (FreshnessReadinessState::Unavailable, "unavailable"),
+            (FreshnessReadinessState::NotChecked, "not_checked"),
+        ] {
+            assert_eq!(state.label(), label);
+        }
+        for (state, label) in [
+            (DeterministicRetrievalReadinessState::Ready, "ready"),
+            (
+                DeterministicRetrievalReadinessState::Unavailable,
+                "unavailable",
+            ),
+            (
+                DeterministicRetrievalReadinessState::NotChecked,
+                "not_checked",
+            ),
+        ] {
+            assert_eq!(state.label(), label);
+        }
+        for (state, label) in [
+            (SemanticRetrievalReadinessState::Ready, "ready"),
+            (
+                SemanticRetrievalReadinessState::NotConfigured,
+                "not_configured",
+            ),
+            (SemanticRetrievalReadinessState::NotIndexed, "not_indexed"),
+            (SemanticRetrievalReadinessState::Stale, "stale"),
+            (SemanticRetrievalReadinessState::Unavailable, "unavailable"),
+            (SemanticRetrievalReadinessState::NotChecked, "not_checked"),
+        ] {
+            assert_eq!(state.label(), label);
+        }
+        assert_eq!(HostVerificationReadinessState::Ready.label(), "ready");
+        assert_eq!(
+            HostVerificationReadinessState::NotChecked.label(),
+            "not_checked"
+        );
+        for (state, label) in [
+            (OverallOnboardingReadinessState::Ready, "ready"),
+            (OverallOnboardingReadinessState::Incomplete, "incomplete"),
+            (OverallOnboardingReadinessState::Blocked, "blocked"),
+            (OverallOnboardingReadinessState::NotChecked, "not_checked"),
+        ] {
+            assert_eq!(state.label(), label);
+        }
+
+        for (state, readiness) in [
+            (
+                SemanticReadinessState::Ready,
+                SemanticRetrievalReadinessState::Ready,
+            ),
+            (
+                SemanticReadinessState::ModelMissing,
+                SemanticRetrievalReadinessState::NotIndexed,
+            ),
+            (
+                SemanticReadinessState::NoCurrentGeneration,
+                SemanticRetrievalReadinessState::NotIndexed,
+            ),
+            (
+                SemanticReadinessState::NoDocuments,
+                SemanticRetrievalReadinessState::NotIndexed,
+            ),
+            (
+                SemanticReadinessState::CoverageIncomplete,
+                SemanticRetrievalReadinessState::NotIndexed,
+            ),
+            (
+                SemanticReadinessState::IndexUnavailable,
+                SemanticRetrievalReadinessState::NotIndexed,
+            ),
+            (
+                SemanticReadinessState::ModelMismatch,
+                SemanticRetrievalReadinessState::Stale,
+            ),
+            (
+                SemanticReadinessState::ModelRetired,
+                SemanticRetrievalReadinessState::Stale,
+            ),
+            (
+                SemanticReadinessState::QueryProbeFailed,
+                SemanticRetrievalReadinessState::Unavailable,
+            ),
+        ] {
+            assert_eq!(map_semantic_readiness(state), readiness);
+        }
+    }
+
+    #[test]
+    fn readiness_remediation_and_semantic_preflight_cover_degraded_states() {
+        let degraded = ProjectReadiness {
+            database: DatabaseReadinessState::Unavailable,
+            index: IndexReadinessState::Unavailable,
+            freshness: FreshnessReadinessState::Stale,
+            deterministic_retrieval: DeterministicRetrievalReadinessState::Unavailable,
+            semantic_retrieval: SemanticRetrievalReadinessState::Unavailable,
+            registration: HostVerificationReadinessState::NotChecked,
+            live_transport: HostVerificationReadinessState::NotChecked,
+            overall: OverallOnboardingReadinessState::Blocked,
+        };
+        let actions = doctor_next_actions(degraded, false);
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.contains("hard requirements"))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.contains("codevetra status"))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.contains("sync-if-dirty"))
+        );
+
+        let ready_index = ProjectIndexObservation {
+            index: IndexReadinessState::Ready,
+            freshness: FreshnessReadinessState::Current,
+            deterministic_retrieval: DeterministicRetrievalReadinessState::Ready,
+        };
+        assert_eq!(
+            semantic_readiness_without_probe(EmbeddingConfigurationState::Unavailable, ready_index),
+            Some(SemanticRetrievalReadinessState::Unavailable)
+        );
+        for (index, expected) in [
+            (
+                IndexReadinessState::NotIndexed,
+                SemanticRetrievalReadinessState::NotIndexed,
+            ),
+            (
+                IndexReadinessState::Unavailable,
+                SemanticRetrievalReadinessState::Unavailable,
+            ),
+            (
+                IndexReadinessState::NotChecked,
+                SemanticRetrievalReadinessState::NotChecked,
+            ),
+        ] {
+            assert_eq!(
+                semantic_readiness_without_probe(
+                    EmbeddingConfigurationState::Configured,
+                    ProjectIndexObservation {
+                        index,
+                        freshness: FreshnessReadinessState::Unavailable,
+                        deterministic_retrieval: DeterministicRetrievalReadinessState::Unavailable,
+                    },
+                ),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            semantic_readiness_without_probe(
+                EmbeddingConfigurationState::Configured,
+                ProjectIndexObservation {
+                    freshness: FreshnessReadinessState::Stale,
+                    ..ready_index
+                },
+            ),
+            Some(SemanticRetrievalReadinessState::Stale)
+        );
+        assert_eq!(
+            semantic_readiness_without_probe(EmbeddingConfigurationState::Configured, ready_index),
+            None
+        );
+    }
+
+    #[test]
+    fn status_text_renders_compact_storage_ready_and_unavailable_states() {
+        let ready = serde_json::json!({"databaseStorage":{"state":"ready","native":{
+            "fileBytes":2*GIBIBYTE_U64,"allocatedBytes":3*GIBIBYTE_U64,"walBytes":64*(1024_u64*1024),
+            "sstBytes":512*(1024_u64*1024),"memtableBytes":128*(1024_u64*1024),"estimatedPendingCompactionBytes":0}}});
+        assert_eq!(
+            database_storage_text(&ready).as_deref(),
+            Some(
+                "RocksDB storage: 2 GiB files; 3 GiB allocated; 64 MiB WAL.\nEngine allocation: 512 MiB SST, 128 MiB memtables; estimated pending compaction 0 B; details: `codevetra db usage --project-path <path>`"
+            )
+        );
+        let unavailable =
+            serde_json::json!({"databaseStorage":{"state":"unavailable","reason":"timeout"}});
+        assert!(
+            database_storage_text(&unavailable)
+                .is_some_and(|text| text.contains("unavailable (timeout)"))
+        );
+        assert!(database_storage_text(&Value::Null).is_none());
+    }
+
+    #[test]
+    fn generation_retention_warning_matches_automatic_cleanup_bounds() {
+        const FOUR_GIBIBYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
+
+        let healthy = GenerationStorageSummary {
+            staging: 1,
+            ready: 1,
+            superseded: 34,
+            failed: 32,
+            estimated_retained_bytes: FOUR_GIBIBYTES,
+            ..GenerationStorageSummary::default()
+        };
+        assert!(!generation_storage_needs_attention(healthy));
+        let mut warnings = [healthy; 5];
+        warnings[0].staging += 1;
+        warnings[1].ready += 1;
+        warnings[2].superseded += 1;
+        warnings[3].failed += 1;
+        warnings[4].estimated_retained_bytes += 1;
+        for warning in warnings {
+            assert!(generation_storage_needs_attention(warning));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_runtime_accepts_installer_symlink_to_regular_executable() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("temporary directory failed: {error}"));
+        let versioned_binary = directory.path().join("versions/v2.0.4/bin/codevetra");
+        fs::create_dir_all(
+            versioned_binary
+                .parent()
+                .unwrap_or_else(|| panic!("versioned binary must have a parent")),
+        )
+        .unwrap_or_else(|error| panic!("versioned directory failed: {error}"));
+        fs::write(&versioned_binary, b"native-binary")
+            .unwrap_or_else(|error| panic!("versioned binary failed: {error}"));
+        let installer_link = directory.path().join("codevetra");
+        symlink(&versioned_binary, &installer_link)
+            .unwrap_or_else(|error| panic!("installer symlink failed: {error}"));
+
+        assert!(native_executable_path_is_safe(&installer_link));
+    }
+
+    #[test]
+    fn compatibility_file_size_parser_is_strict_and_bounded() {
+        assert_eq!(parse_max_file_size("1"), Ok(1));
+        assert_eq!(parse_max_file_size("64kb"), Ok(64 * 1024));
+        assert_eq!(parse_max_file_size("10 MiB"), Ok(10 * 1024 * 1024));
+        assert!(parse_max_file_size("0").is_err());
+        assert!(parse_max_file_size("10.5mb").is_err());
+        assert!(parse_max_file_size("11mb").is_err());
+    }
+
+    #[test]
+    fn cli_parses_index_status_and_serve_commands() {
+        let index = Cli::try_parse_from([
+            "codevetra",
+            "index",
+            "workspace",
+            "--workers",
+            "4",
+            "--force",
+            "--format",
+            "json",
+        ])
+        .unwrap_or_else(|error| panic!("index CLI did not parse: {error}"));
+        match index.command {
+            Command::Index {
+                project_path,
+                workers,
+                force,
+                exclude,
+                preserve_current_excludes,
+                supervised,
+                format,
+            } => {
+                assert_eq!(project_path, PathBuf::from("workspace"));
+                assert_eq!(workers, Some(4));
+                assert!(force);
+                assert_eq!(exclude, [] as [String; 0]);
+                assert!(!preserve_current_excludes);
+                assert!(!supervised);
+                assert_matches!(format, OutputFormat::Json);
+            }
+            _ => panic!("index parsed as the wrong command"),
+        }
+
+        let status = Cli::try_parse_from(["codevetra", "status", "workspace"])
+            .unwrap_or_else(|error| panic!("status CLI did not parse: {error}"));
+        assert_matches!(status.command, Command::Status { .. });
+        for flag in ["-p", "--project-path"] {
+            let status = Cli::try_parse_from(["codevetra", "status", flag, "workspace"])
+                .unwrap_or_else(|error| panic!("status flag did not parse: {error}"));
+            assert!(
+                matches!(status.command, Command::Status { project_path_flag: Some(path), .. }
+                if path == std::path::Path::new("workspace"))
+            );
+            assert!(
+                Cli::try_parse_from(["codevetra", "status", "other", flag, "workspace"]).is_err()
+            );
+        }
+
+        let guide = Cli::try_parse_from(["codevetra", "guide"])
+            .unwrap_or_else(|error| panic!("guide CLI did not parse: {error}"));
+        assert_matches!(guide.command, Command::Guide);
+
+        let serve = Cli::try_parse_from([
+            "codevetra",
+            "serve",
+            "--mcp",
+            "--project-path",
+            "workspace",
+            "--profile",
+            "read-only",
+            "--no-auto-sync",
+        ])
+        .unwrap_or_else(|error| panic!("serve CLI did not parse: {error}"));
+        assert_matches!(
+            serve.command,
+            Command::Serve {
+                mcp: true,
+                profile: McpProfile::ReadOnly,
+                no_auto_sync: true,
+                ..
+            }
+        );
+    }
+
+    #[test]
+    fn mcp_server_config_reports_the_first_unknown_disabled_tool() {
+        let result = mcp_server_config(
+            McpProfile::Core,
+            &[
+                "codevetra_find".to_owned(),
+                "codevetra_missing_first".to_owned(),
+                "codevetra_missing_second".to_owned(),
+            ],
+            false,
+        );
+        assert_matches!(
+            result,
+            Err(error) if error == "--disable-tool names an unknown tool: codevetra_missing_first"
+        );
+        assert!(mcp_server_config(McpProfile::ReadOnly, &[], true).is_ok());
+        assert!(mcp_server_config(McpProfile::Core, &["codevetra_find".to_owned()], false).is_ok());
+    }
+
+    #[test]
+    fn stale_export_names_only_overrides_the_command_accepts() {
+        // `export` has no `--allow-stale`; its stale failure must not tell callers to pass one.
+        assert!(generated_cli::parse_from(["codevetra", "export", "--allow-stale"]).is_err());
+        let failure = require_current(IndexFreshness::Stale)
+            .err()
+            .unwrap_or_else(|| panic!("a stale index must fail the export gate"));
+        assert!(!failure.contains("--allow-stale"), "{failure}");
+        assert!(require_current(IndexFreshness::Current).is_ok());
+    }
+
+    #[test]
+    fn cli_parses_review_search_and_show_commands() {
+        let review = generated_cli::parse_from([
+            "codevetra",
+            "review",
+            "context",
+            "--ref",
+            "main",
+            "--project-path",
+            "workspace",
+        ])
+        .unwrap_or_else(|error| panic!("review CLI did not parse: {error}"));
+        let generated_cli::ParsedCli::Tool(review) = review else {
+            panic!("review did not route through the generated public command");
+        };
+        assert_eq!(review.tool_name(), "codevetra_review");
+        assert_eq!(review.arguments()["mode"], "context");
+        assert_eq!(review.arguments()["baseRef"], "main");
+
+        let find = generated_cli::parse_from(["codevetra", "find", "trace auth failure"])
+            .unwrap_or_else(|error| panic!("find CLI did not parse: {error}"));
+        assert_matches!(find, generated_cli::ParsedCli::Tool(_));
+
+        let context = generated_cli::parse_from([
+            "codevetra",
+            "context",
+            "trace auth failure",
+            "--mode",
+            "deterministic",
+        ])
+        .unwrap_or_else(|error| panic!("context CLI did not parse: {error}"));
+        assert_matches!(context, generated_cli::ParsedCli::Tool(_));
+
+        let show = Cli::try_parse_from([
+            "codevetra",
+            "show",
+            "11111111-1111-4111-8111-111111111111",
+            "--project-path",
+            "workspace",
+        ])
+        .unwrap_or_else(|error| panic!("show CLI did not parse: {error}"));
+        assert_matches!(show.command, Command::Show { .. });
+
+        let graph_path = generated_cli::parse_from([
+            "codevetra",
+            "graph",
+            "11111111-1111-4111-8111-111111111111",
+            "--direction",
+            "path",
+            "--to",
+            "22222222-2222-4222-8222-222222222222",
+            "--edge-kind",
+            "field-access",
+        ])
+        .unwrap_or_else(|error| panic!("graph path CLI did not parse: {error}"));
+        assert_matches!(graph_path, generated_cli::ParsedCli::Tool(_));
+        let graph_similar = generated_cli::parse_from([
+            "codevetra",
+            "graph",
+            "11111111-1111-4111-8111-111111111111",
+            "--direction",
+            "similar",
+            "--k",
+            "7",
+            "--min-score",
+            "0.75",
+            "--same-language",
+            "--model-id",
+            "22222222-2222-4222-8222-222222222222",
+        ])
+        .unwrap_or_else(|error| panic!("graph similar CLI did not parse: {error}"));
+        assert_matches!(graph_similar, generated_cli::ParsedCli::Tool(_));
+    }
+
+    #[test]
+    fn cli_parses_file_entry_point_and_range_commands() {
+        let files = generated_cli::parse_from([
+            "codevetra",
+            "files",
+            "--dir",
+            "src",
+            "--language",
+            "rust",
+            "--allow-stale",
+        ])
+        .unwrap_or_else(|error| panic!("files CLI did not parse: {error}"));
+        assert_matches!(files, generated_cli::ParsedCli::Tool(_));
+
+        let entry_points = generated_cli::parse_from([
+            "codevetra",
+            "entry-points",
+            "--bucket",
+            "public-exports",
+            "--limit",
+            "40",
+            "--allow-stale",
+        ])
+        .unwrap_or_else(|error| panic!("entry-points CLI did not parse: {error}"));
+        assert_matches!(entry_points, generated_cli::ParsedCli::Tool(_));
+
+        let at_range = generated_cli::parse_from([
+            "codevetra",
+            "at-range",
+            "src/main.rs",
+            "10",
+            "20",
+            "--limit",
+            "50",
+        ])
+        .unwrap_or_else(|error| panic!("at-range CLI did not parse: {error}"));
+        let generated_cli::ParsedCli::Tool(at_range) = at_range else {
+            panic!("at-range did not route through the generated public command");
+        };
+        assert_eq!(at_range.arguments()["file"], "src/main.rs");
+        assert_eq!(at_range.arguments()["startLine"], 10);
+        assert_eq!(at_range.arguments()["endLine"], 20);
+    }
+
+    #[test]
+    fn cursor_navigation_cli_uses_the_public_mcp_coordinate_contract() {
+        let parsed = generated_cli::parse_from([
+            "codevetra",
+            "navigate",
+            "definition",
+            "--file",
+            "src/app.ts",
+            "--line",
+            "2",
+            "--column",
+            "18",
+            "--limit",
+            "10",
+        ])
+        .unwrap_or_else(|error| panic!("navigation CLI: {error}"));
+        let generated_cli::ParsedCli::Tool(tool) = parsed else {
+            panic!("navigation must use shared schema");
+        };
+        assert_eq!(tool.arguments()["operation"], "definition");
+        assert_eq!(tool.arguments()["file"], "src/app.ts");
+        assert_eq!(tool.arguments()["line"], 2);
+        assert_eq!(tool.arguments()["column"], 18);
+        assert_eq!(tool.arguments()["limit"], 10);
+    }
+
+    #[test]
+    fn cli_parses_install_and_database_commands() {
+        let install = Cli::try_parse_from([
+            "codevetra",
+            "install",
+            "--yes",
+            "--target",
+            "codex",
+            "--location",
+            "local",
+            "--project-path",
+            "workspace",
+        ])
+        .unwrap_or_else(|error| panic!("install CLI: {error}"));
+        assert_matches!(install.command,Command::Install {target:Some(ref target),yes:true,..} if target=="codex");
+        let install =
+            Cli::try_parse_from(["codevetra", "llm", "install", "workspace", "--no-models"])
+                .unwrap_or_else(|error| panic!("model install CLI: {error}"));
+        assert_matches!(
+            install.command,
+            Command::Llm {
+                command: llm_commands::LlmCommand::Install(_)
+            }
+        );
+        for flag in [
+            "--managed-database-port",
+            "--database-provider",
+            "--database-url",
+        ] {
+            assert!(Cli::try_parse_from(["codevetra", "install", flag, "retired"]).is_err());
+        }
+    }
+
+    #[test]
+    fn cli_parses_bounded_generation_prune_row_override() {
+        let prune = Cli::try_parse_from([
+            "codevetra",
+            "db",
+            "prune",
+            "--maximum-cascade-rows",
+            "7700",
+            "--maximum-deletions",
+            "8",
+            "--confirm",
+            RETENTION_CONFIRMATION,
+        ])
+        .unwrap_or_else(|error| panic!("prune CLI: {error}"));
+        assert_matches!(
+            prune.command,
+            Command::Db {
+                command: DatabaseCommand::Prune(PruneArguments {
+                    maximum_cascade_rows: 7700,
+                    maximum_deletions: 8,
+                    ..
+                })
+            }
+        );
+        for invalid in ["0", "10001"] {
+            assert!(
+                Cli::try_parse_from([
+                    "codevetra",
+                    "db",
+                    "prune",
+                    "--maximum-cascade-rows",
+                    invalid,
+                    "--confirm",
+                    RETENTION_CONFIRMATION
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "codevetra",
+                "db",
+                "prune",
+                "--maximum-search-relation-bytes",
+                "1",
+                "--confirm",
+                RETENTION_CONFIRMATION
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_parses_credential_migration_and_backend_cleanup_commands() {
+        let credential_migration = Cli::try_parse_from([
+            "codevetra",
+            "llm",
+            "migrate-credentials",
+            "workspace",
+            "--tier-env",
+            "summarize=CODEVETRA_CHAT_KEY",
+        ])
+        .unwrap_or_else(|error| panic!("credential migration CLI did not parse: {error}"));
+        assert_matches!(
+            credential_migration.command,
+            Command::Llm {
+                command: llm_commands::LlmCommand::MigrateCredentials(_)
+            }
+        );
+
+        let backend_cleanup = Cli::try_parse_from([
+            "codevetra",
+            "backend",
+            "cleanup",
+            "workspace",
+            "--minimum-age-hours",
+            "48",
+        ])
+        .unwrap_or_else(|error| panic!("backend cleanup CLI did not parse: {error}"));
+        assert_matches!(
+            backend_cleanup.command,
+            Command::Backend {
+                command: backend::BackendCommand::Cleanup(_)
+            }
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DoctorStatus {
+    Pass,
+    Warn,
+    Fail,
+}

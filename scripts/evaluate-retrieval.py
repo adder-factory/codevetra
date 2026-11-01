@@ -136,7 +136,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--project", type=Path, required=True)
     parser.add_argument("--cases", type=Path, default=Path(__file__).resolve().parents[1] /
-                        "crates/cartograph-agent/tests/fixtures/retrieval_quality/cases.json")
+                        "crates/codevetra-agent/tests/fixtures/retrieval_quality/cases.json")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--repeat", type=int, choices=range(1, 11), default=1)
@@ -177,12 +177,12 @@ def main():
         try:
             report["server"] = client.request("initialize", {
                 "protocolVersion": "2024-11-05", "capabilities": {},
-                "clientInfo": {"name": "cartograph-retrieval-evaluation", "version": "1"},
+                "clientInfo": {"name": "codevetra-retrieval-evaluation", "version": "1"},
             })
             client.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             client.request("tools/list", {})
             project = {"projectPath": str(args.project.resolve())}
-            report["initial_status"] = client.tool("cartograph_status", project)
+            report["initial_status"] = client.tool("codevetra_status", project)
             status = report["initial_status"]["project"]
             if status["fresh"] is not True:
                 raise ValueError("measurement requires a fresh source snapshot")
@@ -193,7 +193,7 @@ def main():
             for case in cases:
                 matched = False
                 for symbol in dict.fromkeys(target["symbol"] for target in case["targets"]):
-                    rows, _ = items_from(client.tool("cartograph_find", {
+                    rows, _ = items_from(client.tool("codevetra_find", {
                         **project, "by": "name", "mode": "exact", "query": symbol,
                         "limit": 100, "lowTokens": True,
                     }))
@@ -204,13 +204,13 @@ def main():
             if invalid:
                 raise ValueError(f"target labels absent from snapshot: {', '.join(invalid)}")
             for mode in ["bm25", "hybrid"]:
-                client.tool("cartograph_find", {**project, "by": mode, "query": cases[0]["query"],
+                client.tool("codevetra_find", {**project, "by": mode, "query": cases[0]["query"],
                                                 "limit": args.limit, "lowTokens": True})
             for repetition in range(args.repeat):
                 for case in cases:
                     for mode in ["bm25", "hybrid"]:
                         started = time.perf_counter()
-                        result = client.tool("cartograph_find", {**project, "by": mode,
+                        result = client.tool("codevetra_find", {**project, "by": mode,
                             "query": case["query"], "limit": args.limit, "lowTokens": True})
                         elapsed = (time.perf_counter() - started) * 1000
                         items, evidence = items_from(result)
@@ -230,7 +230,7 @@ def main():
                             "rerank": evidence.get("rerank"), "fallback": evidence.get("fallback"),
                             "items": [identity(item) for item in items]})
                     print(f"{args.label}: {repetition + 1}/{args.repeat} {case['id']}", flush=True)
-            report["final_status"] = client.tool("cartograph_status", project)
+            report["final_status"] = client.tool("codevetra_status", project)
             final = report["final_status"]["project"]
             if final["fresh"] is not True or final["snapshot"]["current"]["generation_id"] != generation:
                 raise ValueError("measurement ended on a changed source generation")

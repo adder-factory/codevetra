@@ -43,7 +43,7 @@ comparison rebuilds also participate in retention and allocation.
 Run against a dedicated capability-checked PostgreSQL test database:
 
 ```sh
-cargo test --locked -p cartograph-agent --test live_project \
+cargo test --locked -p codevetra-agent --test live_project \
   repeated_edit_workload -- --ignored --nocapture --test-threads=1
 ```
 

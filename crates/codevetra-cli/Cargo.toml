@@ -1,0 +1,49 @@
+[package]
+name = "codevetra-cli"
+publish = false
+description = "Rust CLI and MCP entry point for CodeVetra v2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "codevetra"
+path = "src/main.rs"
+
+[dependencies]
+blake3.workspace = true
+codevetra-agent.workspace = true
+codevetra-config.workspace = true
+codevetra-db.workspace = true
+codevetra-domain.workspace = true
+codevetra-llm.workspace = true
+codevetra-mcp.workspace = true
+codevetra-search.workspace = true
+clap.workspace = true
+notify.workspace = true
+num-traits.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+futures-util.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+toml_edit.workspace = true
+url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+getrandom.workspace = true
+signal-hook.workspace = true
+rustix.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

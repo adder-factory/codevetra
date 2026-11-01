@@ -3,11 +3,11 @@
 [Documentation home](../README.md) · [Project overview](../../README.md) ·
 [Language matrix](../SUPPORT-MATRIX.md) · [Native extraction](EXTRACTION.md)
 
-Last implementation audit: 2026-10-26 (`v3.0.6`).
+Last implementation audit: 2026-10-31 (`v4.0.0`).
 
 Research inventory last reviewed: 2026-08-02 (`v2.1.7`).
 
-Cartograph v2.1.42 recognizes 132 native source-language modes. Seventy-three
+CodeVetra v2.1.42 recognizes 132 native source-language modes. Seventy-three
 remain the byte-for-byte v1.1.33 parity floor, TOML remains an additive v2 mode,
 52 dedicated game, modding, and interactive-fiction scripting modes were
 introduced in v2.1.7, WGSL and Metal were added in v2.1.12, Slang and WESL
@@ -31,7 +31,7 @@ A dedicated mode is included when all of these are true:
    canonical filename, extension, or project path;
 3. the source can carry declarations, control flow, calls, imports, diverts, or
    executable game rules rather than only opaque asset bytes;
-4. Cartograph has bounded, non-executing extraction with deterministic symbols
+4. CodeVetra has bounded, non-executing extraction with deterministic symbols
    and references, malformed-input behavior, cancellation polling, and literal
    masking; and
 5. ambiguous extensions are content- or path-gated without changing the frozen

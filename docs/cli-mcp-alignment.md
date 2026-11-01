@@ -3,10 +3,10 @@
 [Documentation home](README.md) · [CLI reference](CLI-REFERENCE.md) ·
 [MCP usage](MCP-USAGE.md) · [Project overview](../README.md)
 
-Last release audit: 2026-10-26 (`v3.0.6`).
+Last release audit: 2026-11-01 (`v4.0.0`).
 
-Cartograph exposes one native Rust feature surface through human CLI commands
-and 35 bounded MCP tools. Shared schemas generate ordinary CLI adapters where
+CodeVetra exposes one native Rust feature surface through human CLI commands
+and 36 bounded MCP tools. Shared schemas generate ordinary CLI adapters where
 possible; hand-curated family commands retain deliberate positional and
 subcommand shapes.
 
@@ -17,8 +17,8 @@ subcommand shapes.
 
 The v1.1.33 public contracts are frozen in:
 
-- `crates/cartograph-cli/src/v1_1_33_mcp_contract.json`;
-- `crates/cartograph-cli/src/v1_1_33_cli_contract.json`.
+- `crates/codevetra-cli/src/v1_1_33_mcp_contract.json`;
+- `crates/codevetra-cli/src/v1_1_33_cli_contract.json`.
 
 Permanent Rust tests compare the retained v1 coding contracts with the native
 surfaces. Explicit retirement exceptions cover the browser viewer, SQLite and
@@ -28,7 +28,7 @@ these deliberate product changes.
 
 ## Public MCP tools
 
-<!-- CARTOGRAPH_MCP_TOOLS_START -->
+<!-- CODEVETRA_MCP_TOOLS_START -->
 
 ```text
 admin              affected            ask
@@ -38,29 +38,30 @@ coverage           dead_code            deps
 digest             entry_points         explore
 files              find                 graph
 history            host                 hotspots
-imports            node                 note
+imports            navigate             node
+note
 numerical          playbook             propose_rename
 review             role                 session
 status             summaries
 tests_for          trace_to_culprits    verify
 ```
 
-<!-- CARTOGRAPH_MCP_TOOLS_END -->
+<!-- CODEVETRA_MCP_TOOLS_END -->
 
-Each appears on the wire with the `cartograph_` prefix.
+Each appears on the wire with the `codevetra_` prefix.
 
 ### Profile membership
 
 Profiles deliberately bound the surface; a hidden tool cannot be called by name.
-Only `cartograph_admin` is profile-restricted:
+Only `codevetra_admin` is profile-restricted:
 
 | Profile | Advertised tools |
 | --- | --- |
-| `full` | All 35 |
-| `core` (default) | All 35 |
-| `coding` | The 34 tools other than `cartograph_admin` |
-| `review` | The 34 tools other than `cartograph_admin` |
-| `read-only` | The 34 tools other than `cartograph_admin`; `serve` also refuses mutating call branches |
+| `full` | All 36 |
+| `core` (default) | All 36 |
+| `coding` | The 35 tools other than `codevetra_admin` |
+| `review` | The 35 tools other than `codevetra_admin` |
+| `read-only` | The 35 tools other than `codevetra_admin`; `serve` also refuses mutating call branches |
 
 See [MCP profiles](MCP-USAGE.md#profiles) for the intended use of each.
 
@@ -71,14 +72,14 @@ startup schemas:
 
 | MCP family | CLI family examples |
 | --- | --- |
-| `cartograph_admin` | `admin init/index/sync/summarize/embed/classify/scip-export/scip-import/...` |
-| `cartograph_find` | `find --by name/path/reference/bm25/hybrid` plus source/env/SQL/build-context modes |
-| `cartograph_graph` | `graph --direction callers/callees/both/impact/path/similar` |
-| `cartograph_files` | `files --format tree/flat/grouped/summary/deps/symbols/module/read` |
-| `cartograph_numerical` | `numerical sites/coverage/explain/plan` |
-| `cartograph_review` | `review context/neighbors/risk/agent-audit/numerical/trust` |
-| `cartograph_session` | investigation, audit/usage, and macro subcommands |
-| `cartograph_summaries` | `summaries pending/save` |
+| `codevetra_admin` | `admin init/index/sync/summarize/embed/classify/scip-export/scip-import/...` |
+| `codevetra_find` | `find --by name/path/reference/bm25/hybrid` plus source/env/SQL/build-context modes |
+| `codevetra_graph` | `graph --direction callers/callees/both/impact/path/similar` |
+| `codevetra_files` | `files --format tree/flat/grouped/summary/deps/symbols/module/read` |
+| `codevetra_numerical` | `numerical sites/coverage/explain/plan` |
+| `codevetra_review` | `review context/neighbors/risk/agent-audit/numerical/trust` |
+| `codevetra_session` | investigation, audit/usage, and macro subcommands |
+| `codevetra_summaries` | `summaries pending/save` |
 
 The native CLI retains coding family actions and adds native generation,
 retention, embedding-readiness, SCIP, and agent-workflow operations.
@@ -89,13 +90,13 @@ retention, embedding-readiness, SCIP, and agent-workflow operations.
 - `install`, `uninstall`, and `install-hooks` mutate host/repository setup.
 - `db` owns local database lifecycle and destructive confirmation boundaries.
 - `llm setup/smoke/install/migrate-credentials` and `backend` are operator
-  configuration/process checks. MCP `cartograph_admin` covers tier planning and
+  configuration/process checks. MCP `codevetra_admin` covers tier planning and
   application through `llm-plan`/`llm-apply` and the model download (with an
   optional config write) of `llm install` through `install-models`;
   `llm migrate-credentials` has no MCP action.
 - `export` writes capped JSON, DOT, Mermaid, or Cytoscape graph artifacts; MCP
   has no export tool, while graph and SCIP interchange data remain available
-  through `cartograph_graph` and the `cartograph_admin` `scip-export` action.
+  through `codevetra_graph` and the `codevetra_admin` `scip-export` action.
 - `doctor`, `guide`, `mcp-budget`, `completions`, and `upgrade` are operator
   workflows; MCP uses admin/playbook/status equivalents where appropriate.
 - `sync-if-dirty` is the Git-hook compatibility entry point.
@@ -128,7 +129,7 @@ bounded jobs with explicit status/cancel instead of blocking transport.
   SCIP overlay restore failure is one shared job status.
 - Invalid spans and non-cancelled parser stops instead publish an empty partial
   file with a stable degraded reason.
-- Generation-capacity failures name `maxGenerationBytes`, its Cartograph-process
+- Generation-capacity failures name `maxGenerationBytes`, its CodeVetra-process
   scope, and a bounded next action.
 - Text rendering escapes control characters, and neither surface accepts
   arbitrary parser/driver text at that boundary.
@@ -143,13 +144,13 @@ bounded jobs with explicit status/cancel instead of blocking transport.
 Run the actual native surfaces:
 
 ```sh
-cargo test --locked -p cartograph-cli \
+cargo test --locked -p codevetra-cli \
   v1_1_33_cli_tree_remains_available_except_browser_viewer
-cargo test --locked -p cartograph-cli \
+cargo test --locked -p codevetra-cli \
   v1_1_33_mcp_input_contract_remains_accepted_except_retired_storage_modes
-cargo test --locked -p cartograph-mcp
-target/debug/cartograph --help
-target/debug/cartograph serve --help
+cargo test --locked -p codevetra-mcp
+target/debug/codevetra --help
+target/debug/codevetra serve --help
 ```
 
 Then run the full workspace and native RocksDB gates. Contract tests

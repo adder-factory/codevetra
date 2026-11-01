@@ -4,7 +4,7 @@
 # Usage: capture-v1-parity-oracle.sh <v1-cartograph-binary> <corpus-dir> <language> <out.json>
 #
 # Maintainer-only. The v2 product, its tests and CI never run this script or the
-# v1 binary; crates/cartograph-extract/tests/v1_parity_oracle.rs only reads the
+# v1 binary; crates/codevetra-extract/tests/v1_parity_oracle.rs only reads the
 # JSON documents it writes.
 #
 # Getting a verified v1 binary: download cartograph-darwin-arm64.tar.gz and
@@ -17,14 +17,14 @@
 # build fails the coverage test.
 #
 # Regenerating every language, from the repository root:
-#   fixtures=crates/cartograph-extract/tests/fixtures/v1_parity
+#   fixtures=crates/codevetra-extract/tests/fixtures/v1_parity
 #   for corpus in "$fixtures"/*/; do
 #     language="$(basename "$corpus")"
 #     [[ "$language" == expected ]] && continue
 #     scripts/capture-v1-parity-oracle.sh "$v1_binary" "$corpus" "$language" \
 #       "$fixtures/expected/$language.json"
 #   done
-# Then run `cargo test --locked -p cartograph-extract --test v1_parity_oracle` and
+# Then run `cargo test --locked -p codevetra-extract --test v1_parity_oracle` and
 # update v1_parity/{alignments,divergences,reasons}.jsonl for changed dispositions.
 #
 # The corpus is copied to a private temporary checkout, indexed by the v1.1.33

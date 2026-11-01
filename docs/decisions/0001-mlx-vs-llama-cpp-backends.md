@@ -3,14 +3,14 @@
 [Decision index](README.md) · [Documentation home](../README.md) ·
 [Configuration](../CONFIGURATION.md) · [V2 architecture](../v2/ARCHITECTURE.md)
 
-- **Status:** Accepted for Cartograph v2
+- **Status:** Accepted for CodeVetra v2
 - **Last reviewed:** 2026-10-04
 - **Scope:** Optional embedding, reranking, summary, classification, ask,
   local-chat, and decision (Jev) providers.
 
 ## Context
 
-Cartograph's structural engine must remain useful without any model. Optional
+CodeVetra's structural engine must remain useful without any model. Optional
 model tiers need a bounded HTTP/process boundary that works across platforms
 without adding a Python, Node, or provider SDK runtime to the native release.
 
@@ -23,10 +23,10 @@ reused across models.
 
 ## Decision
 
-- The release archive contains only Cartograph's native Rust executable and
+- The release archive contains only CodeVetra's native Rust executable and
   allowlisted notices. It does not bundle llama.cpp, MLX, Python, model files,
   or provider SDKs.
-- `llama-server` remains the only local process family that `cartograph
+- `llama-server` remains the only local process family that `codevetra
   backend` may explicitly start/stop/inspect. It is installed separately and
   configured with absolute model paths and loopback endpoints.
 - MLX, Ollama, LM Studio, vLLM, LocalAI, and other OpenAI-compatible servers are
@@ -53,8 +53,8 @@ reused across models.
 
 ## Consequences
 
-Cartograph remains a single native artifact while users can choose local or
-cloud inference. Managed llama.cpp convenience does not imply that Cartograph
+CodeVetra remains a single native artifact while users can choose local or
+cloud inference. Managed llama.cpp convenience does not imply that CodeVetra
 owns the backend executable or model lifecycle. An endpoint/model/provider
 change is visible in provenance and cannot cross-contaminate model-scoped
 vectors or generated summaries.

@@ -90,17 +90,17 @@ def metadata_member_packages(metadata: dict) -> list[dict]:
 # Production/build dependencies form reviewed, directed capabilities. Test-only
 # support is admitted separately and must never enter a shipped dependency tree.
 ARCHITECTURE_BOUNDARIES = {
-    "cartograph-domain": set(),
-    "cartograph-config": {"cartograph-domain"},
-    "cartograph-mcp": set(),
-    "cartograph-extract": {"cartograph-domain"},
-    "cartograph-db": {"cartograph-config", "cartograph-domain"},
-    "cartograph-scip": {"cartograph-db", "cartograph-domain"},
-    "cartograph-llm": {"cartograph-config", "cartograph-domain"},
-    "cartograph-search": {"cartograph-db", "cartograph-domain"},
-    "cartograph-indexer": {"cartograph-db", "cartograph-domain", "cartograph-extract", "cartograph-scip"},
-    "cartograph-agent": {"cartograph-config", "cartograph-db", "cartograph-domain", "cartograph-extract", "cartograph-indexer", "cartograph-llm", "cartograph-scip", "cartograph-search"},
-    "cartograph-cli": {"cartograph-agent", "cartograph-config", "cartograph-db", "cartograph-domain", "cartograph-llm", "cartograph-mcp", "cartograph-search"},
+    "codevetra-domain": set(),
+    "codevetra-config": {"codevetra-domain"},
+    "codevetra-mcp": set(),
+    "codevetra-extract": {"codevetra-domain"},
+    "codevetra-db": {"codevetra-config", "codevetra-domain"},
+    "codevetra-scip": {"codevetra-db", "codevetra-domain"},
+    "codevetra-llm": {"codevetra-config", "codevetra-domain"},
+    "codevetra-search": {"codevetra-db", "codevetra-domain"},
+    "codevetra-indexer": {"codevetra-db", "codevetra-domain", "codevetra-extract", "codevetra-scip"},
+    "codevetra-agent": {"codevetra-config", "codevetra-db", "codevetra-domain", "codevetra-extract", "codevetra-indexer", "codevetra-llm", "codevetra-scip", "codevetra-search"},
+    "codevetra-cli": {"codevetra-agent", "codevetra-config", "codevetra-db", "codevetra-domain", "codevetra-llm", "codevetra-mcp", "codevetra-search"},
 }
 
 
@@ -141,18 +141,18 @@ def architecture_violations(packages: list[dict], boundaries: dict[str, set[str]
 
 def run_architecture_regressions() -> None:
     fixture = [
-        {"name": "cartograph-extract", "dependencies": []},
-        {"name": "cartograph-db", "dependencies": []},
-        {"name": "cartograph-test-support", "dependencies": []},
+        {"name": "codevetra-extract", "dependencies": []},
+        {"name": "codevetra-db", "dependencies": []},
+        {"name": "codevetra-test-support", "dependencies": []},
     ]
-    fixture_boundaries = {**ARCHITECTURE_BOUNDARIES, "cartograph-test-support": set()}
+    fixture_boundaries = {**ARCHITECTURE_BOUNDARIES, "codevetra-test-support": set()}
     if architecture_violations(fixture, fixture_boundaries):
         fail("the acyclic independent-crate fixture was rejected")
     for kind in (None, "build"):
-        fixture[0]["dependencies"] = [{"name": "cartograph-db", "rename": "store", "kind": kind, "target": "cfg(windows)"}]
+        fixture[0]["dependencies"] = [{"name": "codevetra-db", "rename": "store", "kind": kind, "target": "cfg(windows)"}]
         if not architecture_violations(fixture, fixture_boundaries):
             fail("an aliased target-specific forbidden dependency bypassed architecture checks")
-    fixture[0]["dependencies"] = [{"name": "cartograph-test-support", "kind": "dev"}]
+    fixture[0]["dependencies"] = [{"name": "codevetra-test-support", "kind": "dev"}]
     if architecture_violations(fixture, fixture_boundaries):
         fail("test-only support was rejected")
     fixture[0]["dependencies"][0]["kind"] = None

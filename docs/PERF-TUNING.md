@@ -1,6 +1,6 @@
 # Performance and freshness tuning
 
-This guide applies to Cartograph `v3.0.3` and its native RocksDB backend.
+This guide applies to CodeVetra `v3.0.3` and its native RocksDB backend.
 Published PostgreSQL benchmarks remain historical; they do not prove native
 performance. See [storage](STORAGE-BACKENDS.md) for exact limits and commands.
 
@@ -19,7 +19,7 @@ Use the same corpus and operations for PostgreSQL/RocksDB comparisons.
 
 ## Workers and storage admission
 
-`cartograph index . --workers 4` selects extraction parallelism (1..16).
+`codevetra index . --workers 4` selects extraction parallelism (1..16).
 Begin with defaults; extra workers can increase memory, I/O, and compaction
 pressure without improving latency. Canonical counts and digests must remain
 identical across worker counts.
@@ -91,7 +91,7 @@ freshness and confidence; it omits code whose indexed content hash differs.
 
 ## Space and reclamation
 
-Use `cartograph db usage --project-path . --format json` before attributing
+Use `codevetra db usage --project-path . --format json` before attributing
 space to records. Logical graph bytes, native allocated bytes, SSTs, WAL,
 memtables, and pending compaction represent different quantities. Repeated
 revisions store record changes and retain snapshot-visible versions. Bounded
@@ -153,8 +153,8 @@ publication still verify source identities and the complete source fences.
 
 ## Persistent autosync and longer workloads
 
-`cartograph watch --project-path .` runs the existing native owner independently
-of MCP stdin on Unix. On macOS, `cartograph service start --project-path .`
+`codevetra watch --project-path .` runs the existing native owner independently
+of MCP stdin on Unix. On macOS, `codevetra service start --project-path .`
 installs that executable as a private project-scoped login service. Additional
 CLI/MCP processes use its existing owner transport. `service status` reports
 registration, launchd state, and owner availability separately; `service stop`
@@ -182,7 +182,7 @@ complete reconciliation.
 Run the sustained native workload explicitly:
 
 ```sh
-cargo test --locked --release -p cartograph-cli --test rocks_owner \
+cargo test --locked --release -p codevetra-cli --test rocks_owner \
   sustained_headless_owner_mixed_edits_and_mcp_readers -- --ignored --nocapture
 ```
 
@@ -192,7 +192,7 @@ three real MCP readers. It samples storage and failure history every minute,
 measures edit-to-current MCP evidence, verifies each added/deleted declaration,
 rename path and changed call target, and fences every cycle by changed generation,
 source revision and content digest after completed autosync. It drains the owner
-and compares the final graph with a forced cold rebuild. `CARTOGRAPH_MIXED_SOAK_SECONDS` accepts
+and compares the final graph with a forced cold rebuild. `CODEVETRA_MIXED_SOAK_SECONDS` accepts
 10..7200 seconds for explicit harness validation or longer runs. A short harness
 run does not count as sustained performance or storage evidence.
 
@@ -200,7 +200,7 @@ The frozen worker matrix and concurrent freshness tests are correctness and
 workload-specific performance evidence. They are not proof of a universal
 speedup or of unlimited graph capacity.
 
-Direct `cartograph index` and `sync-if-dirty` publish the base graph and requested
+Direct `codevetra index` and `sync-if-dirty` publish the base graph and requested
 history through one native owner. Their behavior is the same when a project service already owns
 RocksDB. The owner request explicitly sets `baseOnly: true`; it does not start a
 summary or classification sweep. MCP admin index/sync keeps its existing
@@ -227,7 +227,7 @@ The rules commit at most sixteen roles per atomic native batch, with a combined
 Model-backed role sweeps retain their priority-ordered,
 source-rich candidate API.
 
-`cartograph admin status` returns one observation of a running or terminal job.
+`codevetra admin status` returns one observation of a running or terminal job.
 It does not wait for completion or cancel the observed job when the observer
 exits. Commands that start jobs keep their polling and cancellation ownership;
 `admin cancel` waits for the requested cancellation to drain.

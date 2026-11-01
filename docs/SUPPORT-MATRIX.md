@@ -4,19 +4,19 @@
 [Coverage report](LANGUAGE-COVERAGE-REPORT.md) ·
 [Extend support](EXTENDING-EXTRACTORS-RESOLVERS.md)
 
-Last release audit: 2026-10-26 (`v3.0.6`).
+Last release audit: 2026-11-01 (`v4.0.0`).
 
-Use this page to decide whether Cartograph can extract useful graph structure
+Use this page to decide whether CodeVetra can extract useful graph structure
 from a project before you install it. A supported language means files are
 recognized and indexed. Framework-aware signals add routes, entry points,
-dynamic references, or cross-language bridge edges when Cartograph detects a
+dynamic references, or cross-language bridge edges when CodeVetra detects a
 known framework shape.
 
 **At a glance**
 
 | Inventory | Modes | Detail |
 |---|---:|---|
-| Production-admitted total | **134** | Source of truth: `cartograph_domain::SourceLanguage::ALL` |
+| Production-admitted total | **134** | Source of truth: `codevetra_domain::SourceLanguage::ALL` |
 | v1.1.33 parity modes | 73 | All 163 v1 extensions, plus additive v2 `.pyi` for Python |
 | Dedicated game scripting | 52 | Bounded, non-executing scanners; see [below](#dedicated-game-scripting-modes) |
 | Additive v2 modes | 9 | Native TOML; WGSL and Metal (v2.1.12); first-class Slang and WESL (v2.1.15); Ada/SPARK and VHDL (v2.1.27); Kamailio and rtpengine |
@@ -24,18 +24,18 @@ known framework shape.
 | Bounded Rust scanners | 67 | 12 custom v1 modes (Vue and Svelte also parse their script regions with the JavaScript/TypeScript grammar), TOML, Kamailio, rtpengine, and the 52 game-scripting modes |
 | Covered by the v1 parity oracle | 73 | Every v1.1.33 mode has a fixture corpus and the facts the real v1.1.33 binary extracted from it; see the [coverage report](LANGUAGE-COVERAGE-REPORT.md#v1-parity-oracle) |
 
-Cartograph v2 supports all 73 v1.1.33 language modes, native TOML, 52
+CodeVetra v2 supports all 73 v1.1.33 language modes, native TOML, 52
 dedicated textual game-scripting modes, the WGSL and Metal shader modes added
 in v2.1.12, first-class Slang and WESL added in v2.1.15, and Ada/SPARK and VHDL
 added in v2.1.27, plus Kamailio and rtpengine: 134 modes total. Native extractor
 strategy lives in
-`crates/cartograph-extract/src/language.rs`, grammar selection in
-`crates/cartograph-extract/src/grammars.rs`, and framework/cross-language
+`crates/codevetra-extract/src/language.rs`, grammar selection in
+`crates/codevetra-extract/src/grammars.rs`, and framework/cross-language
 enrichment in the focused Rust modules beside them.
 
 > [!NOTE]
 > The per-language claims for the 73 v1 modes are backed by the v1 parity
-> oracle (`crates/cartograph-extract/tests/v1_parity_oracle.rs`), which runs as
+> oracle (`crates/codevetra-extract/tests/v1_parity_oracle.rs`), which runs as
 > part of the workspace `cargo test`. Every fact v1.1.33 extracted from a
 > mode's fixture corpus needs a unique exact per-file identity, committed exact
 > alignment pins, or a pending/intentional ledger entry with shared evidence.
@@ -61,7 +61,7 @@ The **Extractor path** column uses these terms:
 |---|---|
 | Tree-sitter | A pinned, statically linked native grammar plus a structural walker: a dedicated family (JavaScript/TypeScript, Rust/Python/Go, C-family, Objective-C, shell, managed (Java/C#), Apex, VB.NET, JVM-dynamic, shader, Ada/VHDL, Pascal, PHP, Swift, Dart, F#, ArkTS, Astro, Ruby, Lua, R, Nix, Lisp, Lean, ReScript, Solidity, HCL) or the conservative generic structural walker (ABAP, GraphQL, HTML, Prisma, SQL, YAML; GraphQL, Prisma, and SQL have schema-aware slices). Emits declarations and references. |
 | Tree-sitter tags query | Grammar-backed, query-driven declaration and call-reference extraction. |
-| Tree-sitter parser-only | Cartograph recognizes the file, parses it with the statically linked native grammar, emits the file node, and surfaces syntax diagnostics, but does not yet extract language-specific symbols from that grammar. |
+| Tree-sitter parser-only | CodeVetra recognizes the file, parses it with the statically linked native grammar, emits the file node, and surfaces syntax diagnostics, but does not yet extract language-specific symbols from that grammar. |
 | C-family / shader-family slice, or another mode's grammar | The mode reuses the grammar and walker of a related language (for example Metal uses the C++ grammar, WESL the WGSL grammar, KHN the Lua grammar). |
 | Custom extractor | A bounded Rust scanner with no tree-sitter grammar of its own. Vue and Svelte hosts hand their script regions to the JavaScript/TypeScript family (see [embedded component scripts](#language-family-details)). |
 | Bounded native structural scanner | TOML only: the scanner emits the file node (a structural-file floor); see the TOML row. |
@@ -641,8 +641,8 @@ full registration checklist and required gates are in
 
 ## Tree-sitter Catalog Notes
 
-Tree-sitter's homepage and community catalog are not Cartograph's release
-contract. Cartograph pins reviewed native grammar crates deliberately rather
+Tree-sitter's homepage and community catalog are not CodeVetra's release
+contract. CodeVetra pins reviewed native grammar crates deliberately rather
 than downloading parsers at runtime, so the matrix above is the authoritative
 shipped set. A catalog entry is not support until the complete native admission
 and live publication gates pass.

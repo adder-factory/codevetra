@@ -1,12 +1,12 @@
 # Acknowledgements
 
-Cartograph stands on other people's open-source work. Cartograph itself is
+CodeVetra stands on other people's open-source work. CodeVetra itself is
 released under the MIT License; every dependency and external service retains
 its own license and terms.
 
 ## Origin project
 
-Cartograph began as a fork of
+CodeVetra began as a fork of
 [codegraph](https://github.com/colbymchenry/codegraph) by Colby Mchenry, used
 under the MIT License (Copyright (c) 2026 Colby Mchenry). Version 2 is a native
 Rust/PostgreSQL architecture and no longer ships the original TypeScript/Bun
@@ -26,7 +26,7 @@ The native executable uses these principal projects:
 | [clap](https://github.com/clap-rs/clap) | MIT OR Apache-2.0 | Native CLI parsing and help |
 | [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) | MIT | Incremental concrete syntax parsing |
 | [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | Stable identities, source revisions, and logical generation digests |
-| [reqwest](https://github.com/seanmonstar/reqwest) | MIT OR Apache-2.0 | HTTP client for optional LLM, embedding, and Jev providers and for `cartograph upgrade` release downloads |
+| [reqwest](https://github.com/seanmonstar/reqwest) | MIT OR Apache-2.0 | HTTP client for optional LLM, embedding, and Jev providers and for `codevetra upgrade` release downloads |
 | [rustls](https://github.com/rustls/rustls) | Apache-2.0 OR ISC OR MIT | TLS used by PostgreSQL connections and HTTPS requests |
 | [ring](https://github.com/briansmith/ring) | Apache-2.0 AND ISC | Cryptography provider for rustls |
 | [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) | Unlicense OR MIT | Git-compatible bounded source discovery |
@@ -44,7 +44,7 @@ provenance. `Cargo.lock` is the authoritative version inventory for a release.
 
 ## Native Tree-sitter grammars
 
-Cartograph links the Rust grammar crates listed below. It does not bundle the
+CodeVetra links the Rust grammar crates listed below. It does not bundle the
 old v1 WebAssembly grammar collection. `Cargo.lock` (exact versions) and
 `deny.toml` (the enforced license allowlist) remain the authoritative
 inventory.
@@ -83,23 +83,23 @@ communities.
 
 ## External database services
 
-Cartograph requires separately installed services and extensions:
+CodeVetra requires separately installed services and extensions:
 
 - [PostgreSQL](https://www.postgresql.org/) — PostgreSQL License;
 - [ParadeDB / `pg_search`](https://github.com/paradedb/paradedb) — AGPL-3.0
   or commercial terms published by ParadeDB;
 - [pgvector](https://github.com/pgvector/pgvector) — PostgreSQL License.
 
-These projects are not copied into or redistributed with Cartograph's native
-release archives. `cartograph db start` instructs the user's local Docker daemon
+These projects are not copied into or redistributed with CodeVetra's native
+release archives. `codevetra db start` instructs the user's local Docker daemon
 to pull an upstream, digest-pinned ParadeDB image as a separate service. The
 enforced distribution and supported-use boundary ships in each release archive
-as `share/cartograph/PARADEDB-NOTICE.md`; its source is
-[`docs/v2/LICENSING.md`](https://github.com/adder-factory/cartograph/blob/main/docs/v2/LICENSING.md).
+as `share/codevetra/PARADEDB-NOTICE.md`; its source is
+[`docs/v2/LICENSING.md`](https://github.com/adder-factory/codevetra/blob/main/docs/v2/LICENSING.md).
 
 ## Build and quality tools
 
-Cartograph's development and release gates also use:
+CodeVetra's development and release gates also use:
 
 - [Clippy](https://github.com/rust-lang/rust-clippy) and rustfmt from the pinned
   Rust toolchain;
@@ -116,7 +116,7 @@ request so the acknowledgement can be corrected.
 ## Native storage cutover
 
 The native backend includes [RocksDB](https://github.com/facebook/rocksdb)
-11.8.1 through [rust-rocksdb](https://github.com/zaidoon1/rust-rocksdb), with
+11.12.0 through [rust-rocksdb](https://github.com/zaidoon1/rust-rocksdb), with
 [LZ4](https://github.com/lz4/lz4) and [Zstandard](https://github.com/facebook/zstd)
 compression. Lossless publication blocks use the MIT-licensed
 [lz4_flex](https://github.com/PSeitz/lz4_flex) Rust implementation.

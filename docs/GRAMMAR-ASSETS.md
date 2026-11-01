@@ -4,7 +4,7 @@
 [Coverage report](LANGUAGE-COVERAGE-REPORT.md) ·
 [Extension guide](EXTENDING-EXTRACTORS-RESOLVERS.md)
 
-Cartograph v2 links pinned Rust tree-sitter grammar crates. It does not ship or
+CodeVetra v2 links pinned Rust tree-sitter grammar crates. It does not ship or
 load the v1 WebAssembly grammar directory.
 
 ## Release inventory
@@ -14,8 +14,8 @@ The authoritative release inventory is:
 | What | Where |
 | --- | --- |
 | Exact crate versions and checksums | `Cargo.lock` (also the complete set of linked grammar crates) |
-| Direct grammar pins | Workspace dependencies in `Cargo.toml`, enabled for the extractor in `crates/cartograph-extract/Cargo.toml` |
-| Language-to-grammar/custom-scanner registration | `crates/cartograph-extract/src/language.rs`, `grammars.rs`, and related native modules |
+| Direct grammar pins | Workspace dependencies in `Cargo.toml`, enabled for the extractor in `crates/codevetra-extract/Cargo.toml` |
+| Language-to-grammar/custom-scanner registration | `crates/codevetra-extract/src/language.rs`, `grammars.rs`, and related native modules |
 | Third-party licensing and upstream attribution | `ACKNOWLEDGEMENTS.md` and `deny.toml` |
 
 `ACKNOWLEDGEMENTS.md` credits only the principal grammar families. The full

@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [CLI reference](CLI-REFERENCE.md) · [Architecture](v2/ARCHITECTURE.md)
 
-Cartograph v2 derives deterministic, generation-fenced findings from native
+CodeVetra v4 derives deterministic, generation-fenced findings from native
 extraction metrics, graph structure, Git/coverage evidence, architecture
 policy, and duplicate-code analysis. The detector path does not require an
 LLM. LLM-based dead-code judging is a separately labeled advisory workflow and
@@ -20,15 +20,14 @@ Biomarker reads are deliberately non-mutating. Inspect or build the detector
 relation through the dry-run-first admin boundary:
 
 ```sh
-cartograph admin biomarkers-refresh --json
-cartograph admin biomarkers-refresh --no-dry-run --confirm \
+codevetra admin biomarkers-refresh --json
+codevetra admin biomarkers-refresh --no-dry-run --confirm \
   --database-query-timeout-ms 240000 --json
 ```
 
 - The first command reports whether the exact relation would be recomputed.
 - The second is the explicit confirmed mutation. Its timeout is caller-bounded
-  from 1 through 1800000 milliseconds and is applied as the inner PostgreSQL
-  statement timeout. The response reports both `statementTimeoutMs` and
+  from 1 through 1800000 milliseconds and is applied as the native storage work deadline. The response reports both `statementTimeoutMs` and
   `statementTimeoutSource`; the caller deadline must be longer.
 - The legacy `--timeout-ms`/`timeoutMs` spelling remains accepted when the
   explicit field is absent, and passing both is rejected.
@@ -40,7 +39,7 @@ of computing it:
 
 | Read | Before computation |
 | --- | --- |
-| `cartograph biomarkers` | Returns `state: not_computed` |
+| `codevetra biomarkers` | Returns `state: not_computed` |
 | Status | Returns a pending readiness state |
 | Inline biomarker rollup | Returns an empty array with `biomarkerRollupState: not_computed` |
 | Review-risk | Labels its structural-findings lens `not_computed` |
@@ -61,7 +60,7 @@ fingerprint covers:
 - the calendar day bounding the `recently_grew` window;
 - the detector contract compiled into the binary.
 
-A detector-SQL change therefore invalidates every stored relation instead of
+A detector-contract change therefore invalidates every stored relation instead of
 serving findings the shipped rules no longer produce.
 
 </details>
@@ -90,20 +89,120 @@ Some detectors need inputs that are not part of every index:
 Absence of those inputs is reported as unavailable/not configured, not a clean
 finding.
 
+JavaScript/TypeScript safety analysis has bounded scope, binding, and ancestry
+walks. Exhausting one of those detector bounds marks the symbol's source-rule
+coverage unavailable and discards partial operation findings. Structural
+extraction continues under its own limits; unavailable analysis is never
+reported as a clean safety result.
+
+## Applicability and coverage
+
+Use `codevetra biomarkers --mode coverage --format json`, or call
+`codevetra_biomarkers` with `{"mode":"coverage","format":"json"}`. An optional
+`biomarker` filter selects one detector. The bounded catalog is available even
+before the finding relation is computed. Completed native coverage reports
+per-language considered, eligible, evaluated, unsupported, excluded, unavailable
+and finding counts. A missing relation remains `not_computed`; disabled project
+analysis remains `disabled_by_project_config`.
+
+Native AST support means the extractor recorded an actual metrics producer for
+that symbol. Indexing a language does not establish detector support. Nested
+callables own their own metrics. Tests, fixtures and declaration-only signatures
+are excluded. Top-level statements and non-callable initializers are unsupported.
+Layer-policy coverage is reported separately as `projectLayerAnalysis`, with
+resolved imports evaluated and unresolved imports skipped. Native symbol counts
+cannot substitute for that module-import population.
+
+The following matrix is contract-tested against the authoritative registry in
+`crates/codevetra-domain/src/biomarkers/capabilities.rs`.
+
+| Detector | Languages | Scope | Evidence depth | Required input |
+| --- | --- | --- | --- | --- |
+| `accidental_quadratic` | native AST metric producers | callable implementations | `ast_local` | `source_metrics` |
+| `agent_debug_log` | javascript, jsx, typescript, tsx | callable implementations | `ast_local` | `source_metrics` |
+| `brain_method` | native AST metric producers | callable implementations | `structural_metric` | `source_metrics` |
+| `complex_conditional` | native AST metric producers | callable implementations | `structural_metric` | `source_metrics` |
+| `complex_method` | native AST metric producers | callable implementations | `structural_metric` | `source_metrics` |
+| `duplicate_code` | indexed graph languages | callable implementations | `graph_supported` | `clone_evidence` |
+| `dynamic_eval` | javascript, jsx, typescript, tsx | callable implementations | `ast_local` | `source_metrics` |
+| `empty_catch` | native AST metric producers | callable implementations | `ast_local` | `source_metrics` |
+| `empty_function_body` | native AST metric producers | callable implementations | `structural_metric` | `source_metrics` |
+| `env_no_validation` | javascript, jsx, typescript, tsx | callable implementations | `ast_local` | `source_metrics` |
+| `feature_envy` | indexed graph languages | methods | `graph_supported` | `graph` |
+| `forof_await` | javascript, jsx, typescript, tsx | callable implementations | `ast_local` | `source_metrics` |
+| `god_class` | indexed graph languages | class, struct, module | `graph_supported` | `graph` |
+| `hardcoded_url` | native AST metric producers | callable implementations | `ast_local` | `source_metrics` |
+| `high_fan_out` | indexed graph languages | production declarations | `graph_supported` | `graph` |
+| `http_no_timeout` | javascript, jsx, typescript, tsx | callable implementations | `ast_local` | `source_metrics` |
+| `illegal_import` | indexed graph languages | module dependencies | `graph_supported` | `layer_policy` |
+| `incomplete_marker` | native AST metric producers | callable implementations | `lexical_heuristic` | `source_metrics` |
+| `insecure_hash` | javascript, jsx, typescript, tsx | callable implementations | `ast_local` | `source_metrics` |
+| `large_method` | native AST metric producers | callable implementations | `structural_metric` | `source_metrics` |
+| `long_parameter_list` | native AST metric producers | callable implementations | `structural_metric` | `source_metrics` |
+| `low_coverage` | indexed graph languages | callable implementations | `graph_supported` | `coverage` |
+| `magic_number` | native AST metric producers | callable implementations | `ast_local` | `source_metrics` |
+| `nested_complexity` | native AST metric producers | callable implementations | `structural_metric` | `source_metrics` |
+| `random_for_security` | javascript, jsx, typescript, tsx | callable implementations | `ast_local` | `source_metrics` |
+| `recently_grew` | indexed graph languages | callable implementations | `graph_supported` | `previous_generation` |
+| `secrets_handling` | native AST metric producers | callable implementations | `lexical_heuristic` | `source_metrics` |
+| `sql_string_concat` | javascript, jsx, typescript, tsx | callable implementations | `ast_local` | `source_metrics` |
+| `stale_doc` | native AST metric producers | constants | `ast_local` | `source_metrics` |
+| `sync_io_in_async` | javascript, jsx, typescript, tsx | callable implementations | `ast_local` | `source_metrics` |
+| `ts_any_cast` | typescript, tsx | callable implementations | `lexical_heuristic` | `source_metrics` |
+| `ts_ignore_suppression` | typescript, tsx | callable implementations | `lexical_heuristic` | `source_metrics` |
+| `unresolved_reference_pressure` | indexed graph languages | production declarations | `graph_supported` | `graph` |
+| `unsafe_json_parse` | javascript, jsx, typescript, tsx | callable implementations | `ast_local` | `source_metrics` |
+| `unused_export` | indexed graph languages | production declarations | `graph_supported` | `graph` |
+
+An evaluated population with zero findings means no configured rule threshold
+was met in that population. It is not comprehensive security coverage, formal
+proof, or authorization to remove code. Unsupported scopes and missing optional
+inputs remain explicit. Embeddings are optional for clone analysis; model-based
+dead-code judgment is a separate advisory workflow.
+
+Source-local rules share formulas, eligibility and severity through
+`codevetra-domain::biomarkers::SOURCE_RULES`. Source comparison uses those same
+rules and omits informational findings; it explicitly excludes graph, history
+and coverage analysis. Correctness and safety occurrences have no function-size
+minimum. The `magic_number` maintainability rule retains its five-owned-line
+noise-control policy. Declaration and framework-parameter abstentions remain.
+
+JavaScript call-scoped checks recognize conventional unshadowed names and bounded
+direct import shapes. JSON parses require a containing try body with a catch;
+a separate try, a comment, or an identifier containing `try` is insufficient.
+Timeout/abort configuration belongs to the particular request. Environment
+validation requires a direct applicable Zod parse with a recognized schema,
+including an immutable local schema binding. Dynamic aliases, arbitrary client
+configuration and whole-program value flow remain unresolved risk candidates
+or unsupported call identities, rather than proof of safety. TypeScript casts
+and suppressions remain labeled lexical heuristics.
+
+Call-scoped findings retain the enclosing symbol range and separate operation
+locations. Coordinates use half-open UTF-8 byte ranges, one-based lines and
+zero-based byte columns. At most sixteen sites per detector are retained;
+`totalCount` preserves the complete admitted count and `truncated` identifies
+omitted sites. Detectors without exact sites explicitly report symbol precision.
+No source expression or literal is stored in operation-location evidence.
+
+Finding deltas add `worsened`, `improved` and `ambiguous` alongside `introduced`,
+`cleared` and unchanged `carried`. Changed findings retain before/after metrics,
+severity and locations; line-only movement is not a risk transition. Duplicate
+symbol identities abstain from matching. Both sides are evaluated by the same
+reported `findingsContract`; an unavailable/failed source side is skipped.
+
 ## Evidence contract
 
 Each finding carries its detector, severity, metric name/value, threshold,
 symbol/file identity, generation, and graph pressure used for ranking. Findings
-are filtered in PostgreSQL before the response cap. Rollup mode is untruncated;
+are filtered in native storage before the response cap. Rollup mode is untruncated;
 ranked mode returns an exact pre-limit count and explicit truncation.
 
-Thresholds are native release behavior. They live in
-`crates/cartograph-db/src/finding_ctes.sql`, which
-`crates/cartograph-db/src/insights.rs` loads at compile time; `illegal_import`
-is evaluated against the project `layers` policy in
-`crates/cartograph-agent/src/layering.rs`. Extraction metrics are produced under
-`crates/cartograph-extract/src/walk/`; graph/history/coverage inputs remain
-separately attributable. Do not duplicate threshold tables in another runtime.
+Thresholds and source-local eligibility live in
+`crates/codevetra-domain/src/biomarkers.rs`. Native project-dependent rules live
+under `crates/codevetra-db/src/insights/native/findings/`; `illegal_import`
+uses `crates/codevetra-agent/src/layering.rs`. Extraction metrics are produced
+under `crates/codevetra-extract/src/walk/`. Source-rule contract changes invalidate
+the persisted finding relation; extraction changes also advance generation freshness.
 
 All biomarker detectors operate on production symbol documents. Files in a
 modeled test/fixture path and Rust declarations owned by `#[cfg(test)]`, a test
@@ -196,7 +295,7 @@ body contains an `await`.
   callbacks, and nested loops do not contribute to the enclosing loop's metric.
 - It also abstains when an awaited assignment feeds the next iteration, when
   control can `break` or `return` after the await, or when the loop contains
-  the explicit `cartograph: serial-await` intent marker.
+  the explicit `codevetra: serial-await` intent marker.
 - A finding therefore represents independent iterations with no detected
   ordering dependency; detail reports the awaited-expression ownership and each
   abstention category.
@@ -237,7 +336,7 @@ containing “select ... from” therefore abstains.
 - The rule applies to executable and container symbols, not declarative
   constant tables or framework-owned convention exports.
 
-**`unresolved_reference_pressure`.** Cartograph graph-resolution coverage, not
+**`unresolved_reference_pressure`.** CodeVetra graph-resolution coverage, not
 a compiler diagnostic. Its detail sets `compilerDiagnostic: false` and directs
 the caller to confirm source correctness with the language toolchain before an
 edit. It counts unresolved references that could still denote project
@@ -299,14 +398,14 @@ Signatures/search documents reject literal-bearing or credential-shaped values.
 Use:
 
 ```sh
-cartograph biomarkers --help
-cartograph admin biomarkers-refresh --help
-cartograph review agent-audit --help
-cartograph hotspots --help
-cartograph coverage --help
-cartograph dead-code --help
+codevetra biomarkers --help
+codevetra admin biomarkers-refresh --help
+codevetra review agent-audit --help
+codevetra hotspots --help
+codevetra coverage --help
+codevetra dead-code --help
 ```
 
-MCP mirrors are `cartograph_biomarkers`, `cartograph_review`,
-`cartograph_hotspots`, `cartograph_coverage`, and `cartograph_dead_code`; the
-`cartograph_admin` `biomarkers-refresh` action mirrors the admin refresh.
+MCP mirrors are `codevetra_biomarkers`, `codevetra_review`,
+`codevetra_hotspots`, `codevetra_coverage`, and `codevetra_dead_code`; the
+`codevetra_admin` `biomarkers-refresh` action mirrors the admin refresh.

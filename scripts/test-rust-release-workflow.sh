@@ -8,15 +8,15 @@ RELEASE="$ROOT/.github/workflows/release.yml"
 STABLE_CANARY="$ROOT/.github/workflows/stable-canary.yml"
 CHANGE_CLASSIFIER="$ROOT/scripts/classify-v2-ci-change.sh"
 WORKSPACE_DEPENDENCY_CONTRACT="$ROOT/scripts/test-workspace-dependencies.sh"
-DOCUMENTATION_CONTRACT="$ROOT/crates/cartograph-cli/src/tests/documentation_contract.rs"
+DOCUMENTATION_CONTRACT="$ROOT/crates/codevetra-cli/src/tests/documentation_contract.rs"
 PULL_HELPER="$ROOT/scripts/pull-pinned-image.sh"
 SMOKE_HELPER="$ROOT/scripts/smoke-rust-release.sh"
 UNIX_BUILD_HELPER="$ROOT/scripts/build-rust-release.sh"
 LINUX_BUILD_HELPER="$ROOT/scripts/build-linux-rust-release.sh"
 UNIX_INSTALLER="$ROOT/install.sh"
 WINDOWS_INSTALLER="$ROOT/install.ps1"
-UPGRADE_SOURCE="$ROOT/crates/cartograph-cli/src/upgrade.rs"
-CLI_SOURCE="$ROOT/crates/cartograph-cli/src/main.rs"
+UPGRADE_SOURCE="$ROOT/crates/codevetra-cli/src/upgrade.rs"
+CLI_SOURCE="$ROOT/crates/codevetra-cli/src/main.rs"
 DENY_CONFIG="$ROOT/deny.toml"
 RUST_TOOLCHAIN_CONFIG="$ROOT/rust-toolchain.toml"
 SONAR_CONFIG="$ROOT/sonar-project.properties"
@@ -43,6 +43,19 @@ literal_count() {
 }
 
 command -v ruby >/dev/null 2>&1 || fail 'Ruby with the standard YAML parser is required'
+python3 "$ROOT/scripts/test-unix-installer-compatibility.py"
+python3 - "$ROOT" <<'PY'
+import pathlib, re, sys, tomllib
+root = pathlib.Path(sys.argv[1])
+version = tomllib.loads((root / 'Cargo.toml').read_text())['workspace']['package']['version']
+notes = (root / 'docs' / 'releases' / f'v{version}.md').read_text()
+for required in (f'# CodeVetra v{version}', '## Changes', '## Upgrade', '**Compatibility:**', '**Full changelog:**'):
+    if required not in notes:
+        raise SystemExit(f'release notes lack required section: {required}')
+for target in re.findall(r'\]\(([^)]+)\)', notes):
+    if not target.startswith('https://'):
+        raise SystemExit('release notes require absolute HTTPS links')
+PY
 rust_toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' "$RUST_TOOLCHAIN_CONFIG")"
 [[ "$rust_toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
   fail 'the pinned Rust toolchain is not an exact stable release'
@@ -293,9 +306,9 @@ assert_scope "$docs_scope" crates/example/tests/fixtures/corpus/README.md
 assert_scope "$full_scope"
 assert_scope "$full_scope" 'docs/path with spaces/example.rs'
 assert_scope "$full_scope" docs/releases/v9.9.9.md
-assert_scope "$full_scope" crates/cartograph-cli/src/main.rs
-assert_scope "$full_scope" crates/cartograph-cli/src/tests/documentation_contract.rs
-assert_scope "$full_scope" crates/cartograph-cli/assets/cartograph-skill.md
+assert_scope "$full_scope" crates/codevetra-cli/src/main.rs
+assert_scope "$full_scope" crates/codevetra-cli/src/tests/documentation_contract.rs
+assert_scope "$full_scope" crates/codevetra-cli/assets/codevetra-skill.md
 assert_scope "$full_scope" .github/workflows/v2-rust.yml
 assert_scope "$full_scope" docs/CONFIGURATION.md Cargo.lock
 
@@ -429,8 +442,8 @@ for native_contract in \
   '--test rocks_state --test rocks_project --test rocks_graph -- --include-ignored' \
   '--test live_supervisor -- --include-ignored' \
   '--test rocks_cli --test rocks_owner --test live_cli_surface --test live_supervised_index --test index_startup' \
-  'cargo bench --locked -p cartograph-indexer --bench index_scaling' \
-  'DOCKER_HOST: unix:///nonexistent-cartograph-docker.sock'; do
+  'cargo bench --locked -p codevetra-indexer --bench index_scaling' \
+  'DOCKER_HOST: unix:///nonexistent-codevetra-docker.sock'; do
   grep -Fq -- "$native_contract" <<<"$rocksdb_block" || \
     fail "native RocksDB matrix omitted required proof: $native_contract"
 done
@@ -523,10 +536,10 @@ done
 # The current version's tracked notes must already pass the publish job's
 # checks; otherwise a green release commit reaches a tag whose publication fails.
 release_version="$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" |
-  jq -r '.packages[] | select(.name == "cartograph-cli") | .version')"
+  jq -r '.packages[] | select(.name == "codevetra-cli") | .version')"
 release_notes="$ROOT/docs/releases/v$release_version.md"
 if [[ -f "$release_notes" ]]; then
-  grep -Fq "# Cartograph v$release_version" "$release_notes" || \
+  grep -Fq "# CodeVetra v$release_version" "$release_notes" || \
     fail "docs/releases/v$release_version.md does not identify v$release_version"
   if grep -Eiq "$release_note_marker_pattern" "$release_notes"; then
     fail "docs/releases/v$release_version.md contains a marker the publish job rejects"
@@ -556,13 +569,13 @@ if grep -Eq '(i[3-6]86|armv7|thumbv7|windows-x86|linux-x86)' \
 fi
 grep -Fq '#[cfg(not(target_pointer_width = "64"))]' "$CLI_SOURCE" || \
   fail 'the native CLI does not fail closed on 32-bit targets'
-grep -Fq 'Cartograph v2 supports only 64-bit operating systems.' "$CLI_SOURCE" || \
+grep -Fq 'CodeVetra v4 supports only 64-bit operating systems.' "$CLI_SOURCE" || \
   fail 'the 32-bit compile failure is not actionable'
 grep -Fq "rust:1.99.1-trixie@sha256:" "$VALIDATION" || \
   fail 'Linux validation does not build on current stable Debian'
-grep -Fq "rustup toolchain install \"\$CARTOGRAPH_RELEASE_TOOLCHAIN\" --profile minimal" "$LINUX_BUILD_HELPER" || \
+grep -Fq "rustup toolchain install \"\$CODEVETRA_RELEASE_TOOLCHAIN\" --profile minimal" "$LINUX_BUILD_HELPER" || \
   fail 'Linux builds do not install the exact reviewed compiler independently of the base image'
-grep -Fq "\"rustc \$CARTOGRAPH_RELEASE_TOOLCHAIN \"*" "$LINUX_BUILD_HELPER" || \
+grep -Fq "\"rustc \$CODEVETRA_RELEASE_TOOLCHAIN \"*" "$LINUX_BUILD_HELPER" || \
   fail 'Linux builds do not verify the exact compiler after bootstrap'
 grep -Fq "rust-version: '$rust_toolchain'" "$VALIDATION" || \
   fail 'cargo-deny does not use the pinned stable Rust toolchain'
@@ -582,7 +595,7 @@ grep -Fq 'minos 26.0' "$UNIX_BUILD_HELPER" || \
   fail 'macOS release binaries do not verify their minimum OS contract'
 grep -Fq "TARGET_ROOT=\"\${CARGO_TARGET_DIR:-target}\"" "$UNIX_BUILD_HELPER" || \
   fail 'release builds do not honor an isolated Cargo target directory'
-grep -Fq -- '--env CARGO_TARGET_DIR=/tmp/cartograph-target' "$LINUX_BUILD_HELPER" || \
+grep -Fq -- '--env CARGO_TARGET_DIR=/tmp/codevetra-target' "$LINUX_BUILD_HELPER" || \
   fail 'Linux container builds can follow a host target symlink'
 grep -Fq 'requires glibc 2.41 or newer' "$UNIX_INSTALLER" || \
   fail 'the Unix installer does not reject old Linux before download'
@@ -625,11 +638,11 @@ if [[ -n "$unpinned_actions" ]]; then
 fi
 
 unpinned_status=0
-CARTOGRAPH_DOCKER_BIN=/usr/bin/false "$PULL_HELPER" example.invalid/cartograph:latest 1 \
+CODEVETRA_DOCKER_BIN=/usr/bin/false "$PULL_HELPER" example.invalid/codevetra:latest 1 \
   >/dev/null 2>&1 || unpinned_status=$?
 [[ "$unpinned_status" -eq 2 ]] || fail 'unpinned image input was not rejected'
 
-fixture="$(mktemp -d "${TMPDIR:-/tmp}/cartograph-pull-test.XXXXXX")"
+fixture="$(mktemp -d "${TMPDIR:-/tmp}/codevetra-pull-test.XXXXXX")"
 trap 'rm -rf "$fixture"' EXIT
 
 unsupported_release_status=0
@@ -643,15 +656,15 @@ mkdir -p "$fake_uname_dir"
 cat >"$fake_uname_dir/uname" <<'EOF'
 #!/usr/bin/env sh
 case "${1:-}" in
-  -s) printf '%s\n' "${CARTOGRAPH_FAKE_UNAME_S:?}" ;;
-  -m) printf '%s\n' "${CARTOGRAPH_FAKE_UNAME_M:?}" ;;
+  -s) printf '%s\n' "${CODEVETRA_FAKE_UNAME_S:?}" ;;
+  -m) printf '%s\n' "${CODEVETRA_FAKE_UNAME_M:?}" ;;
   *) exit 2 ;;
 esac
 EOF
 chmod 0755 "$fake_uname_dir/uname"
 intel_install_status=0
 PATH="$fake_uname_dir:$PATH" HOME="$fixture/home" \
-  CARTOGRAPH_FAKE_UNAME_S=Darwin CARTOGRAPH_FAKE_UNAME_M=x86_64 "$UNIX_INSTALLER" \
+  CODEVETRA_FAKE_UNAME_S=Darwin CODEVETRA_FAKE_UNAME_M=x86_64 "$UNIX_INSTALLER" \
   >"$fixture/intel-install.out" 2>"$fixture/intel-install.err" || intel_install_status=$?
 [[ "$intel_install_status" -eq 1 ]] || fail 'Intel macOS installer request was not rejected'
 grep -Fq 'Intel macOS is not supported' "$fixture/intel-install.err" || \
@@ -674,7 +687,7 @@ EOF
 chmod 0755 "$fake_uname_dir/ldd" "$fake_uname_dir/sw_vers" "$fake_uname_dir/curl"
 old_macos_install_status=0
 PATH="$fake_uname_dir:$PATH" HOME="$fixture/home" \
-  CARTOGRAPH_FAKE_UNAME_S=Darwin CARTOGRAPH_FAKE_UNAME_M=arm64 "$UNIX_INSTALLER" \
+  CODEVETRA_FAKE_UNAME_S=Darwin CODEVETRA_FAKE_UNAME_M=arm64 "$UNIX_INSTALLER" \
   >"$fixture/old-macos-install.out" 2>"$fixture/old-macos-install.err" || \
   old_macos_install_status=$?
 [[ "$old_macos_install_status" -eq 1 ]] || fail 'old macOS installer request was not rejected'
@@ -683,7 +696,7 @@ grep -Fq 'requires macOS 26 or newer' "$fixture/old-macos-install.err" || \
 
 old_linux_install_status=0
 PATH="$fake_uname_dir:$PATH" HOME="$fixture/home" \
-  CARTOGRAPH_FAKE_UNAME_S=Linux CARTOGRAPH_FAKE_UNAME_M=x86_64 "$UNIX_INSTALLER" \
+  CODEVETRA_FAKE_UNAME_S=Linux CODEVETRA_FAKE_UNAME_M=x86_64 "$UNIX_INSTALLER" \
   >"$fixture/old-linux-install.out" 2>"$fixture/old-linux-install.err" || \
   old_linux_install_status=$?
 [[ "$old_linux_install_status" -eq 1 ]] || fail 'old Linux installer request was not rejected'
@@ -694,7 +707,7 @@ fake_docker="$fixture/docker"
 cat >"$fake_docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-state="${CARTOGRAPH_FAKE_DOCKER_STATE:?}"
+state="${CODEVETRA_FAKE_DOCKER_STATE:?}"
 case "${1:-}:${2:-}" in
   image:inspect)
     [[ -f "$state/available" ]]
@@ -718,22 +731,22 @@ EOF
 chmod 0755 "$fake_docker"
 mkdir -p "$fixture/state"
 
-IMAGE="example.invalid/cartograph@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-CARTOGRAPH_DOCKER_BIN="$fake_docker" \
-  CARTOGRAPH_FAKE_DOCKER_STATE="$fixture/state" \
-  CARTOGRAPH_IMAGE_PULL_RETRY_DELAY_SECONDS=0 \
+IMAGE="example.invalid/codevetra@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+CODEVETRA_DOCKER_BIN="$fake_docker" \
+  CODEVETRA_FAKE_DOCKER_STATE="$fixture/state" \
+  CODEVETRA_IMAGE_PULL_RETRY_DELAY_SECONDS=0 \
   "$PULL_HELPER" "$IMAGE" 4 >/dev/null
 [[ "$(<"$fixture/state/count")" == 3 ]] || fail 'bounded pull retry count changed'
 
 space_binary_directory="$fixture/release path with spaces"
-space_binary="$space_binary_directory/cartograph"
+space_binary="$space_binary_directory/codevetra"
 mkdir -p "$space_binary_directory"
 cat >"$space_binary" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
   --version)
-    printf 'cartograph %s\n' "${CARTOGRAPH_SMOKE_FIXTURE_VERSION:?}"
+    printf 'codevetra %s\n' "${CODEVETRA_SMOKE_FIXTURE_VERSION:?}"
     ;;
   --help)
     cat <<'HELP'
@@ -763,7 +776,7 @@ HELP
 esac
 EOF
 chmod 0755 "$space_binary"
-fixture_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "cartograph-cli") | .version')"
-CARTOGRAPH_SMOKE_FIXTURE_VERSION="$fixture_version" "$SMOKE_HELPER" "$space_binary" >/dev/null
+fixture_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "codevetra-cli") | .version')"
+CODEVETRA_SMOKE_FIXTURE_VERSION="$fixture_version" "$SMOKE_HELPER" "$space_binary" >/dev/null
 
 echo 'Release workflow attestation, sharding, and pinned-image retry contracts passed.'

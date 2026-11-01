@@ -1,10 +1,10 @@
 # Native RocksDB storage
 
-Cartograph `v3.0.3` uses RocksDB exclusively. Earlier v2 releases used
+CodeVetra `v3.0.3` uses RocksDB exclusively. Earlier v2 releases used
 PostgreSQL; install v3 and follow the source-rebuild migration below.
 
-Cartograph stores each project's graph and agent state in its own
-`.cartograph/data` RocksDB database. RocksDB **11.8.1** is compiled into the
+CodeVetra stores each project's graph and agent state in its own
+`.codevetra/data` RocksDB database. RocksDB **11.12.0** is compiled into the
 Rust executable through the pinned `rust-rocksdb` binding. There is no database
 server, Docker requirement, SQL runtime, or selectable PostgreSQL backend.
 
@@ -59,12 +59,12 @@ proven local edits can reuse the validated graph and publish sparse file
 replacements. Declaration, resolution, clone and policy
 changes retain full reconciliation; see [freshness tuning](PERF-TUNING.md#freshness). Status still compares the live supported source with the
 published generation. A running watcher does not prove freshness: require
-`cartograph status .` and a real query to report current evidence. A source edit
+`codevetra status .` and a real query to report current evidence. A source edit
 during indexing is reported explicitly and schedules another reconciliation.
 Use `--no-auto-sync` on a host only when intentionally keeping it quiescent.
 
-For autosync across MCP sessions, run `cartograph watch --project-path .` on
-Unix or use `cartograph service start --project-path .` on macOS. The login
+For autosync across MCP sessions, run `codevetra watch --project-path .` on
+Unix or use `codevetra service start --project-path .` on macOS. The login
 service runs the same native owner and same-user IPC path. It owns one private
 LaunchAgent registration per canonical project, pins the invoking executable,
 restarts unsuccessful exits, and drains work on termination. `service status`
@@ -74,10 +74,10 @@ reports registration, loaded state, and IPC availability independently.
 ## Migration and first use
 
 ```sh
-cartograph db migrate --to rocksdb --project-path . --format json
-cartograph doctor . --format json
-cartograph status . --format json
-cartograph find ProjectRuntime --project-path . --format json
+codevetra db migrate --to rocksdb --project-path . --format json
+codevetra doctor . --format json
+codevetra status . --format json
+codevetra find ProjectRuntime --project-path . --format json
 ```
 
 Migration rebuilds graph facts from the current checkout, verifies destination
@@ -88,15 +88,15 @@ embeddings, or generated artifacts. Keep legacy state if those records matter;
 there is no SQL importer in this checkout. `storageBackend` is a completed
 migration marker, not an engine-selection switch.
 
-New projects can run `cartograph index .` directly. Doctor reports native
+New projects can run `codevetra index .` directly. Doctor reports native
 capabilities separately from index freshness, model readiness, registration,
 and live MCP transport. Re-running an unchanged index should skip publication.
 
 ## Usage and bounded maintenance
 
 ```sh
-cartograph db usage --project-path . --format json
-cartograph db prune --project-path . --keep-superseded 2 \
+codevetra db usage --project-path . --format json
+codevetra db prune --project-path . --keep-superseded 2 \
   --maximum-deletions 4 --maximum-cascade-rows 10000 \
   --confirm prune-old-generations --format json
 ```

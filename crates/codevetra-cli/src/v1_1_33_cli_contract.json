@@ -1,0 +1,1292 @@
+[
+  {
+    "path": "codevetra",
+    "aliases": [],
+    "options": [
+      "no-color",
+      "version"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra admin",
+    "aliases": [],
+    "options": [],
+    "positionals": []
+  },
+  {
+    "path": "codevetra admin init",
+    "aliases": [],
+    "options": [
+      "database-connection-timeout-seconds",
+      "database-max-connections",
+      "database-pgvector",
+      "database-provider",
+      "database-query-timeout-ms",
+      "database-schema",
+      "database-ssl",
+      "database-url",
+      "index",
+      "max-file-size",
+      "verbose"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin uninit",
+    "aliases": [],
+    "options": [
+      "force"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin index",
+    "aliases": [],
+    "options": [
+      "clear-parse-cache",
+      "force",
+      "max-file-size",
+      "parse-workers",
+      "profile",
+      "quiet",
+      "verbose"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin embed-only",
+    "aliases": [],
+    "options": [
+      "max-file-size",
+      "quiet",
+      "verbose"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin sync",
+    "aliases": [],
+    "options": [
+      "max-file-size",
+      "quiet"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin biomarkers-refresh",
+    "aliases": [],
+    "options": [
+      "quiet"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin summarize",
+    "aliases": [],
+    "options": [
+      "all",
+      "concurrency",
+      "endpoint",
+      "limit",
+      "model",
+      "quiet"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin embed",
+    "aliases": [],
+    "options": [
+      "concurrency",
+      "quiet"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin classify",
+    "aliases": [],
+    "options": [
+      "concurrency",
+      "quiet"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin unlock",
+    "aliases": [],
+    "options": [],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin migrate",
+    "aliases": [],
+    "options": [],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin storage-migrate",
+    "aliases": [],
+    "options": [
+      "database-connection-timeout-seconds",
+      "database-max-connections",
+      "database-pgvector",
+      "database-provider",
+      "database-query-timeout-ms",
+      "database-schema",
+      "database-ssl",
+      "database-url",
+      "force"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin build-similarity-edges",
+    "aliases": [],
+    "options": [
+      "k",
+      "min-score"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin prune-store",
+    "aliases": [],
+    "options": [
+      "max-age-days"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin embedding-audit",
+    "aliases": [],
+    "options": [],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin embedding-cleanup",
+    "aliases": [],
+    "options": [
+      "confirm"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin scip-export",
+    "aliases": [],
+    "options": [
+      "out"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin scip-import",
+    "aliases": [],
+    "options": [
+      "in"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin install-models",
+    "aliases": [],
+    "options": [
+      "dir",
+      "minimal",
+      "project-path",
+      "write-config"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra admin doctor",
+    "aliases": [],
+    "options": [
+      "fix",
+      "json",
+      "no-project-checks",
+      "skip-project-checks"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin llm-plan",
+    "aliases": [],
+    "options": [],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra admin llm-apply",
+    "aliases": [],
+    "options": [
+      "preset",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra admin llm-tune",
+    "aliases": [],
+    "options": [
+      "concurrency",
+      "tier"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra summaries",
+    "aliases": [],
+    "options": [
+      "action"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra summaries pending",
+    "aliases": [],
+    "options": [
+      "limit",
+      "model-hint",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra summaries save",
+    "aliases": [],
+    "options": [
+      "model",
+      "project-path"
+    ],
+    "positionals": [
+      "json-file"
+    ]
+  },
+  {
+    "path": "codevetra review",
+    "aliases": [],
+    "options": [
+      "mode"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra review context",
+    "aliases": [],
+    "options": [
+      "diff",
+      "max-callees-per-symbol",
+      "max-callers-per-symbol",
+      "max-co-change-warnings",
+      "min-co-change-jaccard",
+      "min-diff-magnitude",
+      "project-path"
+    ],
+    "positionals": [
+      "diff-file"
+    ]
+  },
+  {
+    "path": "codevetra review neighbors",
+    "aliases": [],
+    "options": [
+      "files",
+      "k",
+      "no-dedupe-by-name",
+      "project-path",
+      "symbols"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra review risk",
+    "aliases": [],
+    "options": [
+      "coverage-source",
+      "limit",
+      "min-centrality",
+      "path-filter",
+      "project-path",
+      "top-n"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra review agent-audit",
+    "aliases": [],
+    "options": [
+      "min-severity",
+      "per-detector-limit",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra review trust",
+    "aliases": [],
+    "options": [
+      "deep",
+      "project-path",
+      "timeout-ms"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra llm",
+    "aliases": [],
+    "options": [],
+    "positionals": []
+  },
+  {
+    "path": "codevetra llm setup",
+    "aliases": [],
+    "options": [],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra llm smoke",
+    "aliases": [],
+    "options": [
+      "json",
+      "timeout-ms"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra llm install",
+    "aliases": [],
+    "options": [
+      "database-connection-timeout-seconds",
+      "database-max-connections",
+      "database-pgvector",
+      "database-provider",
+      "database-query-timeout-ms",
+      "database-schema",
+      "database-ssl",
+      "database-url",
+      "minimal",
+      "no-models"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra session",
+    "aliases": [],
+    "options": [],
+    "positionals": []
+  },
+  {
+    "path": "codevetra session create",
+    "aliases": [],
+    "options": [
+      "label",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra session resume",
+    "aliases": [],
+    "options": [
+      "id",
+      "label",
+      "project-path"
+    ],
+    "positionals": [
+      "id"
+    ]
+  },
+  {
+    "path": "codevetra session audit",
+    "aliases": [],
+    "options": [
+      "id",
+      "label",
+      "project-path"
+    ],
+    "positionals": [
+      "id"
+    ]
+  },
+  {
+    "path": "codevetra session usage",
+    "aliases": [],
+    "options": [
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra session list",
+    "aliases": [],
+    "options": [
+      "limit",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra session delete",
+    "aliases": [],
+    "options": [
+      "id",
+      "label",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra session macro_save",
+    "aliases": [
+      "macro-save"
+    ],
+    "options": [
+      "name",
+      "project-path",
+      "steps"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra session macro_run",
+    "aliases": [
+      "macro-run"
+    ],
+    "options": [
+      "args",
+      "name",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra session macro_list",
+    "aliases": [
+      "macro-list"
+    ],
+    "options": [
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra session macro_delete",
+    "aliases": [
+      "macro-delete"
+    ],
+    "options": [
+      "name",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra at-range",
+    "aliases": [],
+    "options": [
+      "compact",
+      "diff",
+      "fields",
+      "limit",
+      "low-tokens",
+      "project-path",
+      "ranges"
+    ],
+    "positionals": [
+      "file",
+      "startLine",
+      "endLine"
+    ]
+  },
+  {
+    "path": "codevetra ask",
+    "aliases": [],
+    "options": [
+      "endpoint",
+      "max-tokens",
+      "mode",
+      "model",
+      "project-path",
+      "prompt",
+      "quiet",
+      "retrieve-k",
+      "system"
+    ],
+    "positionals": [
+      "question",
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra status",
+    "aliases": [],
+    "options": [
+      "json",
+      "summary-breakdown",
+      "top-biomarkers",
+      "top-hotspots",
+      "verbose"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra find",
+    "aliases": [],
+    "options": [
+      "allow-stale",
+      "by",
+      "case-sensitive",
+      "compact",
+      "different-language",
+      "fields",
+      "key",
+      "kind",
+      "language",
+      "language-filter",
+      "limit",
+      "low-tokens",
+      "mode",
+      "no-include-tests",
+      "op",
+      "path-filter",
+      "project-path",
+      "query",
+      "same-language",
+      "since",
+      "symbol"
+    ],
+    "positionals": [
+      "query"
+    ]
+  },
+  {
+    "path": "codevetra digest",
+    "aliases": [],
+    "options": [
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra files",
+    "aliases": [],
+    "options": [
+      "dir",
+      "dir-path",
+      "direction",
+      "file",
+      "format",
+      "include-imports",
+      "include-parameters",
+      "json",
+      "kinds",
+      "limit",
+      "line-limit",
+      "line-offset",
+      "low-tokens",
+      "max-depth",
+      "no-metadata",
+      "no-symbols",
+      "pattern",
+      "project-path"
+    ],
+    "positionals": [
+      "target"
+    ]
+  },
+  {
+    "path": "codevetra export",
+    "aliases": [],
+    "options": [
+      "edge-kind",
+      "file",
+      "format",
+      "kind",
+      "language",
+      "limit",
+      "out",
+      "project-path"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra affected",
+    "aliases": [],
+    "options": [
+      "depth",
+      "files",
+      "filter",
+      "include-commands",
+      "include-tests",
+      "json",
+      "project-path",
+      "quiet",
+      "stdin"
+    ],
+    "positionals": [
+      "files"
+    ]
+  },
+  {
+    "path": "codevetra serve",
+    "aliases": [],
+    "options": [
+      "allow-stale-default",
+      "daemon",
+      "daemon-child",
+      "disable-tool",
+      "low-tokens-default",
+      "mcp",
+      "no-daemon",
+      "no-startup-sync",
+      "no-write-tools",
+      "profile",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra mcp-budget",
+    "aliases": [],
+    "options": [
+      "disable-tool",
+      "json",
+      "no-write-tools",
+      "profile",
+      "top"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra install",
+    "aliases": [],
+    "options": [
+      "command",
+      "location",
+      "no-hooks",
+      "no-permissions",
+      "print-config",
+      "target",
+      "yes"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra uninstall",
+    "aliases": [],
+    "options": [
+      "location"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra install-hooks",
+    "aliases": [],
+    "options": [
+      "command",
+      "dry-run",
+      "hooks",
+      "remove"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra trace-to-culprits",
+    "aliases": [],
+    "options": [
+      "limit",
+      "project-path",
+      "trace"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra sync-if-dirty",
+    "aliases": [],
+    "options": [
+      "max-file-size",
+      "quiet"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra playbook",
+    "aliases": [],
+    "options": [],
+    "positionals": []
+  },
+  {
+    "path": "codevetra guide",
+    "aliases": [],
+    "options": [],
+    "positionals": []
+  },
+  {
+    "path": "codevetra index",
+    "aliases": [
+      "quickstart"
+    ],
+    "options": [],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra viewer",
+    "aliases": [],
+    "options": [
+      "no-open",
+      "port",
+      "session"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra backend",
+    "aliases": [],
+    "options": [],
+    "positionals": []
+  },
+  {
+    "path": "codevetra backend status",
+    "aliases": [],
+    "options": [
+      "json"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra backend start",
+    "aliases": [],
+    "options": [
+      "bin",
+      "dry-run",
+      "json"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra backend restart",
+    "aliases": [],
+    "options": [
+      "bin",
+      "dry-run",
+      "force",
+      "json",
+      "tier"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra backend stop",
+    "aliases": [],
+    "options": [
+      "force",
+      "json"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra backend logs",
+    "aliases": [],
+    "options": [
+      "json",
+      "lines",
+      "tier"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra doctor",
+    "aliases": [],
+    "options": [
+      "fix",
+      "json",
+      "no-project-checks",
+      "skip-project-checks"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra upgrade",
+    "aliases": [
+      "update"
+    ],
+    "options": [
+      "apply",
+      "json"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra setup",
+    "aliases": [],
+    "options": [
+      "database-connection-timeout-seconds",
+      "database-max-connections",
+      "database-pgvector",
+      "database-provider",
+      "database-query-timeout-ms",
+      "database-schema",
+      "database-ssl",
+      "database-url",
+      "minimal",
+      "no-models"
+    ],
+    "positionals": [
+      "path"
+    ]
+  },
+  {
+    "path": "codevetra completions",
+    "aliases": [
+      "completion"
+    ],
+    "options": [],
+    "positionals": [
+      "shell"
+    ]
+  },
+  {
+    "path": "codevetra __complete",
+    "aliases": [],
+    "options": [],
+    "positionals": [
+      "words"
+    ]
+  },
+  {
+    "path": "codevetra similar",
+    "aliases": [],
+    "options": [
+      "min-score",
+      "project-path",
+      "same-language",
+      "top-k"
+    ],
+    "positionals": [
+      "symbol"
+    ]
+  },
+  {
+    "path": "codevetra changed-since",
+    "aliases": [],
+    "options": [
+      "project-path",
+      "since"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra verify",
+    "aliases": [],
+    "options": [
+      "depth",
+      "files",
+      "format",
+      "project-path",
+      "ref"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra note",
+    "aliases": [],
+    "options": [
+      "action",
+      "author",
+      "id",
+      "kind",
+      "limit",
+      "project-path",
+      "since",
+      "symbol",
+      "text"
+    ],
+    "positionals": [
+      "action"
+    ]
+  },
+  {
+    "path": "codevetra entry-points",
+    "aliases": [],
+    "options": [
+      "bucket",
+      "limit",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra context",
+    "aliases": [],
+    "options": [
+      "code",
+      "explain",
+      "format",
+      "include-code",
+      "local-learning",
+      "low-tokens",
+      "max-nodes",
+      "no-code",
+      "project-path",
+      "query",
+      "retrieval-mode",
+      "working-tree"
+    ],
+    "positionals": [
+      "task"
+    ]
+  },
+  {
+    "path": "codevetra propose-rename",
+    "aliases": [],
+    "options": [
+      "doc-limit",
+      "limit",
+      "project-path"
+    ],
+    "positionals": [
+      "symbol",
+      "newName"
+    ]
+  },
+  {
+    "path": "codevetra blame",
+    "aliases": [],
+    "options": [
+      "limit",
+      "per-commit-peers",
+      "project-path"
+    ],
+    "positionals": [
+      "symbol"
+    ]
+  },
+  {
+    "path": "codevetra history",
+    "aliases": [],
+    "options": [
+      "limit",
+      "min-count",
+      "project-path"
+    ],
+    "positionals": [
+      "symbol"
+    ]
+  },
+  {
+    "path": "codevetra node",
+    "aliases": [],
+    "options": [
+      "code",
+      "deep",
+      "detail",
+      "include-betweenness",
+      "include-biomarkers",
+      "include-callees",
+      "include-callers",
+      "include-tests",
+      "line-limit",
+      "line-offset",
+      "live-source",
+      "low-tokens",
+      "project-path",
+      "symbol"
+    ],
+    "positionals": [
+      "symbols"
+    ]
+  },
+  {
+    "path": "codevetra compare-to-ref",
+    "aliases": [],
+    "options": [
+      "findings-delta",
+      "head",
+      "include-biomarkers",
+      "include-edges",
+      "no-suppress-line-range-only",
+      "path-filter",
+      "project-path",
+      "ref",
+      "suppress-line-range-only"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra deps",
+    "aliases": [],
+    "options": [
+      "limit",
+      "low-tokens",
+      "mode",
+      "project-path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra biomarkers",
+    "aliases": [],
+    "options": [
+      "biomarker",
+      "exclude-file",
+      "format",
+      "limit",
+      "low-tokens",
+      "max-metric",
+      "min-centrality",
+      "min-metric",
+      "min-severity",
+      "mode",
+      "project-path",
+      "symbol",
+      "symbols"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra hotspots",
+    "aliases": [],
+    "options": [
+      "category",
+      "limit",
+      "min-centrality",
+      "min-commits",
+      "project-path",
+      "recency-days",
+      "sort-by"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra host",
+    "aliases": [],
+    "options": [
+      "include-install-targets",
+      "location",
+      "low-tokens",
+      "max-depth",
+      "mode",
+      "no-include-install-targets",
+      "path"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra dead-code",
+    "aliases": [],
+    "options": [
+      "exclude-fixtures",
+      "include-tests",
+      "limit",
+      "max-candidates",
+      "mode",
+      "no-exclude-fixtures",
+      "project-path",
+      "verdict",
+      "via"
+    ],
+    "positionals": []
+  },
+  {
+    "path": "codevetra imports",
+    "aliases": [],
+    "options": [
+      "dynamic",
+      "exclude-fixtures",
+      "ext-missing",
+      "file",
+      "language",
+      "limit",
+      "low-tokens",
+      "no-exclude-fixtures",
+      "project-path",
+      "source",
+      "target"
+    ],
+    "positionals": [
+      "pathFilter"
+    ]
+  },
+  {
+    "path": "codevetra explore",
+    "aliases": [],
+    "options": [
+      "low-tokens",
+      "max-files",
+      "project-path",
+      "query",
+      "since",
+      "start",
+      "summary"
+    ],
+    "positionals": [
+      "query"
+    ]
+  },
+  {
+    "path": "codevetra tests-for",
+    "aliases": [],
+    "options": [
+      "depth",
+      "files",
+      "filter",
+      "project-path"
+    ],
+    "positionals": [
+      "symbol"
+    ]
+  },
+  {
+    "path": "codevetra role",
+    "aliases": [],
+    "options": [
+      "limit",
+      "project-path",
+      "symbol",
+      "symbols",
+      "via"
+    ],
+    "positionals": [
+      "role"
+    ]
+  },
+  {
+    "path": "codevetra sql",
+    "aliases": [],
+    "options": [
+      "compact",
+      "limit",
+      "project-path",
+      "schema",
+      "tables",
+      "timeout-ms"
+    ],
+    "positionals": [
+      "query"
+    ]
+  },
+  {
+    "path": "codevetra coverage",
+    "aliases": [],
+    "options": [
+      "clear",
+      "include-tests",
+      "kinds",
+      "limit",
+      "max-pct",
+      "min-centrality",
+      "mode",
+      "no-include-tests",
+      "path-filter",
+      "project-path",
+      "report-path",
+      "source",
+      "via"
+    ],
+    "positionals": [
+      "symbol"
+    ]
+  },
+  {
+    "path": "codevetra graph",
+    "aliases": [],
+    "options": [
+      "compact",
+      "direction",
+      "edge-kind",
+      "fields",
+      "hops",
+      "include-roles",
+      "include-tests",
+      "limit",
+      "low-tokens",
+      "max-nodes",
+      "min-confidence",
+      "min-score",
+      "no-compact",
+      "no-include-tests",
+      "project-path",
+      "rank-by",
+      "same-language",
+      "since",
+      "start",
+      "to",
+      "top-k"
+    ],
+    "positionals": [
+      "start"
+    ]
+  }
+]

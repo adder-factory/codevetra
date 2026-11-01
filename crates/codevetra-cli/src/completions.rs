@@ -1,0 +1,186 @@
+use std::collections::BTreeSet;
+
+use clap::{Command, ValueEnum};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(super) enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Powershell,
+}
+
+pub(super) fn render_script(shell: CompletionShell) -> &'static str {
+    match shell {
+        CompletionShell::Bash => {
+            r#"# codevetra shell completion for bash
+_codevetra_completion() {
+  local completions
+  completions="$(command codevetra __complete "${COMP_WORDS[@]:1:COMP_CWORD}" 2>/dev/null)" || return 0
+  COMPREPLY=($(compgen -W "$completions" -- "${COMP_WORDS[COMP_CWORD]}"))
+}
+
+complete -o default -F _codevetra_completion codevetra
+"#
+        }
+        CompletionShell::Zsh => {
+            r#"#compdef codevetra
+# codevetra shell completion for zsh
+_codevetra_completion() {
+  local -a completions
+  local candidate
+  while IFS= read -r candidate; do
+    completions+=("$candidate")
+  done < <(command codevetra __complete "${words[@]:1}" 2>/dev/null)
+  compadd -- "${completions[@]}"
+}
+
+_codevetra_completion "$@"
+"#
+        }
+        CompletionShell::Fish => {
+            r#"# codevetra shell completion for fish
+function __codevetra_complete
+  set -l tokens (commandline -opc)
+  if test (count $tokens) -gt 0
+    set tokens $tokens[2..-1]
+  end
+  command codevetra __complete $tokens 2>/dev/null
+end
+
+complete -c codevetra -f -a "(__codevetra_complete)"
+"#
+        }
+        CompletionShell::Powershell => {
+            r"# codevetra shell completion for PowerShell
+Register-ArgumentCompleter -Native -CommandName codevetra -ScriptBlock {
+  param($wordToComplete, $commandAst, $cursorPosition)
+  $words = @($commandAst.CommandElements | ForEach-Object { $_.ToString() })
+  if ($words.Count -le 1) { $words = @() } else { $words = $words[1..($words.Count - 1)] }
+  $completions = & codevetra __complete @words 2>$null
+  foreach ($completion in $completions) {
+    [System.Management.Automation.CompletionResult]::new($completion, $completion, 'ParameterValue', $completion)
+  }
+}
+"
+        }
+    }
+}
+
+pub(super) fn complete(command: &Command, words: &[String]) -> Vec<String> {
+    let words = words
+        .strip_prefix(&["codevetra".to_owned()])
+        .unwrap_or(words);
+    let current = words.last().map_or("", String::as_str);
+    let previous = words
+        .get(..words.len().saturating_sub(1))
+        .unwrap_or_default();
+    let selected = resolve_command(command, previous);
+    if let Some(choices) = option_choices(selected, previous.last().map(String::as_str)) {
+        return filter(choices, current);
+    }
+    filter(command_candidates(selected, current), current)
+}
+
+fn command_candidates(selected: &Command, current: &str) -> BTreeSet<String> {
+    let mut candidates = BTreeSet::new();
+    if !current.starts_with('-') {
+        append_subcommand_candidates(selected, &mut candidates);
+    }
+    candidates.insert("--help".to_owned());
+    append_argument_candidates(selected, &mut candidates);
+    candidates
+}
+
+fn append_subcommand_candidates(selected: &Command, candidates: &mut BTreeSet<String>) {
+    for subcommand in selected.get_subcommands() {
+        if subcommand.is_hide_set() || subcommand.get_name().starts_with("__") {
+            continue;
+        }
+        candidates.insert(subcommand.get_name().to_owned());
+        candidates.extend(subcommand.get_all_aliases().map(str::to_owned));
+    }
+}
+
+fn append_argument_candidates(selected: &Command, candidates: &mut BTreeSet<String>) {
+    for argument in selected.get_arguments() {
+        if argument.is_hide_set() {
+            continue;
+        }
+        if let Some(long) = argument.get_long() {
+            candidates.insert(format!("--{long}"));
+        }
+        if let Some(short) = argument.get_short() {
+            candidates.insert(format!("-{short}"));
+        }
+    }
+}
+
+fn resolve_command<'command>(
+    mut command: &'command Command,
+    words: &[String],
+) -> &'command Command {
+    for word in words {
+        if word == "--" {
+            break;
+        }
+        if word.starts_with('-') {
+            continue;
+        }
+        let Some(next) = command.get_subcommands().find(|candidate| {
+            candidate.get_name() == word || candidate.get_all_aliases().any(|alias| alias == word)
+        }) else {
+            break;
+        };
+        command = next;
+    }
+    command
+}
+
+fn option_choices(command: &Command, previous: Option<&str>) -> Option<BTreeSet<String>> {
+    let previous = previous?.strip_prefix('-')?.trim_start_matches('-');
+    let argument = command.get_arguments().find(|argument| {
+        argument.get_long() == Some(previous)
+            || argument
+                .get_short()
+                .is_some_and(|short| previous == short.to_string())
+    })?;
+    let values = argument
+        .get_value_parser()
+        .possible_values()?
+        .map(|value| value.get_name().to_owned())
+        .collect::<BTreeSet<_>>();
+    (!values.is_empty()).then_some(values)
+}
+
+fn filter(candidates: BTreeSet<String>, current: &str) -> Vec<String> {
+    candidates
+        .into_iter()
+        .filter(|candidate| current.is_empty() || candidate.starts_with(current))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{Arg, Command};
+
+    #[test]
+    fn dynamic_completion_routes_subcommands_options_and_enum_values() {
+        let command = Command::new("codevetra").subcommand(
+            Command::new("find").arg(Arg::new("by").long("by").value_parser(["name", "content"])),
+        );
+        assert_eq!(complete(&command, &[String::new()]), vec!["--help", "find"]);
+        assert_eq!(
+            complete(&command, &["find".to_owned(), "--b".to_owned()]),
+            vec!["--by"]
+        );
+        assert_eq!(
+            complete(
+                &command,
+                &["find".to_owned(), "--by".to_owned(), "n".to_owned()]
+            ),
+            vec!["name"]
+        );
+    }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "codevetra-search"
+publish = false
+description = "Deterministic native graph retrieval and evidence assembly for CodeVetra v2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+codevetra-db.workspace = true
+codevetra-domain.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

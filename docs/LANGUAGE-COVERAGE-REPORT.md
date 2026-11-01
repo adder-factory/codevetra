@@ -4,7 +4,7 @@
 [Grammar provenance](GRAMMAR-ASSETS.md) ·
 [Extend support](EXTENDING-EXTRACTORS-RESOLVERS.md)
 
-Last release audit: 2026-10-26 (`v3.0.6`).
+Last release audit: 2026-11-01 (`v4.0.0`).
 
 This report states what "supported" means for a language mode and where the
 evidence for each admitted mode lives. For the per-language inventory, read the
@@ -18,7 +18,7 @@ evidence for each admitted mode lives. For the per-language inventory, read the
 
 ## Current inventory
 
-Cartograph production-admits all 73 v1.1.33 language modes and all 163 v1
+CodeVetra production-admits all 73 v1.1.33 language modes and all 163 v1
 extensions, plus additive Python `.pyi`, native TOML, and 52 dedicated textual
 game-scripting modes, the WGSL and Metal shader modes added in v2.1.12, and
 Slang and WESL added in v2.1.15, plus Ada/SPARK and VHDL added in v2.1.27, and Kamailio and rtpengine: 134
@@ -31,11 +31,11 @@ modes total.
 
 Where the inventory is defined:
 
-- **Modes:** `cartograph_domain::SourceLanguage::ALL`.
+- **Modes:** `codevetra_domain::SourceLanguage::ALL`.
 - **Extension mapping and detection:** the `source_languages!` table and the
-  `detect_*` helpers in `crates/cartograph-domain/src/source.rs`.
-- **Grammar selection:** `crates/cartograph-extract/src/grammars.rs`; extractor
-  strategy: `crates/cartograph-extract/src/language.rs`.
+  `detect_*` helpers in `crates/codevetra-domain/src/source.rs`.
+- **Grammar selection:** `crates/codevetra-extract/src/grammars.rs`; extractor
+  strategy: `crates/codevetra-extract/src/language.rs`.
 - **Human-readable inventory:** the [support matrix](SUPPORT-MATRIX.md).
 - **Game-language research boundary and source trail:**
   [game scripting language coverage](v2/GAME-SCRIPTING-LANGUAGES.md).
@@ -43,8 +43,8 @@ Where the inventory is defined:
 ## Strategy families
 
 Every mode has exactly one `ExtractionStrategy`, chosen in
-`crates/cartograph-extract/src/language.rs`. The walker dispatch for each
-grammar-backed family lives in `crates/cartograph-extract/src/walk.rs` and
+`crates/codevetra-extract/src/language.rs`. The walker dispatch for each
+grammar-backed family lives in `crates/codevetra-extract/src/walk.rs` and
 `walk/<family>_family.rs`.
 
 | Strategy | Modes |
@@ -123,14 +123,14 @@ pins; it has no runtime matching heuristics.
 
 | Part | Location |
 | --- | --- |
-| Test target | `crates/cartograph-extract/tests/v1_parity_oracle.rs` (runs in `cargo test --locked --workspace`) |
-| Fixture corpus, one per v1 mode | `crates/cartograph-extract/tests/fixtures/v1_parity/<mode>/` |
-| Captured v1.1.33 facts | `crates/cartograph-extract/tests/fixtures/v1_parity/expected/<mode>.json` |
-| Exact alignments | `crates/cartograph-extract/tests/fixtures/v1_parity/alignments.jsonl` |
-| Missing-fact ledger | `crates/cartograph-extract/tests/fixtures/v1_parity/divergences.jsonl` |
-| Shared gap and correction evidence | `crates/cartograph-extract/tests/fixtures/v1_parity/reasons.jsonl` |
-| Small gate regressions | `crates/cartograph-extract/tests/fixtures/v1_parity/gate_cases.jsonl` |
-| Adversarial review regressions | `crates/cartograph-extract/tests/fixtures/v1_parity/counterexamples.jsonl` |
+| Test target | `crates/codevetra-extract/tests/v1_parity_oracle.rs` (runs in `cargo test --locked --workspace`) |
+| Fixture corpus, one per v1 mode | `crates/codevetra-extract/tests/fixtures/v1_parity/<mode>/` |
+| Captured v1.1.33 facts | `crates/codevetra-extract/tests/fixtures/v1_parity/expected/<mode>.json` |
+| Exact alignments | `crates/codevetra-extract/tests/fixtures/v1_parity/alignments.jsonl` |
+| Missing-fact ledger | `crates/codevetra-extract/tests/fixtures/v1_parity/divergences.jsonl` |
+| Shared gap and correction evidence | `crates/codevetra-extract/tests/fixtures/v1_parity/reasons.jsonl` |
+| Small gate regressions | `crates/codevetra-extract/tests/fixtures/v1_parity/gate_cases.jsonl` |
+| Adversarial review regressions | `crates/codevetra-extract/tests/fixtures/v1_parity/counterexamples.jsonl` |
 | Capture script (maintainer-only) | `scripts/capture-v1-parity-oracle.sh` |
 
 ### What the oracle checks
@@ -184,7 +184,7 @@ Three tests make up the target:
 Run the target with diagnostics visible:
 
 ```sh
-cargo test --locked -p cartograph-extract --test v1_parity_oracle -- --nocapture
+cargo test --locked -p codevetra-extract --test v1_parity_oracle -- --nocapture
 ```
 
 Read the frozen selector and up to three nearby native candidates. Suggestions
@@ -214,11 +214,11 @@ detail).
 
 The per-file gate cannot check which declaration a reference resolves to. The
 companion resolution oracle
-(`crates/cartograph-indexer/src/native_pipeline/tests/v1_resolution_oracle.rs`)
+(`crates/codevetra-indexer/src/native_pipeline/tests/v1_resolution_oracle.rs`)
 runs the native pipeline over the same 73 frozen corpora and requires each of
 the 1,730 captured v1 cross-file edges (1,724 distinct facts) to reach the same
 target file and declaration, a pinned alignment, or a ledger entry. Its
-[README](../crates/cartograph-indexer/tests/fixtures/v1_resolution/README.md)
+[README](../crates/codevetra-indexer/tests/fixtures/v1_resolution/README.md)
 owns the tables, update procedure and pending inventory.
 
 | Disposition (v3.0.6) | Distinct facts |
@@ -229,7 +229,7 @@ owns the tables, update procedure and pending inventory.
 | Pending, wave 3 | 96 |
 
 Run it with
-`cargo test --locked -p cartograph-indexer --lib v1_resolution_oracle -- --nocapture`.
+`cargo test --locked -p codevetra-indexer --lib v1_resolution_oracle -- --nocapture`.
 
 ### Frozen capture provenance
 
@@ -243,10 +243,10 @@ they never run the historical binary.
 ## Validation evidence
 
 Rust test surfaces include the focused extractor family suites under
-`crates/cartograph-extract/tests/`, the frozen v1.1.33 oracle for TypeScript,
+`crates/codevetra-extract/tests/`, the frozen v1.1.33 oracle for TypeScript,
 JavaScript, TSX, JSX, C, C++, Java, and C# (`tests/v1_oracle.rs`), the
 per-language [v1 parity oracle](#v1-parity-oracle), the native corpus
-supervisor under `crates/cartograph-indexer/tests/`, and live PostgreSQL/
+supervisor under `crates/codevetra-indexer/tests/`, and live PostgreSQL/
 ParadeDB language publication tests. These live suites run in
 `.github/workflows/v2-rust.yml` against the pinned database image rather than
 trusting a generated count alone, and `release.yml` refuses to publish a tag

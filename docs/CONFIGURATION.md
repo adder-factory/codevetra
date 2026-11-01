@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [Storage and operations](STORAGE-BACKENDS.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Cartograph keeps non-secret project policy in `.cartograph/config.json`.
+CodeVetra keeps non-secret project policy in `.codevetra/config.json`.
 API credentials belong in the process environment or private
 managed state, never in a committed file. This page is the reference for every
 project-configuration key and environment variable; read it before you change
@@ -26,7 +26,7 @@ Every key is optional. Byte values are plain integers in the file.
 
 | Key | Default | Accepted values | Details |
 | --- | --- | --- | --- |
-| `version` | `2` when Cartograph writes a file | `2` for new files; below `2` is a legacy v1 file | [Legacy v1 files](#legacy-v1-files) |
+| `version` | `2` when CodeVetra writes a file | `2` for new files; below `2` is a legacy v1 file | [Legacy v1 files](#legacy-v1-files) |
 | `languages` | all supported modes | Stable language-mode allowlist; empty means all | [Source policy](#source-and-evidence-policy) |
 | `include` | omitted (all admitted paths) | At most 4,096 globs of at most 4,096 bytes each | [Excluding paths](#excluding-paths) |
 | `exclude` | `[]` plus built-in exclusions | At most 4,096 globs of at most 4,096 bytes each; `!` re-includes | [Excluding paths](#excluding-paths) |
@@ -60,30 +60,30 @@ Every key is optional. Byte values are plain integers in the file.
 
 | Variable | Default | Accepted values | Details |
 | --- | --- | --- | --- |
-| `CARTOGRAPH_WATCH_DEBOUNCE_MS` | 150 | 50..60000 ms; an invalid value uses 150 | [Auto-sync and MCP routing](#auto-sync-and-mcp-routing) |
-| `CARTOGRAPH_ALLOWED_PROJECTS` | unset (no extra restriction) | OS path list of project directories | [Auto-sync and MCP routing](#auto-sync-and-mcp-routing) |
-| `CARTOGRAPH_EMBEDDING_ENDPOINT`, `CARTOGRAPH_EMBEDDING_MODEL` | unset | Set both or neither; base URL or complete `/v1/embeddings` URL; model at most 256 bytes | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_EMBEDDING_API_KEY` | unset | At most 8 KiB | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_EMBEDDING_TIMEOUT_MS` | 120000 | 1..600000 | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_EMBEDDING_MAX_BATCH` | 32 | 1..128 inputs per request | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_EMBEDDING_MAX_INPUT_BYTES` | 2 MiB | 1 byte..16 MiB per request | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_EMBEDDING_MAX_RESPONSE_BYTES` | 16 MiB | 1 byte..64 MiB | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_CHAT_ENDPOINT`, `CARTOGRAPH_CHAT_MODEL` | unset | Set both or neither; model at most 256 bytes | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_CHAT_API_KEY` | unset | At most 8 KiB | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_CHAT_TIMEOUT_MS` | 120000 | 1..600000 | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_CHAT_MAX_INPUT_BYTES` | 512 KiB | 1 byte..4 MiB | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_CHAT_MAX_RESPONSE_BYTES` | 2 MiB | 1 byte..16 MiB | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
-| `CARTOGRAPH_CHAT_MAX_OUTPUT_TOKENS` | 4096 | 1..32768 | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_WATCH_DEBOUNCE_MS` | 150 | 50..60000 ms; an invalid value uses 150 | [Auto-sync and MCP routing](#auto-sync-and-mcp-routing) |
+| `CODEVETRA_ALLOWED_PROJECTS` | unset (no extra restriction) | OS path list of project directories | [Auto-sync and MCP routing](#auto-sync-and-mcp-routing) |
+| `CODEVETRA_EMBEDDING_ENDPOINT`, `CODEVETRA_EMBEDDING_MODEL` | unset | Set both or neither; base URL or complete `/v1/embeddings` URL; model at most 256 bytes | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_EMBEDDING_API_KEY` | unset | At most 8 KiB | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_EMBEDDING_TIMEOUT_MS` | 120000 | 1..600000 | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_EMBEDDING_MAX_BATCH` | 32 | 1..128 inputs per request | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_EMBEDDING_MAX_INPUT_BYTES` | 2 MiB | 1 byte..16 MiB per request | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_EMBEDDING_MAX_RESPONSE_BYTES` | 16 MiB | 1 byte..64 MiB | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_CHAT_ENDPOINT`, `CODEVETRA_CHAT_MODEL` | unset | Set both or neither; model at most 256 bytes | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_CHAT_API_KEY` | unset | At most 8 KiB | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_CHAT_TIMEOUT_MS` | 120000 | 1..600000 | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_CHAT_MAX_INPUT_BYTES` | 512 KiB | 1 byte..4 MiB | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_CHAT_MAX_RESPONSE_BYTES` | 2 MiB | 1 byte..16 MiB | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
+| `CODEVETRA_CHAT_MAX_OUTPUT_TOKENS` | 4096 | 1..32768 | [Environment overrides](#environment-overrides-for-embeddings-and-chat) |
 | `TYPESAFE_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | unset | Default credential variables when a tier names no source | [Credential sources](#credential-sources) |
 
 ## Where settings live
 
 | Concern | Location | Commit it? |
 | --- | --- | ---: |
-| Shared source admission, extraction, graph, and capacity policy | `.cartograph/config.json` | Yes, when the team shares the policy |
-| Additional Git-style source exclusions | `.cartographignore` | Yes |
-| Native graph and agent state | `.cartograph/data` | No |
-| Optional embedding, reranking, and chat credentials | Process environment or Cartograph-managed private state | No |
+| Shared source admission, extraction, graph, and capacity policy | `.codevetra/config.json` | Yes, when the team shares the policy |
+| Additional Git-style source exclusions | `.codevetraignore` | Yes |
+| Native graph and agent state | `.codevetra/data` | No |
+| Optional embedding, reranking, and chat credentials | Process environment or CodeVetra-managed private state | No |
 | One-command experiment or recovery override | The exact CLI flag shown by command help | No persistent change unless documented |
 
 ## Project configuration example
@@ -118,15 +118,15 @@ The file is optional. A representative v2 configuration is:
 
 ### Concurrent edits and file limits
 
-- Cartograph rewrites `.cartograph/config.json` (for example during
-  `cartograph llm setup`) while holding a lock on `.cartograph/config.lock`. A
+- CodeVetra rewrites `.codevetra/config.json` (for example during
+  `codevetra llm setup`) while holding a lock on `.codevetra/config.lock`. A
   second writer waits up to 2 seconds for that lock, then fails with
-  `Cartograph project configuration changed concurrently`.
+  `CodeVetra project configuration changed concurrently`.
 - The same error is returned, and nothing is written, when the file changed on
-  disk after Cartograph read it. Re-run the command to apply your change on top
+  disk after CodeVetra read it. Re-run the command to apply your change on top
   of the new content.
 - The file is capped at 1 MiB; a larger file fails with
-  `Cartograph project configuration is too large`.
+  `CodeVetra project configuration is too large`.
 - Writes are atomic (a synced temporary file replaces the original) and leave
   the file with mode `0600`.
 
@@ -134,13 +134,13 @@ The file is optional. A representative v2 configuration is:
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `version` | Config contract version. Use `2` for new files | `2` when Cartograph writes a file |
+| `version` | Config contract version. Use `2` for new files | `2` when CodeVetra writes a file |
 | `languages` | Stable language-mode allowlist; empty means every supported mode | all |
 | `include` | Project-relative glob allowlist; omitted means all admitted paths. At most 4,096 patterns of at most 4,096 bytes each | omitted |
 | `exclude` | Additional project-relative glob exclusions. At most 4,096 patterns of at most 4,096 bytes each | `[]` plus built-in exclusions |
 | `maxFileSize` | Per-source byte ceiling, 1 byte through 32 MiB | 32 MiB (the maximum) |
 | `maxAstDepth` | Defensive syntax-tree depth ceiling, 64 through 1024; overflow retains a partial file and reports its exact path | `256` |
-| `maxGenerationBytes` | Cartograph-process canonical/resolver ceiling, 1 byte through the hard maximum of 8 GiB; out-of-range errors name this field and range | 1 GiB |
+| `maxGenerationBytes` | CodeVetra-process canonical/resolver ceiling, 1 byte through the hard maximum of 8 GiB; out-of-range errors name this field and range | 1 GiB |
 | `generationStorage` | Legacy compatibility input; ignored by the native builder | retired |
 | `maxSpillBytes` | Legacy compatibility input; no native spill quota is selected | retired |
 | `maxSpillRows` | Legacy compatibility input; no native spill row quota is selected | retired |
@@ -163,22 +163,22 @@ The file is optional. A representative v2 configuration is:
 
 ### Legacy v1 files
 
-V1 config files remain readable. For a legacy `version` below 2, Cartograph
+V1 config files remain readable. For a legacy `version` below 2, CodeVetra
 adds `.pyi` and `.toml` admission when an old explicit include list would
 otherwise hide v2's additive coverage. New configuration should use version 2.
 
 ### Excluding paths
 
 Discovery follows Git-compatible ignore behavior, then applies explicit
-Cartograph policy. There are three ways to exclude a path, and all of them apply
+CodeVetra policy. There are three ways to exclude a path, and all of them apply
 to `sync-if-dirty` and the managed Git hooks, because an exclusion that stops
 holding the moment the index refreshes is not an exclusion.
 
 | Form | Scope | Semantics |
 | --- | --- | --- |
-| `exclude` array in `.cartograph/config.json` | Durable, shared | Globs; `!` re-includes |
-| `cartograph index --exclude <GLOB>` (repeatable) | The generation it publishes | Globs; `!` re-includes |
-| `.cartographignore` carrying patterns | Its directory tree | gitignore semantics |
+| `exclude` array in `.codevetra/config.json` | Durable, shared | Globs; `!` re-includes |
+| `codevetra index --exclude <GLOB>` (repeatable) | The generation it publishes | Globs; `!` re-includes |
+| `.codevetraignore` carrying patterns | Its directory tree | gitignore semantics |
 
 - `--exclude` is scoped to the generation it publishes. That generation stores
   the policy privately so status, `changed-since`, source reads, auto-sync, and
@@ -193,10 +193,10 @@ holding the moment the index refreshes is not an exclusion.
   { "exclude": ["benches/**", "!benches/src/lib.rs"] }
   ```
 
-- An *empty* `.cartographignore` keeps its original meaning: it excludes its
+- An *empty* `.codevetraignore` keeps its original meaning: it excludes its
   whole directory tree, and at the project root it opts the entire checkout out
   of indexing.
-- A `.cartographignore` with patterns is instead a gitignore-semantics ignore
+- A `.codevetraignore` with patterns is instead a gitignore-semantics ignore
   file, which means it also inherits git's own rule that a file cannot be
   re-included once a parent directory has been excluded — use the `exclude`
   array when you need that re-include.
@@ -233,9 +233,9 @@ bounded schema.
 
 ## Native storage
 
-Every project uses `.cartograph/data` with one primary owner. There is no SQL
+Every project uses `.codevetra/data` with one primary owner. There is no SQL
 connection, schema, port, connection pool, or TLS configuration. Retired
-`CARTOGRAPH_DATABASE_*` and `CARTOGRAPH_MANAGED_DATABASE_PORT` variables do not
+`CODEVETRA_DATABASE_*` and `CODEVETRA_MANAGED_DATABASE_PORT` variables do not
 select a backend. Old database CLI flags are rejected.
 
 On Unix, clients reuse a live MCP primary through its private same-user owner
@@ -247,8 +247,8 @@ See [storage operations](STORAGE-BACKENDS.md) for policy values and limits.
 
 | Variable | Effect |
 | --- | --- |
-| `CARTOGRAPH_WATCH_DEBOUNCE_MS` | MCP auto-sync quiet window, 50 through 60,000 ms; an unset, unparsable, or out-of-range value uses the 150 ms default. See [Performance tuning](PERF-TUNING.md#auto-sync-watcher) for the coalescing deadline |
-| `CARTOGRAPH_ALLOWED_PROJECTS` | Restricts the MCP `projectPath` argument. When set, it is an OS path list (`:`-separated on Unix, `;` on Windows) of directories; a routed project must be the server's own project, a directory below it, or one of the listed directories or below it. Entries that do not resolve to an existing directory are ignored. Other projects fail with `projectPath is outside CARTOGRAPH_ALLOWED_PROJECTS`. When unset, any initialized project can be routed |
+| `CODEVETRA_WATCH_DEBOUNCE_MS` | MCP auto-sync quiet window, 50 through 60,000 ms; an unset, unparsable, or out-of-range value uses the 150 ms default. See [Performance tuning](PERF-TUNING.md#auto-sync-watcher) for the coalescing deadline |
+| `CODEVETRA_ALLOWED_PROJECTS` | Restricts the MCP `projectPath` argument. When set, it is an OS path list (`:`-separated on Unix, `;` on Windows) of directories; a routed project must be the server's own project, a directory below it, or one of the listed directories or below it. Entries that do not resolve to an existing directory are ignored. Other projects fail with `projectPath is outside CODEVETRA_ALLOWED_PROJECTS`. When unset, any initialized project can be routed |
 
 ## Optional LLM tiers
 
@@ -258,8 +258,8 @@ remain usable without it.
 
 ### Optional Jev navigation
 
-Jev can choose retrieval actions for `cartograph explore` / `cartograph_explore`.
-The calling assistant sends the code question to Cartograph; Cartograph asks
+Jev can choose retrieval actions for `codevetra explore` / `codevetra_explore`.
+The calling assistant sends the code question to CodeVetra; CodeVetra asks
 Jev to select bounded source, callers, callees, exact-name and file-outline
 lookups, executes those lookups locally, and returns the evidence to the
 assistant. Jev does not generate the final answer or replace the code index.
@@ -268,9 +268,9 @@ Bring your own Typesafe API key through the environment of the CLI or MCP host:
 
 ```sh
 # Supply TYPESAFE_API_KEY through your shell or secret manager first.
-cartograph llm setup . --preset jev --api-key-env TYPESAFE_API_KEY
-cartograph explore 'how is request cancellation handled?'
-cartograph explore 'how is request cancellation handled?' --decision native
+codevetra llm setup . --preset jev --api-key-env TYPESAFE_API_KEY
+codevetra explore 'how is request cancellation handled?'
+codevetra explore 'how is request cancellation handled?' --decision native
 ```
 
 Setup writes only an environment-variable reference. It preserves existing
@@ -294,13 +294,13 @@ and low-token exploration also skip Jev.
 
 #### Supplying the key to an MCP host
 
-MCP hosts start `cartograph serve --mcp` without your interactive shell's
+MCP hosts start `codevetra serve --mcp` without your interactive shell's
 environment. Instead of putting the key in the host's `env` block or wrapping the
 server in a secret-manager launcher, you can let the server fetch it with a
 [credential command](#credential-sources):
 
 ```sh
-cartograph llm setup . --preset jev \
+codevetra llm setup . --preset jev \
   --api-key-command /path/to/secret-helper --api-key-arg get --api-key-arg typesafe-api-key
 ```
 
@@ -313,7 +313,7 @@ cartograph llm setup . --preset jev \
 }
 ```
 
-The host registration then stays a plain `cartograph serve --mcp`. If the
+The host registration then stays a plain `codevetra serve --mcp`. If the
 helper fails (a locked store, an expired session), only Jev is affected.
 
 ### Jev data sharing and navigation bounds
@@ -368,7 +368,7 @@ provider `round`), confidence, candidate truncation, source windows and stop
 reason. Candidates carry the latest advisory `relevance` probability once
 judged. Assistance is bounded to seven operations, 40 candidate identities,
 4 KiB per additional source window and a 30-second deadline covering navigation
-and its freshness checks. On expiry, Cartograph cancels and joins
+and its freshness checks. On expiry, CodeVetra cancels and joins
 navigation-owned work; joining an active filesystem read may add cleanup
 latency. `maxFiles` bounds the original source windows; the separate navigation
 supplement has its own seven-operation bound.
@@ -395,7 +395,7 @@ windows and additional windows both contribute to the sufficiency question.
 - Model confidence and sufficiency are advisory scores, not proof that the
   question is answered.
 - Smoke output retains the configured model and endpoint on failure.
-- `cartograph doctor` reports a configured variable that is unset in its own
+- `codevetra doctor` reports a configured variable that is unset in its own
   shell as a warning, because the server reads its own environment; an invalid
   tier still fails.
 
@@ -407,7 +407,7 @@ retrieval candidates, `roles` to classify symbol roles, and `rename` to triage
 rename mentions:
 
 ```sh
-cartograph llm setup . --preset jev --api-key-env TYPESAFE_API_KEY \
+codevetra llm setup . --preset jev --api-key-env TYPESAFE_API_KEY \
   --jev-features explore,context
 ```
 
@@ -422,7 +422,7 @@ cartograph llm setup . --preset jev --api-key-env TYPESAFE_API_KEY \
 
 | Feature | Surface | What is sent |
 | --- | --- | --- |
-| `explore` | `explore` / `cartograph_explore` (the default when `features` is absent) | Question, candidate metadata, bounded source excerpts |
+| `explore` | `explore` / `codevetra_explore` (the default when `features` is absent) | Question, candidate metadata, bounded source excerpts |
 | `context` | [Context ranking](#jev-context-ranking) | Task text and candidate metadata; never indexed source |
 | `roles` | [Role classification](#jev-role-classification) | Symbol metadata with signatures up to 160 bytes; never function bodies |
 | `rename` | [Rename triage](#jev-rename-triage) | Source text: each mention's source line up to 200 bytes |
@@ -505,10 +505,10 @@ native graph publication or structural freshness.
 
 The opt-in Rust test `live_fixed_candidate_context_ranking_pilot` compares Jev
 ordering with the current native ordering on the same retrieval candidate pool
-for 24 frozen repository questions. It requires `CARTOGRAPH_JEV_EVAL_ALLOW_METADATA=1`,
-`CARTOGRAPH_JEV_EVAL_PROJECT`, `CARTOGRAPH_JEV_EVAL_BINARY`, and a new private
-`CARTOGRAPH_JEV_EVAL_OUTPUT` path. Run it with
-`cargo test --locked -p cartograph-agent --lib live_fixed_candidate_context_ranking_pilot -- --ignored --nocapture`.
+for 24 frozen repository questions. It requires `CODEVETRA_JEV_EVAL_ALLOW_METADATA=1`,
+`CODEVETRA_JEV_EVAL_PROJECT`, `CODEVETRA_JEV_EVAL_BINARY`, and a new private
+`CODEVETRA_JEV_EVAL_OUTPUT` path. Run it with
+`cargo test --locked -p codevetra-agent --lib live_fixed_candidate_context_ranking_pilot -- --ignored --nocapture`.
 The project must be fresh, have Jev configured, and keep `context` decisions
 disabled for its native control. The pilot sends task text and candidate metadata
 under the explicit test opt-in without changing configuration. It records
@@ -586,7 +586,7 @@ only their review label.
 Jev with:
 
 ```sh
-cartograph llm setup . --preset jev --clear-credentials
+codevetra llm setup . --preset jev --clear-credentials
 ```
 
 This removes the decision tier. It does not clear other provider tiers.
@@ -717,9 +717,9 @@ The process environment can supply an OpenAI-compatible embedding or chat
 endpoint without editing the project file. The environment pair is read before
 the project `llm` object.
 
-- Setting both `CARTOGRAPH_EMBEDDING_ENDPOINT` and `CARTOGRAPH_EMBEDDING_MODEL`
+- Setting both `CODEVETRA_EMBEDDING_ENDPOINT` and `CODEVETRA_EMBEDDING_MODEL`
   overrides the project `embeddingLlm` tier.
-- Setting both `CARTOGRAPH_CHAT_ENDPOINT` and `CARTOGRAPH_CHAT_MODEL` overrides
+- Setting both `CODEVETRA_CHAT_ENDPOINT` and `CODEVETRA_CHAT_MODEL` overrides
   every chat tier (`summarizeLlm`, `localLlm`, `askLlm`, `classifyLlm`). It does
   not affect `rerankerLlm` or `decisionLlm`.
 - Setting only one variable of a pair fails closed with an incomplete
@@ -741,9 +741,9 @@ rejected, and the shell-free bridges accept none:
 
 | Source | Behavior |
 | --- | --- |
-| `apiKeyEnv` | Names an environment variable read by the process that uses the tier: the MCP server for `cartograph_*` tools, your shell for CLI commands. Without it, Jev reads `TYPESAFE_API_KEY`, `anthropic-api` reads `ANTHROPIC_API_KEY`, and `openai-compat` without an `endpoint` reads `OPENAI_API_KEY` |
+| `apiKeyEnv` | Names an environment variable read by the process that uses the tier: the MCP server for `codevetra_*` tools, your shell for CLI commands. Without it, Jev reads `TYPESAFE_API_KEY`, `anthropic-api` reads `ANTHROPIC_API_KEY`, and `openai-compat` without an `endpoint` reads `OPENAI_API_KEY` |
 | `apiKeyCommand` | An argv array, for example `["/path/to/secret-helper", "get", "typesafe-api-key"]`. Only the argv is stored. The serving process runs it directly, without a shell, the first time the tier needs a credential, not at startup |
-| Legacy inline `apiKey` | Still read; move it with `cartograph llm migrate-credentials` |
+| Legacy inline `apiKey` | Still read; move it with `codevetra llm migrate-credentials` |
 
 `apiKeyCommand` bounds:
 
@@ -756,8 +756,8 @@ rejected, and the shell-free bridges accept none:
 
 > [!WARNING]
 > Like a CLI-bridge command, a credential command is trusted project
-> configuration: Cartograph and `doctor` run whatever program
-> `.cartograph/config.json` names, so review that file before using a checkout
+> configuration: CodeVetra and `doctor` run whatever program
+> `.codevetra/config.json` names, so review that file before using a checkout
 > you do not trust.
 
 <details>
@@ -778,7 +778,7 @@ missing variable, and every other tool keeps working.
 
 Setup preserves the configured source while the provider/endpoint origin is
 unchanged, clears it when the origin changes, and removes it with
-`--clear-credentials`. `cartograph doctor` and `cartograph llm smoke` run a
+`--clear-credentials`. `codevetra doctor` and `codevetra llm smoke` run a
 configured command with the same bounds and report only whether it produced a
 credential.
 
@@ -786,11 +786,11 @@ credential.
 
 A low-load deployment may configure only `embeddingLlm` and `rerankerLlm` and
 set `summarizeLlm`, `askLlm`, `localLlm`, and `classifyLlm` to `null`.
-`cartograph llm smoke` tests configured tiers and reports those absent
+`codevetra llm smoke` tests configured tiers and reports those absent
 generative tiers as explicit skips. Reranking scores the deduplicated lexical and
 eligible semantic shortlist after reciprocal-rank fusion, up to 100 candidates.
 Each source-bearing input is capped at 1,536 UTF-8 bytes, with name and intent
-before code, and is never included in Cartograph's serialized search response.
+before code, and is never included in CodeVetra's serialized search response.
 Original channel scores remain visible beside the separate `rerank_score`.
 Reranker failure retains fusion ordering and reports the exact outcome.
 
@@ -799,8 +799,8 @@ Reranker failure retains fusion ordering and reports the exact outcome.
 Audit and migrate legacy inline tier keys without printing them:
 
 ```sh
-cartograph llm migrate-credentials . --json
-cartograph llm migrate-credentials . \
+codevetra llm migrate-credentials . --json
+codevetra llm migrate-credentials . \
   --tier-env summarize=MY_CHAT_API_KEY \
   --apply \
   --confirm migrate-inline-credentials \
@@ -818,9 +818,9 @@ and status, never credential material.
 Use the native planner/wizard instead of hand-writing provider details:
 
 ```sh
-cartograph llm setup
-cartograph llm smoke .
-cartograph doctor .
+codevetra llm setup
+codevetra llm smoke .
+codevetra doctor .
 ```
 
 Without `--preset`, the planner detects available endpoints and recommends a
@@ -840,7 +840,7 @@ configuration. `--preset` applies one of these non-interactively:
 | `custom` | A custom OpenAI-compatible endpoint, from `--tier`, `--endpoint`, and `--model` |
 | `skip` | Skips provider setup |
 
-`cartograph backend` manages only explicitly configured local `llama-server`
+`codevetra backend` manages only explicitly configured local `llama-server`
 processes; external providers remain operator-owned.
 
 The MCP process reloads LLM configuration at the next LLM operation. Agent-host

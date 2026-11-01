@@ -1,0 +1,34 @@
+//! Explicit package-dependency ownership for independently compiled CLI integration targets.
+//!
+//! Cargo exposes the binary package's complete dependency set to each integration-test crate.
+//! Underscore imports record intentional target ownership without weakening the compiler lint.
+
+use blake3 as _;
+use clap as _;
+use codevetra_agent as _;
+use codevetra_config as _;
+use codevetra_db as _;
+use codevetra_domain as _;
+use codevetra_llm as _;
+use codevetra_mcp as _;
+use codevetra_search as _;
+use futures_util as _;
+use notify as _;
+use num_traits as _;
+use regex as _;
+use reqwest as _;
+#[cfg(unix)]
+use rustix as _;
+use serde as _;
+use serde_json as _;
+use sha2 as _;
+#[cfg(unix)]
+use signal_hook as _;
+use tempfile as _;
+use thiserror as _;
+use tokio as _;
+use toml_edit as _;
+use url as _;
+
+#[cfg(unix)]
+use getrandom as _;

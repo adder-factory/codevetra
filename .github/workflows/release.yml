@@ -1,4 +1,4 @@
-# Cartograph v2 tag-only release pipeline. The complete live suite runs once on
+# CodeVetra v2 tag-only release pipeline. The complete live suite runs once on
 # the exact published main SHA in v2-rust.yml and emits a GitHub-attested gate
 # manifest. This workflow verifies that immutable evidence, then performs only
 # the four release-specific native builds, archive audits, provenance, and
@@ -156,15 +156,15 @@ jobs:
             asset_target: linux-x64
             shell: bash
             cache_key: unused-linux-x64
-            build_image: rust:1.99.1-trixie@sha256:c3d8fc865b8bee83c7894fb833c2c78c8cac5e865d45afc9d05ed026a6301c14
-            runtime_image: debian:13-slim@sha256:4876fdea29cac1a33a3195f1eb1952feb1fca7dd6dd00be3e2f1879cf20d34d2
+            build_image: rust:1.99.1-trixie@sha256:d841af61827b29b3efa46f5363e8f2e972b379cc0463c319e8f320d9f0c8eb0c
+            runtime_image: debian:13-slim@sha256:1e1a22175fbf1b32157ddaf0219e1db4e5401fab2b94ed285add64d18587cd2d
           - os: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             asset_target: linux-arm64
             shell: bash
             cache_key: unused-linux-arm64
-            build_image: rust:1.99.1-trixie@sha256:85dfd20bf1b23fa5001e30c181e148a218a2af53a1e5aa7ac4c8824d1be55e85
-            runtime_image: debian:13-slim@sha256:a66b19aa552f595b4ab276c6b4f9b24fa4546632c5ecd88cccdced4a6866323a
+            build_image: rust:1.99.1-trixie@sha256:921d0846059e80eb1723e542a5090a76a245945511e4f59ea168e461febe3baf
+            runtime_image: debian:13-slim@sha256:1470991b497d26788dc4d6f438bf5690c6ba0d499235d237e55f4b43caea7a75
           - os: macos-26
             rust_target: aarch64-apple-darwin
             asset_target: darwin-arm64
@@ -198,9 +198,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cartograph-rust-${{ runner.os }}-${{ matrix.cache_key }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-${{ matrix.cache_key }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
-            cartograph-rust-${{ runner.os }}-${{ matrix.cache_key }}-
+            codevetra-rust-${{ runner.os }}-${{ matrix.cache_key }}-
 
       - name: Build, audit, and smoke Unix archive
         if: matrix.shell == 'bash' && !startsWith(matrix.asset_target, 'linux-')
@@ -236,7 +236,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-${{ matrix.asset_target }}
-          path: release/cartograph-*
+          path: release/codevetra-*
           if-no-files-found: error
 
   publish:
@@ -263,15 +263,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          find release-artifacts -type f -name 'cartograph-*' -exec cp {} release/ \;
-          expected=$'cartograph-darwin-arm64\ncartograph-darwin-arm64.tar.gz\ncartograph-linux-arm64\ncartograph-linux-arm64.tar.gz\ncartograph-linux-x64\ncartograph-linux-x64.tar.gz\ncartograph-windows-x64.exe\ncartograph-windows-x64.zip'
-          actual="$(find release -maxdepth 1 -type f -name 'cartograph-*' -exec basename {} \; | LC_ALL=C sort)"
+          find release-artifacts -type f -name 'codevetra-*' -exec cp {} release/ \;
+          expected=$'codevetra-darwin-arm64\ncodevetra-darwin-arm64.tar.gz\ncodevetra-linux-arm64\ncodevetra-linux-arm64.tar.gz\ncodevetra-linux-x64\ncodevetra-linux-x64.tar.gz\ncodevetra-windows-x64.exe\ncodevetra-windows-x64.zip'
+          actual="$(find release -maxdepth 1 -type f -name 'codevetra-*' -exec basename {} \; | LC_ALL=C sort)"
           if [[ "$actual" != "$expected" ]]; then
             echo 'release asset set mismatch' >&2
             diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
             exit 1
           fi
-          (cd release && sha256sum cartograph-* > SHA256SUMS)
+          (cd release && sha256sum codevetra-* > SHA256SUMS)
           ls -lh release
 
       - name: Attest release artifacts
@@ -286,7 +286,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="$GITHUB_REF_NAME"
-          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "cartograph-cli") | .version')"
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "codevetra-cli") | .version')"
           EXPECTED_TAG="v$VERSION"
           if [[ "$TAG" != "$EXPECTED_TAG" ]]; then
             echo "Release tag $TAG does not match Cargo version $EXPECTED_TAG" >&2
@@ -308,7 +308,7 @@ jobs:
             echo "Tracked release notes are required at $NOTES" >&2
             exit 1
           fi
-          if ! grep -Fq "# Cartograph $TAG" "$NOTES"; then
+          if ! grep -Fq "# CodeVetra $TAG" "$NOTES"; then
             echo "Release notes at $NOTES do not identify $TAG" >&2
             exit 1
           fi
@@ -328,6 +328,6 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
               --title "$TAG" --notes-file "$NOTES" --draft
           fi
-          gh release upload "$TAG" release/cartograph-* release/SHA256SUMS \
+          gh release upload "$TAG" release/codevetra-* release/SHA256SUMS \
             --clobber --repo "$GITHUB_REPOSITORY"
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

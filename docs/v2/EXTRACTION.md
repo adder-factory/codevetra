@@ -4,7 +4,7 @@
 [Language matrix](../SUPPORT-MATRIX.md) ·
 [Extension guide](../EXTENDING-EXTRACTORS-RESOLVERS.md)
 
-Cartograph v2 extracts every v1.1.33 language mode in Rust. The extractor owns
+CodeVetra v2 extracts every v1.1.33 language mode in Rust. The extractor owns
 bounded project discovery, exact source snapshots, grammar or custom structural
 parsing, structural facts, deterministic resolution, and canonical generation
 input. It does not depend on PostgreSQL, MCP, or an LLM.
@@ -21,7 +21,7 @@ input. It does not depend on PostgreSQL, MCP, or an LLM.
 ## Supported language families
 
 The authoritative, exhaustively tested manifest is
-`cartograph_domain::SourceLanguage::ALL`: all 73 v1.1.33 modes and their 163
+`codevetra_domain::SourceLanguage::ALL`: all 73 v1.1.33 modes and their 163
 extensions, plus additive `.pyi`, native TOML, 52 dedicated textual
 game-scripting modes, the WGSL, Metal, Slang, and WESL shader additions,
 Ada/SPARK and VHDL, and Kamailio and rtpengine: 134 admitted modes in total. The
@@ -49,7 +49,7 @@ facts of all 73 v1 modes are checked against v1.1.33's own output by the
 Astro frontmatter, Vue and Svelte `<script>` blocks, and template expressions
 are extracted by the same walker as standalone scripts, not by a line scanner.
 One embedded-script mechanism
-(`crates/cartograph-extract/src/walk/embedded_script.rs`) parses each region
+(`crates/codevetra-extract/src/walk/embedded_script.rs`) parses each region
 with the native JavaScript/TypeScript grammar restricted to its exact byte
 range through tree-sitter included ranges over the full host bytes:
 
@@ -124,14 +124,14 @@ importer applies the same language boundary.
    byte size, digest, and source.
 
 Discovery follows Git-compatible ignore rules and has file/path/manifest byte
-ceilings. Local Cartograph state, Git internals, build outputs, and ignored
+ceilings. Local CodeVetra state, Git internals, build outputs, and ignored
 paths do not enter the supported-source revision.
 
 ## Complete source revision
 
 Freshness is the digest of an exact file count followed by normalized
 path/content-digest pairs in deterministic order. The encoding lives in
-`cartograph-domain::SourceManifestDigestBuilder` and is shared by agent status,
+`codevetra-domain::SourceManifestDigestBuilder` and is shared by agent status,
 source context, indexing, and v1 import. An exact set mismatch fails closed.
 
 Generation freshness additionally requires the current native generation-digest
@@ -189,7 +189,7 @@ the `nesting_limit_exceeded` degraded reason and its exact normalized
 path; the remaining project continues through resolution and publication.
 Increase the bound only for authored source that legitimately needs deeper
 syntax. Generated outputs should normally be excluded through project ignore
-rules or `.cartograph/config.json` rather than forcing the whole corpus to
+rules or `.codevetra/config.json` rather than forcing the whole corpus to
 accept their depth.
 
 Optional enrichment facts never make a file unextractable. The Rust, Python,

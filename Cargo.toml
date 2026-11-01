@@ -2,26 +2,26 @@
 resolver = "3"
 exclude = ["vendor/tree-sitter-026-compat"]
 members = [
-  "crates/cartograph-agent",
-  "crates/cartograph-cli",
-  "crates/cartograph-config",
-  "crates/cartograph-db",
-  "crates/cartograph-domain",
-  "crates/cartograph-extract",
-  "crates/cartograph-indexer",
-  "crates/cartograph-llm",
-  "crates/cartograph-mcp",
-  "crates/cartograph-search",
-  "crates/cartograph-scip",
+  "crates/codevetra-agent",
+  "crates/codevetra-cli",
+  "crates/codevetra-config",
+  "crates/codevetra-db",
+  "crates/codevetra-domain",
+  "crates/codevetra-extract",
+  "crates/codevetra-indexer",
+  "crates/codevetra-llm",
+  "crates/codevetra-mcp",
+  "crates/codevetra-search",
+  "crates/codevetra-scip",
 ]
 
 [workspace.package]
-version = "3.0.6"
+version = "4.0.0"
 edition = "2024"
 rust-version = "1.99.1"
 authors = ["Adder Factory"]
 license = "MIT"
-repository = "https://github.com/adder-factory/cartograph"
+repository = "https://github.com/adder-factory/codevetra"
 
 [workspace.dependencies]
 arborium-bash = "=2.18.2"
@@ -66,17 +66,17 @@ arborium-verilog = "=2.18.2"
 arborium-vhdl = "=2.18.2"
 arborium-yaml = "=2.18.2"
 blake3 = "1.8.7"
-cartograph-agent = { path = "crates/cartograph-agent" }
-cartograph-cli = { path = "crates/cartograph-cli" }
-cartograph-config = { path = "crates/cartograph-config" }
-cartograph-db = { path = "crates/cartograph-db" }
-cartograph-domain = { path = "crates/cartograph-domain" }
-cartograph-extract = { path = "crates/cartograph-extract" }
-cartograph-indexer = { path = "crates/cartograph-indexer" }
-cartograph-llm = { path = "crates/cartograph-llm" }
-cartograph-mcp = { path = "crates/cartograph-mcp" }
-cartograph-scip = { path = "crates/cartograph-scip" }
-cartograph-search = { path = "crates/cartograph-search" }
+codevetra-agent = { path = "crates/codevetra-agent" }
+codevetra-cli = { path = "crates/codevetra-cli" }
+codevetra-config = { path = "crates/codevetra-config" }
+codevetra-db = { path = "crates/codevetra-db" }
+codevetra-domain = { path = "crates/codevetra-domain" }
+codevetra-extract = { path = "crates/codevetra-extract" }
+codevetra-indexer = { path = "crates/codevetra-indexer" }
+codevetra-llm = { path = "crates/codevetra-llm" }
+codevetra-mcp = { path = "crates/codevetra-mcp" }
+codevetra-scip = { path = "crates/codevetra-scip" }
+codevetra-search = { path = "crates/codevetra-search" }
 clap = { version = "4.6.7", default-features = false, features = [
   "derive",
   "error-context",
@@ -87,7 +87,7 @@ clap = { version = "4.6.7", default-features = false, features = [
   "usage",
 ] }
 getrandom = "0.4.3"
-ignore = "0.4.33"
+ignore = "0.4.34"
 itoa = "=1.0.18"
 jiff = { version = "=0.2.38", default-features = false, features = ["std"] }
 libc = "0.2.191"
@@ -96,20 +96,19 @@ memchr = "=2.8.3"
 notify = "=8.2.1"
 num-traits = "=0.2.19"
 futures-util = "=0.3.34"
-globset = "0.4.20"
+globset = "0.4.21"
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
 regex = "1.13.1"
 regex-syntax = "0.8.11"
-# Native 11.8.1, with the upstream bindgen 0.73 build-dependency update.
-# Keep this immutable source until its next crates.io release includes that fix.
-rocksdb = { package = "rust-rocksdb", version = "=0.53.0", git = "https://github.com/zaidoon1/rust-rocksdb", rev = "50017c3de5bc24cf5d81fdc0fe6b0f23df700765", default-features = false, features = ["bindgen-runtime", "lz4", "zstd", "multi-threaded-cf"] }
+# Native RocksDB 11.12.0; the published binding includes bindgen 0.73.
+rocksdb = { package = "rust-rocksdb", version = "=0.54.0", default-features = false, features = ["bindgen-runtime", "lz4", "zstd", "multi-threaded-cf"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring"] }
-rustix = { version = "=1.1.5", default-features = false, features = ["std", "process"] }
+rustix = { version = "=1.1.6", default-features = false, features = ["std", "process"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "=0.11.1"
-signal-hook = { version = "0.4.5", default-features = false }
+signal-hook = { version = "0.4.6", default-features = false }
 thiserror = "2.0.21"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = [
@@ -126,7 +125,7 @@ tokio = { version = "1.54.1", features = [
 toml_edit = "=0.25.17"
 tree-sitter = "=0.27.1"
 tree-sitter-abap-sqry = "=33.0.1"
-tree-sitter-ada = "=0.9.1"
+tree-sitter-ada = "=0.9.2"
 tree-sitter-arkts = "=0.3.0"
 tree-sitter-astro-next = "=0.1.1"
 tree-sitter-cuda = "=0.21.2"

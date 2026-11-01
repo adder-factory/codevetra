@@ -1,10 +1,10 @@
 # PostgreSQL to RocksDB cutover
 
-Cartograph `v3.0.3` replaces PostgreSQL with native RocksDB. Install the v3
+CodeVetra `v3.0.3` replaces PostgreSQL with native RocksDB. Install the v3
 release first; earlier v2 binaries and already attached MCP children continue
 to use PostgreSQL until explicitly replaced.
 
-The Rust runtime now uses per-project RocksDB 11.8.1 exclusively. The old SQL
+The Rust runtime now uses per-project RocksDB 11.12.0 exclusively. The old SQL
 facade, managed database lifecycle, SQLX runtime dependencies, SQL query tool,
 and PostgreSQL generation builder are removed. Existing extraction and typed
 agent services use the native owner: context, exact/BM25/hybrid retrieval,
@@ -14,12 +14,12 @@ SCIP, embeddings, and sessions retain their public evidence boundaries.
 Run the installed v3 executable:
 
 ```sh
-cartograph --version
-cartograph db migrate --to rocksdb --project-path . --format json
-cartograph upgrade --apply --project-path . --json
-cartograph doctor . --format json
-cartograph status . --format json
-cartograph context 'explain the project runtime' --project-path .
+codevetra --version
+codevetra db migrate --to rocksdb --project-path . --format json
+codevetra upgrade --apply --project-path . --json
+codevetra doctor . --format json
+codevetra status . --format json
+codevetra context 'explain the project runtime' --project-path .
 ```
 
 Migration is a source rebuild and verified marker update. It preserves the
@@ -48,9 +48,9 @@ the libraries now compiled into the executable.
 
 Stop the existing native owner before reconciliation. A newly installed client
 reuses a running Unix owner, so its own `--version` does not prove that owner
-has upgraded. On macOS, use `cartograph service stop --project-path .` before
-`cartograph upgrade --apply --project-path .`, then `cartograph service start
---project-path .`. On Linux, stop/start `cartograph watch` through its user
+has upgraded. On macOS, use `codevetra service stop --project-path .` before
+`codevetra upgrade --apply --project-path .`, then `codevetra service start
+--project-path .`. On Linux, stop/start `codevetra watch` through its user
 service manager. For a foreground owner, stop it cooperatively and relaunch it
 with the selected executable. Start the new owner before reconnecting clients.
 Verify status version, source freshness, and one real query through a fresh MCP

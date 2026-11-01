@@ -1,0 +1,33 @@
+[package]
+name = "codevetra-indexer"
+publish = false
+description = "Bounded, lease-owned indexing supervision for CodeVetra v2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3.workspace = true
+codevetra-db.workspace = true
+codevetra-domain.workspace = true
+codevetra-extract.workspace = true
+codevetra-scip.workspace = true
+globset.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+codevetra-config.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "index_scaling"
+harness = false
+
+[lints]
+workspace = true

@@ -41,13 +41,13 @@ deny = [
   { crate = "sqlx", reason = "The PostgreSQL runtime was retired in the native storage cutover" },
   { crate = "sqlx-core", reason = "The PostgreSQL runtime was retired in the native storage cutover" },
   { crate = "sqlx-postgres", reason = "The PostgreSQL runtime was retired in the native storage cutover" },
-  { crate = "tokio-postgres", reason = "Cartograph has one native RocksDB storage backend" },
-  { crate = "postgres", reason = "Cartograph has one native RocksDB storage backend" },
-  { crate = "aws-lc-rs", reason = "Cartograph standardizes Rustls on ring to avoid duplicate crypto providers" },
-  { crate = "aws-lc-sys", reason = "Cartograph standardizes Rustls on ring to avoid duplicate crypto providers" },
-  { crate = "libsqlite3-sys", reason = "Cartograph uses only the native RocksDB runtime" },
-  { crate = "rusqlite", reason = "Cartograph uses only the native RocksDB runtime" },
-  { crate = "sqlx-sqlite", reason = "Cartograph uses only the native RocksDB runtime" },
+  { crate = "tokio-postgres", reason = "CodeVetra has one native RocksDB storage backend" },
+  { crate = "postgres", reason = "CodeVetra has one native RocksDB storage backend" },
+  { crate = "aws-lc-rs", reason = "CodeVetra standardizes Rustls on ring to avoid duplicate crypto providers" },
+  { crate = "aws-lc-sys", reason = "CodeVetra standardizes Rustls on ring to avoid duplicate crypto providers" },
+  { crate = "libsqlite3-sys", reason = "CodeVetra uses only the native RocksDB runtime" },
+  { crate = "rusqlite", reason = "CodeVetra uses only the native RocksDB runtime" },
+  { crate = "sqlx-sqlite", reason = "CodeVetra uses only the native RocksDB runtime" },
 ]
 skip = [
   { crate = "tree-sitter@0.26.13", reason = "Local ABAP compatibility facade reexports 0.27 types and has no native code; the workspace gate verifies exactly one 0.27 runtime" },
@@ -58,6 +58,4 @@ skip = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# Immutable Cargo pin includes the upstream bindgen 0.73 update; no version ban
-# is bypassed. Return to crates.io after that update is published.
-allow-git = ["https://github.com/zaidoon1/rust-rocksdb"]
+allow-git = []

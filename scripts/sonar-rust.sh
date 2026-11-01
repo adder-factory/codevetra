@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SONAR_OUTPUT_ROOT="${CARTOGRAPH_SONAR_OUTPUT_ROOT:-$ROOT/target}"
+SONAR_OUTPUT_ROOT="${CODEVETRA_SONAR_OUTPUT_ROOT:-$ROOT/target}"
 CLIPPY_DIRECTORY="$SONAR_OUTPUT_ROOT/sonar"
 CLIPPY_REPORT="$CLIPPY_DIRECTORY/clippy.json"
 CLIPPY_TEMPORARY="$CLIPPY_REPORT.tmp.$$"
@@ -30,19 +30,19 @@ mv "$CLIPPY_TEMPORARY" "$CLIPPY_REPORT"
 
 # The actual native store is exercised by ordinary process/database tests.
 # Keep obsolete endpoint variables absent for deterministic negative inputs.
-unset CARTOGRAPH_DATABASE_URL CARTOGRAPH_DATABASE_SCHEMA CARTOGRAPH_TEST_DATABASE_URL
+unset CODEVETRA_DATABASE_URL CODEVETRA_DATABASE_SCHEMA CODEVETRA_TEST_DATABASE_URL
 
 export CARGO_TARGET_DIR="$COVERAGE_BUILD_DIRECTORY"
 eval "$(cargo llvm-cov show-env --sh)"
 cargo llvm-cov clean --workspace
 cargo test --locked --quiet --workspace --all-features
 
-coverage_test -p cartograph-db --test rocks_graph \
+coverage_test -p codevetra-db --test rocks_graph \
   -- --ignored --nocapture --test-threads=1
-coverage_test -p cartograph-indexer --test live_supervisor \
+coverage_test -p codevetra-indexer --test live_supervisor \
   -- --ignored --nocapture --test-threads=1
 
-coverage_test -p cartograph-cli --test rocks_owner \
+coverage_test -p codevetra-cli --test rocks_owner \
   -- --ignored --nocapture --test-threads=1
 
 cargo llvm-cov report --locked --lcov \

@@ -22,7 +22,7 @@ function Get-NonPrivateReleaseBuildRoot {
       $AssetTarget -cnotmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$') {
     throw 'could not determine a non-private release build root'
   }
-  return Join-Path $VolumeRoot "cartograph-release-build-$AssetTarget"
+  return Join-Path $VolumeRoot "codevetra-release-build-$AssetTarget"
 }
 
 function Initialize-NonPrivateReleaseBuildEnvironment {

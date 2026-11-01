@@ -3,9 +3,9 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [MCP usage](MCP-USAGE.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Last release audit: 2026-10-26 (`v3.0.6`).
+Last release audit: 2026-11-01 (`v4.0.0`).
 
-The installed executable is `cartograph`. Run `cartograph <command> --help` for
+The installed executable is `codevetra`. Run `codevetra <command> --help` for
 the exact bounds in the installed version. Bounded maintenance and its
 confirmation phrases are documented in
 [Storage and operations](STORAGE-BACKENDS.md#usage-and-bounded-maintenance). This page
@@ -29,7 +29,7 @@ subcommand help remains the authority for every option and default.
 | Read an index failure, cancellation, or JSON error object | [Index failure reporting](#index-failure-reporting) |
 | Every public top-level command | [Complete command inventory](#complete-top-level-command-inventory) |
 | Upgrade to a new release and read its report | [Upgrade](#upgrade) |
-| Exact flags, defaults, or bounds | `cartograph <command> --help` from the installed version |
+| Exact flags, defaults, or bounds | `codevetra <command> --help` from the installed version |
 | Confirmation phrase for a destructive operation | [Bounded maintenance](STORAGE-BACKENDS.md#usage-and-bounded-maintenance) |
 | Equivalent agent tools | [CLI and MCP alignment](cli-mcp-alignment.md) |
 | Database ownership and lifecycle | [Native storage and operations](STORAGE-BACKENDS.md) |
@@ -37,35 +37,35 @@ subcommand help remains the authority for every option and default.
 ## High-use coding forms
 
 ```text
-cartograph index [PROJECT] [--exclude GLOB]...
-cartograph sync-if-dirty [PROJECT] [--quiet] [--max-file-size SIZE]
-cartograph status [PROJECT]
-cartograph watch --project-path [PROJECT]
-cartograph service start|stop|status --project-path [PROJECT]  # macOS login owner
-cartograph embedding-status [PROJECT]
-cartograph embed [PROJECT]
-cartograph find <QUERY> --by auto|name|content|env|sql|build|path|reference|bm25|hybrid
+codevetra index [PROJECT] [--exclude GLOB]...
+codevetra sync-if-dirty [PROJECT] [--quiet] [--max-file-size SIZE]
+codevetra status [PROJECT]
+codevetra watch --project-path [PROJECT]
+codevetra service start|stop|status --project-path [PROJECT]  # macOS login owner
+codevetra embedding-status [PROJECT]
+codevetra embed [PROJECT]
+codevetra find <QUERY> --by auto|name|content|env|sql|build|path|reference|bm25|hybrid
   [--format text|json] [--compact]
-cartograph context <TASK> [--exact-name NAME] [--exact-path PATH] [--exact-reference TEXT]
-cartograph entry-points [--bucket routes|cli|cli-commands|mcp-tools|cli-files|public-exports]
+codevetra context <TASK> [--exact-name NAME] [--exact-path PATH] [--exact-reference TEXT]
+codevetra entry-points [--bucket routes|cli|cli-commands|mcp-tools|cli-files|public-exports]
   [--limit 20]
-cartograph graph <SYMBOL_ID> --direction callers|callees|both|impact
-cartograph graph <SYMBOL_ID> --direction path --to <TARGET_SYMBOL_ID>
+codevetra graph <SYMBOL_ID> --direction callers|callees|both|impact
+codevetra graph <SYMBOL_ID> --direction path --to <TARGET_SYMBOL_ID>
   [--edge-kind calls|imports|references|implements|extends|tests|type-of|returns|instantiates|overrides|decorates|field-access|def-use|exports|contains]
-cartograph graph <SYMBOL_ID> --direction similar
+codevetra graph <SYMBOL_ID> --direction similar
   [--k 5] [--min-score 0.3] [--same-language] [--model-id <UUID>]
   [--edge-kind similar-to]   # similar-to is valid only with --direction similar
-cartograph affected [CHANGED_FILE ...] [--stdin | --files CHANGED_FILE ...]
+codevetra affected [CHANGED_FILE ...] [--stdin | --files CHANGED_FILE ...]
   [--depth 5] [--max-nodes 200] [--limit 50]
-cartograph affected --symbol-id <SYMBOL_ID> [--depth 5] [--max-nodes 200]
+codevetra affected --symbol-id <SYMBOL_ID> [--depth 5] [--max-nodes 200]
   [--limit 50]
-cartograph show <SYMBOL_ID>
-cartograph review --ref <GIT_REF>
-cartograph doctor [PROJECT]
-cartograph admin biomarkers-refresh [--no-dry-run --confirm]
+codevetra show <SYMBOL_ID>
+codevetra review --ref <GIT_REF>
+codevetra doctor [PROJECT]
+codevetra admin biomarkers-refresh [--no-dry-run --confirm]
   [--database-query-timeout-ms 240000]
-cartograph admin scip-export [--out index.scip] [--maximum-rows 5000000]
-cartograph admin scip-import [--in index.scip] [--maximum-rows 10000000]
+codevetra admin scip-export [--out index.scip] [--maximum-rows 5000000]
+codevetra admin scip-import [--in index.scip] [--maximum-rows 10000000]
   [--maximum-source-bytes 268435456] [--workers 16]
 ```
 
@@ -107,7 +107,7 @@ retained as partial files and listed in a successful index report with degraded
 reason `extraction_invalid_span` or `extraction_parser_stopped`.
 
 For a generation-capacity failure, text and JSON name `maxGenerationBytes`, the
-`cartograph_process` scope, its hard 8 GiB maximum, and the bounded
+`codevetra_process` scope, its hard 8 GiB maximum, and the bounded
 generated-artifact-exclusion and finite native-build limits. An out-of-range
 configuration names the field and exact inclusive range. Auto-sync performs
 bounded failed-generation cleanup after each failed attempt and suppresses
@@ -120,7 +120,7 @@ reported setting and run an explicit index to clear that circuit. See
 | `code` | Meaning |
 | --- | --- |
 | `lease_busy` | Retryable. Another admitted native writer owns the project. Wait for it to finish or cancel its exact admin job; reads continue against the last complete revision |
-| `index_failed` with message `Cartograph project status is unavailable` | The bounded current-publication or live-source observation failed; freshness is unverified |
+| `index_failed` with message `CodeVetra project status is unavailable` | The bounded current-publication or live-source observation failed; freshness is unverified |
 | `index_cleanup_failed` (as `code`, alone) | The pre-reservation recovery of abandoned staging generations itself failed for a reason other than contention |
 | `request_cancelled` | The index request was interrupted; see [Index cancellation](#index-cancellation) |
 | `source_changed_during_index` | An ordinary index whose checkout kept changing after it published rebuilt a bounded number of times and then failed |
@@ -218,10 +218,10 @@ diagnostics. `--quiet` suppresses successful hook output, not failures.
 ### SCIP import and export
 
 - `scip-export` requires a fresh generation and writes atomically inside the
-  project. It emits standard SCIP plus a forward-compatible Cartograph extension
+  project. It emits standard SCIP plus a forward-compatible CodeVetra extension
   for every exact edge kind and represented site count.
 - `scip-import` validates a bounded project-local artifact, installs it at
-  `.cartograph/scip/overlay.scip`, and forces a new generation. Covered files use
+  `.codevetra/scip/overlay.scip`, and forces a new generation. Covered files use
   SCIP facts; uncovered files retain native extraction.
 - The overlay digest participates in freshness, so changing it cannot leave an
   apparently current generation.
@@ -262,10 +262,10 @@ function/class categories.
 ## Complete top-level command inventory
 
 This inventory contains every non-hidden native top-level command advertised
-by `cartograph --help`. Hidden compatibility adapters and Clap's generated
+by `codevetra --help`. Hidden compatibility adapters and Clap's generated
 `help` command are intentionally excluded.
 
-<!-- CARTOGRAPH_TOP_LEVEL_COMMANDS_START -->
+<!-- CODEVETRA_TOP_LEVEL_COMMANDS_START -->
 
 - Project and runtime: `index`, `status`, `embed`, `embedding-status`, `show`,
   `export`, `similar`, `sync-if-dirty`, `install-hooks`, `mcp-budget`,
@@ -273,31 +273,31 @@ by `cartograph --help`. Hidden compatibility adapters and Clap's generated
 - Code intelligence and agent state: `ask`, `blame`, `changed-since`, `context`,
   `compare-to-ref`, `digest`, `explore`, `find`, `node`, `files`,
   `entry-points`, `at-range`, `graph`, `affected`, `tests-for`, `biomarkers`,
-  `numerical`, `coverage`, `dead-code`, `deps`, `hotspots`, `host`, `history`,
+  `navigate`, `numerical`, `coverage`, `dead-code`, `deps`, `hotspots`, `host`, `history`,
   `imports`, `note`, `propose-rename`, `role`, `session`, `summaries`,
   `trace-to-culprits`, `verify`, `review`, `playbook`, `admin`.
 - Configuration and lifecycle: `backend`, `llm`, `upgrade`, `install`,
-  `uninstall`, `serve`, `watch`, `service`, `db`.
+  `uninstall`, `serve`, `watch`, `service`, `db`, `migrate-name`.
 
-<!-- CARTOGRAPH_TOP_LEVEL_COMMANDS_END -->
+<!-- CODEVETRA_TOP_LEVEL_COMMANDS_END -->
 
 ## MCP and agent configuration
 
 ```text
-cartograph serve --mcp [--profile coding|core|full|read-only|review] [--no-startup-sync] [--no-auto-sync]
-cartograph install --yes --target <TARGET[,TARGET...]> --location local
-cartograph uninstall --target <TARGET[,TARGET...]> --location local
+codevetra serve --mcp [--profile coding|core|full|read-only|review] [--no-startup-sync] [--no-auto-sync]
+codevetra install --yes --target <TARGET[,TARGET...]> --location local
+codevetra uninstall --target <TARGET[,TARGET...]> --location local
 ```
 
 The 19 concrete host target IDs are:
 
-<!-- CARTOGRAPH_INSTALL_TARGETS_START -->
+<!-- CODEVETRA_INSTALL_TARGETS_START -->
 
 `claude`, `cursor`, `codex`, `codebuddy`, `copilot`, `codewhale`, `zed`,
 `opencode`, `hermes`, `gemini`, `antigravity`, `kiro`, `factory`, `rovo`,
 `qoder`, `bob`, `kimi`, `pi`, and `reasonix`.
 
-<!-- CARTOGRAPH_INSTALL_TARGETS_END -->
+<!-- CODEVETRA_INSTALL_TARGETS_END -->
 
 ### Target selectors and locations
 
@@ -315,7 +315,7 @@ The 19 concrete host target IDs are:
 - Install/uninstall preserves unrelated entries and pins the absolute native
   executable.
 - A versioned native installation is registered through the stable
-  `~/.cartograph-cli/current/bin/cartograph` launcher, whose target changes
+  `~/.codevetra-cli/current/bin/codevetra` launcher, whose target changes
   atomically on upgrade.
 - With `--location local`, installation modifies only project-local agent
   configuration. Each project uses its own native storage owner.
@@ -331,15 +331,15 @@ The 19 concrete host target IDs are:
 
 ### Merging an existing registration
 
-Rewriting an existing `cartograph` entry merges instead of replacing it.
+Rewriting an existing `codevetra` entry merges instead of replacing it.
 
-| Cartograph owns and rewrites | Kept as written |
+| CodeVetra owns and rewrites | Kept as written |
 | --- | --- |
 | `command`, its own server flags in `args` (`serve`, `--mcp`, `--project-path`, the native owner flags), and the target's transport keys | `env`, `cwd`, other host-specific keys, and extra server arguments such as `--profile` |
 
-An entry that launches Cartograph through a wrapper (`/usr/bin/env`,
+An entry that launches CodeVetra through a wrapper (`/usr/bin/env`,
 `op run --`, `doppler run --`, `aws-vault exec`, `direnv exec`, or a custom
-helper), meaning a non-Cartograph `command` whose arguments name a Cartograph
+helper), meaning a non-CodeVetra `command` whose arguments name a CodeVetra
 executable followed by `serve`, is never replaced: installation repins only that
 embedded executable argument, and only when it is an absolute path. A `PATH`
 name through a wrapper is left as written. To replace a wrapper with a direct
@@ -357,10 +357,10 @@ selection belongs in the host rather than a connection-mutating dispatcher.
 
 ## Upgrade
 
-`cartograph upgrade --project-path <PATH>` audits published release and host
+`codevetra upgrade --project-path <PATH>` audits published release and host
 registration state; `--apply` installs a checksum-verified published release
 and reconciles the native project. For the v2-to-v3 cutover, first install
-v3 and run `cartograph db migrate --to rocksdb --project-path <PATH>`; legacy
+v3 and run `codevetra db migrate --to rocksdb --project-path <PATH>`; legacy
 PostgreSQL user state is preserved separately, not imported into RocksDB.
 
 Read `completed`, `projectReconciliation`, and `restartRequired` separately.
@@ -375,9 +375,9 @@ that an already attached child has restarted.
 ## Native database operations
 
 ```sh
-cartograph db migrate --to rocksdb --project-path . --format json
-cartograph db usage --project-path . --format json
-cartograph db prune --project-path . --keep-superseded 2 \
+codevetra db migrate --to rocksdb --project-path . --format json
+codevetra db usage --project-path . --format json
+codevetra db prune --project-path . --keep-superseded 2 \
   --maximum-deletions 4 --maximum-cascade-rows 10000 \
   --confirm prune-old-generations --format json
 ```
@@ -417,10 +417,10 @@ replaces it.
 
 | State | Meaning |
 | --- | --- |
-| `featureReadiness.biomarkers` `state: pending`, `reason: not_computed` | Before the first computation. `cartograph biomarkers` returns the same typed state without mutation, and requested status rollups return `biomarkers: []` plus `biomarkerRollupState: not_computed` instead of failing |
+| `featureReadiness.biomarkers` `state: pending`, `reason: not_computed` | Before the first computation. `codevetra biomarkers` returns the same typed state without mutation, and requested status rollups return `biomarkers: []` plus `biomarkerRollupState: not_computed` instead of failing |
 | `state: unavailable` with `reason: timeout` or `reason: database_error` | Remains reserved for a storage read that genuinely failed |
 
-`cartograph admin biomarkers-refresh` is dry-run-first. Execute mode requires
+`codevetra admin biomarkers-refresh` is dry-run-first. Execute mode requires
 `--no-dry-run --confirm` and accepts a native operation deadline through
 `--database-query-timeout-ms`, from 1 through 300000. The old
 `--timeout-ms` spelling remains an exclusive compatibility alias. Dry-run and
@@ -448,24 +448,24 @@ empty/null fallback and sets `degraded: true` without discarding the other four.
 ## LLM credentials and local backend state
 
 ```text
-cartograph llm migrate-credentials [PROJECT] [--tier-env TIER=ENV]
+codevetra llm migrate-credentials [PROJECT] [--tier-env TIER=ENV]
   [--apply --confirm migrate-inline-credentials]
-cartograph llm setup [PROJECT] --preset custom --tier <TIER> --endpoint URL --model MODEL
+codevetra llm setup [PROJECT] --preset custom --tier <TIER> --endpoint URL --model MODEL
   [--api-key-env ENV | --api-key-command EXE [--api-key-arg ARG]... | --clear-credentials]
-cartograph llm setup [PROJECT] --preset jev
+codevetra llm setup [PROJECT] --preset jev
   [--api-key-env ENV | --api-key-command EXE [--api-key-arg ARG]...]
   [--jev-features explore,context,roles,rename] | [--clear-credentials]
-cartograph llm setup [PROJECT] --preset cli-bridge --tier <chat|local|ask|classify>
+codevetra llm setup [PROJECT] --preset cli-bridge --tier <chat|local|ask|classify>
   --model MODEL --command EXECUTABLE [--arg ARG]... --input <stdin|arg>
   [--prompt-template TEMPLATE] --response-format <raw|json-path|claude>
   [--response-path PATH]
-cartograph backend cleanup [PROJECT] [--minimum-age-hours 24]
+codevetra backend cleanup [PROJECT] [--minimum-age-hours 24]
   [--apply --confirm cleanup-backend-junk]
 ```
 
 `llm migrate-credentials` and `backend cleanup` are both dry-run-first, bounded,
 and emit secret-free JSON. Credential migration requires an exact
-environment-value match, serializes Cartograph writers with a private lock, and
+environment-value match, serializes CodeVetra writers with a private lock, and
 aborts if the config bytes changed after the proof was made.
 `--preset cli-bridge` requires `--model MODEL`.
 
@@ -480,7 +480,7 @@ aborts if the config bytes changed after the proof was made.
   without a shell on the tier's first use, and the two sources are mutually
   exclusive.
 - Every preset that accepts `--api-key-env` accepts it; the MCP
-  `cartograph_admin` `llm-apply` action takes the same argv as `apiKeyCommand`.
+  `codevetra_admin` `llm-apply` action takes the same argv as `apiKeyCommand`.
   See [credential sources](CONFIGURATION.md#credential-sources).
 - `doctor` and `llm smoke` run a configured command and report only whether it
   produced a credential.
@@ -502,7 +502,7 @@ codes; unsafe/control-character names are never echoed.
 
 ## Native storage selection
 
-Every project uses `.cartograph/data` RocksDB 11.8.1. `storageBackend` is a
+Every project uses `.codevetra/data` RocksDB 11.12.0. `storageBackend` is a
 verified migration marker, not an optional backend. Retired database flags are
 rejected, and old PostgreSQL environment variables do not choose a runtime.
 One primary owns a project; Unix CLI/MCP clients route to the active MCP owner.
@@ -519,12 +519,51 @@ than parse human prose.
 
 ### Persistent project owner
 
-`cartograph watch --project-path .` keeps the existing RocksDB owner, watcher,
+`codevetra watch --project-path .` keeps the existing RocksDB owner, watcher,
 and bounded maintenance alive independently of MCP stdin on Unix. SIGINT and
 SIGTERM drain admitted requests, watcher work, and native storage before exit.
-On macOS, `cartograph service start --project-path .` registers the invoking
+On macOS, `codevetra service start --project-path .` registers the invoking
 executable with launchd at login. `service status` reports private registration,
 loaded state, and IPC availability separately. `service stop` stops only that
 project's verified owned service and removes its login registration. An existing
 owner keeps the primary; launchd retries after it exits. Additional CLI/MCP
 processes retain their own authorization ceilings when using the owner.
+
+### Cursor navigation
+
+`codevetra navigate definition --file src/app.ts --line 12 --column 8`
+resolves an indexed occurrence. `codevetra navigate references --symbol-id <ID>`
+finds usages of that exact declaration; `codevetra navigate implementation
+--symbol-id <ID>` follows supported implementation/override evidence. Lines are
+one-based, columns are zero-based UTF-8 byte offsets, and ranges are half-open.
+Use `--limit` (1–100) and the returned `--after` continuation for references.
+See [the navigation evidence contract](MCP-USAGE.md#cursor-navigation-and-symbol-references)
+for ambiguity, unsupported/coarse evidence, stale-source and continuation rules.
+
+Source-bearing `context`, `explore`, `review`, `node`, and `files` commands support
+`--source-reuse offer|reuse|full|reset` with explicit `--known-sources` handles.
+No shared daemon consumption history exists. Recover a delivered exact range
+with `files --format read --source-handle <handle>`, or read current bytes using
+`files --format read --file <path> --byte-offset <offset> --byte-limit 65536`.
+Continue at `excerpt.endByte`; source/index changes invalidate old handles.
+See [source reuse](MCP-USAGE.md#explicit-source-reuse-and-byte-recovery) for bounds,
+expiry, byte accounting and client-compaction recovery.
+
+`codevetra navigate trace --symbol-id <id> --max-steps 128 --max-depth 2` exposes
+possible static execution paths for JS/JSX/TS/TSX. `--focus-symbol-id <id>` annotates
+an exact target; `--max-bytes` bounds report JSON. Nested branches, cleanup and
+source spans remain separate from call-resolution confidence. Repeated/recursive
+calls link to a bounded definition table. Unsupported syntax, unresolved calls,
+stale source and limits are explicit. See the [trace contract](MCP-USAGE.md#possible-static-execution-paths).
+
+### `migrate-name`
+
+`codevetra migrate-name --project-path /absolute/project --format json` explicitly
+adopts an existing Cartograph project through a validated `.codevetra` alias. Stop
+its current host first; the command refuses active primary/configuration locks,
+independent old/new directories and conflicting ignore files. It preserves database,
+configuration and overlay bytes. Repeating it is idempotent. Fresh initialization
+requires no name migration. See [the CodeVetra migration guide](CODEVETRA-MIGRATION.md)
+for host registration, Windows alias permissions, the 4.x compatibility window and
+rollback. Existing `--disable-tool cartograph_*` restrictions are translated to their
+canonical tool names during server configuration; unknown names still fail closed.

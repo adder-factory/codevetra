@@ -35,7 +35,7 @@ Thumbs.db
 .env.local
 .env.*.local
 
-# Local v2 database credentials written by future `cartograph db start`
+# Local v2 database credentials written by future `codevetra db start`
 # lifecycle commands. The checked-in `.env.example` remains public.
 /deploy/paradedb/.env
 
@@ -49,22 +49,31 @@ Thumbs.db
 # absolute paths (e.g. --project-path) and shouldn't be shared.
 .mcp.json
 
-# Cartograph data directories (in test projects)
-.cartograph/
+# CodeVetra data directories (in test projects)
+.codevetra/
 
 # Local archive of stale design docs / session memos — kept on disk
 # for reference but never pushed.
 docs/archive/
 CLAUDE.local.md
 AGENTS.local.md
-.claude/skills/cartograph/SKILL.md
+.claude/skills/codevetra/SKILL.md
 .codex/config.toml
-.codex/skills/cartograph/SKILL.md
-# Cartograph private agent configuration
+.codex/skills/codevetra/SKILL.md
+# CodeVetra private agent configuration
 /.codex/config.toml
-/.codex/skills/cartograph/SKILL.md
+/.codex/skills/codevetra/SKILL.md
 /.claude/settings.local.json
-/.claude/skills/cartograph/SKILL.md
+/.claude/skills/codevetra/SKILL.md
 /CLAUDE.local.md
 /.mcp.json
 /.kimi-code/mcp.json
+
+# Legacy private state and maintainer skills retained through the v4 transition.
+.cartograph/
+.cartograph
+.claude/skills/cartograph/
+.codex/skills/cartograph/
+
+/.codex/skills/codevetra-release/
+/.codex/skills/codevetra-extractors/

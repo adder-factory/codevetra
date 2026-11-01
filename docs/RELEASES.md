@@ -1,20 +1,20 @@
 # Changelog
 
 [Documentation home](README.md) · [Project overview](../README.md) ·
-[Latest GitHub release](https://github.com/adder-factory/cartograph/releases/latest) ·
+[Latest GitHub release](https://github.com/adder-factory/codevetra/releases/latest) ·
 [Verification evidence](v2/benchmarks/README.md)
 
 One line per stable release, newest first. Each version links to its compact
 release notes, which are also the description of the matching
-[GitHub release](https://github.com/adder-factory/cartograph/releases) and link
+[GitHub release](https://github.com/adder-factory/codevetra/releases) and link
 to the original detailed notes. Published binaries, signed tags, checksums, and
 provenance live on GitHub Releases.
 
 > [!TIP]
-> Upgrading native v3 projects is one resumable command:
-> `cartograph upgrade --apply --project-path <PATH>`. Require `completed: true`
-> and follow any reported next step. For v2 projects, install v3 first and follow
-> the [RocksDB source-rebuild migration](v2/ROCKSDB-MIGRATION.md).
+> Existing Cartograph projects must first follow the explicit
+> [CodeVetra name migration](CODEVETRA-MIGRATION.md). After that transition, use
+> `codevetra upgrade --apply --project-path <PATH>` for subsequent releases.
+> v2 projects also need the [RocksDB source rebuild](v2/ROCKSDB-MIGRATION.md).
 
 **On this page:** [Release index](#release-index) ·
 [Reading the index](#reading-the-index) · [Dependency audits](#dependency-audits) ·
@@ -24,6 +24,7 @@ provenance live on GitHub Releases.
 
 | Version | Date | Schema · Contract | Headline |
 | --- | --- | --- | --- |
+| [v4.0.0](releases/v4.0.0.md) | 2026-11-01 | Rocks v1 · V27 ↑ | CodeVetra rename and state migration; precise review, code-health rules, navigation, application boundaries, static traces, and dependency updates |
 | [v3.0.6](releases/v3.0.6.md) | 2026-10-26 | Rocks v1 · V26 ↑ | Private-method call edges, partial graph batches, explicit affected-test and audit readiness, retrieval diagnostics, and dependency updates |
 | [v3.0.5](releases/v3.0.5.md) | 2026-10-22 | Rocks v1 · V25 ↑ | FreeSWITCH, Kamailio, and rtpengine configuration support; idle retention CPU optimization |
 | [v3.0.4](releases/v3.0.4.md) | 2026-10-20 | Rocks v1 · V24 ↑ | Source-aware hybrid reranking, bounded query cleanup, and Rust test discovery |
@@ -87,7 +88,7 @@ provenance live on GitHub Releases.
   release; v2.1.20 ships the same fixes.
 
 Release notes are historical records. For the current command surface and
-limits, use the installed `cartograph <command> --help` and the current
+limits, use the installed `codevetra <command> --help` and the current
 [CLI reference](CLI-REFERENCE.md); confirmation phrases are listed in
 [Storage and operations](STORAGE-BACKENDS.md#usage-and-bounded-maintenance).
 
@@ -97,6 +98,7 @@ Dated records of dependency selection and maintenance reviews.
 
 | Date | Shipped in | Record | Scope |
 | --- | --- | --- | --- |
+| 2026-10-31 | [v4.0.0](releases/v4.0.0.md) | [Dependency update](v2/DEPENDENCY-UPDATE-2026-10-31.md) | RocksDB 11.12.0, compatible Rust crates, CI actions and Linux images; wrapper maintenance review |
 | 2026-10-26 | [v3.0.6](releases/v3.0.6.md) | [Dependency update](v2/DEPENDENCY-UPDATE-2026-10-26.md) | notify and Ada grammar; 16 package upgrades; 90 direct dependencies, 289 registry names, actions, and Linux images audited |
 | 2026-10-20 | [v3.0.3](releases/v3.0.3.md) | [Dependency update](v2/DEPENDENCY-UPDATE-2026-10-20.md) | Rust 1.99.1; 90 direct dependencies and 288 registry crate names audited; rustls-webpki update |
 | 2026-10-19 | [v3.0.2](releases/v3.0.2.md) | [Dependency update](v2/DEPENDENCY-UPDATE-2026-10-19.md) | 90 direct dependencies; ten package updates; actions and build images audited |
@@ -115,19 +117,19 @@ the 2026-09-08 architecture review that shipped alongside the v2.1.28 update.
 ## Earlier releases
 
 Releases before v2.1.4 (v2.0.0–v2.1.3) and the v1.x line keep their notes only
-on [GitHub Releases](https://github.com/adder-factory/cartograph/releases). The
+on [GitHub Releases](https://github.com/adder-factory/codevetra/releases). The
 v2 PostgreSQL importer is historical; v3 rebuilds from source through the
 [RocksDB migration](v2/ROCKSDB-MIGRATION.md).
 
 ## Writing release notes
 
 `release.yml` publishes `docs/releases/<tag>.md` verbatim as the GitHub release
-description. The file must start with `# Cartograph <tag>` and must not contain
+description. The file must start with `# CodeVetra <tag>` and must not contain
 unfinished-work marker words, or publication fails. Keep it compact (about 15–30
 lines) and use this shape:
 
 ```markdown
-# Cartograph vX.Y.Z
+# CodeVetra vX.Y.Z
 
 One sentence saying what this release is about.
 
@@ -139,15 +141,15 @@ One sentence saying what this release is about.
 
 ## Upgrade
 
-Run `cartograph upgrade --apply --project-path <PATH>`, plus any extra action
+Run `codevetra upgrade --apply --project-path <PATH>`, plus any extra action
 (managed database replacement, re-index, host restart, config change).
 
 **Compatibility:** native storage format · generation contract · platform and migration requirements.
 
-**Full changelog:** [vX.Y.(Z-1)...vX.Y.Z](https://github.com/adder-factory/cartograph/compare/vX.Y.(Z-1)...vX.Y.Z)
+**Full changelog:** [vX.Y.(Z-1)...vX.Y.Z](https://github.com/adder-factory/codevetra/compare/vX.Y.(Z-1)...vX.Y.Z)
 ```
 
-Use absolute `https://github.com/adder-factory/cartograph/blob/main/...` links;
+Use absolute `https://github.com/adder-factory/codevetra/blob/main/...` links;
 repository-relative links do not resolve in a GitHub release description. Put
 long-form detail in the linked dependency audit, the guides, or the pull request,
 and add the release to the [release index](#release-index) in the same change.
