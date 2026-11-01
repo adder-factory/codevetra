@@ -97,6 +97,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Preserve native project identity after moving its physical checkout directory.
+    Relocate {
+        /// Existing relocated project; migrate legacy state names first and stop its owner.
+        #[arg(long, default_value = ".")]
+        project_path: PathBuf,
+        /// Previous absolute canonical path, before the directory was moved.
+        #[arg(long)]
+        from_project_path: PathBuf,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
     /// Explicitly migrate legacy project names while preserving the existing data and owner lock.
     MigrateName {
         /// Initialized project root. Stop its existing host before migration.
@@ -1051,6 +1063,17 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<ExitCode, String> {
     let command = cli.command;
     match command {
+        Command::Relocate {
+            project_path,
+            from_project_path,
+            format,
+        } => {
+            let report = codevetra_agent::relocate_project(project_path, from_project_path)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_serialized(&report, format)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::MigrateName {
             project_path,
             format,

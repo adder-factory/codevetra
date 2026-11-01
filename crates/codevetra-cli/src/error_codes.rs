@@ -150,6 +150,7 @@ const fn pipeline_failure_reason_code(
     match reason {
         PipelineFailureReason::DeadlineExceeded => pipeline_deadline_code(stage),
         PipelineFailureReason::ProgressStalled => pipeline_progress_stalled_code(stage),
+        PipelineFailureReason::NativeReadCapacityExceeded => "native_read_capacity_exceeded",
         _ => pipeline_stage_reason_code(stage, reason),
     }
 }

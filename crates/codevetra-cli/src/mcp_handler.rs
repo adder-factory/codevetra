@@ -2859,6 +2859,7 @@ enum AdminJobFailure {
     ReduceFailed,
     ReduceDeadlineExceeded,
     ReduceGenerationCapacityExceeded,
+    NativeReadCapacityExceeded,
     ReduceReferenceNameTooLong,
     ReduceProgressStalled,
     CopyFailed,
@@ -3429,6 +3430,9 @@ const fn admin_job_reason_failure(
     reason: PipelineFailureReason,
 ) -> AdminJobFailure {
     match (stage, reason) {
+        (_, PipelineFailureReason::NativeReadCapacityExceeded) => {
+            AdminJobFailure::NativeReadCapacityExceeded
+        }
         (stage, PipelineFailureReason::ProgressStalled) => {
             admin_job_progress_stalled_failure(stage)
         }
@@ -27337,6 +27341,22 @@ mod tests {
         assert!(!detail.next_action.contains("generationStorage=postgres"));
         assert!(detail.next_action.contains("native working limits"));
         assert!(detail.next_action.contains("--exclude"));
+    }
+
+    #[test]
+    fn native_read_capacity_has_matching_cli_and_mcp_job_codes() {
+        let error = ProjectError::IndexStageFailedWithReason {
+            stage: PipelineStage::Reduce,
+            reason: PipelineFailureReason::NativeReadCapacityExceeded,
+        };
+        let wire = admin_job_wire(Err(error.clone().into()));
+        assert_eq!(wire["status"], "failed");
+        assert_eq!(wire["failure"], "native_read_capacity_exceeded");
+        assert_eq!(
+            project_error_reason(&error),
+            "native_read_capacity_exceeded"
+        );
+        assert!(wire.get("failureDetail").is_none());
     }
 
     #[test]

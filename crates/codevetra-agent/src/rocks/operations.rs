@@ -141,7 +141,7 @@ impl RocksProjectRuntime {
         .await
     }
 
-    async fn owned_operation<T, Work, Operation>(
+    pub(crate) async fn owned_operation<T, Work, Operation>(
         self: &Arc<Self>,
         request: &StorageRequest,
         work: Work,

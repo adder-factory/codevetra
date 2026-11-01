@@ -241,6 +241,7 @@ impl EmbeddingIndexStatus {
 pub struct EmbeddingPageCursor {
     pub(crate) generation_id: GenerationId,
     pub(crate) after_row_id: u64,
+    pub(crate) after_document: DocumentId,
 }
 
 impl EmbeddingPageCursor {

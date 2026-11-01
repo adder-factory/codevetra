@@ -1,6 +1,6 @@
 # Native storage distribution notices
 
-This notice describes CodeVetra `v4.0.0`, RocksDB 11.12.0, and its
+This notice describes CodeVetra `v4.0.1`, RocksDB 11.12.0, and its
 `rust-rocksdb` 0.54.0 binding.
 CodeVetra code remains MIT licensed. The executable now includes native
 RocksDB and compression libraries; their upstream terms remain in force.

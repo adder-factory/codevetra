@@ -12,8 +12,7 @@ use super::{
     ProjectError, ProjectId, ProjectSourceIdentity, ProjectStatus, RocksIndexOptions,
     RocksMaintenanceReport, RocksProjectError, RocksProjectRuntime, Semaphore, SourceDriftPolicy,
     SourceScanCounters, history_unavailable_reason, issue_history_unavailable_reason,
-    load_project_source_settings, monotonic_millis, project_identity_digest, project_root_identity,
-    source_revision,
+    load_project_source_settings, monotonic_millis, project_root_identity, source_revision,
 };
 use codevetra_db::rocks::{RocksError, StorageRequest};
 
@@ -54,7 +53,7 @@ impl ProjectRuntime {
     #[must_use]
     pub fn from_native(native: Arc<RocksProjectRuntime>) -> Self {
         let root = native.project_root_for_host_operations().to_path_buf();
-        let repository_fingerprint = project_identity_digest(&root);
+        let repository_fingerprint = native.identity().clone();
         let root_identity = project_root_identity(&repository_fingerprint);
         Self {
             root,
@@ -79,7 +78,7 @@ impl ProjectRuntime {
         }
         let source = source_revision(&root)?;
         Ok(ProjectSourceIdentity {
-            repository_fingerprint: project_identity_digest(&root),
+            repository_fingerprint: crate::relocation::resolved_identity(&root)?,
             source_revision: source.digest,
             v1_source_manifest: source.v1_source_manifest,
             files: source.files,
@@ -457,10 +456,16 @@ fn native_storage_error(error: RocksError) -> ProjectError {
         RocksError::WriterBusy => ProjectError::IndexLeaseBusy,
         RocksError::GenerationChanged => ProjectError::SourceChangedDuringIndex,
         RocksError::Limit {
-            resource: "operation_deadline",
+            resource: "operation_deadline" | "read_deadline" | "deadline",
         } => ProjectError::IndexStageFailedWithReason {
             stage: PipelineStage::Reduce,
             reason: PipelineFailureReason::DeadlineExceeded,
+        },
+        RocksError::Limit {
+            resource: "read_rows" | "read_bytes",
+        } => ProjectError::IndexStageFailedWithReason {
+            stage: PipelineStage::Reduce,
+            reason: PipelineFailureReason::NativeReadCapacityExceeded,
         },
         RocksError::Limit { .. } => ProjectError::IndexStageFailedWithReason {
             stage: PipelineStage::Reduce,
@@ -503,6 +508,27 @@ impl ProjectRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_read_bounds_and_deadlines_keep_their_classification() {
+        for resource in ["read_rows", "read_bytes"] {
+            assert_eq!(
+                native_storage_error(RocksError::Limit { resource }),
+                ProjectError::IndexStageFailedWithReason {
+                    stage: PipelineStage::Reduce,
+                    reason: PipelineFailureReason::NativeReadCapacityExceeded,
+                }
+            );
+        }
+        for resource in ["read_deadline", "deadline", "operation_deadline"] {
+            assert_eq!(
+                native_storage_error(RocksError::Limit { resource }),
+                ProjectError::IndexStageFailedWithReason {
+                    stage: PipelineStage::Reduce,
+                    reason: PipelineFailureReason::DeadlineExceeded,
+                }
+            );
+        }
+    }
     #[test]
     fn expired_native_request_keeps_deadline_classification()
     -> Result<(), Box<dyn std::error::Error>> {

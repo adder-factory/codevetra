@@ -68,6 +68,8 @@ pub enum PipelineFailureReason {
     ProgressStalled,
     /// The configured in-memory generation ceiling rejected bounded work.
     GenerationCapacityExceeded,
+    /// A finite native read exceeded its physical record or byte budget.
+    NativeReadCapacityExceeded,
     /// One manifest input could not be reopened under the bounded source contract.
     SourceReadFailed,
     /// One source changed after its exact manifest entry was read.
@@ -122,6 +124,7 @@ const fn pipeline_failure_text(reason: PipelineFailureReason) -> PipelineFailure
         PipelineFailureReason::DeadlineExceeded
         | PipelineFailureReason::ProgressStalled
         | PipelineFailureReason::GenerationCapacityExceeded
+        | PipelineFailureReason::NativeReadCapacityExceeded
         | PipelineFailureReason::SourceReadFailed
         | PipelineFailureReason::SourceChangedDuringParse => pipeline_control_failure_text(reason),
         PipelineFailureReason::ExtractionUnsupportedLanguage
@@ -154,6 +157,10 @@ const fn pipeline_control_failure_text(reason: PipelineFailureReason) -> Pipelin
         PipelineFailureReason::GenerationCapacityExceeded => PipelineFailureText::new(
             "generation_capacity_exceeded",
             "the configured generation capacity rejected this work",
+        ),
+        PipelineFailureReason::NativeReadCapacityExceeded => PipelineFailureText::new(
+            "native_read_capacity_exceeded",
+            "the bounded native read exceeded its record or byte budget",
         ),
         PipelineFailureReason::SourceReadFailed => PipelineFailureText::new(
             "source_read_failed",

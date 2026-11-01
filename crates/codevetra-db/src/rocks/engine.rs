@@ -810,8 +810,9 @@ impl RevisionSnapshot<'_> {
     ///
     /// `after` is exclusive and must belong to the supplied prefix. Tombstones
     /// and unpublished revisions never appear. Pages stop at four MiB or the
-    /// row limit; one indivisible record may exceed the page byte target.
-    /// Continue with `next_after` even when a page is shorter than `limit`.
+    /// logical-key limit, including invisible keys; one indivisible record may
+    /// exceed the page byte target. Continue with `next_after` even when a page
+    /// is empty. A key's version chain is never split across pages.
     ///
     /// # Errors
     /// Returns an input-bound, read-budget, corrupt-value, or storage error.
@@ -835,16 +836,18 @@ impl RevisionSnapshot<'_> {
                 next_after: None,
             });
         };
-        let mut options = ReadOptions::default();
-        if let Some(upper) = key::successor(encoded_prefix.clone()) {
-            options.set_iterate_upper_bound(upper);
-        }
-        options.fill_cache(false);
         let family = self.store.family(collection)?;
         let meta = self.store.meta()?;
         let mut rows = Vec::new();
         let mut bytes = 0_usize;
-        let mut iterator = self.snapshot.raw_iterator_cf_opt(&family, options);
+        let mut keys = ScanKeys {
+            limit,
+            examined: 0,
+            previous: None,
+        };
+        let mut iterator = self
+            .snapshot
+            .raw_iterator_cf_opt(&family, scan_read_options(&encoded_prefix));
         budget.checkpoint()?;
         iterator.seek(start);
         while let Some((encoded_key, value)) = iterator.item() {
@@ -853,6 +856,12 @@ impl RevisionSnapshot<'_> {
                 break;
             }
             let (logical_key, sequence) = key::decode(encoded_key)?;
+            if keys.at_boundary(&logical_key) {
+                return Ok(RecordPage {
+                    rows,
+                    next_after: keys.previous,
+                });
+            }
             if sequence > self.revision.sequence {
                 budget.checkpoint()?;
                 iterator.seek(logical_key.at_sequence(self.revision.sequence));
@@ -889,6 +898,35 @@ impl RevisionSnapshot<'_> {
             rows,
             next_after: None,
         })
+    }
+}
+
+fn scan_read_options(encoded_prefix: &[u8]) -> ReadOptions {
+    let mut options = ReadOptions::default();
+    if let Some(upper) = key::successor(encoded_prefix.to_vec()) {
+        options.set_iterate_upper_bound(upper);
+    }
+    options.fill_cache(false);
+    options
+}
+
+struct ScanKeys {
+    limit: u16,
+    examined: u16,
+    previous: Option<RecordKey>,
+}
+
+impl ScanKeys {
+    fn at_boundary(&mut self, key: &RecordKey) -> bool {
+        if self.previous.as_ref() == Some(key) {
+            return false;
+        }
+        if self.examined == self.limit {
+            return true;
+        }
+        self.examined += 1;
+        self.previous = Some(key.clone());
+        false
     }
 }
 

@@ -516,6 +516,7 @@ pub struct ProjectLlmTierConfig {
     timeout_ms: Option<u64>,
     concurrency: Option<u16>,
     summary_batch_size: Option<u16>,
+    embedding_batch_size: Option<u16>,
     claude_bin: Option<String>,
     cli_bridge: Option<CliBridgeConfig>,
     llama_server_args: Vec<String>,
@@ -542,6 +543,7 @@ impl std::fmt::Debug for ProjectLlmTierConfig {
             .field("timeout_ms", &self.timeout_ms)
             .field("concurrency", &self.concurrency)
             .field("summary_batch_size", &self.summary_batch_size)
+            .field("embedding_batch_size", &self.embedding_batch_size)
             .field("claude_binary_configured", &self.claude_bin.is_some())
             .field("cli_bridge_configured", &self.cli_bridge.is_some())
             .field("llama_server_argument_count", &self.llama_server_args.len())
@@ -552,6 +554,11 @@ impl std::fmt::Debug for ProjectLlmTierConfig {
 }
 
 impl ProjectLlmTierConfig {
+    /// Optional per-request embedding input count, bounded to 1..=128.
+    #[must_use]
+    pub const fn embedding_batch_size(&self) -> Option<u16> {
+        self.embedding_batch_size
+    }
     #[must_use]
     /// Returns the provider.
     pub const fn provider(&self) -> ProjectLlmProvider {
@@ -2117,6 +2124,16 @@ fn parse_tier(
         timeout_ms: limits.timeout_ms,
         concurrency: limits.concurrency,
         summary_batch_size: limits.summary_batch_size,
+        embedding_batch_size: optional_bounded_u64(
+            value,
+            "embeddingBatchSize",
+            BoundedU64Field {
+                maximum: 128,
+                invalid: ProjectLlmConfigError::InvalidTier,
+            },
+        )?
+        .map(|value| u16::try_from(value).map_err(|_| ProjectLlmConfigError::InvalidTier))
+        .transpose()?,
         claude_bin,
         cli_bridge,
         llama_server_args,

@@ -49,6 +49,35 @@ ignore changes separately. After V27 publication, an older executable may requir
 own source rebuild; do not promise it can query a newer generation. Do not delete
 retained state to force compatibility.
 
+## Physically moved project directories
+
+Product-name migration does not change the canonical checkout path bound to an
+existing native index. A directory move can therefore make the index unavailable;
+an old-name symlink does not restore its original canonical path.
+
+Builds with the `relocate` command support an explicit identity-preserving move:
+
+```sh
+codevetra migrate-name --project-path /absolute/new-project --format json
+codevetra relocate --project-path /absolute/new-project \
+  --from-project-path /absolute/previous-project --format json
+codevetra index /absolute/new-project
+codevetra doctor /absolute/new-project --format json
+```
+
+Stop the project's native owner first. Supply the previous **canonical** absolute
+path as it was before the move. The operation refuses an independent original that
+still exists, a live owner, incompatible native state, or concurrent configuration
+changes. It validates the existing database with its original identity and records
+an atomic `nativeRootIdentity` binding in project configuration. Only digests are
+stored in that binding. The database, project ID, graph IDs, notes, sessions and
+embeddings retain their identities. Opening a copied or subsequently moved binding
+at another path still fails until another explicit relocation is performed.
+
+Repeating the same completed relocation is a no-op. Reinstall registrations and
+restart hosts against the new directory, then verify fresh status and real queries.
+Older executables without relocation support cannot open the relocated index.
+
 ## Names and compatibility
 
 | Surface | Canonical 4.x name | Legacy handling |

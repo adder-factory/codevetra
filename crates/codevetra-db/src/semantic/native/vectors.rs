@@ -72,49 +72,61 @@ impl NativeDatabase {
                 {
                     return Err(Error::CurrentGenerationChanged);
                 }
-                let after = request.cursor.map_or(0, |cursor| cursor.after_row_id);
                 let snapshot = transaction.graph_snapshot()?;
                 let graph = snapshot.graph(budget)?;
                 let mut documents = Vec::new();
                 let mut bytes = 0_u64;
                 let mut more = false;
-                documents_scan(&graph, budget, |ordinal, document, budget| {
-                    if ordinal <= after {
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    let id = document.document_id.clone();
-                    let path = document.path.clone();
-                    let (text, digest) =
-                        source(transaction, &graph, &generation, document, budget)?;
-                    if read_vector(transaction, &request.model, &id, &digest, budget)?.is_some() {
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    let next = bytes.checked_add(text.len() as u64).ok_or(corrupt())?;
-                    if !embedding_page_has_room(
-                        documents.len(),
-                        next,
-                        (
-                            usize::from(request.maximum_documents),
-                            request.maximum_source_bytes,
-                        ),
-                    )? {
-                        more = true;
-                        return Ok(ControlFlow::Break(()));
-                    }
-                    bytes = next;
-                    documents.push(PendingEmbeddingDocument {
-                        row_id: ordinal,
-                        document_id: id,
-                        path,
-                        text,
-                        source_digest: digest,
-                    });
-                    Ok(ControlFlow::Continue(()))
-                })?;
+                let mut consumed = None;
+                let mut examined = 0_u16;
+                documents_scan_after(
+                    &graph,
+                    budget,
+                    request.cursor.as_ref(),
+                    |ordinal, document, budget| {
+                        if examined == 128 {
+                            more = true;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        examined += 1;
+                        let id = document.document_id.clone();
+                        let path = document.path.clone();
+                        let (text, digest) =
+                            source(transaction, &graph, &generation, document, budget)?;
+                        if read_vector(transaction, &request.model, &id, &digest, budget)?.is_some()
+                        {
+                            consumed = Some((ordinal, id));
+                            return Ok(ControlFlow::Continue(()));
+                        }
+                        let next = bytes.checked_add(text.len() as u64).ok_or(corrupt())?;
+                        if !embedding_page_has_room(
+                            documents.len(),
+                            next,
+                            (
+                                usize::from(request.maximum_documents),
+                                request.maximum_source_bytes,
+                            ),
+                        )? {
+                            more = true;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        bytes = next;
+                        consumed = Some((ordinal, id.clone()));
+                        documents.push(PendingEmbeddingDocument {
+                            row_id: ordinal,
+                            document_id: id,
+                            path,
+                            text,
+                            source_digest: digest,
+                        });
+                        Ok(ControlFlow::Continue(()))
+                    },
+                )?;
                 let next_cursor = if more {
-                    documents.last().map(|document| EmbeddingPageCursor {
+                    consumed.map(|(ordinal, id)| EmbeddingPageCursor {
                         generation_id: generation.clone(),
-                        after_row_id: document.row_id,
+                        after_row_id: ordinal,
+                        after_document: id,
                     })
                 } else {
                     None
@@ -515,14 +527,25 @@ fn visit_vector_batch(
 pub(super) fn documents_scan(
     graph: &GraphSnapshot<'_, '_>,
     budget: &mut ReadBudget,
+    visit: impl FnMut(u64, CanonicalSearchDocument, &mut ReadBudget) -> Result<ControlFlow<()>, Error>,
+) -> Result<(), Error> {
+    documents_scan_after(graph, budget, None, visit)
+}
+
+pub(super) fn documents_scan_after(
+    graph: &GraphSnapshot<'_, '_>,
+    budget: &mut ReadBudget,
+    start: Option<&EmbeddingPageCursor>,
     mut visit: impl FnMut(
         u64,
         CanonicalSearchDocument,
         &mut ReadBudget,
     ) -> Result<ControlFlow<()>, Error>,
 ) -> Result<(), Error> {
-    let mut cursor = None;
-    let mut ordinal = 0_u64;
+    let mut cursor = start
+        .map(|cursor| GraphSnapshot::document_cursor(&cursor.after_document))
+        .transpose()?;
+    let mut ordinal = start.map_or(0, |cursor| cursor.after_row_id);
     loop {
         let (documents, next) = graph.documents(cursor.as_ref(), 64, budget)?;
         for document in documents {

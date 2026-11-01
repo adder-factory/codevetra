@@ -158,6 +158,9 @@ impl EmbeddingSettings {
     pub fn from_project_config(config: &ProjectLlmTierConfig) -> Result<Self, EmbeddingError> {
         let mut settings = Self::new(config.endpoint(), config.model(), None)?;
         settings.credential = config.credential();
+        if let Some(batch_size) = config.embedding_batch_size() {
+            settings.maximum_batch = usize::from(batch_size);
+        }
         if let Some(timeout_ms) = config.timeout_ms() {
             settings.request_timeout = Duration::from_millis(timeout_ms);
         }
@@ -280,6 +283,31 @@ fn parse_usize(input: IntegerSetting<usize>) -> Result<usize, EmbeddingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_embedding_batch_size_is_bounded_and_preserves_model_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join(".codevetra"))?;
+        for batch in [0, 4, 128, 129] {
+            std::fs::write(
+                root.path().join(".codevetra/config.json"),
+                serde_json::to_vec(
+                    &serde_json::json!({"llm":{"embeddingLlm":{"provider":"openai-compat","endpoint":"http://localhost:8080","model":"fixture","embeddingBatchSize":batch}}}),
+                )?,
+            )?;
+            let config = load_project_llm_tier(root.path(), ProjectLlmTier::Embedding);
+            if batch == 0 || batch == 129 {
+                assert!(config.is_err());
+            } else {
+                let config = config?.ok_or("missing tier")?;
+                let settings = EmbeddingSettings::from_project_config(&config)?;
+                assert_eq!(settings.maximum_batch(), batch);
+                assert_eq!(settings.model(), "fixture");
+            }
+        }
+        Ok(())
+    }
 
     const LOCAL_ENDPOINT: &str = "http://localhost:8080";
     const IPV6_LOOPBACK_ENDPOINT: &str = "http://[::1]:8080";

@@ -167,59 +167,7 @@ async fn seed_cold_rows(
             )?,
         )
         .await?;
-    let model = database
-        .register_embedding_model(
-            EmbeddingModelRegistration::new(EmbeddingModelRegistrationInput {
-                model_id: ModelId::from_uuid_v8([1; 16]),
-                fingerprint: digest(8),
-                provider: "fixture".into(),
-                model_name: "fixture".into(),
-                dimension: 2,
-                normalization: EmbeddingNormalization::None,
-            })?,
-            Duration::from_secs(30),
-        )
-        .await?
-        .selector()
-        .clone();
-    loop {
-        let page = database
-            .pending_current_embedding_documents(PendingEmbeddingPageRequest::new(
-                PendingEmbeddingPageInput {
-                    project_id: project.clone(),
-                    model: model.clone(),
-                    maximum_documents: 64,
-                    maximum_source_bytes: 1_048_576,
-                    statement_timeout: Duration::from_secs(30),
-                },
-            )?)
-            .await?;
-        if page.documents().is_empty() {
-            break;
-        }
-        let rows = page
-            .documents()
-            .iter()
-            .map(|document| {
-                EmbeddingUpsertRow::new(
-                    document.document_id().clone(),
-                    document.source_digest().clone(),
-                    vec![1.0, 0.0],
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        database
-            .upsert_current_document_embeddings(EmbeddingBatchUpsertRequest::new(
-                EmbeddingBatchUpsertInput {
-                    project_id: project.clone(),
-                    generation_id: generation(1),
-                    model: model.clone(),
-                    rows,
-                    statement_timeout: Duration::from_secs(30),
-                },
-            )?)
-            .await?;
-    }
+    seed_embeddings(database, project).await?;
     database
         .state(None, 1_048_576, 132, |tx, _| {
             for number in 1..=131 {
@@ -237,6 +185,72 @@ async fn seed_cold_rows(
             Ok(())
         })
         .await?;
+    Ok(())
+}
+
+async fn seed_embeddings(
+    database: &NativeDatabase,
+    project: &codevetra_domain::ProjectId,
+) -> TestResult {
+    let model = database
+        .register_embedding_model(
+            EmbeddingModelRegistration::new(EmbeddingModelRegistrationInput {
+                model_id: ModelId::from_uuid_v8([1; 16]),
+                fingerprint: digest(8),
+                provider: "fixture".into(),
+                model_name: "fixture".into(),
+                dimension: 2,
+                normalization: EmbeddingNormalization::None,
+            })?,
+            Duration::from_secs(30),
+        )
+        .await?
+        .selector()
+        .clone();
+    let mut cursor = None;
+    loop {
+        let mut pending = PendingEmbeddingPageRequest::new(PendingEmbeddingPageInput {
+            project_id: project.clone(),
+            model: model.clone(),
+            maximum_documents: 64,
+            maximum_source_bytes: 1_048_576,
+            statement_timeout: Duration::from_secs(30),
+        })?;
+        if let Some(after) = cursor.take() {
+            pending = pending.with_cursor(after)?;
+        }
+        let page = database
+            .pending_current_embedding_documents(pending)
+            .await?;
+        cursor = page.next_cursor().cloned();
+        if !page.documents().is_empty() {
+            let rows = page
+                .documents()
+                .iter()
+                .map(|document| {
+                    EmbeddingUpsertRow::new(
+                        document.document_id().clone(),
+                        document.source_digest().clone(),
+                        vec![1.0, 0.0],
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            database
+                .upsert_current_document_embeddings(EmbeddingBatchUpsertRequest::new(
+                    EmbeddingBatchUpsertInput {
+                        project_id: project.clone(),
+                        generation_id: generation(1),
+                        model: model.clone(),
+                        rows,
+                        statement_timeout: Duration::from_secs(30),
+                    },
+                )?)
+                .await?;
+        }
+        if cursor.is_none() {
+            break;
+        }
+    }
     Ok(())
 }
 

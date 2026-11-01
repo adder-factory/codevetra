@@ -233,6 +233,13 @@ bounded schema.
 
 ## Native storage
 
+An explicit `codevetra relocate --from-project-path <previous-root>` operation
+can add a `nativeRootIdentity` record after validating the original native store
+under exclusive ownership. It binds the new canonical-root digest to the original
+storage identity, preserving project IDs and mutable state. Do not edit this
+internal record manually. A path mismatch or malformed binding fails closed;
+see [directory relocation](CODEVETRA-MIGRATION.md#physically-moved-project-directories).
+
 Every project uses `.codevetra/data` with one primary owner. There is no SQL
 connection, schema, port, connection pool, or TLS configuration. Retired
 `CODEVETRA_DATABASE_*` and `CODEVETRA_MANAGED_DATABASE_PORT` variables do not
@@ -702,6 +709,7 @@ Claude argv, stdin prompt bytes, and Claude response decoder.
 | Tier `timeoutMs` | 120,000 (embedding; chat except `anthropic-api`); 60,000 (`anthropic-api` chat, reranker); 5,000 (`decisionLlm`) | 1 through 600,000; `decisionLlm` accepts at most 30,000 |
 | Tier `concurrency` | operation default | 1 through 16 |
 | Tier `summaryBatchSize` | 1 (`openai-compat`); 3 (`cli-bridge`, `claude-bridge`, `anthropic-api`) | 1 through 16 |
+| Tier `embeddingBatchSize` | 32 | 1 through 128; lower this for providers with a padded batch context limit |
 | Tier `askModel` | none | Model used when the ask tier falls back to this (summarize) tier. Without it, `anthropic-api` and `claude-bridge` use `claude-sonnet-4-6` and other providers use the tier's `model` |
 | `decisionLlm.features` | absent (exploration only) | At most 16 names; see [Jev features](#jev-features) |
 

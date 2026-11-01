@@ -699,7 +699,7 @@ impl<'a, 'store> PreviousRows<'a, 'store> {
 
     fn fill(&mut self) -> Result<()> {
         self.request.check()?;
-        if self.rows.is_empty()
+        while self.rows.is_empty()
             && !self.done
             && let Some(snapshot) = self.snapshot
         {

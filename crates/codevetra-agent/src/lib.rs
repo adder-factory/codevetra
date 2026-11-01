@@ -62,6 +62,8 @@ mod issue_history;
 mod layering;
 mod navigation;
 mod position_navigation;
+mod relocation;
+pub use relocation::{ProjectRelocationReport, relocate_project};
 mod rename;
 mod retrieval;
 mod review;

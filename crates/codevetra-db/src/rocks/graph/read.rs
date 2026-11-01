@@ -199,6 +199,10 @@ impl GraphSnapshot<'_, '_> {
         self.table_records(Collection::Search, DOCUMENT, after, limit, budget)
     }
 
+    pub(crate) fn document_cursor(id: &DocumentId) -> Result<RecordKey> {
+        codec::key(DOCUMENT, &codec::uuid(id.as_str())?)
+    }
+
     /// Read a finite canonical reference page, including unresolved references.
     ///
     /// # Errors
@@ -505,14 +509,23 @@ impl Neighborhood<'_, '_> {
                 .ok_or_else(codec::corrupt)?;
             return Ok(Some((key.clone(), bytes)));
         }
-        let page = self.snapshot.scan_prefix(
-            Collection::Graph,
-            self.prefix.as_bytes(),
-            self.cursor.as_ref().map(|cursor| &cursor.block),
-            1,
-            budget,
-        )?;
-        Ok(page.rows.into_iter().next())
+        let mut after = self.cursor.as_ref().map(|cursor| cursor.block.clone());
+        loop {
+            let page = self.snapshot.scan_prefix(
+                Collection::Graph,
+                self.prefix.as_bytes(),
+                after.as_ref(),
+                1,
+                budget,
+            )?;
+            if let Some(row) = page.rows.into_iter().next() {
+                return Ok(Some(row));
+            }
+            after = page.next_after;
+            if after.is_none() {
+                return Ok(None);
+            }
+        }
     }
 
     fn append(

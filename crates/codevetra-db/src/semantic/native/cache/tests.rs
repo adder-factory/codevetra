@@ -20,6 +20,117 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_embeddings_continue_after_an_empty_already_embedded_page() -> TestResult {
+    let fixture = Fixture::with_count(true, 255).await?;
+    let request = || {
+        PendingEmbeddingPageRequest::new(PendingEmbeddingPageInput {
+            project_id: fixture.database.project_id().clone(),
+            model: fixture.model.clone(),
+            maximum_documents: 128,
+            maximum_source_bytes: 1_048_576,
+            statement_timeout: TIMEOUT,
+        })
+    };
+    let first = fixture
+        .database
+        .pending_current_embedding_documents(request()?)
+        .await?;
+    let (_, rows, cursor) = first.into_parts();
+    assert_eq!(rows.len(), 0);
+    let cursor = cursor.ok_or("empty page lost continuation")?;
+    assert_eq!(cursor.after_row_id(), 128);
+    let second = fixture
+        .database
+        .pending_current_embedding_documents(request()?.with_cursor(cursor)?)
+        .await?;
+    let (_, rows, cursor) = second.into_parts();
+    assert_eq!(rows.len(), 127);
+    assert_eq!(rows[0].document_id(), &document(129));
+    assert_eq!(rows[126].document_id(), &document(255));
+    assert!(cursor.is_none());
+    fixture.runtime.shutdown(&super::tests::request()?).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedding_cursor_seeks_past_consumed_document_bodies() -> TestResult {
+    let fixture = Fixture::new(false).await?;
+    let ids = fixture
+        .store
+        .state(
+            Some(generation()),
+            ReadBudget::new(100, 1_048_576, TIMEOUT)?,
+            0,
+            0,
+            &request()?,
+            |transaction, budget| {
+                let snapshot = transaction.graph_snapshot()?;
+                let graph = snapshot.graph(budget)?;
+                let cursor = crate::EmbeddingPageCursor {
+                    generation_id: generation(),
+                    after_row_id: 127,
+                    after_document: document(127),
+                };
+                let mut small = ReadBudget::new(4, 4096, TIMEOUT)?;
+                let mut ids = Vec::new();
+                let result = vectors::documents_scan_after(
+                    &graph,
+                    &mut small,
+                    Some(&cursor),
+                    |ordinal, row, _| {
+                        ids.push((ordinal, row.document_id));
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    },
+                );
+                Ok(result.map(|()| ids))
+            },
+        )
+        .await??;
+    assert_eq!(ids, vec![(128, document(128))]);
+    fixture.runtime.shutdown(&request()?).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absent_summary_scopes_render_exact_source_without_loading_symbols() -> TestResult {
+    let fixture = Fixture::new(false).await?;
+    let text = fixture
+        .store
+        .state(
+            Some(generation()),
+            ReadBudget::new(100, 1_048_576, TIMEOUT)?,
+            0,
+            0,
+            &request()?,
+            |transaction, budget| {
+                let snapshot = transaction.graph_snapshot()?;
+                let graph = snapshot.graph(budget)?;
+                let source = graph.document(&document(1), budget)?.ok_or(
+                    crate::rocks::RocksError::Corrupt {
+                        field: "test_document",
+                    },
+                )?;
+                let mut small = ReadBudget::new(8, 256, TIMEOUT)?;
+                Ok(vectors::source(
+                    transaction,
+                    &graph,
+                    &generation(),
+                    source,
+                    &mut small,
+                ))
+            },
+        )
+        .await??
+        .0;
+    assert_eq!(
+        text,
+        "path:\nsrc/lib.rs\n\nlanguage:\nrust\n\nkind:\nsymbol\n\nname:\nfunction_1\n\ncode:\nfn function() {}"
+    );
+    fixture.runtime.shutdown(&request()?).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rerank_sources_preserve_order_and_reject_foreign_generations_and_missing_ids() -> TestResult
 {
     let fixture = Fixture::new(false).await?;
@@ -105,7 +216,7 @@ fn request() -> TestResult<StorageRequest> {
     Ok(StorageRequest::new(TIMEOUT)?)
 }
 
-fn facts() -> GenerationFacts {
+fn facts(count: u8) -> GenerationFacts {
     let file = FileInput {
         file_id: FileId::from_uuid_v8([1; 16]),
         normalized_path: "src/lib.rs".into(),
@@ -114,7 +225,7 @@ fn facts() -> GenerationFacts {
         byte_size: 1,
         parse_status: FileParseStatus::Parsed,
     };
-    let symbols: Vec<_> = (1..=128_u8)
+    let symbols: Vec<_> = (1..=count)
         .map(|id| SymbolInput {
             symbol_id: SymbolId::from_uuid_v8([id; 16]),
             file_id: file.file_id.clone(),
@@ -136,7 +247,7 @@ fn facts() -> GenerationFacts {
         .collect();
     let documents = symbols
         .iter()
-        .zip(1..=128_u8)
+        .zip(1..=count)
         .map(|(symbol, id)| SearchDocumentInput {
             document_id: document(id),
             file_id: Some(file.file_id.clone()),
@@ -168,6 +279,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(complete: bool) -> TestResult<Self> {
+        Self::with_count(complete, 128).await
+    }
+
+    async fn with_count(complete: bool, count: u8) -> TestResult<Self> {
         let root = tempfile::tempdir()?;
         let runtime = StorageRuntime::new(WorkerPolicy::default())?;
         let store = AsyncProjectStore::open(
@@ -179,7 +294,7 @@ impl Fixture {
         )
         .await?;
         let (facts, _) = validate_generation_facts(
-            facts(),
+            facts(count),
             GenerationValidationLimits::new(16 * 1_048_576, 64 * 1_048_576)?,
             || false,
         )?;

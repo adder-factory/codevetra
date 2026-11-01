@@ -352,6 +352,14 @@ pub(crate) fn embedding_summary(
     budget: &mut ReadBudget,
 ) -> Result<String, RocksError> {
     if let Some(id) = &document.symbol_id
+        && !summary_scope_present(transaction, Scope::Symbol, id.as_str(), budget)?
+        && !summary_scope_present(transaction, Scope::File, &document.path, budget)?
+    {
+        // Neither scope can contribute text in this exact state snapshot. An
+        // unrelated symbol row need not be hydrated to prove an empty summary.
+        return Ok(String::new());
+    }
+    if let Some(id) = &document.symbol_id
         && let Some(symbol) = graph.symbol(id, budget)?
         && symbol.symbol_kind != "file"
     {
@@ -378,6 +386,21 @@ pub(crate) fn embedding_summary(
             && summary.generation_id.as_deref() == Some(generation.as_str())
     })
     .map_or_else(String::new, |summary| summary.body))
+}
+
+fn summary_scope_present(
+    transaction: &StateTransaction<'_>,
+    scope: Scope,
+    key: &str,
+    budget: &mut ReadBudget,
+) -> Result<bool, RocksError> {
+    transaction
+        .get(
+            super::NAMESPACE,
+            super::scope_key(Kind::Summary, scope, key).as_bytes(),
+            budget,
+        )
+        .map(|value| value.is_some())
 }
 
 pub(crate) fn documentation_lengths(

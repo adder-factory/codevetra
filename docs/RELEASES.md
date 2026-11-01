@@ -24,6 +24,7 @@ provenance live on GitHub Releases.
 
 | Version | Date | Schema · Contract | Headline |
 | --- | --- | --- | --- |
+| [v4.0.1](releases/v4.0.1.md) | 2026-11-01 | Rocks v1 · V27 | Preserved project identity after relocation, bounded large-index reads, resumable embeddings, and provider batch sizing |
 | [v4.0.0](releases/v4.0.0.md) | 2026-11-01 | Rocks v1 · V27 ↑ | CodeVetra rename and state migration; precise review, code-health rules, navigation, application boundaries, static traces, and dependency updates |
 | [v3.0.6](releases/v3.0.6.md) | 2026-10-26 | Rocks v1 · V26 ↑ | Private-method call edges, partial graph batches, explicit affected-test and audit readiness, retrieval diagnostics, and dependency updates |
 | [v3.0.5](releases/v3.0.5.md) | 2026-10-22 | Rocks v1 · V25 ↑ | FreeSWITCH, Kamailio, and rtpengine configuration support; idle retention CPU optimization |

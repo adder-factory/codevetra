@@ -6,6 +6,55 @@ use crate::rocks::StorePolicy;
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 #[test]
+fn previous_rows_follow_empty_pages_to_remaining_facts() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let store = ProjectStore::open(
+        root.path(),
+        &ContentDigest::from_bytes([7; 32]),
+        StorePolicy::default(),
+    )?;
+    for sequence in [1_u8, 2] {
+        let writer = store.begin_revision(
+            GenerationId::from_uuid_v8([sequence; 16]),
+            ContentDigest::from_bytes([1; 32]),
+            std::time::Duration::from_secs(30),
+        )?;
+        let mut changes = (0..256)
+            .map(|number| {
+                let key = RecordKey::new(format!("test/{number:04}").into_bytes())?;
+                Ok(if sequence == 1 {
+                    RecordChange::put(Collection::Graph, key, b"old".to_vec())
+                } else {
+                    RecordChange::delete(Collection::Graph, key)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if sequence == 1 {
+            changes.push(RecordChange::put(
+                Collection::Graph,
+                RecordKey::new(b"test/z".to_vec())?,
+                b"remaining".to_vec(),
+            ));
+        }
+        store.stage(&writer, &changes)?;
+        store.seal(
+            &writer,
+            ContentDigest::from_bytes([sequence; 32]),
+            GenerationDigestVersion::V27,
+        )?;
+        store.publish(&writer)?;
+    }
+    let snapshot = store.current_snapshot(None)?;
+    let request = StorageRequest::new(std::time::Duration::from_secs(30))?;
+    let mut rows = PreviousRows::new(Some(&snapshot), Collection::Graph, b"test/", &request);
+    let (key, value) = rows.pop()?.ok_or("lost fact after empty continuation")?;
+    assert_eq!(key.as_bytes(), b"test/z");
+    assert_eq!(value, b"remaining");
+    assert!(rows.pop()?.is_none());
+    Ok(())
+}
+
+#[test]
 fn grouped_discovery_polls_cancellation_before_a_large_group_finishes() -> TestResult {
     use codevetra_domain::{FileId, FileParseStatus};
     let file_id = FileId::from_uuid_v8([1; 16]);

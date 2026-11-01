@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [MCP usage](MCP-USAGE.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Last release audit: 2026-11-01 (`v4.0.0`).
+Last release audit: 2026-11-01 (`v4.0.1`).
 
 The installed executable is `codevetra`. Run `codevetra <command> --help` for
 the exact bounds in the installed version. Bounded maintenance and its
@@ -277,7 +277,7 @@ by `codevetra --help`. Hidden compatibility adapters and Clap's generated
   `imports`, `note`, `propose-rename`, `role`, `session`, `summaries`,
   `trace-to-culprits`, `verify`, `review`, `playbook`, `admin`.
 - Configuration and lifecycle: `backend`, `llm`, `upgrade`, `install`,
-  `uninstall`, `serve`, `watch`, `service`, `db`, `migrate-name`.
+  `uninstall`, `serve`, `watch`, `service`, `db`, `migrate-name`, `relocate`.
 
 <!-- CODEVETRA_TOP_LEVEL_COMMANDS_END -->
 

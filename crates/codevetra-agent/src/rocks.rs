@@ -25,9 +25,8 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::{
     DEFAULT_MAX_GENERATION_BYTES, DEFAULT_MAX_SOURCE_BYTES, IndexProfile, NativeIndexMetrics,
     PipelineBounds, ProjectError, ProjectSourcePolicy, SourceRevision, SourceRevisionRequest,
-    finish_source_manifest, monotonic_millis, pipeline_config, project_identity_digest,
-    project_source_policy_with_excludes, run_source_worker, select_worker_count,
-    source_revision_with_options,
+    finish_source_manifest, monotonic_millis, pipeline_config, project_source_policy_with_excludes,
+    run_source_worker, select_worker_count, source_revision_with_options,
 };
 
 #[cfg(test)]
@@ -265,6 +264,7 @@ impl SourceScanPause {
 /// Project lifetime owns one bounded storage runtime; adapters explicitly drain it.
 pub struct RocksProjectRuntime {
     root: PathBuf,
+    identity: ContentDigest,
     storage: StorageRuntime,
     store: AsyncProjectStore,
     database: codevetra_db::NativeDatabase,
@@ -276,6 +276,10 @@ pub struct RocksProjectRuntime {
 }
 
 impl RocksProjectRuntime {
+    pub(super) const fn identity(&self) -> &ContentDigest {
+        &self.identity
+    }
+
     /// Typed services sharing this project's existing native storage owner.
     #[must_use]
     pub const fn database(&self) -> &codevetra_db::NativeDatabase {
@@ -298,15 +302,24 @@ impl RocksProjectRuntime {
     ) -> Result<Arc<Self>, RocksProjectError> {
         request.check()?;
         let root = root.as_ref().to_path_buf();
-        let root = run_source_worker(move || {
+        let (root, identity) = run_source_worker(move || {
             let root =
                 std::fs::canonicalize(root).map_err(|_| ProjectError::ProjectRootUnavailable)?;
             if !root.is_dir() {
                 return Err(ProjectError::ProjectRootUnavailable);
             }
-            Ok(root)
+            let identity = crate::relocation::resolved_identity(&root)?;
+            Ok((root, identity))
         })
         .await?;
+        Self::open_with_identity(root, identity, request).await
+    }
+
+    pub(crate) async fn open_with_identity(
+        root: PathBuf,
+        identity: ContentDigest,
+        request: &StorageRequest,
+    ) -> Result<Arc<Self>, RocksProjectError> {
         // The CLI owns at most one complete build. Its measured canonical input
         // plus 32 MiB workspace and bounded native buffers fit the kernel's
         // existing 512 MiB hard reservation ceiling.
@@ -317,15 +330,15 @@ impl RocksProjectRuntime {
         let store = AsyncProjectStore::open(
             &storage,
             root.clone(),
-            project_identity_digest(&root),
+            identity.clone(),
             StorePolicy::default(),
             request,
         )
         .await?;
-        let database =
-            codevetra_db::NativeDatabase::new(store.clone(), &project_identity_digest(&root));
+        let database = codevetra_db::NativeDatabase::new(store.clone(), &identity);
         Ok(Arc::new(Self {
             root,
+            identity,
             storage,
             store,
             database,

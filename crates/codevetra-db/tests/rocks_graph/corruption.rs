@@ -3,6 +3,62 @@ use codevetra_domain::GenerationDigestVersion;
 
 use super::*;
 
+#[test]
+fn adjacency_continues_after_a_deleted_block_prefix() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let store = ProjectStore::open(root.path(), &digest(1), StorePolicy::default())?;
+    store.publish_graph(
+        input(
+            1,
+            facts(301, (2..=301).map(|id| edge(1, id, "native")).collect())?,
+        )?,
+        &request()?,
+    )?;
+    let old = store.current_snapshot(None)?;
+    let first = old
+        .scan_prefix(Collection::Graph, b"cg1/o/", None, 1, &mut budget()?)?
+        .rows
+        .remove(0)
+        .0;
+    let prefix = RecordKey::new(first.as_bytes()[..b"cg1/o/".len() + 16].to_vec())?;
+    assert!(first.as_bytes().len() > prefix.as_bytes().len());
+    let writer = store.begin_revision(generation(2), digest(9), Duration::from_secs(30))?;
+    store.stage(&writer, &[RecordChange::delete(Collection::Graph, prefix)])?;
+    store.seal(
+        &writer,
+        old.revision()
+            .content_digest
+            .clone()
+            .ok_or("missing digest")?,
+        GenerationDigestVersion::V27,
+    )?;
+    store.publish(&writer)?;
+    let snapshot = store.current_snapshot(None)?;
+    let graph = snapshot.graph(&mut budget()?)?;
+    let mut after = None;
+    let mut actual = std::collections::BTreeSet::new();
+    loop {
+        let page = graph.neighbors(
+            &symbol(1),
+            GraphDirection::Outgoing,
+            after.as_ref(),
+            33,
+            &mut budget()?,
+        )?;
+        actual.extend(
+            page.links
+                .iter()
+                .map(|link| link.target_symbol_id().clone()),
+        );
+        after = page.next;
+        if after.is_none() {
+            break;
+        }
+    }
+    assert_eq!(actual, (2..=301).map(symbol).collect());
+    Ok(())
+}
+
 fn replace_raw(store: &ProjectStore, key: RecordKey, bytes: Vec<u8>) -> TestResult {
     let snapshot = store.current_snapshot(None)?;
     let digest = snapshot

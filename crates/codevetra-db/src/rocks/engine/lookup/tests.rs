@@ -34,6 +34,64 @@ fn publish(store: &ProjectStore, sequence: u8, changes: &[RecordChange]) -> Test
 }
 
 #[test]
+fn scan_pages_continue_across_tombstones_and_unpublished_only_keys() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let store = ProjectStore::open(
+        root.path(),
+        &ContentDigest::from_bytes([7; 32]),
+        StorePolicy::default(),
+    )?;
+    publish(
+        &store,
+        1,
+        &[
+            row(Collection::Graph, b"a", b"deleted")?,
+            row(Collection::Graph, b"c", b"visible")?,
+        ],
+    )?;
+    let failed = store.begin_revision(
+        GenerationId::from_uuid_v8([2; 16]),
+        ContentDigest::from_bytes([1; 32]),
+        Duration::from_secs(30),
+    )?;
+    store.stage(&failed, &[row(Collection::Graph, b"b", b"unpublished")?])?;
+    store.fail(&failed)?;
+    publish(
+        &store,
+        3,
+        &[RecordChange::delete(
+            Collection::Graph,
+            RecordKey::new(b"a".to_vec())?,
+        )],
+    )?;
+    let snapshot = store.current_snapshot(None)?;
+    let mut cursor = None;
+    for expected in [b"a", b"b"] {
+        let page =
+            snapshot.scan_prefix(Collection::Graph, b"", cursor.as_ref(), 1, &mut budget()?)?;
+        assert_eq!(page.rows.len(), 0);
+        assert_eq!(
+            page.next_after.as_ref().map(RecordKey::as_bytes),
+            Some(expected.as_slice())
+        );
+        cursor = page.next_after;
+    }
+    let page = snapshot.scan_prefix(Collection::Graph, b"", cursor.as_ref(), 1, &mut budget()?)?;
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].0.as_bytes(), b"c");
+    assert_eq!(page.rows[0].1, b"visible");
+    let final_page = snapshot.scan_prefix(
+        Collection::Graph,
+        b"",
+        page.next_after.as_ref(),
+        1,
+        &mut budget()?,
+    )?;
+    assert!(final_page.rows.is_empty() && final_page.next_after.is_none());
+    Ok(())
+}
+
+#[test]
 fn point_readers_reseek_all_collections_without_crossing_their_snapshot() -> TestResult {
     let root = tempfile::tempdir()?;
     let store = ProjectStore::open(

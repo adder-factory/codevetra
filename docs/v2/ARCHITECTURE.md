@@ -1,11 +1,11 @@
-# CodeVetra v3 architecture
+# CodeVetra v4 architecture
 
 [Documentation home](../README.md) · [Project overview](../../README.md) ·
 [Native extraction](EXTRACTION.md) · [Language matrix](../SUPPORT-MATRIX.md)
 
-Last release audit: 2026-11-01 (`v4.0.0`).
+Last release audit: 2026-11-01 (`v4.0.1`).
 
-CodeVetra v3 is a native Rust code-intelligence server for AI coding agents.
+CodeVetra v4 is a native Rust code-intelligence server for AI coding agents.
 Each project owns an embedded RocksDB 11.12.0 store. Rust implements
 code-aware BM25 and model-scoped exact cosine retrieval. Exact,
 lexical, graph, review, freshness, and affected-test workflows require no LLM.
@@ -133,7 +133,12 @@ source/query data, credentials, driver internals, and absolute checkout paths.
 ## Project identity and source freshness
 
 The canonical checkout path is hashed under a domain separator. The native store
-binds that identity to its per-project database. Live source is compared against
+binds that identity to its per-project database. Explicit `codevetra relocate`
+preserves the original storage identity after a physical checkout move through
+a validated `nativeRootIdentity` binding. It requires stopped storage owners
+and verifies the existing database marker before atomically updating the
+binding; ordinary opens never silently rebind a copied or moved database.
+Live source is compared against
 the complete publication's recorded source-admission policy and content
 manifest under the native generation-digest contract emitted by the running
 binary and under its recorded source-admission policy. Run-scoped exclusion
@@ -217,7 +222,7 @@ not prove. It never stores the source expression or literal. Static heuristic
 evidence is not relabeled as a runtime observation or formal proof;
 `codevetra_numerical`, status, and numerical review report observation and
 formal adapters as `not_configured`. Generations recorded under an older digest
-contract (anything before the current V26) remain explicitly stale until an
+contract (anything before the current V27) remain explicitly stale until an
 ordinary index republishes them; for generations older than V7, which predate
 numerical sites, that republication is also what publishes numerical evidence.
 
