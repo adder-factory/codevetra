@@ -3,7 +3,7 @@
 use super::{NativeDatabase, decode, storage_error};
 use crate::{
     AgentArtifactKind, AgentArtifactScope, RegisteredEmbeddingModel, StorageError,
-    artifacts::native::{bump_epoch, decode_primary, is_current, remove},
+    artifacts::native::{decode_primary, is_current, remove},
     retrieval::native::visit_files,
     rocks::{
         GraphSnapshot, ReadBudget, RocksError, StateNamespace as Ns, StateTransaction,
@@ -277,9 +277,8 @@ fn collect_vectors(
             report.vectors_removed += 1;
         }
     }
-    if report.vectors_removed > 0 {
-        bump_epoch(tx, budget, b"vector_epoch")?;
-    }
+    // Every removed vector was already excluded by the current source digest.
+    // Reclaiming those bytes does not change current similarity or biomarker inputs.
     Ok(())
 }
 

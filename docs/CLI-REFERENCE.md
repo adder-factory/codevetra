@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [MCP usage](MCP-USAGE.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Last release audit: 2026-11-01 (`v4.0.2`).
+Last release audit: 2026-11-01 (`v4.0.3`).
 
 The installed executable is `codevetra`. Run `codevetra <command> --help` for
 the exact bounds in the installed version. Bounded maintenance and its
@@ -576,11 +576,10 @@ stale source and limits are explicit. See the [trace contract](MCP-USAGE.md#poss
 ### `migrate-name`
 
 `codevetra migrate-name --project-path /absolute/project --format json` explicitly
-adopts an existing Cartograph project through a validated `.codevetra` alias. Stop
+moves existing Cartograph state into a real `.codevetra` directory. Stop
 its current host first; the command refuses active primary/configuration locks,
 independent old/new directories and conflicting ignore files. It preserves database,
 configuration and overlay bytes. Repeating it is idempotent. Fresh initialization
 requires no name migration. See [the CodeVetra migration guide](CODEVETRA-MIGRATION.md)
-for host registration, Windows alias permissions, the 4.x compatibility window and
-rollback. Existing `--disable-tool cartograph_*` restrictions are translated to their
+for host registration, interrupted-migration recovery and retiring old executables. Existing `--disable-tool cartograph_*` restrictions are translated to their
 canonical tool names during server configuration; unknown names still fail closed.

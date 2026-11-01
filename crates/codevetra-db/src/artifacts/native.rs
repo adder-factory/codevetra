@@ -480,6 +480,7 @@ pub(crate) fn remove(
     if record.id != id {
         return Err(corrupt());
     }
+    let invalidates_summary = current_summary_input(transaction, &record, budget)?;
     if indexed(record.kind, record.state) {
         let key = scope_key(record.kind, record.scope, &record.scope_key);
         let value = transaction
@@ -493,10 +494,26 @@ pub(crate) fn remove(
     transaction.delete(NAMESPACE, key.as_bytes())?;
     crate::native_database::retention::forget_orphan(transaction, "artifact", key.as_bytes())?;
     transaction.delete(NAMESPACE, format!("u/{}", record.artifact_id).as_bytes())?;
-    if record.kind == Kind::Summary {
+    if invalidates_summary {
         bump_epoch(transaction, budget, b"summary_epoch")?;
     }
     Ok(true)
+}
+
+fn current_summary_input(
+    transaction: &StateTransaction<'_>,
+    record: &Record,
+    budget: &mut ReadBudget,
+) -> Result<bool, RocksError> {
+    if record.kind != Kind::Summary {
+        return Ok(false);
+    }
+    let Some(current) = transaction.current()? else {
+        return Ok(false);
+    };
+    let snapshot = transaction.graph_snapshot()?;
+    let graph = snapshot.graph(budget)?;
+    is_current(record, Some(&current.generation_id), Some(&graph), budget)
 }
 
 pub(crate) fn bump_epoch(

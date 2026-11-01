@@ -1,4 +1,4 @@
-//! Explicit product-name migration. The compatibility alias keeps one physical owner lock.
+//! Explicit product-name migration preserves the directory and native owner lock identities.
 use serde::Serialize;
 use std::{
     fs::{self, File, OpenOptions},
@@ -33,21 +33,14 @@ pub enum NameMigrationError {
     /// An untrusted path or failed operation left existing state intact.
     #[error("name migration path is unavailable or unsafe; existing state was preserved")]
     UnsafePath,
-    /// Windows directory-link creation may require Developer Mode or elevated rights.
-    #[error(
-        "cannot create the canonical state alias; on Windows enable directory symlink permission and retry"
-    )]
-    AliasUnavailable,
 }
 
-/// Physical storage placement during the naming compatibility window.
+/// Physical storage placement reported by name migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatePlacement {
     /// Fresh canonical state, or an uninitialized project with no legacy data.
     Canonical,
-    /// Canonical alias to preserved legacy state and its original lock.
-    LegacyAlias,
 }
 
 /// Migration changes names while preserving the physical state and its native lock.
@@ -56,9 +49,9 @@ pub enum StatePlacement {
 pub struct NameMigrationReport {
     /// The canonical path is available or already migrated.
     pub completed: bool,
-    /// No graph/config/overlay bytes were moved or rewritten.
+    /// Graph/config/overlay contents and the physical directory identity are preserved.
     pub state_preserved: bool,
-    /// The compatibility alias shares the legacy native owner lock and data directory.
+    /// Completed migrations use a real canonical directory.
     pub placement: StatePlacement,
     /// Restart hosts after updating their managed registration with `codevetra install`.
     pub host_restart_required: bool,
@@ -105,91 +98,157 @@ pub fn project_state_directory(root: &Path) -> Result<PathBuf, NameMigrationErro
     Ok(canonical)
 }
 
-/// Reserve the old name before creating fresh canonical state, preventing an old
-/// binary from silently initializing a second database in the same project.
+/// Resolve canonical state without creating a legacy compatibility marker.
 /// # Errors
-/// Rejects conflicting state or a failed exclusive tombstone creation.
+/// Rejects conflicting state, unsafe aliases, and unmigrated legacy directories.
 pub fn prepare_project_state(root: &Path) -> Result<PathBuf, NameMigrationError> {
-    let state = project_state_directory(root)?;
-    if state == root.join(CANONICAL) && metadata(&root.join(LEGACY))?.is_none() {
-        match write_new_atomic(&root.join(LEGACY), TOMBSTONE) {
-            Ok(()) => (),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                project_state_directory(root)?;
-            }
-            Err(_) => return Err(NameMigrationError::UnsafePath),
-        }
-    }
-    Ok(state)
+    project_state_directory(root)
 }
 
-/// Idempotently expose existing state through `.codevetra` after proving that
-/// its original native primary and configuration locks are both idle. The alias
-/// avoids a rename gap in which an older binary could create a second owner.
+/// Move existing state into a real `.codevetra` directory while holding both
+/// original locks. Existing migration aliases and exact legacy markers are retired.
+/// Stop legacy hosts first; old binaries that only know `.cartograph` must no longer run.
 /// # Errors
-/// Refuses live owners, independent old/new directories, unsafe links and ignore conflicts.
+/// Refuses active owners, independent directories, unsafe paths and ignore conflicts.
 pub fn migrate_project_name(root: &Path) -> Result<NameMigrationReport, NameMigrationError> {
     let root = fs::canonicalize(root).map_err(|_| NameMigrationError::UnsafePath)?;
     let legacy = root.join(LEGACY);
     let canonical = root.join(CANONICAL);
-    if let Ok(state) = project_state_directory(&root)
-        && state == canonical
-    {
-        return Ok(report(false));
-    }
-    let meta = metadata(&legacy)?.ok_or(NameMigrationError::UnsafePath)?;
+    let state = match project_state_directory(&root) {
+        Ok(state) => state,
+        Err(NameMigrationError::Required) => legacy.clone(),
+        Err(error) => return Err(error),
+    };
+    let Some(meta) = metadata(&state)? else {
+        IgnoreMigration::inspect(&root)?.finish(&root)?;
+        retire_marker(&legacy)?;
+        sync_directory(&root)?;
+        return Ok(report());
+    };
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Err(NameMigrationError::UnsafePath);
     }
     #[cfg(unix)]
     validate_owner(&meta)?;
-    if metadata(&canonical)?.is_some() && project_state_directory(&root)? != legacy {
-        return Err(NameMigrationError::Conflict);
-    }
-    let _primary = lock(&legacy.join("native-primary.lock"))?;
-    let _config = lock(&legacy.join("config.lock"))?;
-    let ignore = migrate_ignore(&root)?;
-    if metadata(&canonical)?.is_none() {
-        directory_alias(Path::new(LEGACY), &canonical)?;
-    }
-    if let Some((path, bytes)) = ignore {
-        match write_new_atomic(&path, &bytes) {
-            Ok(()) => (),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::AlreadyExists
-                    && read_bounded(&path, 1024 * 1024)? == bytes => {}
-            Err(_) => return Err(NameMigrationError::Conflict),
+    let _primary = lock(&state.join("native-primary.lock"))?;
+    let _config = lock(&state.join("config.lock"))?;
+    let ignore = IgnoreMigration::inspect(&root)?;
+    if state == legacy {
+        if metadata(&canonical)?.is_some() {
+            if project_state_directory(&root)? != legacy {
+                return Err(NameMigrationError::Conflict);
+            }
+            remove_alias(&canonical)?;
         }
+        rename_exclusive(&legacy, &canonical)?;
+    } else if metadata(&legacy)?.is_some() {
+        retire_marker(&legacy)?;
     }
-    Ok(report(true))
+    ignore.finish(&root)?;
+    sync_directory(&root)?;
+    Ok(report())
 }
-fn report(alias: bool) -> NameMigrationReport {
+
+fn retire_marker(path: &Path) -> Result<(), NameMigrationError> {
+    if metadata(path)?.is_some() {
+        if read_bounded(path, 256)? != TOMBSTONE {
+            return Err(NameMigrationError::Conflict);
+        }
+        fs::remove_file(path).map_err(|_| NameMigrationError::UnsafePath)?;
+    }
+    Ok(())
+}
+
+fn report() -> NameMigrationReport {
     NameMigrationReport {
         completed: true,
         state_preserved: true,
-        placement: if alias {
-            StatePlacement::LegacyAlias
-        } else {
-            StatePlacement::Canonical
-        },
+        placement: StatePlacement::Canonical,
         host_restart_required: true,
     }
 }
-fn migrate_ignore(root: &Path) -> Result<Option<(PathBuf, Vec<u8>)>, NameMigrationError> {
-    let old = root.join(".cartographignore");
-    let new = root.join(".codevetraignore");
-    if metadata(&old)?.is_none() {
-        return Ok(None);
-    }
-    let bytes = read_bounded(&old, 1024 * 1024)?;
-    if metadata(&new)?.is_some() {
-        return if read_bounded(&new, 1024 * 1024)? == bytes {
-            Ok(None)
-        } else {
-            Err(NameMigrationError::Conflict)
+
+struct IgnoreMigration(Option<(Vec<u8>, fs::Permissions)>);
+impl IgnoreMigration {
+    fn inspect(root: &Path) -> Result<Self, NameMigrationError> {
+        let old = root.join(".cartographignore");
+        let new = root.join(".codevetraignore");
+        let Some(meta) = metadata(&old)? else {
+            return Ok(Self(None));
         };
+        let bytes = read_bounded(&old, 1024 * 1024)?;
+        if metadata(&new)?.is_some() && read_bounded(&new, 1024 * 1024)? != bytes {
+            return Err(NameMigrationError::Conflict);
+        }
+        Ok(Self(Some((bytes, meta.permissions()))))
     }
-    Ok(Some((new, bytes)))
+
+    fn finish(self, root: &Path) -> Result<(), NameMigrationError> {
+        let Some((bytes, permissions)) = self.0 else {
+            return Ok(());
+        };
+        let old = root.join(".cartographignore");
+        let new = root.join(".codevetraignore");
+        if read_bounded(&old, 1024 * 1024)? != bytes {
+            return Err(NameMigrationError::Conflict);
+        }
+        if metadata(&new)?.is_none() {
+            match write_new_atomic(&new, &bytes, permissions) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(_) => return Err(NameMigrationError::UnsafePath),
+            }
+        }
+        if read_bounded(&new, 1024 * 1024)? != bytes || read_bounded(&old, 1024 * 1024)? != bytes {
+            return Err(NameMigrationError::Conflict);
+        }
+        fs::remove_file(&old).map_err(|_| NameMigrationError::UnsafePath)
+    }
+}
+
+fn remove_alias(path: &Path) -> Result<(), NameMigrationError> {
+    #[cfg(windows)]
+    let result = fs::remove_dir(path);
+    #[cfg(not(windows))]
+    let result = fs::remove_file(path);
+    result.map_err(|_| NameMigrationError::UnsafePath)
+}
+
+fn rename_exclusive(old: &Path, new: &Path) -> Result<(), NameMigrationError> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let result = rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        old,
+        rustix::fs::CWD,
+        new,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from);
+    // Windows directory rename refuses an existing destination.
+    #[cfg(windows)]
+    let result = fs::rename(old, new);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    let result = {
+        let _ = (old, new);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    };
+    result.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            NameMigrationError::Conflict
+        } else {
+            NameMigrationError::UnsafePath
+        }
+    })
+}
+
+fn sync_directory(path: &Path) -> Result<(), NameMigrationError> {
+    #[cfg(unix)]
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| NameMigrationError::UnsafePath)?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 fn metadata(path: &Path) -> Result<Option<fs::Metadata>, NameMigrationError> {
     match fs::symlink_metadata(path) {
@@ -222,11 +281,16 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, NameMigrationError> 
     }
     Ok(bytes)
 }
-fn write_new_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_new_atomic(
+    path: &Path,
+    bytes: &[u8],
+    permissions: fs::Permissions,
+) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.as_file().set_permissions(permissions)?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
     temporary
@@ -278,14 +342,13 @@ fn validate_owner(meta: &fs::Metadata) -> Result<(), NameMigrationError> {
     }
     Ok(())
 }
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn directory_alias(target: &Path, alias: &Path) -> Result<(), NameMigrationError> {
-    std::os::unix::fs::symlink(target, alias).map_err(|_| NameMigrationError::AliasUnavailable)
+    std::os::unix::fs::symlink(target, alias).map_err(|_| NameMigrationError::UnsafePath)
 }
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn directory_alias(target: &Path, alias: &Path) -> Result<(), NameMigrationError> {
-    std::os::windows::fs::symlink_dir(target, alias)
-        .map_err(|_| NameMigrationError::AliasUnavailable)
+    std::os::windows::fs::symlink_dir(target, alias).map_err(|_| NameMigrationError::UnsafePath)
 }
 
 #[cfg(test)]
@@ -301,6 +364,143 @@ mod tests {
         ("config.lock", b"original-config-lock"),
     ];
 
+    #[test]
+    fn migration_uses_a_real_canonical_directory_and_retires_legacy_paths() -> TestResult {
+        let root = migration_fixture()?;
+        let original = fs::metadata(root.path().join(LEGACY))?;
+        let report = migrate_project_name(root.path())?;
+        assert_eq!(report.placement, StatePlacement::Canonical);
+        let canonical = root.path().join(CANONICAL);
+        assert!(!fs::symlink_metadata(&canonical)?.file_type().is_symlink());
+        assert!(metadata(&root.path().join(LEGACY))?.is_none());
+        assert!(metadata(&root.path().join(".cartographignore"))?.is_none());
+        for (path, bytes) in PRESERVED_FILES {
+            assert_eq!(fs::read(canonical.join(path))?, *bytes);
+        }
+        assert_eq!(
+            fs::read(root.path().join(".codevetraignore"))?,
+            b"private/**\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let moved = fs::metadata(&canonical)?;
+            assert_eq!(
+                (original.dev(), original.ino(), original.mode()),
+                (moved.dev(), moved.ino(), moved.mode())
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = original;
+        assert!(migrate_project_name(root.path())?.completed);
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_state_never_creates_a_legacy_marker() -> TestResult {
+        let root = tempfile::tempdir()?;
+        assert_eq!(
+            prepare_project_state(root.path())?,
+            root.path().join(CANONICAL)
+        );
+        assert!(metadata(&root.path().join(LEGACY))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_physical_migration_resumes_at_each_durable_boundary() -> TestResult {
+        for renamed in [false, true] {
+            let root = migration_fixture()?;
+            directory_alias(Path::new(LEGACY), &root.path().join(CANONICAL))?;
+            remove_alias(&root.path().join(CANONICAL))?;
+            if renamed {
+                rename_exclusive(&root.path().join(LEGACY), &root.path().join(CANONICAL))?;
+            }
+            migrate_project_name(root.path())?;
+            assert_preserved(root.path())?;
+            assert!(metadata(&root.path().join(LEGACY))?.is_none());
+            assert!(metadata(&root.path().join(".cartographignore"))?.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_owner_blocks_marker_retirement_and_ignore_completion() -> TestResult {
+        let root = migration_fixture()?;
+        rename_exclusive(&root.path().join(LEGACY), &root.path().join(CANONICAL))?;
+        fs::write(root.path().join(LEGACY), TOMBSTONE)?;
+        let owner = lock(&root.path().join(CANONICAL).join("native-primary.lock"))?;
+        assert!(matches!(
+            migrate_project_name(root.path()),
+            Err(NameMigrationError::Busy)
+        ));
+        assert_eq!(fs::read(root.path().join(LEGACY))?, TOMBSTONE);
+        assert!(metadata(&root.path().join(".codevetraignore"))?.is_none());
+        drop(owner);
+        migrate_project_name(root.path())?;
+        assert_preserved(root.path())?;
+        assert!(metadata(&root.path().join(LEGACY))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ignore_only_migration_preserves_permissions_and_retires_only_exact_markers() -> TestResult {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join(LEGACY), b"unrecognized legacy file")?;
+        assert!(migrate_project_name(root.path()).is_err());
+        assert_eq!(
+            fs::read(root.path().join(LEGACY))?,
+            b"unrecognized legacy file"
+        );
+        fs::write(root.path().join(LEGACY), TOMBSTONE)?;
+        let old_ignore = root.path().join(".cartographignore");
+        fs::write(&old_ignore, b"private/**\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&old_ignore, fs::Permissions::from_mode(0o640))?;
+        }
+        migrate_project_name(root.path())?;
+        assert!(metadata(&root.path().join(LEGACY))?.is_none());
+        assert!(metadata(&old_ignore)?.is_none());
+        assert!(metadata(&root.path().join(CANONICAL))?.is_none());
+        assert_eq!(
+            fs::read(root.path().join(".codevetraignore"))?,
+            b"private/**\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(root.path().join(".codevetraignore"))?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_rename_and_ignore_publication_preserve_concurrent_destinations() -> TestResult {
+        let root = migration_fixture()?;
+        let pending = IgnoreMigration::inspect(root.path())?;
+        fs::write(root.path().join(".codevetraignore"), b"concurrent policy")?;
+        assert_eq!(
+            pending.finish(root.path()),
+            Err(NameMigrationError::Conflict)
+        );
+        assert_eq!(
+            fs::read(root.path().join(".codevetraignore"))?,
+            b"concurrent policy"
+        );
+        fs::create_dir(root.path().join(CANONICAL))?;
+        assert!(rename_exclusive(&root.path().join(LEGACY), &root.path().join(CANONICAL)).is_err());
+        assert_preserved(root.path())?;
+        Ok(())
+    }
+
     fn migration_fixture() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let state = root.path().join(LEGACY);
@@ -314,10 +514,20 @@ mod tests {
     }
 
     fn assert_preserved(root: &Path) -> TestResult {
+        let state = if root.join(LEGACY).is_dir() {
+            root.join(LEGACY)
+        } else {
+            root.join(CANONICAL)
+        };
         for (path, bytes) in PRESERVED_FILES {
-            assert_eq!(fs::read(root.join(LEGACY).join(path))?, *bytes);
+            assert_eq!(fs::read(state.join(path))?, *bytes);
         }
-        assert_eq!(fs::read(root.join(".cartographignore"))?, b"private/**\n");
+        let ignore = if root.join(".cartographignore").is_file() {
+            ".cartographignore"
+        } else {
+            ".codevetraignore"
+        };
+        assert_eq!(fs::read(root.join(ignore))?, b"private/**\n");
         Ok(())
     }
 
@@ -367,20 +577,22 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(
                 migrate_project_name(root.path())?.placement,
-                StatePlacement::LegacyAlias
+                StatePlacement::Canonical
             );
             assert_preserved(root.path())?;
             assert_eq!(
                 fs::read(root.path().join(".codevetraignore"))?,
                 b"private/**\n"
             );
-            assert_eq!(
-                fs::canonicalize(root.path().join(CANONICAL))?,
-                fs::canonicalize(root.path().join(LEGACY))?
+            assert!(
+                !fs::symlink_metadata(root.path().join(CANONICAL))?
+                    .file_type()
+                    .is_symlink()
             );
+            assert!(metadata(&root.path().join(LEGACY))?.is_none());
         }
         for name in ["native-primary.lock", "config.lock"] {
-            let original = lock(&root.path().join(LEGACY).join(name))?;
+            let original = lock(&root.path().join(CANONICAL).join(name))?;
             assert!(matches!(
                 lock(&root.path().join(CANONICAL).join(name)),
                 Err(NameMigrationError::Busy)
@@ -460,10 +672,13 @@ mod tests {
         drop(owner);
         assert_eq!(
             migrate_project_name(root.path())?.placement,
-            StatePlacement::LegacyAlias
+            StatePlacement::Canonical
         );
         assert!(migrate_project_name(root.path())?.completed);
-        assert_eq!(project_state_directory(root.path())?, state);
+        assert_eq!(
+            project_state_directory(root.path())?,
+            root.path().join(CANONICAL)
+        );
         assert_eq!(
             fs::read(root.path().join(CANONICAL).join("config.json"))?,
             b"{\"restricted\":true}"
@@ -472,7 +687,7 @@ mod tests {
             fs::read(root.path().join(".codevetraignore"))?,
             b"private/**\n"
         );
-        let owner = lock(&state.join("native-primary.lock"))?;
+        let owner = lock(&root.path().join(CANONICAL).join("native-primary.lock"))?;
         assert!(matches!(
             lock(&root.path().join(CANONICAL).join("native-primary.lock")),
             Err(NameMigrationError::Busy)
@@ -481,13 +696,13 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn fresh_state_reserves_old_name_and_conflicts_never_merge() -> TestResult {
+    fn fresh_state_uses_only_canonical_name_and_conflicts_never_merge() -> TestResult {
         let root = tempfile::tempdir()?;
         assert_eq!(
             prepare_project_state(root.path())?,
             root.path().join(CANONICAL)
         );
-        assert!(root.path().join(LEGACY).is_file());
+        assert!(metadata(&root.path().join(LEGACY))?.is_none());
         let conflict = tempfile::tempdir()?;
         fs::create_dir(conflict.path().join(LEGACY))?;
         fs::create_dir(conflict.path().join(CANONICAL))?;

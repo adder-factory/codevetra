@@ -8,8 +8,9 @@ configuration, exclusions, SCIP overlays and mutable user state are preserved.
 
 ## Existing installations
 
-1. Install the `codevetra` executable using the new installer/release archive. Keep
-   the prior Cartograph executable and installation directory for rollback.
+1. Install the `codevetra` executable using the new installer/release archive. Retire old
+   launchers and update pinned host commands before moving state. Preserve old
+   release archives separately if needed.
 2. Close the project's old MCP host/watch service. Migration refuses a live native
    primary or configuration writer; it never removes locks or stops an owner.
 3. Run `codevetra migrate-name --project-path /absolute/project --format json`.
@@ -20,34 +21,32 @@ configuration, exclusions, SCIP overlays and mutable user state are preserved.
    `codevetra` registration, `codevetra_*` tools, a fresh generation, and real
    context/find/graph/review/biomarker results.
 
-During the 4.x compatibility window, migrated projects use a relative `.codevetra`
-link to their existing physical `.cartograph` directory. All project services resolve
-only that exact migration alias; arbitrary state symlinks remain invalid. This keeps
-one native owner lock and database throughout migration, including if an older binary
-tries to reopen the project. No data directory is copied, moved, opened by the migration
-command, or deleted. Canonical and legacy independent directories are a conflict;
-resolve their ownership deliberately before retrying. On Windows, creating the alias
-requires directory-symlink permission (Developer Mode or an appropriately privileged
-installation). An unsuccessful alias creation leaves the legacy state intact.
+Starting with v4.0.3, migration renames the existing physical directory to
+`.codevetra`. It also converts the `.codevetra -> .cartograph` layout created by
+v4.0.0–v4.0.2. Directory identity, permissions, database contents and original
+owner/configuration locks are preserved; the database is neither copied nor rebuilt.
+The command holds both locks throughout the move and refuses an independent
+canonical directory. No symlink privilege is needed. Fresh projects create only
+`.codevetra`; existing exact legacy marker files are removed during migration.
 
-Fresh projects create a real `.codevetra` directory and reserve `.cartograph` as a
-small marker file. The marker prevents older executables from creating a second
-state directory. Do not replace that marker with a directory or delete locks.
+Old binaries that only understand `.cartograph` must no longer run against a migrated
+project: without the legacy directory or marker, they could initialize independent
+state. Update managed registrations and services, then restart hosts using the new
+executable. Never bypass ownership by removing locks.
 
-Root `.cartographignore` patterns are copied atomically to `.codevetraignore`; equal
-files make repeated migration a no-op, and differing files are a conflict. Nested
-legacy ignore files remain supported when no canonical file overrides them. Both
-private state directory names are always excluded from discovery. Configured provider
-identifiers and `apiKeyEnv` references retain their exact stored values.
+Root `.cartographignore` patterns and permissions are copied atomically to
+`.codevetraignore`, then the verified equal legacy file is removed. Differing files
+are a conflict. Nested legacy ignore files remain supported when no canonical file
+overrides them. Both state directory names remain excluded from source discovery.
+Provider identifiers and `apiKeyEnv` references retain their exact stored values.
 
-If migration is interrupted after the alias is created, rerun the same command. It
-checks the original owner/configuration locks and completes the remaining ignore-file
-step without creating another database. To roll back an alias migration, first close
-all hosts, remove only the `.codevetra` alias, restore the previous host registration
-and executable, and use the untouched `.cartograph` state. Preserve any canonical
-ignore changes separately. After V27 publication, an older executable may require its
-own source rebuild; do not promise it can query a newer generation. Do not delete
-retained state to force compatibility.
+If interrupted after removing an old alias, moving state, or publishing the canonical
+ignore file, rerun the same command. It resumes from the preserved directory while
+checking the original locks and ignore contents. Do not create a second index to
+recover. Downgrading to a pre-CodeVetra executable requires stopping every owner,
+explicitly moving the preserved state back, and restoring matching registrations;
+a newer generation may require a source rebuild. Preserve canonical ignore changes
+and retained state when assessing a downgrade.
 
 ## Physically moved project directories
 
@@ -86,7 +85,7 @@ Older executables without relocation support cannot open the relocated index.
 | CLI/archive binary | `codevetra`, `codevetra.exe` | Old installations remain available for rollback; update scripts/host commands explicitly |
 | Rust packages/imports | `codevetra-*`, `codevetra_*` | Major-version source change |
 | MCP server/tools | `codevetra`, `codevetra_*` | Canonical catalog only; reinstall/restart hosts and update saved tool calls |
-| Project state | `.codevetra` | Explicit validated alias for migrated projects throughout 4.x |
+| Project state | `.codevetra` | Physical rename; v4.0.0–v4.0.2 aliases are accepted as migration input |
 | Ignore rules | `.codevetraignore` | Legacy fallback; root migration checks conflicts |
 | Runtime environment | `CODEVETRA_*` | Corresponding `CARTOGRAPH_*` read only when canonical variable is absent; an empty/invalid canonical value never falls back |
 | User models/caches | `~/.codevetra` | Run the explicit name migration with `--project-path "$HOME"` when `~/.cartograph` contains existing user state; do not index the home directory |

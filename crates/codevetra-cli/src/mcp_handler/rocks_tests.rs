@@ -83,7 +83,6 @@ async fn codevetra_name_migration_reopens_the_original_database_and_preserves_po
     original.shutdown().await?;
     drop(original);
     // Model a legacy installation without modifying any durable database bytes.
-    std::fs::remove_file(root.path().join(".cartograph"))?;
     std::fs::rename(
         root.path().join(".codevetra"),
         root.path().join(".cartograph"),

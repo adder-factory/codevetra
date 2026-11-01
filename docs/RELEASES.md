@@ -24,6 +24,7 @@ provenance live on GitHub Releases.
 
 | Version | Date | Schema · Contract | Headline |
 | --- | --- | --- | --- |
+| [v4.0.3](releases/v4.0.3.md) | 2026-11-01 | Rocks v1 · V27 | Biomarker cache stability during maintenance and physical canonical state migration |
 | [v4.0.2](releases/v4.0.2.md) | 2026-11-01 | Rocks v1 · V27 | Bounded large-project biomarker refreshes, actionable refresh failures, and CLI/MCP surface validation |
 | [v4.0.1](releases/v4.0.1.md) | 2026-11-01 | Rocks v1 · V27 | Preserved project identity after relocation, bounded large-index reads, resumable embeddings, and provider batch sizing |
 | [v4.0.0](releases/v4.0.0.md) | 2026-11-01 | Rocks v1 · V27 ↑ | CodeVetra rename and state migration; precise review, code-health rules, navigation, application boundaries, static traces, and dependency updates |

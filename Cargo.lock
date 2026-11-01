@@ -682,7 +682,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "codevetra-agent"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "blake3",
  "codevetra-config",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "codevetra-cli"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "blake3",
  "clap",
@@ -742,10 +742,11 @@ dependencies = [
 
 [[package]]
 name = "codevetra-config"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "codevetra-domain",
  "libc",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -754,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "codevetra-db"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "blake3",
  "codevetra-config",
@@ -778,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "codevetra-domain"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "blake3",
  "serde",
@@ -787,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "codevetra-extract"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "arborium-bash",
  "arborium-c",
@@ -863,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "codevetra-indexer"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "blake3",
  "codevetra-config",
@@ -881,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "codevetra-llm"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "blake3",
  "codevetra-config",
@@ -902,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "codevetra-mcp"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -911,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "codevetra-scip"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "blake3",
  "codevetra-db",
@@ -923,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "codevetra-search"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "codevetra-db",
  "codevetra-domain",

@@ -355,6 +355,9 @@ jobs:
       - name: Windows all-target, all-feature Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+      - name: Windows physical name migration and original-lock preservation
+        run: cargo test --locked -p codevetra-config name_migration -- --nocapture
+
       - name: Save Rust dependency cache
         if: >-
           github.event_name == 'push' &&

@@ -292,6 +292,7 @@ async fn cold_derived_rows_drain_in_bounded_pages_across_reopen_without_deleting
         assert_eq!(report.vectors_removed, 0);
         assert_eq!(report.artifacts_removed, 0);
     }
+    let in_flight = capture_biomarker_guard(&database, &project).await?;
     runtime.shutdown(&request()?).await?;
     let reopened_runtime = StorageRuntime::new(WorkerPolicy::default())?;
     let reopened = NativeDatabase::new(
@@ -316,17 +317,29 @@ async fn cold_derived_rows_drain_in_bounded_pages_across_reopen_without_deleting
     }
     assert_eq!(vectors, 130);
     assert_eq!(artifacts, 130);
+    // Resume a computation admitted before maintenance, without weakening its fence.
+    reopened
+        .replace_dataset_guarded(
+            Ns::Derived,
+            "retention-inflight",
+            Some(generation(2)),
+            &serde_json::json!({}),
+            std::iter::once(1_u8),
+            in_flight,
+        )
+        .await?;
+    assert_eq!(
+        reopened
+            .refresh_current_structural_findings(&project, Duration::from_secs(30))
+            .await?,
+        crate::StructuralFindingRefresh::Current,
+        "collecting obsolete inputs must preserve current biomarker evidence across restart",
+    );
     assert_eq!(count(&reopened, Ns::Embeddings, b"v/").await?, 1);
     assert_eq!(count(&reopened, Ns::Artifacts, b"a/").await?, 2);
     assert_eq!(count(&reopened, Ns::Metadata, b"gc/orphan/").await?, 0);
     assert_eq!(count(&reopened, Ns::Derived, b"q/").await?, 1);
-    assert_eq!(
-        reopened
-            .embedding_storage_audit(&project, Duration::from_secs(30))
-            .await?
-            .current_embeddings,
-        1
-    );
+    assert_current_input_invalidation(&reopened, &project).await?;
     let stopped = request()?;
     stopped.cancel();
     assert!(
@@ -337,6 +350,55 @@ async fn cold_derived_rows_drain_in_bounded_pages_across_reopen_without_deleting
     );
     reopened_runtime.shutdown(&request()?).await?;
     Ok(())
+}
+
+async fn assert_current_input_invalidation(
+    database: &NativeDatabase,
+    project: &codevetra_domain::ProjectId,
+) -> TestResult {
+    // Removing a current summary still invalidates the derived relation.
+    assert!(database.delete_agent_artifact_by_id(project, 1).await?);
+    assert!(
+        database
+            .cached_current_structural_finding_stats(project)
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        database
+            .embedding_storage_audit(project, Duration::from_secs(30))
+            .await?
+            .current_embeddings,
+        1
+    );
+    Ok(())
+}
+
+async fn capture_biomarker_guard(
+    database: &NativeDatabase,
+    project: &codevetra_domain::ProjectId,
+) -> Result<crate::native_database::dataset::CommitGuard, crate::StorageError> {
+    assert_eq!(
+        database
+            .refresh_current_structural_findings(project, Duration::from_secs(30))
+            .await?,
+        crate::StructuralFindingRefresh::Recomputed,
+    );
+    let guard = database
+        .state(None, 0, 0, |tx, budget| {
+            crate::native_database::dataset::CommitGuard::capture(
+                tx,
+                &[
+                    b"coverage_epoch",
+                    b"similarity_epoch",
+                    b"vector_epoch",
+                    b"summary_epoch",
+                ],
+                budget,
+            )
+        })
+        .await?;
+    Ok(guard)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
