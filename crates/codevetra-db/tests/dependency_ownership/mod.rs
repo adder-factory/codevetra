@@ -5,6 +5,8 @@
 
 use blake3 as _;
 use codevetra_domain as _;
+#[cfg(windows)]
+use dunce as _;
 use futures_util as _;
 use getrandom as _;
 use itoa as _;
