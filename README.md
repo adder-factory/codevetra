@@ -274,7 +274,7 @@ generation atomically.
 | `codevetra_graph` | Callers, callees, reverse impact, paths, and symbol similarity |
 | `codevetra_affected` | Bounded affected-test selection |
 | `codevetra_navigate` | Cursor navigation and bounded possible static JS/TS execution paths |
-| `codevetra_biomarkers` | Code-health findings, rule coverage, and generation-scoped comparisons |
+| `codevetra_biomarkers` | Current-generation code-health findings, rankings, and rule coverage |
 | `codevetra_numerical` | Generation-scoped static numerical hazards, coverage, explanations, and non-executing probe plans |
 | `codevetra_review` | Git-ref plus staged, unstaged, and untracked evidence |
 | `codevetra_admin` | Explicit index, sync, embedding, and maintenance jobs |
