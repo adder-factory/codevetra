@@ -298,6 +298,11 @@ impl ProjectStore {
         #[cfg(windows)]
         drop(admission);
         let directory = state.join("data");
+        // RocksDB appends slash-separated filenames. Win32 verbatim paths do
+        // not normalize those slashes, so use the equivalent ordinary path
+        // only when it preserves the exact Windows filename semantics.
+        #[cfg(windows)]
+        let directory = dunce::simplified(&directory).to_path_buf();
         private_directory(&directory)?;
         // Refuse foreign storage before RocksDB can recover a WAL, create a
         // column family, or write its options/log files.
@@ -628,6 +633,8 @@ impl ProjectStore {
     /// Returns a redacted checkpoint error if creation fails.
     pub fn checkpoint(&self, destination: &Path) -> Result<()> {
         self.check_control()?;
+        #[cfg(windows)]
+        let destination = dunce::simplified(destination);
         Checkpoint::new(&self.inner.database)
             .map_err(|_| operation("checkpoint"))?
             .create_checkpoint(destination)

@@ -24,6 +24,7 @@ license = "MIT"
 repository = "https://github.com/adder-factory/codevetra"
 
 [workspace.dependencies]
+dunce = "=1.0.5"
 winsafe = { version = "=0.0.29", default-features = false, features = ["kernel"] }
 arborium-bash = "=2.18.2"
 arborium-c = "=2.18.2"

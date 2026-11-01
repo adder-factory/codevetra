@@ -30,6 +30,9 @@ tokio.workspace = true
 libc.workspace = true
 rustix.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+dunce.workspace = true
+
 [dev-dependencies]
 futures-util.workspace = true
 

@@ -106,6 +106,8 @@ pub(super) fn admit(directory: &Path, identity: &ContentDigest) -> Result<()> {
 /// Validate an existing native catalog without recovering or modifying it in
 /// writable mode. A valid outer marker cannot conceal incompatible inner data.
 pub(super) fn validate_native(directory: &Path, identity: &ContentDigest) -> Result<()> {
+    #[cfg(windows)]
+    let directory = dunce::simplified(directory);
     if !directory
         .join("CURRENT")
         .try_exists()
@@ -220,6 +222,38 @@ fn encoded(identity: &ContentDigest) -> Vec<u8> {
 #[cfg(test)]
 mod primary_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn name_migration_admission_preserves_real_database_and_checkpoint()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::Builder::new()
+            .prefix("codevetra migration ")
+            .tempdir()?;
+        let canonical = root.path().canonicalize()?;
+        let identity = ContentDigest::from_bytes([33; 32]);
+        let open = || {
+            super::super::ProjectStore::open(
+                &canonical,
+                &identity,
+                super::super::StorePolicy::default(),
+            )
+        };
+        let store = open()?;
+        let state = canonical.join(".codevetra");
+        let native_identity = fs::read(state.join("data/IDENTITY"))?;
+        let checkpoint = canonical.join("checkpoint");
+        store.checkpoint(&checkpoint)?;
+        validate_native(&checkpoint, &identity)?;
+        drop(store);
+        fs::rename(&state, canonical.join(".cartograph"))?;
+        let migrated = codevetra_config::migrate_project_name(&canonical)?;
+        assert!(migrated.completed && migrated.state_preserved);
+        assert!(!canonical.join(".cartograph").exists());
+        drop(open()?);
+        assert_eq!(fs::read(state.join("data/IDENTITY"))?, native_identity);
+        Ok(())
+    }
 
     #[cfg(windows)]
     #[test]

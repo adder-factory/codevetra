@@ -376,7 +376,14 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Windows native name migration admission
-        run: cargo test --locked -p codevetra-db --lib name_migration_admission -- --nocapture
+        run: cargo llvm-cov test --locked -p codevetra-db --lib --lcov --output-path target/windows-native.lcov name_migration_admission -- --nocapture
+
+      - name: Preserve Windows native migration coverage
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-native-coverage-${{ github.sha }}
+          path: target/windows-native.lcov
+          if-no-files-found: error
 
       - name: Save Rust dependency cache
         if: >-
