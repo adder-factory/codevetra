@@ -226,9 +226,10 @@ fn rename_exclusive(old: &Path, new: &Path) -> Result<(), NameMigrationError> {
         rustix::fs::RenameFlags::NOREPLACE,
     )
     .map_err(std::io::Error::from);
-    // Windows directory rename refuses an existing destination.
+    // MoveFileExW without REPLACE_EXISTING preserves a concurrent destination.
+    // std::fs::rename can replace an existing empty directory on current Windows.
     #[cfg(windows)]
-    let result = fs::rename(old, new);
+    let result = atomicwrites::move_atomic(old, new);
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let result = {
         let _ = (old, new);
@@ -538,12 +539,12 @@ mod tests {
             migrate_project_name(root.path()),
             Err(NameMigrationError::Busy)
         ));
-        assert_preserved(root.path())?;
         assert!(metadata(&root.path().join(CANONICAL))?.is_none());
         assert!(metadata(&root.path().join(".codevetraignore"))?.is_none());
         // A failed attempt also releases the primary lock it acquired first.
         drop(lock(&root.path().join(LEGACY).join("native-primary.lock"))?);
         drop(writer);
+        assert_preserved(root.path())?;
         assert!(migrate_project_name(root.path())?.completed);
         assert_preserved(root.path())
     }
