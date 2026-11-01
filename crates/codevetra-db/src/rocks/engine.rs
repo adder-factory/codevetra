@@ -307,8 +307,18 @@ impl ProjectStore {
             control.check()?;
         }
         let (options, families) = database_options(policy);
-        let database = DB::open_cf_descriptors(&options, &directory, families)
-            .map_err(|_| operation("open"))?;
+        let database =
+            DB::open_cf_descriptors(&options, &directory, families).map_err(|error| {
+                #[cfg(all(windows, test))]
+                eprintln!(
+                    "native fixture open error: {}",
+                    error
+                        .to_string()
+                        .replace(&directory.to_string_lossy().to_string(), "<fixture-state>")
+                );
+                drop(error);
+                operation("open")
+            })?;
         let store = Self {
             inner: Arc::new(Inner {
                 database,
