@@ -24,7 +24,6 @@ rustix = { workspace = true, features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 winsafe.workspace = true
-blake3.workspace = true
 
 [lints]
 workspace = true

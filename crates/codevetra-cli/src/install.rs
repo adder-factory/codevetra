@@ -1914,11 +1914,12 @@ fn ensure_project_config_ignored(
         .filter_map(|path| path.to_str())
         .map(|path| format!("/{path}"))
         .collect::<Vec<_>>();
-    patterns.sort();
-    patterns.dedup();
     if patterns.is_empty() {
         return Ok(());
     }
+    patterns.push("/.codevetra.lock".to_owned());
+    patterns.sort();
+    patterns.dedup();
     let path = request.project_root.join(".gitignore");
     let prior = read_optional_config(&path)?.unwrap_or_default();
     if prior.contains('\0') {

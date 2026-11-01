@@ -30,6 +30,10 @@ pub enum NameMigrationError {
         "project owner or configuration writer is active; close its host before name migration"
     )]
     Busy,
+    /// Windows admission storage is unavailable; no state transition was admitted.
+    #[cfg(windows)]
+    #[error("state admission lock is unavailable or unsafe; check project permissions")]
+    AdmissionUnavailable,
     /// An untrusted path or failed operation left existing state intact.
     #[error("name migration path is unavailable or unsafe; existing state was preserved")]
     UnsafePath,
@@ -135,17 +139,19 @@ pub fn migrate_project_name(root: &Path) -> Result<NameMigrationReport, NameMigr
     }
     #[cfg(unix)]
     validate_owner(&meta)?;
-    let _primary = lock(&state.join("native-primary.lock"))?;
-    let _config = lock(&state.join("config.lock"))?;
+    let primary = lock(&state.join("native-primary.lock"))?;
+    let config = lock(&state.join("config.lock"))?;
     let ignore = IgnoreMigration::inspect(&root)?;
     // Windows denies directory rename with open descendants. Both old locks
     // proved quiescence; admission now prevents new owners/config writers from
     // resolving state until the physical move and ignore-policy update finish.
     #[cfg(windows)]
     {
-        drop(_config);
-        drop(_primary);
+        drop(config);
+        drop(primary);
     }
+    #[cfg(not(windows))]
+    let _original_locks = (primary, config);
     if state == legacy {
         if metadata(&canonical)?.is_some() {
             if project_state_directory(&root)? != legacy {
@@ -251,7 +257,8 @@ fn rename_exclusive(old: &Path, new: &Path) -> Result<(), NameMigrationError> {
     let old = old.to_str().ok_or(NameMigrationError::UnsafePath)?;
     let new = new.to_str().ok_or(NameMigrationError::UnsafePath)?;
     // Unlike std::fs::rename, this cannot replace an existing empty directory.
-    // Keep both original lock handles open throughout the native move.
+    // Original locks were verified and closed; sibling admission covers the move.
+    // Legacy binaries without admission must already have been retired.
     winsafe::MoveFileEx(old, Some(new), winsafe::co::MOVEFILE::WRITE_THROUGH).map_err(|error| {
         if matches!(
             error,

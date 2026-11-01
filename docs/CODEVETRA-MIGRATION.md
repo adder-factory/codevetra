@@ -109,6 +109,16 @@ and permissions migrate together; deny/ask permissions are retained alongside al
 For an old macOS login service, use the old executable's `service uninstall` after
 closing the owner, then install the new CodeVetra service explicitly.
 
+On Windows, `.codevetra.lock` is a persistent sibling admission file. It inherits
+project directory access controls, rejects reparse points, and coordinates ordinary
+state opens/config writers with physical migration. Never delete or replace it:
+openers must share one lock identity. Ordinary callers wait within their bounded
+operation/config deadline. Migration verifies both original state locks, closes
+them because Windows prevents moving a directory with open descendants, and keeps
+the sibling admission locked through the move. Retire legacy binaries before this
+operation; they do not participate in this admission. The OS releases the lock on
+process loss, even when another process already has the file open.
+
 ## Intentional old-name exceptions
 
 - Frozen v1 captures, source corpora, exact identity/disposition evidence and historical

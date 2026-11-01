@@ -223,6 +223,43 @@ mod primary_tests {
 
     #[cfg(windows)]
     #[test]
+    fn name_migration_admission_allows_native_open_during_config_update()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().to_owned();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            codevetra_config::update_project_config(&path, |_| {
+                entered_tx
+                    .send(())
+                    .map_err(|_| codevetra_config::ProjectConfigError::WriteFailed)?;
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|_| codevetra_config::ProjectConfigError::WriteFailed)?;
+                Ok((serde_json::json!({"version": 2}), ()))
+            })
+        });
+        entered_rx.recv_timeout(std::time::Duration::from_secs(10))?;
+        let store = super::super::ProjectStore::open(
+            root.path(),
+            &ContentDigest::from_bytes([32; 32]),
+            super::super::StorePolicy::default(),
+        );
+        release_tx.send(())?;
+        writer.join().map_err(|_| "writer panicked")??;
+        drop(store?);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(
+                root.path().join(".codevetra/config.json")
+            )?)?["version"],
+            2
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn name_migration_admission_blocks_native_open_before_state_creation()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;

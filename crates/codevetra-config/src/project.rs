@@ -790,9 +790,14 @@ fn acquire_config_write_target_after_missing_observed(
     project_root: &Path,
     observe_missing: impl FnOnce(),
 ) -> Result<ConfigWriteTarget, ProjectConfigError> {
+    let started = Instant::now();
     let root = canonical_project_root(project_root)?;
     #[cfg(windows)]
-    let _admission = crate::StateAdmission::acquire(&root)?;
+    let _admission = crate::StateAdmission::acquire_until(&root, started + CONFIG_LOCK_WAIT)
+        .map_err(|error| match error {
+            crate::NameMigrationError::Busy => ProjectConfigError::ConcurrentModification,
+            other => ProjectConfigError::NameMigration(other),
+        })?;
     let directory = crate::prepare_project_state(&root)?;
     match fs::symlink_metadata(&directory) {
         Ok(_) => {}
@@ -811,7 +816,7 @@ fn acquire_config_write_target_after_missing_observed(
     {
         return Err(ProjectConfigError::ProjectUnavailable);
     }
-    let lock = acquire_config_write_lock(&directory)?;
+    let lock = acquire_config_write_lock_until(&directory, started)?;
     let path = directory.join(CONFIG_FILE);
     if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(ProjectConfigError::ProjectUnavailable);
@@ -842,15 +847,36 @@ fn write_config_value_at(
         .write_all(&bytes)
         .and_then(|()| temporary.as_file().sync_all())
         .map_err(|_| ProjectConfigError::WriteFailed)?;
-    temporary
-        .persist(path)
-        .map_err(|_| ProjectConfigError::WriteFailed)?;
-    File::open(directory)
-        .and_then(|directory| directory.sync_all())
+    #[cfg(windows)]
+    {
+        let temporary = temporary.into_temp_path();
+        winsafe::MoveFileEx(
+            temporary.to_str().ok_or(ProjectConfigError::WriteFailed)?,
+            Some(path.to_str().ok_or(ProjectConfigError::WriteFailed)?),
+            winsafe::co::MOVEFILE::REPLACE_EXISTING | winsafe::co::MOVEFILE::WRITE_THROUGH,
+        )
         .map_err(|_| ProjectConfigError::WriteFailed)
+    }
+    #[cfg(not(windows))]
+    {
+        temporary
+            .persist(path)
+            .map_err(|_| ProjectConfigError::WriteFailed)?;
+        File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| ProjectConfigError::WriteFailed)
+    }
 }
 
+#[cfg(test)]
 fn acquire_config_write_lock(directory: &Path) -> Result<ConfigWriteLock, ProjectConfigError> {
+    acquire_config_write_lock_until(directory, Instant::now())
+}
+
+fn acquire_config_write_lock_until(
+    directory: &Path,
+    started: Instant,
+) -> Result<ConfigWriteLock, ProjectConfigError> {
     let path = directory.join(CONFIG_LOCK_FILE);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
@@ -875,7 +901,6 @@ fn acquire_config_write_lock(directory: &Path) -> Result<ConfigWriteLock, Projec
     }
     #[cfg(unix)]
     set_private_permissions(&file)?;
-    let started = Instant::now();
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(ConfigWriteLock { file }),

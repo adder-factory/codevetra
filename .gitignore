@@ -51,6 +51,7 @@ Thumbs.db
 
 # CodeVetra data directories (in test projects)
 .codevetra/
+.codevetra.lock
 
 # Local archive of stale design docs / session memos — kept on disk
 # for reference but never pushed.

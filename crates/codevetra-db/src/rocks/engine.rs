@@ -277,7 +277,21 @@ impl ProjectStore {
             return Err(RocksError::Directory);
         }
         #[cfg(windows)]
-        let admission = codevetra_config::StateAdmission::acquire(&root)?;
+        let admission = {
+            let wait = std::time::Duration::from_secs(2);
+            let wait = control.as_ref().map_or(Ok(wait), |request| {
+                request
+                    .remaining_timeout()
+                    .map(|remaining| remaining.min(wait))
+            })?;
+            codevetra_config::StateAdmission::acquire_until(
+                &root,
+                std::time::Instant::now() + wait,
+            )?
+        };
+        if let Some(control) = &control {
+            control.check()?;
+        }
         let state = codevetra_config::prepare_project_state(&root)?;
         private_directory(&state)?;
         let primary = ownership::lock_primary(&state)?;

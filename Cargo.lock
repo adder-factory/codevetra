@@ -744,7 +744,6 @@ dependencies = [
 name = "codevetra-config"
 version = "4.0.3"
 dependencies = [
- "blake3",
  "codevetra-domain",
  "libc",
  "rustix",
