@@ -35,12 +35,13 @@ abstention instead of presenting stale or incomplete data as certainty.
 > before indexing or reconnecting hosts. Existing RocksDB state is preserved;
 > PostgreSQL-era v2 projects also need a source rebuild. See [Upgrade](#upgrade).
 
-Version [4.0.1](docs/releases/v4.0.1.md) repairs project relocation, bounded
-storage scans, and resumable embedding sweeps. It also adds per-project
-embedding batch sizes for providers with smaller request limits. See the
-[release notes](docs/releases/v4.0.1.md) for changes and the
-[adapter coverage](docs/MCP-USAGE.md#application-boundaries-and-navigation) for
-supported forms and limits.
+Version [4.0.2](docs/releases/v4.0.2.md) repairs biomarker refreshes on large
+projects by reading detailed metrics from the indexed snapshot as needed.
+Source-rich exploration also preserves native evidence within the optional
+navigator's bounded input.
+Capacity, generation-change, and invalid-record failures now report distinct
+CLI/MCP diagnostics. See the [release notes](docs/releases/v4.0.2.md) and
+[CLI/MCP alignment](docs/cli-mcp-alignment.md) for the verified public surface.
 
 ## Start here
 
@@ -430,7 +431,7 @@ audience.
 | Area | Guides |
 | --- | --- |
 | **Set up** | [Agent-assisted installation](docs/AGENT-INSTALL.md) · [Configuration](docs/CONFIGURATION.md) · [MCP usage](docs/MCP-USAGE.md) |
-| **Upgrade** | [Cartograph to CodeVetra](docs/CODEVETRA-MIGRATION.md) · [RocksDB migration](docs/v2/ROCKSDB-MIGRATION.md) · [v4.0.1 release notes](docs/releases/v4.0.1.md) |
+| **Upgrade** | [Cartograph to CodeVetra](docs/CODEVETRA-MIGRATION.md) · [RocksDB migration](docs/v2/ROCKSDB-MIGRATION.md) · [v4.0.2 release notes](docs/releases/v4.0.2.md) |
 | **Use** | [CLI reference](docs/CLI-REFERENCE.md) · [CLI/MCP alignment](docs/cli-mcp-alignment.md) · [Language support matrix](docs/SUPPORT-MATRIX.md) · [Graph export formats](docs/GRAPH-EXPORT-FORMATS.md) |
 | **Operate** | [Storage and operations](docs/STORAGE-BACKENDS.md) · [Performance tuning](docs/PERF-TUNING.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | **Extend** | [Architecture](docs/v2/ARCHITECTURE.md) · [Native extraction](docs/v2/EXTRACTION.md) · [Extending languages and resolvers](docs/EXTENDING-EXTRACTORS-RESOLVERS.md) |

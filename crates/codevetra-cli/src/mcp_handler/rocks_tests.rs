@@ -11,6 +11,54 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explore_retains_large_native_allocations_without_exceeding_navigation_seed_bounds()
+-> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut source = String::new();
+    for number in 0..30 {
+        writeln!(
+            source,
+            "pub fn inventory_operation_{number}() -> u32 {{ {number} }}"
+        )?;
+    }
+    std::fs::write(root.path().join("lib.rs"), source)?;
+    let control = StorageRequest::new(Duration::from_secs(30))?;
+    let native = RocksProjectRuntime::open(root.path(), &control).await?;
+    native
+        .index(codevetra_agent::RocksIndexOptions::default(), &control)
+        .await?;
+    let handler = RocksHandler::new(native.clone(), false)?;
+    for decision in ["native", "auto"] {
+        let result = handler.call(ToolCall {
+            name: super::super::EXPLORE_TOOL.to_owned(),
+            arguments: json!({"query":"inventory operation", "mode":"deterministic", "decision":decision, "maxFiles":1})
+                .as_object().cloned().ok_or("missing exploration arguments")?,
+        }, ToolCallContext::local(Duration::from_secs(30))).await?;
+        let result = result
+            .structured_content()
+            .ok_or("missing exploration result")?;
+        assert_eq!(result["freshness"], "current");
+        let evidence = &result["evidence"];
+        assert!(
+            evidence["sourceWindows"]
+                .as_array()
+                .is_some_and(|windows| windows.len() > 20)
+        );
+        assert_eq!(
+            evidence["navigation"]["stop"],
+            if decision == "native" {
+                "native_requested"
+            } else {
+                "not_configured"
+            }
+        );
+        assert_eq!(evidence["navigation"]["nativeSourceWindows"], 0);
+    }
+    handler.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codevetra_name_migration_reopens_the_original_database_and_preserves_policy() -> TestResult
 {
     let root = tempfile::tempdir()?;

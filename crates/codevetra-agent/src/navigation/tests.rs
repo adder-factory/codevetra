@@ -558,6 +558,86 @@ async fn verify_native_evidence_and_candidate_kinds(
     assert_eq!(nav.ledger.report.native_source_windows, 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_native_allocations_preserve_provider_seed_bounds_and_report_truncation()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let root = tempfile::tempdir()?;
+    let mut source = String::new();
+    for number in 0..30 {
+        writeln!(
+            source,
+            "pub fn inventory_operation_{number}() -> u32 {{ {number} }}"
+        )?;
+    }
+    std::fs::write(root.path().join("lib.rs"), source)?;
+    let runtime = ProjectRuntime::open(root.path()).await?;
+    runtime
+        .index(crate::IndexOptions::default().with_history_refresh(false))
+        .await?;
+    let project = runtime
+        .status()
+        .await?
+        .snapshot
+        .ok_or("missing snapshot")?
+        .project_id;
+    let context = ContextRequest::new(
+        project.clone(),
+        "inventory operation",
+        ContextRequestOptions::new(IndexFreshness::Current, ContextBudget::default()),
+    )?
+    .with_anchor(codevetra_search::ContextAnchor::ExactPath(
+        NormalizedPath::parse("lib.rs")?,
+    ))?;
+    let packet = DeterministicRetriever::new(runtime.database.clone())
+        .context_packet(&context)
+        .await?;
+    let generation = packet
+        .generation()
+        .ok_or("missing generation")?
+        .generation_id();
+    let selections = packet
+        .evidence()
+        .iter()
+        .filter_map(|evidence| evidence.symbol_id())
+        .map(|id| crate::SourceSelection {
+            symbol_id: id.clone(),
+            prioritized: true,
+        })
+        .collect();
+    let allocation = runtime
+        .allocate_source_with_cancellation(
+            generation,
+            selections,
+            crate::SourceAllocationOptions::new(crate::SourceSelectionPolicy::Full, 512 * 1024)?,
+            ProjectCancellation::new(),
+        )
+        .await?
+        .ok_or("missing allocation")?;
+    assert!(allocation.windows.len() > 20);
+    assert!(matches!(
+        NavigationRequest::new(&project, "inventory operation", &packet)?
+            .with_native_sources(&allocation.windows),
+        Err(ProjectError::SourceContextUnavailable)
+    ));
+    let request = NavigationRequest::new(&project, "inventory operation", &packet)?
+        .with_source_allocation(&allocation)?;
+    let ledger = NavigationLedger::new(&request);
+    assert!(ledger.report.native_source_windows > 0);
+    assert!(ledger.report.native_source_windows <= 20);
+    assert!(ledger.report.native_sources_truncated);
+    assert_eq!(request.native_sources.len(), 20);
+    assert_eq!(
+        request.native_sources[19].symbol().symbol_id(),
+        allocation.windows[19].symbol().symbol_id()
+    );
+    assert!(
+        allocation.windows.len() > 20,
+        "the native response retains every allocated window"
+    );
+    runtime.close().await?;
+    Ok(())
+}
+
 async fn verify_native_and_outage(
     runtime: &ProjectRuntime,
     project: &ProjectId,

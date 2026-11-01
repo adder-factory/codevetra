@@ -52,6 +52,7 @@ impl<'a> NavigationLedger<'a> {
                 .generation()
                 .map(|g| g.generation_id().clone()),
         );
+        report.native_sources_truncated = request.native_sources_truncated;
         for evidence in request.packet.evidence() {
             let Some(id) = evidence.symbol_id() else {
                 continue;

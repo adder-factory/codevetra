@@ -8,7 +8,7 @@ use crate::{
     retrieval::native::simple_name,
     rocks::{GraphSnapshot, ReadBudget, RocksError, StateTransaction, StoredRevision},
 };
-use codevetra_domain::{DocumentKind, EdgeKind, FileId, SymbolId, Visibility};
+use codevetra_domain::{DocumentId, DocumentKind, EdgeKind, FileId, SymbolId, Visibility};
 use num_traits::ToPrimitive as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -62,6 +62,41 @@ pub(super) struct Document {
     pub(super) secrets_actionable: bool,
     pub(super) facade_factory: bool,
 }
+
+/// Keep only identity and the child metrics needed by relational detectors in memory.
+/// Detailed metrics, operation sites, and clone members are read from the same snapshot.
+pub(super) struct DocumentHandle {
+    id: DocumentId,
+    pub(super) test: bool,
+    code_lines: f64,
+    cyclomatic: f64,
+}
+
+impl DocumentHandle {
+    pub(super) fn load(
+        &self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+    ) -> Result<Document, RocksError> {
+        let document = graph.document(&self.id, budget)?.ok_or(corrupt())?;
+        if !matches!(document.kind, DocumentKind::Symbol | DocumentKind::Test)
+            || self.test != (document.kind == DocumentKind::Test)
+        {
+            return Err(corrupt());
+        }
+        let value = serde_json::from_str(&document.metadata_json).map_err(|_| corrupt())?;
+        parse_document(&value, self.test)
+    }
+
+    fn bytes(&self, symbol: &SymbolId) -> usize {
+        // Account for both owned IDs and conservatively allow for B-tree allocation overhead.
+        size_of::<Self>()
+            + size_of::<SymbolId>()
+            + self.id.as_str().len()
+            + symbol.as_str().len()
+            + 128
+    }
+}
 pub(super) struct ClonePolicy {
     pub(super) enabled: bool,
     pub(super) near_compatible: bool,
@@ -85,15 +120,6 @@ impl Document {
             .position(|name| *name == key)
             .and_then(|index| self.health.iter().find(|(id, _)| usize::from(*id) == index))
             .map_or(default, |(_, value)| *value)
-    }
-    fn bytes(&self) -> usize {
-        size_of::<Self>()
-            + self.health.capacity() * size_of::<(u8, f64)>()
-            + self.operation_sites.capacity()
-                * size_of::<codevetra_domain::biomarkers::HealthOperationSite>()
-            + self.shape.as_ref().map_or(0, String::capacity)
-            + self.partial.listed.capacity() * 96
-            + 256
     }
 }
 pub(super) struct Base<'a> {
@@ -175,12 +201,13 @@ pub(super) fn compute(
     let mut bytes = 0_usize;
     let mut analyzed = 0_u64;
     let mut detector_coverage = super::coverage::CoverageAccumulator::new();
-    for (id, document) in &documents {
+    for (id, handle) in &documents {
         budget.checkpoint()?;
         let symbol = graph.symbol(id, budget)?.ok_or(corrupt())?;
         let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
+        let document = handle.load(&graph, budget)?;
         if document.test || matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter") {
-            detector_coverage.observe(&file, &symbol, document, None);
+            detector_coverage.observe(&file, &symbol, &document, None);
             continue;
         }
         if document
@@ -206,7 +233,7 @@ pub(super) fn compute(
         let base = Base {
             symbol: &symbol,
             file: &file,
-            document,
+            document: &document,
             topology,
             external,
             centrality,
@@ -216,7 +243,7 @@ pub(super) fn compute(
             prior,
             recent_prior,
         };
-        detector_coverage.observe(&file, &symbol, document, Some(&base));
+        detector_coverage.observe(&file, &symbol, &document, Some(&base));
         validate_operation_sites(&base)?;
         let mut findings = rules::evaluate(&base)?;
         if let Some(finding) = clone_classes.finding(&base, &graph, budget)? {
@@ -287,7 +314,7 @@ fn dynamic_external_references(
 
 fn population(
     graph: &GraphSnapshot<'_, '_>,
-    documents: &BTreeMap<SymbolId, Document>,
+    documents: &BTreeMap<SymbolId, DocumentHandle>,
     budget: &mut ReadBudget,
 ) -> Result<f64, RocksError> {
     let mut count = 0_u64;
@@ -306,8 +333,8 @@ fn population(
 fn documents(
     graph: &GraphSnapshot<'_, '_>,
     budget: &mut ReadBudget,
-) -> Result<BTreeMap<SymbolId, Document>, RocksError> {
-    let mut output = BTreeMap::<SymbolId, Document>::new();
+) -> Result<BTreeMap<SymbolId, DocumentHandle>, RocksError> {
+    let mut output = BTreeMap::<SymbolId, DocumentHandle>::new();
     let mut bytes = 0_usize;
     visit_documents(graph, budget, |document, _| {
         if !matches!(document.kind, DocumentKind::Symbol | DocumentKind::Test) {
@@ -322,14 +349,20 @@ fn documents(
         let value: serde_json::Value =
             serde_json::from_str(&document.metadata_json).map_err(|_| corrupt())?;
         let parsed = parse_document(&value, document.kind == DocumentKind::Test)?;
+        let handle = DocumentHandle {
+            id: document.document_id,
+            test: parsed.test,
+            code_lines: parsed.health("code_lines"),
+            cyclomatic: parsed.health("cyclomatic"),
+        };
         bytes = bytes
-            .checked_sub(output.get(&id).map_or(0, Document::bytes))
-            .and_then(|bytes| bytes.checked_add(parsed.bytes()))
+            .checked_sub(output.get(&id).map_or(0, |previous| previous.bytes(&id)))
+            .and_then(|bytes| bytes.checked_add(handle.bytes(&id)))
             .ok_or_else(workspace)?;
         if bytes > 24 * 1_048_576 {
             return Err(workspace());
         }
-        output.insert(id, parsed);
+        output.insert(id, handle);
         Ok(())
     })?;
     Ok(output)
@@ -449,7 +482,7 @@ pub(super) fn topology(
     graph: &GraphSnapshot<'_, '_>,
     symbol: &SymbolInput,
     file: &FileInput,
-    documents: Option<&BTreeMap<SymbolId, Document>>,
+    documents: Option<&BTreeMap<SymbolId, DocumentHandle>>,
     budget: &mut ReadBudget,
 ) -> Result<Topology, RocksError> {
     let mut output = Topology::default();
@@ -503,7 +536,7 @@ pub(super) fn topology(
 fn contained_symbols(
     graph: &GraphSnapshot<'_, '_>,
     symbol: &SymbolInput,
-    documents: Option<&BTreeMap<SymbolId, Document>>,
+    documents: Option<&BTreeMap<SymbolId, DocumentHandle>>,
     budget: &mut ReadBudget,
     output: &mut Topology,
 ) -> Result<BTreeSet<SymbolId>, RocksError> {
@@ -527,8 +560,8 @@ fn contained_symbols(
                         .and_then(|documents| documents.get(&child.symbol_id))
                         .filter(|document| !document.test)
                 {
-                    output.behavioral += u64::from(document.health("code_lines") >= 5.0);
-                    output.complex += u64::from(document.health("cyclomatic") >= 3.0);
+                    output.behavioral += u64::from(document.code_lines >= 5.0);
+                    output.complex += u64::from(document.cyclomatic >= 3.0);
                 }
             }
             Ok(())

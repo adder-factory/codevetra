@@ -6358,20 +6358,19 @@ impl ContextTools<'_> {
             },
         )
         .await?;
+        let navigation_request = NavigationRequest::new(&project_id, input.query, &packet)
+            .map_err(|error| project_error(&error))?
+            .with_policy(policy);
+        let navigation_request = if let Some(allocation) = &sources {
+            navigation_request
+                .with_source_allocation(allocation)
+                .map_err(|error| project_error(&error))?
+        } else {
+            navigation_request
+        };
         let navigation = self
             .runtime
-            .navigate(
-                NavigationRequest::new(&project_id, input.query, &packet)
-                    .map_err(|error| project_error(&error))?
-                    .with_native_sources(
-                        sources
-                            .as_ref()
-                            .map_or(&[], |allocation| allocation.windows.as_slice()),
-                    )
-                    .map_err(|error| project_error(&error))?
-                    .with_policy(policy),
-                cancellation,
-            )
+            .navigate(navigation_request, cancellation)
             .await
             .map_err(|error| project_error(&error))?;
         let packet = if input.low_tokens {
@@ -12403,7 +12402,7 @@ impl AdminCoreTools<'_> {
                     "clientDeadlineRequirement": "The MCP/CLI caller deadline must exceed statementTimeoutMs",
                     "nextAction": "Set dryRun false and confirm true to recompute the exact current-generation relation",
                     "storage": "generation_fenced_derived_relation",
-                    "detectorAuthority": "complete_generation_fenced_sql_relation",
+                    "detectorAuthority": "complete_generation_fenced_native_relation",
                 }),
             );
         }
@@ -12437,7 +12436,7 @@ impl AdminCoreTools<'_> {
                 "stats": stats,
                 "storage": "generation_fenced_derived_relation",
                 "cacheRebuildRequired": false,
-                "detectorAuthority": "complete_generation_fenced_sql_relation",
+                "detectorAuthority": "complete_generation_fenced_native_relation",
             }),
         )
     }
@@ -25801,6 +25800,18 @@ fn biomarker_refresh_storage_error(error: StorageError) -> ToolError {
             ToolErrorCode::Timeout,
             "biomarker_refresh_timeout: retry biomarkers-refresh with a larger bounded databaseQueryTimeoutMs value (legacy timeoutMs is also accepted)",
         ),
+        StorageError::NativeCapacityExceeded => safe_error(
+            ToolErrorCode::Unavailable,
+            "biomarker_refresh_capacity_exceeded: native read or workspace capacity was exhausted; a complete biomarker result was not published",
+        ),
+        StorageError::CurrentGenerationChanged => safe_error(
+            ToolErrorCode::Conflict,
+            "biomarker_refresh_generation_changed: source or auxiliary inputs changed during computation; retry against the current generation",
+        ),
+        StorageError::NativeRecordInvalid | StorageError::CorruptStoredValue { .. } => safe_error(
+            ToolErrorCode::Unavailable,
+            "biomarker_refresh_invalid_record: native detector inputs failed validation; a complete biomarker result was not published",
+        ),
         error => internal_error(error),
     }
 }
@@ -26272,6 +26283,51 @@ mod tests {
             ),
         ]));
         assert!(excessive_timeout.is_err());
+    }
+
+    #[test]
+    fn biomarker_refresh_failures_preserve_safe_categories_without_storage_details() {
+        for (error, code, prefix) in [
+            (
+                StorageError::NativeCapacityExceeded,
+                ToolErrorCode::Unavailable,
+                "biomarker_refresh_capacity_exceeded:",
+            ),
+            (
+                StorageError::CurrentGenerationChanged,
+                ToolErrorCode::Conflict,
+                "biomarker_refresh_generation_changed:",
+            ),
+            (
+                StorageError::NativeRecordInvalid,
+                ToolErrorCode::Unavailable,
+                "biomarker_refresh_invalid_record:",
+            ),
+            (
+                StorageError::CorruptStoredValue {
+                    field: "private-diagnostic-marker",
+                },
+                ToolErrorCode::Unavailable,
+                "biomarker_refresh_invalid_record:",
+            ),
+            (
+                StorageError::StatementTimeout {
+                    operation: "private-diagnostic-marker",
+                },
+                ToolErrorCode::Timeout,
+                "biomarker_refresh_timeout:",
+            ),
+        ] {
+            let result = biomarker_refresh_storage_error(error);
+            assert_eq!(result.code(), code);
+            assert!(result.wire_message().starts_with(prefix));
+            assert!(!result.wire_message().contains("private-diagnostic-marker"));
+        }
+        let unknown = biomarker_refresh_storage_error(StorageError::DatabaseOperation {
+            operation: "private-diagnostic-marker",
+        });
+        assert_eq!(unknown.code(), ToolErrorCode::Internal);
+        assert_eq!(unknown.wire_message(), "Tool execution failed");
     }
 
     #[test]
@@ -31562,6 +31618,10 @@ pub fn target(value: u32) -> u32 {
             dry_run["structuredContent"]["evidence"]["wouldRecompute"],
             true
         );
+        assert_eq!(
+            dry_run["structuredContent"]["evidence"]["detectorAuthority"],
+            "complete_generation_fenced_native_relation"
+        );
         let refreshed = execute_live_tool(
             handler,
             ADMIN_TOOL,
@@ -31580,6 +31640,10 @@ pub fn target(value: u32) -> u32 {
         assert_eq!(
             refreshed["structuredContent"]["evidence"]["confirmed"],
             true
+        );
+        assert_eq!(
+            refreshed["structuredContent"]["evidence"]["detectorAuthority"],
+            "complete_generation_fenced_native_relation"
         );
         for arguments in [
             json!({"mode": "ranked", "minSeverity": "info", "limit": 20}),

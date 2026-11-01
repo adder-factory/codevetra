@@ -71,6 +71,7 @@ pub(super) fn measure(input: McpBudgetInput<'_>) -> Result<McpBudgetReport, Stri
         instructions,
         playbook,
     } = input;
+    let read_only_only = read_only_only || profile == ToolProfile::ReadOnly;
     let disabled_set = disabled.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut tools = definitions
         .into_iter()

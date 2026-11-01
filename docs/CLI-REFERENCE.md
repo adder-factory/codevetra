@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [MCP usage](MCP-USAGE.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Last release audit: 2026-11-01 (`v4.0.1`).
+Last release audit: 2026-11-01 (`v4.0.2`).
 
 The installed executable is `codevetra`. Run `codevetra <command> --help` for
 the exact bounds in the installed version. Bounded maintenance and its
@@ -426,6 +426,23 @@ replaces it.
 `--timeout-ms` spelling remains an exclusive compatibility alias. Dry-run and
 execution output report `statementTimeoutMs` and `statementTimeoutSource`; the
 caller deadline bounds the operation even when the selected inner timeout is longer.
+
+Refresh keeps compact document references and child metrics in its bounded
+inventory, then reads detailed metrics, operation sites, and clone members
+from the same immutable snapshot as needed. Complete counts and the existing
+workspace limits remain enforced. The CLI and MCP preserve distinct failures:
+
+- `biomarker_refresh_capacity_exceeded`: native read or workspace capacity was
+  exhausted; no complete result was published.
+- `biomarker_refresh_generation_changed`: source or auxiliary inputs changed
+  during computation; retry against the current generation.
+- `biomarker_refresh_invalid_record`: detector inputs failed validation;
+  no complete result was published.
+- `biomarker_refresh_timeout`: the selected native deadline expired.
+
+An uncomputed relation is not a zero-finding result. Internal storage details
+remain redacted, and refresh output identifies its detector authority as
+`complete_generation_fenced_native_relation`.
 
 ### Dead code and digest
 

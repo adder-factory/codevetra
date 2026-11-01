@@ -12,6 +12,32 @@ use std::{
 use serde_json::Value;
 
 #[test]
+fn mcp_budget_reports_effective_read_only_profile_and_write_gate() {
+    let project = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+    for (profile, writes) in [("full", true), ("coding", true), ("read-only", false)] {
+        let report = json_success(
+            project.path(),
+            &["mcp-budget", "--profile", profile, "--json"],
+        );
+        assert_eq!(report["writeTools"], writes, "profile {profile}");
+        let report = json_success(
+            project.path(),
+            &[
+                "mcp-budget",
+                "--profile",
+                profile,
+                "--no-write-tools",
+                "--json",
+            ],
+        );
+        assert_eq!(
+            report["writeTools"], false,
+            "explicit write gate for {profile}"
+        );
+    }
+}
+
+#[test]
 fn public_cli_exercises_native_agent_backend_and_optional_llm_routes() {
     let project = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
     let project_path = project.path().to_string_lossy().into_owned();

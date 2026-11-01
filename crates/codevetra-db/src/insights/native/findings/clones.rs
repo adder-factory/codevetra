@@ -2,7 +2,7 @@
 
 use super::{
     corrupt, framework,
-    inventory::{Base, Document},
+    inventory::{Base, DocumentHandle},
     rules, workspace,
 };
 use crate::{
@@ -35,7 +35,7 @@ impl Classes {
     pub(super) fn new(
         transaction: &StateTransaction<'_>,
         graph: &GraphSnapshot<'_, '_>,
-        documents: &BTreeMap<SymbolId, Document>,
+        documents: &BTreeMap<SymbolId, DocumentHandle>,
         budget: &mut ReadBudget,
     ) -> Result<Self, RocksError> {
         let mut output = Self {
@@ -45,9 +45,9 @@ impl Classes {
         };
         let mut exact = Groups::new();
         let mut bytes = 0_usize;
-        for (id, document) in documents {
+        for (id, handle) in documents {
             budget.checkpoint()?;
-            if document.test || !document.clones.enabled {
+            if handle.test {
                 continue;
             }
             let symbol = graph.symbol(id, budget)?.ok_or(corrupt())?;
@@ -59,6 +59,10 @@ impl Classes {
             }
             let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
             if !framework::production(&file.normalized_path)? {
+                continue;
+            }
+            let document = handle.load(graph, budget)?;
+            if !document.clones.enabled {
                 continue;
             }
             output.production.insert(id.clone());
@@ -81,14 +85,14 @@ impl Classes {
     fn near_groups(
         &self,
         graph: &GraphSnapshot<'_, '_>,
-        documents: &BTreeMap<SymbolId, Document>,
+        documents: &BTreeMap<SymbolId, DocumentHandle>,
         budget: &mut ReadBudget,
     ) -> Result<Groups, RocksError> {
         let mut groups = Groups::new();
         let mut bytes = self.bytes();
         for id in self.production.difference(&self.claimed) {
             budget.checkpoint()?;
-            let document = documents.get(id).ok_or(corrupt())?;
+            let document = documents.get(id).ok_or(corrupt())?.load(graph, budget)?;
             let Some(shape) = document
                 .shape
                 .as_ref()
@@ -158,12 +162,12 @@ impl Classes {
         &mut self,
         transaction: &StateTransaction<'_>,
         graph: &GraphSnapshot<'_, '_>,
-        documents: &BTreeMap<SymbolId, Document>,
+        documents: &BTreeMap<SymbolId, DocumentHandle>,
         budget: &mut ReadBudget,
     ) -> Result<(), RocksError> {
         let mut eligible = BTreeSet::new();
         for id in self.production.difference(&self.claimed) {
-            let document = documents.get(id).ok_or(corrupt())?;
+            let document = documents.get(id).ok_or(corrupt())?.load(graph, budget)?;
             let symbol = graph.symbol(id, budget)?.ok_or(corrupt())?;
             if document.partial.peers == 0 && symbol.end_line - symbol.start_line + 1 >= 6 {
                 eligible.insert(id.clone());

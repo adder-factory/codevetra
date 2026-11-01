@@ -1965,6 +1965,48 @@ mod tests {
                 "missing generated command {expected}"
             );
         }
+        let expected = definitions
+            .iter()
+            .filter(|definition| definition.name() != "codevetra_status")
+            .map(ToolDefinition::name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let actual = specs
+            .iter()
+            .map(|spec| spec.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected, "an advertised MCP tool has no CLI route");
+        assert_eq!(names.len(), specs.len(), "generated CLI names collided");
+    }
+
+    #[test]
+    fn every_advertised_tool_has_working_public_cli_help() {
+        let definitions = mcp_handler::tool_definitions()
+            .unwrap_or_else(|error| panic!("tool definitions failed: {error}"));
+        for definition in definitions {
+            let name = definition
+                .name()
+                .strip_prefix("codevetra_")
+                .unwrap_or_else(|| panic!("unexpected tool name"))
+                .replace('_', "-");
+            let Err(error) = parse_from(["codevetra", name.as_str(), "--help"]) else {
+                panic!("help unexpectedly executed a tool");
+            };
+            match error {
+                ParseFailure::Clap(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        clap::error::ErrorKind::DisplayHelp,
+                        "{name}: {error}"
+                    );
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("Usage: codevetra {name}"))
+                    );
+                }
+                ParseFailure::Contract(error) => panic!("{name}: {error}"),
+            }
+        }
     }
 
     #[test]

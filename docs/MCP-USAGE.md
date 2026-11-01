@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [CLI reference](CLI-REFERENCE.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Last release audit: 2026-11-01 (`v4.0.1`).
+Last release audit: 2026-11-01 (`v4.0.2`).
 
 CodeVetra v2 exposes a compact native stdio MCP server. Its core returns
 bounded, generation-scoped evidence and never makes the database a source of
@@ -597,6 +597,10 @@ Expand a body with `codevetra node --symbol-id <ID> --detail full --max-bytes
 --line-limit 500` for subsequent line windows. The allocation's completeness
 concerns its selected source bodies; graph/review truncation and unresolved
 relationships remain separate limitations.
+
+Optional exploration navigation consumes at most 20 native source windows and
+16 KiB of serialized seed evidence. Larger allocations remain in the native
+response; active navigation reports omitted seeds as `nativeSourcesTruncated`.
 
 ### Explicit source reuse and byte recovery
 

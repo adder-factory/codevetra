@@ -22,8 +22,8 @@ use serde_json::Value;
 
 use self::ledger::{NavigationLedger, RoundOutcome, RoundPrompt};
 use crate::{
-    ProjectCancellation, ProjectError, ProjectRuntime, SourceContextOptions, SourceContextRequest,
-    SymbolSourceContext,
+    ProjectCancellation, ProjectError, ProjectRuntime, SourceAllocation, SourceContextOptions,
+    SourceContextRequest, SymbolSourceContext,
 };
 
 const MAXIMUM_STEPS: usize = 7;
@@ -72,6 +72,7 @@ pub struct NavigationRequest<'a> {
     packet: &'a ContextPacket,
     policy: NavigationPolicy,
     native_sources: &'a [SymbolSourceContext],
+    native_sources_truncated: bool,
 }
 
 impl<'a> NavigationRequest<'a> {
@@ -95,6 +96,7 @@ impl<'a> NavigationRequest<'a> {
             packet,
             policy: NavigationPolicy::Auto,
             native_sources: &[],
+            native_sources_truncated: false,
         })
     }
 
@@ -126,7 +128,22 @@ impl<'a> NavigationRequest<'a> {
             return Err(ProjectError::SourceContextUnavailable);
         }
         self.native_sources = sources;
+        self.native_sources_truncated = false;
         Ok(self)
+    }
+
+    /// Seed navigation from the bounded prefix of a larger native allocation.
+    /// The caller retains the full allocation; provider reports disclose omitted windows.
+    /// # Errors
+    /// Rejects stale, approximate, or differently fenced admitted evidence.
+    pub fn with_source_allocation(
+        self,
+        allocation: &'a SourceAllocation,
+    ) -> Result<Self, ProjectError> {
+        let admitted = allocation.windows.len().min(MAXIMUM_NATIVE_SOURCE_WINDOWS);
+        let mut request = self.with_native_sources(&allocation.windows[..admitted])?;
+        request.native_sources_truncated = admitted < allocation.windows.len();
+        Ok(request)
     }
 }
 
