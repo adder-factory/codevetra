@@ -2,12 +2,12 @@
 
 # CodeVetra
 
-**CodeVetra 3.0 — current code intelligence, stored with your project.**
+**CodeVetra 4.0 — current code intelligence, stored with your project.**
 
 Native Rust CLI and MCP server · per-project RocksDB · code-aware BM25 · typed code graph
 
 [![Release](https://img.shields.io/github/v/release/adder-factory/codevetra?display_name=tag&sort=semver)](https://github.com/adder-factory/codevetra/releases/latest)
-[![v2 Rust](https://github.com/adder-factory/codevetra/actions/workflows/v2-rust.yml/badge.svg?branch=main)](https://github.com/adder-factory/codevetra/actions/workflows/v2-rust.yml)
+[![Rust CI](https://github.com/adder-factory/codevetra/actions/workflows/v2-rust.yml/badge.svg?branch=main)](https://github.com/adder-factory/codevetra/actions/workflows/v2-rust.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f855a.svg)](LICENSE)
 [![Runtime: Rust](https://img.shields.io/badge/runtime-Rust-b7410e.svg?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
@@ -29,15 +29,26 @@ generation provenance, freshness, confidence, truncation, and explicit
 abstention instead of presenting stale or incomplete data as certainty.
 
 > [!IMPORTANT]
-> Version 3.0 replaces PostgreSQL with embedded RocksDB. Each project owns its
-> database, and a persistent native service keeps its graph current. Existing
-> v2 projects need a source rebuild and host restart; see [Upgrade](#upgrade).
+> Cartograph is now **CodeVetra**. Version 4.0 uses the `codevetra` executable,
+> `codevetra_*` MCP tools, and `.codevetra` project state. Existing Cartograph
+> projects must follow the explicit [name migration](docs/CODEVETRA-MIGRATION.md)
+> before indexing or reconnecting hosts. Existing RocksDB state is preserved;
+> PostgreSQL-era v2 projects also need a source rebuild. See [Upgrade](#upgrade).
+
+Version [4.0.0](docs/releases/v4.0.0.md) adds verified supplied-diff review,
+operation-local JS/TS code-health evidence, cursor navigation, bounded possible
+static execution paths, and scoped application-boundary relationships. Source
+packets prioritize requested bodies and make omissions explicit. See the
+[release notes](docs/releases/v4.0.0.md) for changes and the
+[adapter coverage](docs/MCP-USAGE.md#application-boundaries-and-navigation) for
+supported forms and limits.
 
 ## Start here
 
 | I want to… | Go to |
 | --- | --- |
 | Install CodeVetra and build a first graph | [Quick start](#quick-start) |
+| Upgrade an existing Cartograph installation | [CodeVetra name migration](docs/CODEVETRA-MIGRATION.md) |
 | Hand setup to a coding agent | [Agent-assisted installation](docs/AGENT-INSTALL.md) |
 | Connect Codex, Claude Code, Cursor, or another host | [MCP usage](docs/MCP-USAGE.md) |
 | Look up a command, flag, or JSON field | [CLI reference](docs/CLI-REFERENCE.md) |
@@ -55,6 +66,10 @@ abstention instead of presenting stale or incomplete data as certainty.
 | Which code is most relevant? | Code-aware BM25 over names, implementation identifiers, and documentation |
 | What calls this, and what does it call? | Typed callers, callees, imports, references, and shortest paths |
 | What could this change affect? | Bounded reverse impact and structurally connected tests |
+| What is defined or referenced at this cursor? | Generation-fenced definition, reference, and implementation lookup |
+| Which routes, events, or queues connect this code? | Scoped application-boundary edges with adapter coverage and explicit unknowns |
+| Which execution paths are statically possible? | Bounded JS/TS traces with guards, exits, and unresolved steps; no code execution |
+| Which code-health findings changed? | Operation-local findings, rule coverage, and introduced, cleared, carried, or changed results |
 | Where is numerical behavior risky or statically unknown? | Generation-scoped Rust operation/hazard/precision sites with exact spans and explicit evidence limits |
 | Is the graph current? | Immutable generation identity and exact supported-source freshness |
 | What changed in the working tree? | Separately labeled live overlay and Git-ref review packets |
@@ -108,10 +123,10 @@ An unchanged second index skips publication. Require a fresh generation and
 real retrieval evidence before calling setup ready. Doctor reports native
 capabilities separately from freshness, models, registration, and transport.
 
-For a previously indexed PostgreSQL project, run
-`codevetra db migrate --to rocksdb --project-path .` to rebuild and verify the
-native destination while preserving legacy data. See the
-[migration guide](docs/v2/ROCKSDB-MIGRATION.md) for the scope of that rebuild.
+For an existing Cartograph project, complete the [upgrade steps](#upgrade)
+before building the graph. PostgreSQL-era projects also use the verified
+[RocksDB source rebuild](docs/v2/ROCKSDB-MIGRATION.md), which preserves legacy
+data without importing legacy-only state.
 
 ### 3. Connect a coding agent
 
@@ -128,8 +143,6 @@ codevetra install --yes --target cursor --location local --project-path .  # Cur
 The installer supports 19 hosts in total; see the
 [CLI reference](docs/CLI-REFERENCE.md#mcp-and-agent-configuration) for every
 target ID.
-
-
 
 ### 4. Verify the live integration
 
@@ -167,21 +180,46 @@ macOS launchd. On Windows, the serving MCP primary owns the watcher.
 
 ### Upgrade
 
-For an existing v2 installation, install v3 with the installer above, then run
-the v3 executable:
+**From Cartograph v3 or earlier:** install the new CodeVetra executable and
+keep the previous executable and state for rollback. Close the project's old
+MCP host and watch service, then run:
+
+```sh
+codevetra migrate-name --project-path . --format json
+```
+
+Migration preserves the existing physical `.cartograph` directory and creates
+a validated `.codevetra` alias to it during the 4.x compatibility window. Both
+names share one database and owner lock. Migration refuses a live owner or
+conflicting state directories. Follow the [name migration guide](docs/CODEVETRA-MIGRATION.md)
+for ignore rules, environment compatibility, old macOS service removal, and rollback.
+
+**For PostgreSQL-era v2 projects**, also rebuild and verify the native
+destination before continuing:
 
 ```sh
 codevetra db migrate --to rocksdb --project-path . --format json
-codevetra upgrade --apply --project-path . --json
 ```
 
-Migration rebuilds the graph from current source and verifies retrieval before
-recording completion. It preserves the old PostgreSQL database. Legacy notes,
-sessions, embeddings, and artifacts are not imported; keep the old data if you
-need them. The upgrade repairs recognized host pins and reports any remaining
-manual steps. Reopen attached coding hosts to load v3, then verify live MCP
-status and a real query. Future native upgrades use the same `upgrade --apply`
-command after stopping the existing owner. For a macOS native service:
+The [RocksDB migration](docs/v2/ROCKSDB-MIGRATION.md) preserves the old PostgreSQL
+database. Legacy notes, sessions, embeddings, and artifacts are not imported;
+keep the old data if you need them.
+
+Re-index once for the v4 generation contract, verify freshness, and reinstall
+the managed registration for your host (Codex shown):
+
+```sh
+codevetra index .
+codevetra doctor . --format json
+codevetra status . --format json
+codevetra install --yes --target codex --location local --project-path .
+```
+
+Restart the host and verify one `codevetra` registration, `codevetra_*` tools,
+a fresh generation, and a real context or find result.
+
+**For subsequent CodeVetra upgrades**, stop the existing owner before applying
+the upgrade. For a macOS native service:
 
 ```sh
 codevetra service stop --project-path . --format json
@@ -194,7 +232,7 @@ For a manually managed owner, stop that project's `watch` or serving process
 cooperatively, upgrade, then start it again through its service manager. Start
 the new owner before reconnecting MCP hosts. Verify the status report's version
 as well as the client's `--version`; a new client can still proxy to an older
-owner. See the [migration guide](docs/v2/ROCKSDB-MIGRATION.md).
+owner. See the [CLI upgrade reference](docs/CLI-REFERENCE.md).
 
 ## Platform and database support
 
@@ -235,6 +273,8 @@ generation atomically.
 | `codevetra_entry_points` | Routes, commands, MCP tools, exports, and API boundaries |
 | `codevetra_graph` | Callers, callees, reverse impact, paths, and symbol similarity |
 | `codevetra_affected` | Bounded affected-test selection |
+| `codevetra_navigate` | Cursor navigation and bounded possible static JS/TS execution paths |
+| `codevetra_biomarkers` | Code-health findings, rule coverage, and generation-scoped comparisons |
 | `codevetra_numerical` | Generation-scoped static numerical hazards, coverage, explanations, and non-executing probe plans |
 | `codevetra_review` | Git-ref plus staged, unstaged, and untracked evidence |
 | `codevetra_admin` | Explicit index, sync, embedding, and maintenance jobs |
@@ -362,10 +402,15 @@ can lag logical deletions. See [storage operations](docs/STORAGE-BACKENDS.md).
 
 ## Migrating earlier graphs
 
-`codevetra db migrate --to rocksdb --project-path .` rebuilds source facts and
-verifies the current native graph before recording completion. It preserves
-legacy PostgreSQL data but does not copy notes, sessions, embeddings, or other
-legacy-only state. See the [migration guide](docs/v2/ROCKSDB-MIGRATION.md).
+Existing Cartograph projects first use the explicit
+[CodeVetra name migration](docs/CODEVETRA-MIGRATION.md). It preserves native
+RocksDB state; re-indexing publishes the current generation contract.
+
+For PostgreSQL-era projects, `codevetra db migrate --to rocksdb --project-path .`
+rebuilds source facts and verifies the current native graph before recording
+completion. It preserves legacy PostgreSQL data but does not copy notes,
+sessions, embeddings, or other legacy-only state. See the
+[RocksDB migration guide](docs/v2/ROCKSDB-MIGRATION.md).
 
 ## Security and release guarantees
 
@@ -386,6 +431,7 @@ audience.
 | Area | Guides |
 | --- | --- |
 | **Set up** | [Agent-assisted installation](docs/AGENT-INSTALL.md) · [Configuration](docs/CONFIGURATION.md) · [MCP usage](docs/MCP-USAGE.md) |
+| **Upgrade** | [Cartograph to CodeVetra](docs/CODEVETRA-MIGRATION.md) · [RocksDB migration](docs/v2/ROCKSDB-MIGRATION.md) · [v4.0.0 release notes](docs/releases/v4.0.0.md) |
 | **Use** | [CLI reference](docs/CLI-REFERENCE.md) · [CLI/MCP alignment](docs/cli-mcp-alignment.md) · [Language support matrix](docs/SUPPORT-MATRIX.md) · [Graph export formats](docs/GRAPH-EXPORT-FORMATS.md) |
 | **Operate** | [Storage and operations](docs/STORAGE-BACKENDS.md) · [Performance tuning](docs/PERF-TUNING.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | **Extend** | [Architecture](docs/v2/ARCHITECTURE.md) · [Native extraction](docs/v2/EXTRACTION.md) · [Extending languages and resolvers](docs/EXTENDING-EXTRACTORS-RESOLVERS.md) |
@@ -402,7 +448,7 @@ cargo build --locked --release -p codevetra-cli
 
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo test --locked --workspace
+cargo test --locked --workspace --all-features
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps
 cargo deny --all-features check
 ```
