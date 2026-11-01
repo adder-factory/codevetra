@@ -22,6 +22,7 @@ use crate::{DiscoveryPolicy, SourceRoot};
 
 const LEGACY_DIRECTORY: &str = ".cartograph";
 const CODEVETRA_DIRECTORY: &str = ".codevetra";
+const CODEVETRA_ADMISSION_LOCK: &str = ".codevetra.lock";
 const CODEVETRA_IGNORE_MARKER: &str = ".codevetraignore";
 const GIT_DIRECTORY: &str = ".git";
 const MAX_CONFIGURED_SOURCE_FILES: usize = 10_000_000;
@@ -744,7 +745,11 @@ impl WalkFilter {
             return true;
         }
         let name = entry.file_name();
-        if name == GIT_DIRECTORY || name == CODEVETRA_DIRECTORY || name == LEGACY_DIRECTORY {
+        if name == GIT_DIRECTORY
+            || name == CODEVETRA_DIRECTORY
+            || name == LEGACY_DIRECTORY
+            || name == CODEVETRA_ADMISSION_LOCK
+        {
             return false;
         }
         let is_directory = entry
@@ -802,7 +807,7 @@ fn is_internal_path(path: &NormalizedPath) -> bool {
     path.as_str().split('/').next().is_some_and(|component| {
         matches!(
             component,
-            GIT_DIRECTORY | CODEVETRA_DIRECTORY | LEGACY_DIRECTORY
+            GIT_DIRECTORY | CODEVETRA_DIRECTORY | LEGACY_DIRECTORY | CODEVETRA_ADMISSION_LOCK
         )
     })
 }
@@ -912,6 +917,14 @@ mod tests {
         assert!(fs::write(root.join("src/marker-tree/.codevetraignore"), "\n").is_ok());
         assert!(fs::write(root.join("src/marker-tree/no.js"), "ignored\n").is_ok());
         assert!(fs::write(root.join(".codevetra/secret.ts"), "ignored\n").is_ok());
+        // Internal admission must be excluded independently of extension detection
+        // and installer-created ignore patterns, including malformed directories.
+        assert!(fs::create_dir(root.join(".codevetra.lock")).is_ok());
+        assert!(fs::write(root.join(".codevetra.lock/secret.ts"), "ignored\n").is_ok());
+        assert!(is_internal_path(
+            &NormalizedPath::parse(".codevetra.lock")
+                .unwrap_or_else(|error| panic!("invalid fixture: {error}"))
+        ));
 
         let source_root = match SourceRoot::open(root) {
             Ok(source_root) => source_root,

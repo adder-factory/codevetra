@@ -4011,7 +4011,7 @@ fn check_or_fix_project_state(input: &mut ProjectStateCheckInput<'_>) -> Result<
     match fs::symlink_metadata(&state) {
         Ok(metadata) if metadata.file_type().is_dir() => input.checks.push(doctor_pass(
             "project-state",
-            "The project has a real .codevetra state directory.",
+            "The project state directory passed native path validation.",
         )),
         Ok(_) => input.checks.push(doctor_fail(
             "project-state",
@@ -4034,7 +4034,7 @@ fn check_or_fix_project_state(input: &mut ProjectStateCheckInput<'_>) -> Result<
                 .push("created the private .codevetra state directory".to_owned());
             input.checks.push(doctor_pass(
                 "project-state",
-                "The project has a real .codevetra state directory.",
+                "The project state directory passed native path validation.",
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

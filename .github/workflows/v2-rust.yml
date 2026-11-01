@@ -362,7 +362,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo install cargo-llvm-cov --version 0.9.1 --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo llvm-cov --locked -p codevetra-config --lcov --output-path target/windows-config.lcov name_migration -- --nocapture
+          cargo llvm-cov test --locked -p codevetra-config --lcov --output-path target/windows-config.lcov name_migration -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Preserve Windows state migration coverage

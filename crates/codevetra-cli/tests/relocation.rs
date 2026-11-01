@@ -52,7 +52,12 @@ fn physical_relocation_preserves_identity_generation_notes_and_configuration() -
     assert!(!old.join(".cartograph").exists());
     fs::rename(old.join(".codevetra"), old.join(".cartograph"))?;
     fs::rename(&old, &new)?;
-    json(&new, &["migrate-name", "--format", "json"])?;
+    assert_eq!(
+        json(&new, &["migrate-name", "--format", "json"])?,
+        serde_json::json!({
+            "completed": true, "statePreserved": true, "placement": "canonical", "hostRestartRequired": true,
+        })
+    );
     assert!(!call(&new, &["status", "--json"])?.status.success());
     let from = old.to_str().ok_or("fixture path is not UTF-8")?;
     refusals_preserve_configuration(&old, &new, from)?;
