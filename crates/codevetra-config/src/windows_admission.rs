@@ -19,7 +19,8 @@ impl StateAdmission {
             .ok_or(NameMigrationError::UnsafePath)?
             .to_lowercase();
         let digest = blake3::hash(root.as_bytes());
-        let name = format!("Local\\CodeVetra-StateAdmission-{digest}");
+        // Global events coordinate service and interactive sessions as well.
+        let name = format!("Global\\CodeVetra-StateAdmission-{digest}");
         let event = HEVENT::CreateEvent(None, false, true, Some(&name))
             .map_err(|_| NameMigrationError::UnsafePath)?;
         match event.WaitForSingleObject(Some(0)) {
