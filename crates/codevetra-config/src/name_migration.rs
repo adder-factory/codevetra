@@ -105,13 +105,17 @@ pub fn prepare_project_state(root: &Path) -> Result<PathBuf, NameMigrationError>
     project_state_directory(root)
 }
 
-/// Move existing state into a real `.codevetra` directory while holding both
-/// original locks. Existing migration aliases and exact legacy markers are retired.
+/// Move existing state into a real `.codevetra` directory under exclusive admission.
+/// Original owner/configuration locks prove quiescence; Unix keeps them open through
+/// the move, while Windows keeps its shared admission guard. Old aliases and markers
+/// are retired.
 /// Stop legacy hosts first; old binaries that only know `.cartograph` must no longer run.
 /// # Errors
 /// Refuses active owners, independent directories, unsafe paths and ignore conflicts.
 pub fn migrate_project_name(root: &Path) -> Result<NameMigrationReport, NameMigrationError> {
     let root = fs::canonicalize(root).map_err(|_| NameMigrationError::UnsafePath)?;
+    #[cfg(windows)]
+    let _admission = crate::StateAdmission::acquire(&root)?;
     let legacy = root.join(LEGACY);
     let canonical = root.join(CANONICAL);
     let state = match project_state_directory(&root) {
@@ -134,6 +138,14 @@ pub fn migrate_project_name(root: &Path) -> Result<NameMigrationReport, NameMigr
     let _primary = lock(&state.join("native-primary.lock"))?;
     let _config = lock(&state.join("config.lock"))?;
     let ignore = IgnoreMigration::inspect(&root)?;
+    // Windows denies directory rename with open descendants. Both old locks
+    // proved quiescence; admission now prevents new owners/config writers from
+    // resolving state until the physical move and ignore-policy update finish.
+    #[cfg(windows)]
+    {
+        drop(_config);
+        drop(_primary);
+    }
     if state == legacy {
         if metadata(&canonical)?.is_some() {
             if project_state_directory(&root)? != legacy {

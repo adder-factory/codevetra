@@ -4,6 +4,10 @@ mod name_migration;
 mod numeric;
 mod project;
 mod storage;
+#[cfg(windows)]
+mod windows_admission;
+#[cfg(windows)]
+pub use windows_admission::StateAdmission;
 
 pub use storage::{StorageMigrationGuard, record_rocksdb_migration, storage_migration_guard};
 

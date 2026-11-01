@@ -25,8 +25,11 @@ Starting with v4.0.3, migration renames the existing physical directory to
 `.codevetra`. It also converts the `.codevetra -> .cartograph` layout created by
 v4.0.0–v4.0.2. Directory identity, permissions, database contents and original
 owner/configuration locks are preserved; the database is neither copied nor rebuilt.
-The command holds both locks throughout the move and refuses an independent
-canonical directory. No symlink privilege is needed. Fresh projects create only
+The command refuses an independent canonical directory. On macOS/Linux it holds
+both original locks throughout the move. On Windows it first acquires a process-shared
+state-admission guard and verifies both original file locks. It then closes those
+handles for the directory move while the admission guard prevents new native owners
+and configuration writers from resolving state. Existing owners still block migration. No symlink privilege is needed. Fresh projects create only
 `.codevetra`; existing exact legacy marker files are removed during migration.
 
 Old binaries that only understand `.cartograph` must no longer run against a migrated

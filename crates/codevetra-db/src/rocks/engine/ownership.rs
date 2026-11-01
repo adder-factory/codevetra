@@ -221,6 +221,30 @@ fn encoded(identity: &ContentDigest) -> Vec<u8> {
 mod primary_tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn name_migration_admission_blocks_native_open_before_state_creation()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let gate = codevetra_config::StateAdmission::acquire(root.path())?;
+        assert!(
+            super::super::ProjectStore::open(
+                root.path(),
+                &ContentDigest::from_bytes([31; 32]),
+                super::super::StorePolicy::default(),
+            )
+            .is_err()
+        );
+        assert!(!root.path().join(".codevetra").exists());
+        drop(gate);
+        drop(super::super::ProjectStore::open(
+            root.path(),
+            &ContentDigest::from_bytes([31; 32]),
+            super::super::StorePolicy::default(),
+        )?);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn directory_with_a_different_owner_is_refused_without_changing_permissions()

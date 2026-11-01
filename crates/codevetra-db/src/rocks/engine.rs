@@ -276,9 +276,13 @@ impl ProjectStore {
         if !root.is_dir() {
             return Err(RocksError::Directory);
         }
+        #[cfg(windows)]
+        let admission = codevetra_config::StateAdmission::acquire(&root)?;
         let state = codevetra_config::prepare_project_state(&root)?;
         private_directory(&state)?;
         let primary = ownership::lock_primary(&state)?;
+        #[cfg(windows)]
+        drop(admission);
         let directory = state.join("data");
         private_directory(&directory)?;
         // Refuse foreign storage before RocksDB can recover a WAL, create a

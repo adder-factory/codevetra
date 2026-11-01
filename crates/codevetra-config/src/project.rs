@@ -791,6 +791,8 @@ fn acquire_config_write_target_after_missing_observed(
     observe_missing: impl FnOnce(),
 ) -> Result<ConfigWriteTarget, ProjectConfigError> {
     let root = canonical_project_root(project_root)?;
+    #[cfg(windows)]
+    let _admission = crate::StateAdmission::acquire(&root)?;
     let directory = crate::prepare_project_state(&root)?;
     match fs::symlink_metadata(&directory) {
         Ok(_) => {}
