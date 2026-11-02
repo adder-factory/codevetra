@@ -28,6 +28,7 @@ mod jvm_dynamic_family;
 mod managed_family;
 mod module_system;
 mod numerical;
+mod php_family;
 mod polyglot;
 mod prisma_family;
 mod references;
@@ -320,6 +321,8 @@ struct ExtractionBuilder<'source, 'cancel> {
     /// Whether any synthesized name exceeded its canonical bound and had to be
     /// deterministically shortened for this file.
     shortened_canonical_names: bool,
+    /// PHP compile-time name-resolution state (namespace, `use` aliases, class context).
+    php: php_family::PhpScope,
 }
 
 fn visit_container(
@@ -682,6 +685,7 @@ pub(super) struct PendingReference<'tree> {
 #[derive(Clone, Copy)]
 enum ExtractionFamily {
     Ada,
+    Php,
     Shader,
     Shell,
     C,
@@ -736,7 +740,6 @@ const GENERIC_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::Nix,
     SourceLanguage::ObjectiveC,
     SourceLanguage::Pascal,
-    SourceLanguage::Php,
     SourceLanguage::R,
     SourceLanguage::ReScript,
     SourceLanguage::Ruby,
@@ -774,6 +777,13 @@ const fn family_slice_structural(family: ExtractionFamily) -> Option<FamilySlice
             visit_declaration: ada_family::visit_declaration,
             visit_usage: |builder, node, depth| {
                 ada_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        ExtractionFamily::Php => FamilySlice {
+            visit_declaration: php_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                php_family::capture_usage(builder, node)?;
                 builder.visit_named_children(node, depth)
             },
         },
@@ -888,6 +898,7 @@ fn extraction_family(language: SourceLanguage) -> ExtractionFamily {
         match language {
             SourceLanguage::GraphQl => ExtractionFamily::GraphQl,
             SourceLanguage::Wesl | SourceLanguage::Wgsl => ExtractionFamily::Shader,
+            SourceLanguage::Php => ExtractionFamily::Php,
             SourceLanguage::Prisma => ExtractionFamily::Prisma,
             SourceLanguage::Sql => ExtractionFamily::Sql,
             _ => ExtractionFamily::Unsupported,
@@ -1123,6 +1134,7 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
             commonjs_shadowing: module_system::CommonJsShadowing::default(),
             maximum_ast_depth,
             shortened_canonical_names: false,
+            php: php_family::PhpScope::default(),
         })
     }
 

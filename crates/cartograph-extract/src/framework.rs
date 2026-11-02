@@ -66,6 +66,7 @@ pub(crate) fn enrich(
     crate::framework_manifest::scan(&mut builder, &masked_source)?;
     crate::framework_nest::scan(&mut builder, &masked_source)?;
     crate::framework_rails::scan(&mut builder, &masked_source)?;
+    crate::framework_symfony::scan(&mut builder, &masked_source)?;
     scan_framework_signals(&mut builder, &masked_source)?;
     crate::framework_bridge::scan(&mut builder, &masked_source)?;
     builder.finish()
@@ -450,6 +451,16 @@ impl<'source, 'cancel> FrameworkBuilder<'source, 'cancel> {
 
     pub(crate) const fn original_symbol_count(&self) -> usize {
         self.original_symbols
+    }
+
+    /// Number of references currently retained for this file.
+    pub(crate) fn reference_count(&self) -> usize {
+        self.file.references.len()
+    }
+
+    /// One retained reference, including those the language walker extracted.
+    pub(crate) fn reference(&self, index: usize) -> Option<&ExtractedReference> {
+        self.file.references.get(index)
     }
 
     pub(crate) fn add_route(&mut self, input: FrameworkRouteInput<'_>) -> Result<(), ExtractError> {
@@ -2373,7 +2384,7 @@ fn scan_managed_config_placeholders(
     Ok(())
 }
 
-fn safe_route_value(value: &str, command: bool) -> Option<String> {
+pub(crate) fn safe_route_value(value: &str, command: bool) -> Option<String> {
     let value = value.trim();
     if value.is_empty()
         || value.len() > MAX_ROUTE_BYTES

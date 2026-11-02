@@ -26,6 +26,9 @@ pub enum ExtractionStrategy {
     ShaderFamily,
     /// Ada and VHDL declarations, case-insensitive references, and compilation imports.
     AdaFamily,
+    /// PHP declarations, namespace `use` imports, literal includes, and
+    /// compile-time-resolved class, member, and static call references.
+    PhpFamily,
     /// Grammar-backed conservative structural extraction for the remaining v1 language modes.
     GenericStructural,
     /// Bounded native scanners for custom, mixed-markup, and domain-specific v1 modes.
@@ -48,6 +51,7 @@ impl ExtractionStrategy {
                 | Self::JvmDynamicFamily
                 | Self::ShaderFamily
                 | Self::AdaFamily
+                | Self::PhpFamily
                 | Self::GenericStructural
                 | Self::CustomStructural
         )
@@ -133,6 +137,7 @@ const fn grammar_strategy(language: SourceLanguage) -> Option<ExtractionStrategy
         | SourceLanguage::Slang => Some(ExtractionStrategy::CFamily),
         SourceLanguage::Wesl | SourceLanguage::Wgsl => Some(ExtractionStrategy::ShaderFamily),
         SourceLanguage::Ada | SourceLanguage::Vhdl => Some(ExtractionStrategy::AdaFamily),
+        SourceLanguage::Php => Some(ExtractionStrategy::PhpFamily),
         SourceLanguage::Bash
         | SourceLanguage::Fish
         | SourceLanguage::PowerShell
@@ -165,7 +170,6 @@ const fn fallback_strategy(language: SourceLanguage) -> ExtractionStrategy {
         | SourceLanguage::Nix
         | SourceLanguage::ObjectiveC
         | SourceLanguage::Pascal
-        | SourceLanguage::Php
         | SourceLanguage::Prisma
         | SourceLanguage::R
         | SourceLanguage::ReScript
@@ -236,6 +240,7 @@ mod tests {
             SourceLanguage::Kotlin,
             SourceLanguage::Scala,
             SourceLanguage::Groovy,
+            SourceLanguage::Php,
         ] {
             assert!(
                 LanguageSpec::for_language(language)
