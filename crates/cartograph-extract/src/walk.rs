@@ -8,8 +8,9 @@ use tree_sitter::Node;
 
 use crate::{
     Containment, DiagnosticCode, ExtractError, ExtractedFile, ExtractedImportBinding,
-    ExtractedReference, ExtractedSymbol, ExtractionDiagnostic, ExtractionStrategy, LanguageSpec,
-    SourceSnapshot, SymbolExecutionFlags, SymbolExportFlags, SymbolImplementationFlags,
+    ExtractedReceiverBinding, ExtractedReceiverLookup, ExtractedReference, ExtractedSymbol,
+    ExtractionDiagnostic, ExtractionStrategy, LanguageSpec, SourceSnapshot, SymbolExecutionFlags,
+    SymbolExportFlags, SymbolImplementationFlags,
     budget::{
         ExtractionBudget, containment_budget_bytes, diagnostic_budget_bytes,
         import_binding_budget_bytes, reference_budget_bytes, symbol_budget_bytes,
@@ -28,6 +29,7 @@ mod def_use;
 mod dynamic_dispatch;
 pub(crate) mod embedded_script;
 mod embedded_sql;
+mod explicit_receivers;
 mod family_support;
 mod fsharp_family;
 mod generic_family;
@@ -234,7 +236,8 @@ fn enrich_visited(
     schema::enrich(builder, root)?;
     embedded_sql::enrich(builder, root)?;
     value_references::enrich(builder, root)?;
-    javascript_reads::enrich_binding_tables(builder, root)
+    javascript_reads::enrich_binding_tables(builder, root)?;
+    explicit_receivers::enrich(builder, root)
 }
 
 fn collect_extraction_diagnostics(
@@ -277,6 +280,7 @@ fn finish_extraction(
     input: WalkInput<'_>,
     diagnostics: Vec<ExtractionDiagnostic>,
 ) -> Result<ExtractedFile, ExtractError> {
+    let receiver_evidence = explicit_receivers::finish(&mut builder)?;
     let snapshot = builder.context.snapshot;
     let output_limit = builder.context.budget.output_limit();
     polyglot::fence_python_import_uses(&mut builder, input.root)?;
@@ -305,6 +309,7 @@ fn finish_extraction(
         symbols: builder.facts.symbols,
         containments: builder.facts.containments,
         references: builder.facts.references,
+        receiver_evidence,
         numerical_sites: builder.facts.numerical_sites,
         import_bindings: builder.facts.import_bindings,
         has_inline_tests,
@@ -619,6 +624,8 @@ struct ExtractionFacts {
     symbols: Vec<ExtractedSymbol>,
     containments: Vec<Containment>,
     references: Vec<ExtractedReference>,
+    receiver_lookups: Vec<ExtractedReceiverLookup>,
+    receiver_bindings: Vec<ExtractedReceiverBinding>,
     numerical_sites: Vec<crate::ExtractedNumericalSite>,
     import_bindings: Vec<ExtractedImportBinding>,
 }

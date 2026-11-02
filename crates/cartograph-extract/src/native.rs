@@ -284,6 +284,7 @@ fn degraded_file(snapshot: &SourceSnapshot, diagnostic: DiagnosticCode) -> Extra
         symbols: Vec::new(),
         containments: Vec::new(),
         references: Vec::new(),
+        receiver_evidence: None,
         numerical_sites: Vec::new(),
         import_bindings: Vec::new(),
         has_inline_tests: false,

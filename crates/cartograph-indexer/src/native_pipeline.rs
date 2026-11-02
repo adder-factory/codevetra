@@ -1,6 +1,7 @@
 mod pascal_resolution;
 mod php_resolution;
 mod python_resolution;
+mod receiver_resolution;
 mod scip_spill;
 mod script_modules;
 
@@ -39,13 +40,14 @@ use cartograph_extract::{
     CloneTokenCount, CloneTokenProfile, Containment, DEFAULT_MAXIMUM_AST_DEPTH,
     DYNAMIC_DISPATCH_RESOLUTION_PREFIX, DiagnosticCode, DiscoveredSource, DiscoveryLimits,
     EMBEDDED_SQL_RESOLUTION_PREFIX, ExtractError, ExtractedFile, ExtractedImportBinding,
-    ExtractedNumericalSite, ExtractedReference, ImportBindingKind, LEXICAL_SCOPE_RESOLUTION_PREFIX,
-    MAXIMUM_AST_DEPTH, MINIMUM_AST_DEPTH, NativeExtractor, PHP_EXACT_RESOLUTION_PREFIX,
-    PYTHON_UNBOUND_IMPORT_RESOLUTION_PREFIX, RUST_MACRO_RESOLUTION_PREFIX,
-    RUST_SELF_RECEIVER_RESOLUTION_PREFIX, SourceDiscoveryOptions, SourceExclusionEvidence,
-    SourceLimits, SourceReadError, SourceReadOptions, SourceRoot, SourceSnapshot,
-    TYPE_QUERY_VALUE_RESOLUTION_PREFIX, is_test_source_path, native_extraction_reservation,
-    native_extractor_contract_digest, native_read_reservation, substitute_module_alias,
+    ExtractedNumericalSite, ExtractedReceiverEvidence, ExtractedReference, ImportBindingKind,
+    LEXICAL_SCOPE_RESOLUTION_PREFIX, MAXIMUM_AST_DEPTH, MINIMUM_AST_DEPTH, NativeExtractor,
+    PHP_EXACT_RESOLUTION_PREFIX, PYTHON_UNBOUND_IMPORT_RESOLUTION_PREFIX,
+    RUST_MACRO_RESOLUTION_PREFIX, RUST_SELF_RECEIVER_RESOLUTION_PREFIX, SourceDiscoveryOptions,
+    SourceExclusionEvidence, SourceLimits, SourceReadError, SourceReadOptions, SourceRoot,
+    SourceSnapshot, TYPE_QUERY_VALUE_RESOLUTION_PREFIX, is_test_source_path,
+    native_extraction_reservation, native_extractor_contract_digest, native_read_reservation,
+    substitute_module_alias,
 };
 use cartograph_scip::{
     ScipOverlayPlan, ScipOverlayReport, ScipOverlayRequest, apply_scip_overlay_with_cancellation,
@@ -4753,6 +4755,7 @@ fn append_degraded_files(
 fn compact_clone_file(mut file: NativeFileFacts) -> NativeFileFacts {
     file.containments = Vec::new();
     file.references = Vec::new();
+    file.receiver_evidence = None;
     file.numerical_sites = Vec::new();
     file.import_bindings = Vec::new();
     file.test_search_text = String::new();
@@ -4773,6 +4776,7 @@ struct NativeFileFacts {
     symbols: Vec<NativeSymbolFacts>,
     containments: Vec<Containment>,
     references: Vec<ExtractedReference>,
+    receiver_evidence: Option<Box<ExtractedReceiverEvidence>>,
     numerical_sites: Vec<ExtractedNumericalSite>,
     import_bindings: Vec<ExtractedImportBinding>,
     has_inline_tests: bool,
@@ -4793,6 +4797,7 @@ impl NativeFileFacts {
             symbols,
             containments,
             references,
+            receiver_evidence,
             numerical_sites,
             import_bindings,
             has_inline_tests,
@@ -4820,6 +4825,7 @@ impl NativeFileFacts {
             symbols: normalized_symbols,
             containments,
             references,
+            receiver_evidence,
             numerical_sites,
             import_bindings,
             has_inline_tests,
@@ -4834,6 +4840,9 @@ impl NativeFileFacts {
             .saturating_add(vector_capacity_bytes(&self.symbols))
             .saturating_add(vector_capacity_bytes(&self.containments))
             .saturating_add(vector_capacity_bytes(&self.references))
+            .saturating_add(receiver_resolution::evidence_bytes(
+                self.receiver_evidence.as_deref(),
+            ))
             .saturating_add(vector_capacity_bytes(&self.numerical_sites))
             .saturating_add(vector_capacity_bytes(&self.import_bindings))
             .saturating_add(usize_to_u64(self.test_search_text.capacity()));
@@ -5231,6 +5240,7 @@ struct ResolutionIndex {
     rust_named_re_exports: Vec<RustNamedReExport>,
     test_files: Vec<TestFileEvidence>,
     php: php_resolution::PhpResolutionIndex,
+    receivers: receiver_resolution::ReceiverIndex,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -9745,6 +9755,7 @@ where
     Cancel: FnMut() -> bool,
 {
     python_resolution::index_source_roots(&mut ResolutionIndexTarget { index, budget }, cancelled)?;
+    receiver_resolution::finish_index(&mut ResolutionIndexTarget { index, budget }, cancelled)?;
     let mut order = Vec::new();
     order
         .try_reserve_exact(index.candidates.len())
@@ -10455,6 +10466,11 @@ where
         },
         cancelled,
     )?;
+    receiver_resolution::index_file(
+        &mut ResolutionIndexTarget { index, budget },
+        file,
+        cancelled,
+    )?;
     index_project_reexports(index, file, budget)
 }
 
@@ -10744,6 +10760,7 @@ struct FileResolutionContext<'a> {
     identity: &'a FileDocumentIdentity,
     file_symbol_id: &'a SymbolId,
     import_bindings: &'a FileImportBindingIndex<'a>,
+    receiver_lookups: &'a receiver_resolution::FileLookups<'a>,
 }
 
 struct FileImportBindingIndex<'a> {
@@ -11081,7 +11098,16 @@ where
         target.confidence = DYNAMIC_DISPATCH_CONFIDENCE;
         target.provenance = DYNAMIC_DISPATCH_PROVENANCE;
     }
-    Ok(resolution)
+    let receiver = receiver_resolution::resolve(
+        index,
+        receiver_resolution::ReceiverQuery {
+            context,
+            reference,
+            import_binding_scratch,
+        },
+        cancelled,
+    )?;
+    Ok(receiver_resolution::prefer_base(resolution, receiver))
 }
 
 struct FileRecordInput<'file> {
@@ -11118,6 +11144,7 @@ impl ResolutionOutput<'_> {
             symbols,
             containments,
             references,
+            receiver_evidence,
             numerical_sites,
             import_bindings,
             has_inline_tests: _,
@@ -11154,10 +11181,18 @@ impl ResolutionOutput<'_> {
         let import_binding_index = FileImportBindingIndex::new(&import_bindings, self.budget)?;
         let mut import_binding_scratch =
             ImportBindingScratch::new(import_bindings.len(), self.budget)?;
+        let receiver_lookups = receiver_resolution::FileLookups::new(
+            receiver_evidence
+                .as_deref()
+                .map_or(&[], |evidence| evidence.lookups.as_slice()),
+            self.budget,
+            cancelled,
+        )?;
         let context = FileResolutionContext {
             identity: &identity,
             file_symbol_id: &file_symbol_id,
             import_bindings: &import_binding_index,
+            receiver_lookups: &receiver_lookups,
         };
         for reference in references {
             if cancelled() {
@@ -16765,6 +16800,7 @@ mod tests {
     mod php_namespaces;
     mod polyglot_parity;
     mod python_imports;
+    mod receiver_types;
     mod rust_receivers;
     mod script_modules;
     mod v1_resolution_oracle;

@@ -510,6 +510,7 @@ impl<'source, 'cancel> CustomBuilder<'source, 'cancel> {
             symbols: self.symbols,
             containments: self.containments,
             references: self.references,
+            receiver_evidence: None,
             numerical_sites: Vec::new(),
             import_bindings: self.import_bindings,
             has_inline_tests: false,
