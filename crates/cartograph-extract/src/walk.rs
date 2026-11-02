@@ -47,6 +47,7 @@ mod lisp_family;
 mod lua_family;
 mod managed_family;
 mod module_system;
+mod namespace_bindings;
 mod nix_family;
 mod numerical;
 mod objc_family;
@@ -66,6 +67,7 @@ mod script_support;
 mod shader_family;
 mod shell_family;
 mod solidity_family;
+mod source_bindings;
 pub(crate) mod specifier_safety;
 mod sql_family;
 mod swift_family;
@@ -280,6 +282,8 @@ fn finish_extraction(
     let snapshot = builder.context.snapshot;
     let output_limit = builder.context.budget.output_limit();
     polyglot::fence_python_import_uses(&mut builder, input.root)?;
+    namespace_bindings::fence(&mut builder, input.root)?;
+    source_bindings::fence(&mut builder, input.root)?;
     let has_inline_tests = has_inline_tests(&mut builder, input.root)?;
     // An embedded script region that failed to parse, or a template
     // expression too deep to walk, leaves a diagnostic even when the host

@@ -1,8 +1,18 @@
+mod declaration_resolution;
+mod explicit_edge_resolution;
+mod go_path_resolution;
+mod module_call_resolution;
 mod pascal_resolution;
 mod php_resolution;
 mod python_resolution;
+mod resource_resolution;
+mod rust_dependency_paths;
+mod rust_facade_resolution;
+mod rust_path_resolution;
+mod rust_root_ownership;
 mod scip_spill;
 mod script_modules;
+mod shell_resolution;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -5231,6 +5241,9 @@ struct ResolutionIndex {
     rust_named_re_exports: Vec<RustNamedReExport>,
     test_files: Vec<TestFileEvidence>,
     php: php_resolution::PhpResolutionIndex,
+    module_calls: module_call_resolution::ModuleCallIndex,
+    rust_paths: rust_path_resolution::PathIndex,
+    shell_sources: shell_resolution::SourceIndex,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -9745,6 +9758,9 @@ where
     Cancel: FnMut() -> bool,
 {
     python_resolution::index_source_roots(&mut ResolutionIndexTarget { index, budget }, cancelled)?;
+    shell_resolution::finalize(&mut ResolutionIndexTarget { index, budget }, cancelled)?;
+    rust_root_ownership::index(&mut ResolutionIndexTarget { index, budget }, cancelled)?;
+    rust_facade_resolution::index(&mut ResolutionIndexTarget { index, budget }, cancelled)?;
     let mut order = Vec::new();
     order
         .try_reserve_exact(index.candidates.len())
@@ -10398,6 +10414,21 @@ where
     if cancelled() {
         return Err(StageItemFailure);
     }
+    shell_resolution::index_file(
+        &mut ResolutionIndexTarget { index, budget },
+        file,
+        cancelled,
+    )?;
+    rust_path_resolution::index_file(
+        &mut ResolutionIndexTarget { index, budget },
+        file,
+        cancelled,
+    )?;
+    module_call_resolution::index_file(
+        &mut ResolutionIndexTarget { index, budget },
+        file,
+        cancelled,
+    )?;
     let file_ordinal = *index
         .file_ordinals
         .get(&file.file.file_id)
@@ -10618,6 +10649,9 @@ fn index_test_file_evidence(
     }
     let mut import_specifiers = BTreeSet::new();
     for binding in &file.import_bindings {
+        if explicit_edge_resolution::metadata_binding(&file.file.language, binding) {
+            continue;
+        }
         if !matches!(
             binding.kind,
             ImportBindingKind::IncludeSystem
@@ -10755,6 +10789,7 @@ struct FileImportBindingIndex<'a> {
 impl<'a> FileImportBindingIndex<'a> {
     fn new(
         bindings: &'a [ExtractedImportBinding],
+        language: &str,
         budget: &mut ResolveBudget,
     ) -> Result<Self, StageItemFailure> {
         let mut index = Self {
@@ -10771,6 +10806,9 @@ impl<'a> FileImportBindingIndex<'a> {
             .try_reserve_exact(bindings.len())
             .map_err(|_| StageItemFailure)?;
         for (position, binding) in bindings.iter().enumerate() {
+            if explicit_edge_resolution::metadata_binding(language, binding) {
+                continue;
+            }
             if binding.local_name == "*" {
                 budget.charge(usize_to_u64(size_of::<usize>()))?;
                 index.wildcards.push(position);
@@ -11151,7 +11189,8 @@ impl ResolutionOutput<'_> {
             },
             cancelled,
         )?;
-        let import_binding_index = FileImportBindingIndex::new(&import_bindings, self.budget)?;
+        let import_binding_index =
+            FileImportBindingIndex::new(&import_bindings, &file.language, self.budget)?;
         let mut import_binding_scratch =
             ImportBindingScratch::new(import_bindings.len(), self.budget)?;
         let context = FileResolutionContext {
@@ -11278,7 +11317,12 @@ impl ResolutionOutput<'_> {
             .clone()
             .unwrap_or_else(|| context.file_symbol_id.clone());
         if let Some(target) = resolution.target.as_ref()
-            && source_symbol_id != target.symbol_id
+            && (source_symbol_id != target.symbol_id
+                || resource_resolution::retain_self_edge(
+                    &context.identity.language,
+                    reference.kind,
+                    target.kind,
+                ))
             && let Some(edge_kind) = reference_edge_kind(reference.kind, target.kind)
         {
             self.facts.edges.push(EdgeInput {
@@ -12463,8 +12507,14 @@ where
     if let Some(resolution) = resolve_declaration_reference(index, request, cancelled)? {
         return Ok(resolution);
     }
-    if let Some(target) = resolve_lexical(index, request, cancelled)? {
+    if let Some(target) = resource_resolution::resolve(index, request, cancelled)? {
         return Ok(ReferenceResolution::resolved(target));
+    }
+    if let Some(resolution) = module_call_resolution::qualified(index, request, cancelled)? {
+        return Ok(resolution);
+    }
+    if let Some(target) = resolve_lexical(index, request, cancelled)? {
+        return declaration_resolution::prefer_definition(index, (request, target), cancelled);
     }
     if request.import_bindings.fallback_blocked {
         return Ok(ReferenceResolution::unresolved(
@@ -12475,6 +12525,9 @@ where
         return Ok(ReferenceResolution::unresolved(
             DYNAMIC_DISPATCH_UNRESOLVED_PROVENANCE,
         ));
+    }
+    if let Some(resolution) = explicit_edge_resolution::resolve(index, request, cancelled)? {
+        return Ok(resolution);
     }
     if let Some(target) = resolve_rust_qualified_path(index, request, cancelled)? {
         return Ok(ReferenceResolution::resolved(target));
@@ -16767,6 +16820,9 @@ mod tests {
     mod python_imports;
     mod rust_receivers;
     mod script_modules;
+    mod unqual_digests;
+    mod unqual_repair;
+    mod unqual_resolution;
     mod v1_resolution_oracle;
 
     use std::assert_matches;
