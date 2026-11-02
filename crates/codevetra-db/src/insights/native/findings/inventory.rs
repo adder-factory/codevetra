@@ -1,19 +1,17 @@
 //! Detector inputs stream from canonical metadata and compact topology.
 
-use super::{clones, corrupt, framework, row_bytes, rules, workspace};
+use super::file_counts::{FileCounts, reserve};
+
+use super::{clones, corrupt, documents::Documents, framework, row_bytes, rules, workspace};
 use crate::{
     FileInput, GraphDirection, SymbolInput,
-    artifacts::native::summaries::visit_documents,
     insights::StructuralFinding,
     retrieval::native::simple_name,
-    rocks::{GraphSnapshot, ReadBudget, RocksError, StateTransaction, StoredRevision},
+    rocks::{GraphSnapshot, ReadBudget, RocksError, StateTransaction, StoredRevision, packed_uuid},
 };
-use codevetra_domain::{DocumentId, DocumentKind, EdgeKind, FileId, SymbolId, Visibility};
+use codevetra_domain::{EdgeKind, SourceLanguage, SymbolId, Visibility};
 use num_traits::ToPrimitive as _;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    mem::size_of,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 const FIELDS: &[&str] = &[
     "code_lines",
@@ -63,40 +61,6 @@ pub(super) struct Document {
     pub(super) facade_factory: bool,
 }
 
-/// Keep only identity and the child metrics needed by relational detectors in memory.
-/// Detailed metrics, operation sites, and clone members are read from the same snapshot.
-pub(super) struct DocumentHandle {
-    id: DocumentId,
-    pub(super) test: bool,
-    code_lines: f64,
-    cyclomatic: f64,
-}
-
-impl DocumentHandle {
-    pub(super) fn load(
-        &self,
-        graph: &GraphSnapshot<'_, '_>,
-        budget: &mut ReadBudget,
-    ) -> Result<Document, RocksError> {
-        let document = graph.document(&self.id, budget)?.ok_or(corrupt())?;
-        if !matches!(document.kind, DocumentKind::Symbol | DocumentKind::Test)
-            || self.test != (document.kind == DocumentKind::Test)
-        {
-            return Err(corrupt());
-        }
-        let value = serde_json::from_str(&document.metadata_json).map_err(|_| corrupt())?;
-        parse_document(&value, self.test)
-    }
-
-    fn bytes(&self, symbol: &SymbolId) -> usize {
-        // Account for both owned IDs and conservatively allow for B-tree allocation overhead.
-        size_of::<Self>()
-            + size_of::<SymbolId>()
-            + self.id.as_str().len()
-            + symbol.as_str().len()
-            + 128
-    }
-}
 pub(super) struct ClonePolicy {
     pub(super) enabled: bool,
     pub(super) near_compatible: bool,
@@ -149,16 +113,15 @@ pub(super) struct Topology {
 }
 #[derive(Default)]
 pub(super) struct Envy {
-    pub(super) fields: BTreeSet<SymbolId>,
-    pub(super) classes: BTreeSet<SymbolId>,
+    pub(super) fields: BTreeSet<[u8; 16]>,
+    pub(super) classes: BTreeSet<[u8; 16]>,
     pub(super) own: u64,
     pub(super) foreign: u64,
 }
 #[derive(Default)]
 struct References {
-    unresolved: BTreeMap<SymbolId, u64>,
-    dynamic: BTreeMap<String, BTreeMap<FileId, u64>>,
-    envy: BTreeMap<SymbolId, Envy>,
+    dynamic: BTreeMap<String, FileCounts>,
+    envy: BTreeMap<[u8; 16], Envy>,
     bytes: usize,
 }
 
@@ -168,104 +131,197 @@ pub(super) struct ComputedInventory {
     pub(super) coverage: Vec<codevetra_domain::biomarkers::DetectorCoverage>,
 }
 
-pub(super) fn compute(
-    transaction: &StateTransaction<'_>,
-    budget: &mut ReadBudget,
-    previous: Option<&StoredRevision>,
-) -> Result<ComputedInventory, RocksError> {
-    let snapshot = transaction.graph_snapshot()?;
-    let graph = snapshot.graph(budget)?;
-    let documents = documents(&graph, budget)?;
-    let population = population(&graph, &documents, budget)?;
-    let references = references(&graph, budget)?;
-    let coverage = coverage(transaction, &graph, budget)?;
-    let clone_classes = clones::Classes::new(transaction, &graph, &documents, budget)?;
-    let prior = previous
-        .map(|previous| transaction.retained_graph_snapshot(&previous.generation_id))
-        .transpose()?;
-    let prior_graph = prior
-        .as_ref()
-        .map(|snapshot| snapshot.graph(budget))
-        .transpose()?;
-    let recent_prior = previous
-        .and_then(|previous| previous.published_at.as_ref())
-        .map(|time| time.parse::<jiff::Timestamp>().map_err(|_| corrupt()))
-        .transpose()?
-        .is_some_and(|time| {
-            time.as_second()
-                >= jiff::Timestamp::now()
-                    .as_second()
-                    .saturating_sub(30 * 86400)
-        });
-    let mut rows = Vec::new();
-    let mut bytes = 0_usize;
-    let mut analyzed = 0_u64;
-    let mut detector_coverage = super::coverage::CoverageAccumulator::new();
-    for (id, handle) in &documents {
-        budget.checkpoint()?;
-        let symbol = graph.symbol(id, budget)?.ok_or(corrupt())?;
-        let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
-        let document = handle.load(&graph, budget)?;
-        if document.test || matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter") {
-            detector_coverage.observe(&file, &symbol, &document, None);
-            continue;
-        }
-        if document
-            .analyzed_language
-            .is_some_and(|language| language.as_str() != file.language)
-        {
-            return Err(corrupt());
-        }
-        let topology = topology(&graph, &symbol, &file, Some(&documents), budget)?;
-        let potential = dynamic_external_references(&references, &symbol)?;
-        let external = topology
-            .external
-            .checked_add(topology.exported_api)
-            .and_then(|sum| sum.checked_add(potential))
-            .ok_or(corrupt())?;
-        let centrality = (topology.incoming.to_f64().ok_or(corrupt())? / population).min(1.0);
-        let prior = prior_graph
-            .as_ref()
-            .map(|graph| graph.symbol(id, budget))
-            .transpose()?
-            .flatten()
-            .map(|symbol| symbol.end_line - symbol.start_line + 1);
-        let base = Base {
-            symbol: &symbol,
-            file: &file,
-            document: &document,
-            topology,
-            external,
-            centrality,
-            unresolved: references.unresolved.get(id).copied().unwrap_or(0),
-            envy: references.envy.get(id),
-            coverage: coverage.get(id).copied(),
-            prior,
-            recent_prior,
-        };
-        detector_coverage.observe(&file, &symbol, &document, Some(&base));
-        validate_operation_sites(&base)?;
-        let mut findings = rules::evaluate(&base)?;
-        if let Some(finding) = clone_classes.finding(&base, &graph, budget)? {
-            findings.push(finding);
-        }
-        for finding in findings {
-            detector_coverage.finding(&file.language, &finding.finding);
-            bytes = bytes
-                .checked_add(row_bytes(&finding))
-                .ok_or_else(workspace)?;
-            if bytes > 16 * 1_048_576 {
-                return Err(workspace());
-            }
-            rows.push(finding);
-        }
-        analyzed += 1;
+pub(super) struct Inputs {
+    documents: Documents,
+    population: f64,
+}
+
+impl Inputs {
+    pub(super) fn read(
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+    ) -> Result<Self, RocksError> {
+        let snapshot = transaction.graph_snapshot()?;
+        let graph = snapshot.graph(budget)?;
+        let documents = Documents::read(&graph, budget)?;
+        let population = population(&graph, &documents, budget)?;
+        Ok(Self {
+            documents,
+            population,
+        })
     }
-    Ok(ComputedInventory {
-        rows,
-        analyzed,
-        coverage: detector_coverage.finish(),
-    })
+
+    pub(super) fn references(
+        mut self,
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+    ) -> Result<Referenced, RocksError> {
+        let snapshot = transaction.graph_snapshot()?;
+        let graph = snapshot.graph(budget)?;
+        Ok(Referenced {
+            references: references(&graph, &mut self.documents, budget)?,
+            coverage: coverage(transaction, &graph, budget)?,
+            inputs: self,
+        })
+    }
+}
+
+pub(super) struct Referenced {
+    inputs: Inputs,
+    references: References,
+    coverage: BTreeMap<SymbolId, (f64, f64)>,
+}
+
+impl Referenced {
+    pub(super) fn clones(
+        self,
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+    ) -> Result<Inventory, RocksError> {
+        let snapshot = transaction.graph_snapshot()?;
+        let graph = snapshot.graph(budget)?;
+        let clone_classes =
+            clones::Classes::new(transaction, &graph, &self.inputs.documents, budget)?;
+        Ok(Inventory {
+            inputs: self,
+            clone_classes,
+            rows: Vec::new(),
+            bytes: 0,
+            analyzed: 0,
+            position: 0,
+            detector_coverage: super::coverage::CoverageAccumulator::new(),
+        })
+    }
+}
+
+pub(super) struct Inventory {
+    inputs: Referenced,
+    clone_classes: clones::Classes,
+    rows: Vec<StructuralFinding>,
+    bytes: usize,
+    analyzed: u64,
+    position: usize,
+    detector_coverage: super::coverage::CoverageAccumulator,
+}
+
+impl Inventory {
+    pub(super) fn batch(
+        &mut self,
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+        previous: Option<&StoredRevision>,
+    ) -> Result<bool, RocksError> {
+        let snapshot = transaction.graph_snapshot()?;
+        let graph = snapshot.graph(budget)?;
+        let documents = &self.inputs.inputs.documents;
+        let population = self.inputs.inputs.population;
+        let references = &self.inputs.references;
+        let coverage = &self.inputs.coverage;
+        let clone_classes = &self.clone_classes;
+        let prior = previous
+            .map(|previous| transaction.retained_graph_snapshot(&previous.generation_id))
+            .transpose()?;
+        let prior_graph = prior
+            .as_ref()
+            .map(|snapshot| snapshot.graph(budget))
+            .transpose()?;
+        let recent_prior = previous
+            .and_then(|previous| previous.published_at.as_ref())
+            .map(|time| time.parse::<jiff::Timestamp>().map_err(|_| corrupt()))
+            .transpose()?
+            .is_some_and(|time| {
+                time.as_second()
+                    >= jiff::Timestamp::now()
+                        .as_second()
+                        .saturating_sub(30 * 86400)
+            });
+        for handle in documents.iter().skip(self.position).take(4096) {
+            self.position += 1;
+            budget.checkpoint()?;
+            let id = handle.symbol()?;
+            let symbol = graph.symbol(&id, budget)?.ok_or(corrupt())?;
+            let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
+            let document = handle.load(&graph, budget)?;
+            if document.test
+                || matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter")
+            {
+                self.detector_coverage
+                    .observe(&file, &symbol, &document, None);
+                continue;
+            }
+            if document
+                .analyzed_language
+                .is_some_and(|language| !language_matches_host(language, &file.language))
+            {
+                return Err(corrupt());
+            }
+            let topology = topology(&graph, &symbol, &file, Some(documents), budget)?;
+            let potential = dynamic_external_references(references, &symbol)?;
+            let external = topology
+                .external
+                .checked_add(topology.exported_api)
+                .and_then(|sum| sum.checked_add(potential))
+                .ok_or(corrupt())?;
+            let centrality = (topology.incoming.to_f64().ok_or(corrupt())? / population).min(1.0);
+            let prior = prior_graph
+                .as_ref()
+                .map(|graph| graph.symbol(&id, budget))
+                .transpose()?
+                .flatten()
+                .map(|symbol| symbol.end_line - symbol.start_line + 1);
+            let base = Base {
+                symbol: &symbol,
+                file: &file,
+                document: &document,
+                topology,
+                external,
+                centrality,
+                unresolved: handle.unresolved,
+                envy: references.envy.get(&packed_uuid(id.as_str())?),
+                coverage: coverage.get(&id).copied(),
+                prior,
+                recent_prior,
+            };
+            self.detector_coverage
+                .observe(&file, &symbol, &document, Some(&base));
+            validate_operation_sites(&base)?;
+            let mut findings = rules::evaluate(&base)?;
+            if let Some(finding) = clone_classes.finding(&base, &graph, budget)? {
+                findings.push(finding);
+            }
+            for finding in findings {
+                self.detector_coverage
+                    .finding(&file.language, &finding.finding);
+                self.bytes = self
+                    .bytes
+                    .checked_add(row_bytes(&finding))
+                    .ok_or_else(workspace)?;
+                if self.bytes > 16 * 1_048_576 {
+                    return Err(workspace());
+                }
+                self.rows.push(finding);
+            }
+            self.analyzed += 1;
+        }
+        Ok(self.position == documents.len())
+    }
+
+    pub(super) fn finish(self) -> ComputedInventory {
+        ComputedInventory {
+            rows: self.rows,
+            analyzed: self.analyzed,
+            coverage: self.detector_coverage.finish(),
+        }
+    }
+}
+
+fn language_matches_host(language: SourceLanguage, host: &str) -> bool {
+    language.as_str() == host
+        || (matches!(host, "svelte" | "vue" | "astro")
+            && matches!(
+                language,
+                SourceLanguage::JavaScript | SourceLanguage::TypeScript | SourceLanguage::Tsx
+            ))
 }
 
 fn validate_operation_sites(base: &Base<'_>) -> Result<(), RocksError> {
@@ -299,30 +355,26 @@ fn dynamic_external_references(
     {
         return Ok(0);
     }
+    let file_id = packed_uuid(symbol.file_id.as_str())?;
     references
         .dynamic
         .get(simple_name(&symbol.qualified_name))
-        .map_or(Ok(0), |files| {
-            files
-                .iter()
-                .filter(|(file, _)| *file != &symbol.file_id)
-                .try_fold(0_u64, |sum, (_, count)| {
-                    sum.checked_add(*count).ok_or(corrupt())
-                })
-        })
+        .map_or(Ok(0), |files| files.external(file_id))
 }
 
 fn population(
     graph: &GraphSnapshot<'_, '_>,
-    documents: &BTreeMap<SymbolId, DocumentHandle>,
+    documents: &Documents,
     budget: &mut ReadBudget,
 ) -> Result<f64, RocksError> {
     let mut count = 0_u64;
-    for (id, document) in documents {
+    for document in documents.iter() {
         if !document.test
-            && graph.symbol(id, budget)?.is_some_and(|symbol| {
-                !matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter")
-            })
+            && graph
+                .symbol(&document.symbol()?, budget)?
+                .is_some_and(|symbol| {
+                    !matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter")
+                })
         {
             count += 1;
         }
@@ -330,44 +382,10 @@ fn population(
     count.saturating_sub(1).max(1).to_f64().ok_or(corrupt())
 }
 
-fn documents(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-) -> Result<BTreeMap<SymbolId, DocumentHandle>, RocksError> {
-    let mut output = BTreeMap::<SymbolId, DocumentHandle>::new();
-    let mut bytes = 0_usize;
-    visit_documents(graph, budget, |document, _| {
-        if !matches!(document.kind, DocumentKind::Symbol | DocumentKind::Test) {
-            return Ok(());
-        }
-        let Some(id) = document.symbol_id else {
-            return Ok(());
-        };
-        if output.get(&id).is_some_and(|document| document.test) {
-            return Ok(());
-        }
-        let value: serde_json::Value =
-            serde_json::from_str(&document.metadata_json).map_err(|_| corrupt())?;
-        let parsed = parse_document(&value, document.kind == DocumentKind::Test)?;
-        let handle = DocumentHandle {
-            id: document.document_id,
-            test: parsed.test,
-            code_lines: parsed.health("code_lines"),
-            cyclomatic: parsed.health("cyclomatic"),
-        };
-        bytes = bytes
-            .checked_sub(output.get(&id).map_or(0, |previous| previous.bytes(&id)))
-            .and_then(|bytes| bytes.checked_add(handle.bytes(&id)))
-            .ok_or_else(workspace)?;
-        if bytes > 24 * 1_048_576 {
-            return Err(workspace());
-        }
-        output.insert(id, handle);
-        Ok(())
-    })?;
-    Ok(output)
-}
-fn parse_document(value: &serde_json::Value, test: bool) -> Result<Document, RocksError> {
+pub(super) fn parse_document(
+    value: &serde_json::Value,
+    test: bool,
+) -> Result<Document, RocksError> {
     let mut health = Vec::new();
     for (index, &key) in FIELDS.iter().enumerate() {
         let number = number(value.get("health").and_then(|health| health.get(key)))?;
@@ -482,7 +500,7 @@ pub(super) fn topology(
     graph: &GraphSnapshot<'_, '_>,
     symbol: &SymbolInput,
     file: &FileInput,
-    documents: Option<&BTreeMap<SymbolId, DocumentHandle>>,
+    documents: Option<&Documents>,
     budget: &mut ReadBudget,
 ) -> Result<Topology, RocksError> {
     let mut output = Topology::default();
@@ -536,7 +554,7 @@ pub(super) fn topology(
 fn contained_symbols(
     graph: &GraphSnapshot<'_, '_>,
     symbol: &SymbolInput,
-    documents: Option<&BTreeMap<SymbolId, DocumentHandle>>,
+    documents: Option<&Documents>,
     budget: &mut ReadBudget,
     output: &mut Topology,
 ) -> Result<BTreeSet<SymbolId>, RocksError> {
@@ -556,8 +574,9 @@ fn contained_symbols(
                     .symbol(link.target_symbol_id(), budget)?
                     .ok_or(corrupt())?;
                 if matches!(child.symbol_kind.as_str(), "function" | "method")
+                    && let Some(documents) = documents
                     && let Some(document) = documents
-                        .and_then(|documents| documents.get(&child.symbol_id))
+                        .get(&child.symbol_id)?
                         .filter(|document| !document.test)
                 {
                     output.behavioral += u64::from(document.code_lines >= 5.0);
@@ -617,13 +636,14 @@ fn dependency_group(kind: EdgeKind) -> Option<usize> {
 
 fn references(
     graph: &GraphSnapshot<'_, '_>,
+    documents: &mut Documents,
     budget: &mut ReadBudget,
 ) -> Result<References, RocksError> {
     let mut output = References::default();
     let mut classes = Parents::default();
     super::super::visit_references(graph, budget, |reference, budget| {
         if reference.target_symbol_id.is_none() {
-            record_unresolved_reference(&mut output, reference)?;
+            record_unresolved_reference(&mut output, documents, reference)?;
         } else if reference.reference_kind == "field_access" {
             record_envy(graph, budget, &reference, &mut output, &mut classes)?;
         }
@@ -636,6 +656,7 @@ fn references(
 }
 fn record_unresolved_reference(
     output: &mut References,
+    documents: &mut Documents,
     reference: crate::ReferenceInput,
 ) -> Result<(), RocksError> {
     let count = u64::from(reference.site_count);
@@ -644,22 +665,19 @@ fn record_unresolved_reference(
     {
         let name = dynamic_name(&reference.reference_name);
         if !output.dynamic.contains_key(name) {
-            output.bytes += name.len() + 128;
+            let node = if output.dynamic.is_empty() { 768 } else { 160 };
+            reserve(&mut output.bytes, name.len() + node)?;
         }
         let files = output.dynamic.entry(name.to_owned()).or_default();
-        if !files.contains_key(&reference.file_id) {
-            output.bytes += 128;
-        }
-        let value = files.entry(reference.file_id).or_default();
-        *value = value.checked_add(count).ok_or(corrupt())?;
+        files.add(
+            packed_uuid(reference.file_id.as_str())?,
+            count,
+            &mut output.bytes,
+        )?;
     } else if !excluded_unresolved(&reference.resolution_provenance)
         && let Some(owner) = reference.owner_symbol_id
     {
-        if !output.unresolved.contains_key(&owner) {
-            output.bytes += 128;
-        }
-        let value = output.unresolved.entry(owner).or_default();
-        *value = value.checked_add(count).ok_or(corrupt())?;
+        documents.record_unresolved(&owner, count)?;
     }
     Ok(())
 }
@@ -791,19 +809,28 @@ fn record_envy_pair(
     target_class: &SymbolId,
     count: u64,
 ) -> Result<(), RocksError> {
-    if !output.envy.contains_key(owner) {
-        output.bytes += 256;
+    let owner = packed_uuid(owner.as_str())?;
+    if !output.envy.contains_key(&owner) {
+        let node = if output.envy.is_empty() { 1024 } else { 256 };
+        reserve(&mut output.bytes, node)?;
     }
-    let envy = output.envy.entry(owner.clone()).or_default();
+    let envy = output.envy.entry(owner).or_default();
     if own {
         envy.own = envy.own.checked_add(count).ok_or(corrupt())?;
     } else {
         envy.foreign = envy.foreign.checked_add(count).ok_or(corrupt())?;
-        if envy.fields.insert(target.clone()) {
-            output.bytes += 128;
-        }
-        if envy.classes.insert(target_class.clone()) {
-            output.bytes += 128;
+        for (set, id) in [
+            (&mut envy.fields, target),
+            (&mut envy.classes, target_class),
+        ] {
+            let id = packed_uuid(id.as_str())?;
+            if !set.contains(&id) {
+                reserve(
+                    &mut output.bytes,
+                    super::packed_tree_insertion_bytes(set.len()),
+                )?;
+                set.insert(id);
+            }
         }
     }
     Ok(())

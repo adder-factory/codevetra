@@ -1,7 +1,10 @@
 //! Cached native detector results preserve complete counts and exact input fingerprints.
 
 mod clones;
+mod computation;
 mod coverage;
+mod documents;
+mod file_counts;
 mod framework;
 mod inventory;
 mod rules;
@@ -53,6 +56,7 @@ struct Prepared {
     fingerprint: Fingerprint,
     rows: Vec<StructuralFinding>,
     stats: StructuralFindingStats,
+    _admission: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl NativeDatabase {
@@ -65,6 +69,13 @@ impl NativeDatabase {
         timeout: Duration,
     ) -> Result<StructuralFindingRefresh, StorageError> {
         self.require_project(project)?;
+        Self::with_preparation_deadline(timeout, self.refresh_findings(timeout)).await
+    }
+
+    async fn refresh_findings(
+        &self,
+        timeout: Duration,
+    ) -> Result<StructuralFindingRefresh, StorageError> {
         let current = self
             .state_with_timeout(None, 0, 0, timeout, |transaction, budget| {
                 let Some(fingerprint) = fingerprint(transaction, budget)? else {
@@ -78,8 +89,7 @@ impl NativeDatabase {
             Some(true) => return Ok(StructuralFindingRefresh::Current),
             Some(false) => {}
         }
-        let prepared = self
-            .state_with_timeout(None, 0, 0, timeout, prepare)
+        let prepared = computation::prepare(self, timeout)
             .await?
             .ok_or(StorageError::CurrentGenerationChanged)?;
         let run = Run {
@@ -142,12 +152,10 @@ impl NativeDatabase {
                 field: "statement_timeout",
             });
         }
-        self.state_with_timeout(None, 0, 0, timeout, |transaction, budget| {
-            Ok(prepare(transaction, budget)?
-                .map(|prepared| prepared.stats)
-                .unwrap_or_default())
-        })
-        .await
+        Ok(computation::prepare(self, timeout)
+            .await?
+            .map(|prepared| prepared.stats)
+            .unwrap_or_default())
     }
 
     /// Read an info-or-worse ranked page from a complete current detector relation.
@@ -313,10 +321,15 @@ fn fingerprint(
             .to_be_bytes(),
     );
     for contract in [
+        include_str!("findings/computation.rs"),
+        include_str!("findings/documents.rs"),
         include_str!("findings/inventory.rs"),
+        include_str!("findings/file_counts.rs"),
         include_str!("findings/rules.rs"),
         include_str!("findings/clones.rs"),
+        include_str!("findings/clones/groups.rs"),
         include_str!("findings/framework.rs"),
+        include_str!("findings/coverage.rs"),
     ] {
         hash.update(contract.as_bytes());
     }
@@ -398,51 +411,7 @@ fn visit_current(
         stats: run.stats,
     }))
 }
-fn prepare(
-    transaction: &mut StateTransaction<'_>,
-    budget: &mut ReadBudget,
-) -> Result<Option<Prepared>, RocksError> {
-    let Some(fingerprint) = fingerprint(transaction, budget)? else {
-        return Ok(None);
-    };
-    let inventory::ComputedInventory {
-        rows,
-        analyzed,
-        coverage,
-    } = inventory::compute(transaction, budget, fingerprint.previous.as_ref())?;
-    let mut stats = StructuralFindingStats {
-        state: Computation::Ready,
-        analyzed_symbols: analyzed,
-        detector_coverage: coverage,
-        ..StructuralFindingStats::default()
-    };
-    for row in &rows {
-        stats.total_findings += 1;
-        match row.severity.as_str() {
-            "error" => stats.error_findings += 1,
-            "warning" => stats.warning_findings += 1,
-            "info" => stats.info_findings += 1,
-            _ => return Err(corrupt()),
-        }
-        *stats.by_finding.entry(row.finding.clone()).or_default() += 1;
-        stats.very_long_symbols += u64::from(row.finding == "large_method");
-        stats.high_fan_out_symbols += u64::from(row.finding == "high_fan_out");
-        stats.unresolved_reference_pressure +=
-            u64::from(row.finding == "unresolved_reference_pressure");
-    }
-    let weighted = stats.error_findings * 4 + stats.warning_findings * 2 + stats.info_findings;
-    stats.code_health_score = (100.0
-        - weighted.to_f64().ok_or(corrupt())? * 100.0
-            / analyzed.max(1).to_f64().ok_or(corrupt())?)
-    .max(0.0)
-    .to_f32()
-    .ok_or(corrupt())?;
-    Ok(Some(Prepared {
-        fingerprint,
-        rows,
-        stats,
-    }))
-}
+
 fn matches(row: &StructuralFinding, request: &StructuralFindingQuery) -> Result<bool, RocksError> {
     Ok(request
         .finding
@@ -502,4 +471,19 @@ fn row_bytes(row: &StructuralFinding) -> usize {
         + row.detail.as_ref().map_or(0, |detail| {
             serde_json::to_vec(detail).map_or(usize::MAX / 2, |bytes| bytes.len())
         })
+}
+
+// A singleton packed-key B-tree owns a complete leaf allocation. Later
+// entries include minimum node occupancy and allocator overhead on the pinned
+// 64-bit Rust toolchain; the initial root must not be amortized across siblings.
+fn packed_tree_bytes(entries: usize) -> usize {
+    if entries == 0 {
+        0
+    } else {
+        384 + (entries - 1) * 64
+    }
+}
+
+fn packed_tree_insertion_bytes(entries: usize) -> usize {
+    if entries == 0 { 384 } else { 64 }
 }

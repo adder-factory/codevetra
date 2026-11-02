@@ -3,7 +3,7 @@
 [Documentation home](../README.md) · [Project overview](../../README.md) ·
 [Native extraction](EXTRACTION.md) · [Language matrix](../SUPPORT-MATRIX.md)
 
-Last release audit: 2026-11-01 (`v4.0.3`).
+Last release audit: 2026-11-01 (`v4.0.4`).
 
 CodeVetra v4 is a native Rust code-intelligence server for AI coding agents.
 Each project owns an embedded RocksDB 11.12.0 store. Rust implements
@@ -507,6 +507,16 @@ confidence.
 committed/staged/unstaged/untracked paths with current-generation exact file,
 reverse-impact, and affected-test evidence. It reports dirty state, freshness,
 abstention, and per-stage truncation.
+
+Biomarker refreshes retain packed identities and aggregate counts across separately
+admitted native input, reference, and clone stages, followed by batches of at most
+4096 document owners. Every stage requires the captured current generation and
+shares the original deadline. A final fingerprint comparison and the existing
+atomic dataset publication guard reject changed source or auxiliary evidence;
+partial stage results never become a visible relation. One computation admission
+is retained through publication, while ordinary cached reads remain available.
+The 24 MiB document inventory, 8 MiB reference aggregate, 16 MiB clone/finding
+workspaces, and native per-request read limits remain bounded independently.
 
 ## MCP and CLI boundary
 

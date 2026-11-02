@@ -29,7 +29,7 @@ pub(super) fn corrupt() -> RocksError {
     }
 }
 
-pub(super) fn uuid(raw: &str) -> Result<[u8; ID_BYTES]> {
+pub(crate) fn uuid(raw: &str) -> Result<[u8; ID_BYTES]> {
     let mut bytes = [0; ID_BYTES];
     let mut hex = raw.bytes().filter(|&byte| byte != b'-');
     for byte in &mut bytes {
@@ -52,6 +52,10 @@ fn nibble(byte: u8) -> Option<u8> {
 }
 
 pub(super) fn symbol(bytes: &[u8]) -> Result<SymbolId> {
+    SymbolId::parse(&uuid_text(bytes)?).map_err(|_| corrupt())
+}
+
+pub(crate) fn uuid_text(bytes: &[u8]) -> Result<String> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     if bytes.len() != ID_BYTES {
         return Err(corrupt());
@@ -64,7 +68,7 @@ pub(super) fn symbol(bytes: &[u8]) -> Result<SymbolId> {
         raw.push(char::from(HEX[usize::from(byte >> 4)]));
         raw.push(char::from(HEX[usize::from(byte & 15)]));
     }
-    SymbolId::parse(&raw).map_err(|_| corrupt())
+    Ok(raw)
 }
 
 pub(super) fn key(prefix: &[u8], suffix: &[u8]) -> Result<RecordKey> {

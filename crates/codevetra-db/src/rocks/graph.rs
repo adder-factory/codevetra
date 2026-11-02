@@ -9,7 +9,7 @@ use crate::{CanonicalGenerationFacts, GenerationMemoryModelError};
 
 use super::{ProjectStore, PruneReport, Result, RocksError, StorageRequest, StoredRevision};
 
-mod codec;
+pub(super) mod codec;
 mod ingest;
 mod lexical;
 mod names;

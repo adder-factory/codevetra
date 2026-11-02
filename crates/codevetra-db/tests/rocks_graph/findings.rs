@@ -2,8 +2,8 @@
 
 use super::*;
 use codevetra_db::{
-    NativeDatabase, SearchDocumentInput, StructuralFindingQuery, StructuralFindingRefresh,
-    StructuralFindingSeverity,
+    NativeDatabase, ReferenceInput, ReferenceSpanPrecision, SearchDocumentInput,
+    StructuralFindingQuery, StructuralFindingRefresh, StructuralFindingSeverity,
     rocks::{AsyncProjectStore, StorageRuntime, WorkerPolicy},
 };
 use codevetra_domain::{DocumentId, DocumentKind};
@@ -88,7 +88,6 @@ fn detector_facts() -> GenerationFacts {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_metric_inventory_refreshes_without_retaining_every_document() -> TestResult {
-    let mut facts = raw_facts(20_000, Vec::new());
     let health = json!({
         "code_lines": 0, "parameter_count": 0, "cyclomatic": 0, "max_nesting": 0,
         "max_conditional_operands": 0, "magic_numbers": 0, "hardcoded_urls": 0,
@@ -104,9 +103,38 @@ async fn large_metric_inventory_refreshes_without_retaining_every_document() -> 
         "sql_string_concatenation": 0, "unsafe_json_parse": 0,
         "unvalidated_env": 0, "empty_body": 0, "literal_bytes": 0
     });
+    assert_inventory_refresh(20_000, health, false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_symbol_and_reference_inventory_refreshes_within_existing_workspace_bounds()
+-> TestResult {
+    assert_inventory_refresh(100_000, json!({"code_lines": 0, "cyclomatic": 0}), false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_distinct_clone_inventory_keeps_the_existing_workspace_bound() -> TestResult {
+    assert_inventory_refresh(60_000, json!({"code_lines": 0, "cyclomatic": 0}), true).await
+}
+
+static INVENTORY_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn assert_inventory_refresh(
+    symbol_count: u64,
+    health: serde_json::Value,
+    all_functions: bool,
+) -> TestResult {
+    // These regressions exercise detector bounds, not concurrent fixture building.
+    let _fixture_admission = INVENTORY_FIXTURE.lock().await;
+    let mut facts = raw_facts(symbol_count, Vec::new());
     for (index, symbol) in facts.symbols.iter_mut().enumerate() {
-        if index > 0 {
+        if index > 0 && !all_functions {
             symbol.symbol_kind = "parameter".into();
+        }
+        if all_functions {
+            symbol.end_line = 6;
+            symbol.structural_digest =
+                ContentDigest::from_bytes(*blake3::hash(&index.to_be_bytes()).as_bytes());
         }
         let mut metadata = json!({"health": health});
         if index == 0 {
@@ -126,13 +154,32 @@ async fn large_metric_inventory_refreshes_without_retaining_every_document() -> 
             metadata,
         });
     }
+    if symbol_count == 100_000 {
+        facts.references = facts
+            .symbols
+            .iter()
+            .map(|symbol| ReferenceInput {
+                file_id: symbol.file_id.clone(),
+                owner_symbol_id: Some(symbol.symbol_id.clone()),
+                target_symbol_id: None,
+                reference_name: "missing".into(),
+                reference_kind: "calls".into(),
+                start_byte: 0,
+                end_byte: 1,
+                confidence: 0.0,
+                resolution_provenance: "unresolved".into(),
+                site_count: 7,
+                span_precision: ReferenceSpanPrecision::Exact,
+            })
+            .collect();
+    }
     // Admit the larger input fixture independently of the unchanged detector workspace bound.
     for document in &mut facts.documents {
         document.metadata["health"]["analyzed_language"] = json!("rust");
     }
     let canonical = validate_generation_facts(
         facts,
-        GenerationValidationLimits::new(256 * 1_048_576, 512 * 1_048_576)?,
+        GenerationValidationLimits::new(256 * 1_048_576, 1024 * 1_048_576)?,
         || false,
     )?
     .0;
@@ -141,27 +188,34 @@ async fn large_metric_inventory_refreshes_without_retaining_every_document() -> 
     let project = database.project_id();
     assert_eq!(
         database
-            .refresh_current_structural_findings(project, Duration::from_secs(30))
+            .refresh_current_structural_findings(project, Duration::from_secs(90))
             .await?,
         StructuralFindingRefresh::Recomputed
     );
     let stats = database.current_structural_finding_stats(project).await?;
-    assert_eq!(stats.analyzed_symbols(), 1);
+    assert_eq!(
+        stats.analyzed_symbols(),
+        if all_functions { symbol_count } else { 1 }
+    );
     assert_eq!(stats.total_findings(), 1);
     let findings = database.current_structural_findings(project, 10).await?;
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].symbol_id(), symbol(1).as_str());
     assert_eq!(findings[0].finding(), "large_method");
+    assert_eq!(
+        serde_json::to_value(&findings[0])?["unresolvedReferences"],
+        if symbol_count == 100_000 { 7 } else { 0 }
+    );
     assert_ne!(stats.detector_coverage(), []);
     assert!(
         stats
             .detector_coverage()
             .iter()
-            .all(|row| row.considered_symbols == 20_000)
+            .all(|row| row.considered_symbols == symbol_count)
     );
     assert_eq!(
         database
-            .refresh_current_structural_findings(project, Duration::from_secs(30))
+            .refresh_current_structural_findings(project, Duration::from_secs(90))
             .await?,
         StructuralFindingRefresh::Current
     );
@@ -518,5 +572,119 @@ async fn semantic_clone_cache_follows_vector_epochs_and_canonicalizes_components
     assert_eq!(detail["detail"]["cloneType"], "semantic");
     assert_eq!(detail["detail"]["classSize"], 2);
     fixture.runtime.shutdown(&request()?).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedded_script_metrics_keep_host_locations_and_dialect_coverage() -> TestResult {
+    for host in ["svelte", "vue", "astro"] {
+        for dialect in ["javascript", "typescript", "tsx"] {
+            let mut facts = searchable(1);
+            let path = format!("src/Component.{host}");
+            facts.files[0].normalized_path = path.clone();
+            facts.files[0].language = host.into();
+            facts.symbols[0].end_line = 250;
+            facts.documents[0].path = path.clone();
+            facts.documents[0].language = host.into();
+            facts.documents[0].metadata = json!({"health": {
+                "analyzed_language": dialect, "code_lines": 200, "ts_any_casts": 3
+            }});
+            let fixture = Fixture::from_canonical(canonical(facts)?).await?;
+            let database = &fixture.database;
+            database
+                .refresh_current_structural_findings(database.project_id(), Duration::from_secs(30))
+                .await?;
+            let findings = database
+                .current_structural_findings(database.project_id(), 10)
+                .await?;
+            assert!(findings.iter().any(|row| row.finding() == "large_method"));
+            assert_eq!(
+                findings.iter().any(|row| row.finding() == "ts_any_cast"),
+                dialect != "javascript"
+            );
+            assert!(findings.iter().all(|row| row.path() == path));
+            let stats = database
+                .current_structural_finding_stats(database.project_id())
+                .await?;
+            assert_eq!(stats.analyzed_symbols(), 1);
+            let coverage = stats
+                .detector_coverage()
+                .iter()
+                .find(|row| row.detector == "ts_any_cast")
+                .ok_or("missing TypeScript coverage")?;
+            assert_eq!(coverage.language, host);
+            assert_eq!(
+                coverage.evaluated_symbols,
+                u64::from(dialect != "javascript")
+            );
+            assert_eq!(
+                coverage.unsupported_symbols,
+                u64::from(dialect == "javascript")
+            );
+            fixture.runtime.shutdown(&request()?).await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_metric_language_mismatch_never_publishes_findings() -> TestResult {
+    for (host, dialect) in [
+        ("rust", "typescript"),
+        ("svelte", "rust"),
+        ("html", "typescript"),
+    ] {
+        let mut facts = searchable(1);
+        facts.files[0].language = host.into();
+        facts.documents[0].language = host.into();
+        facts.documents[0].metadata =
+            json!({"health": {"analyzed_language": dialect, "code_lines": 200}});
+        let fixture = Fixture::from_canonical(canonical(facts)?).await?;
+        let database = &fixture.database;
+        assert!(matches!(
+            database
+                .refresh_current_structural_findings(database.project_id(), Duration::from_secs(30))
+                .await,
+            Err(codevetra_db::StorageError::CorruptStoredValue { .. })
+        ));
+        assert!(
+            database
+                .cached_current_structural_finding_stats(database.project_id())
+                .await?
+                .is_none()
+        );
+        fixture.runtime.shutdown(&request()?).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiple_symbol_documents_preserve_test_and_last_production_precedence() -> TestResult {
+    for has_test in [false, true] {
+        let mut facts = searchable(1);
+        facts.symbols[0].end_line = 250;
+        let original = facts.documents[0].clone();
+        facts.documents.clear();
+        for id in 1..=3 {
+            let mut document = original.clone();
+            document.document_id = DocumentId::from_uuid_v8([id; 16]);
+            if id == 2 && has_test {
+                document.kind = DocumentKind::Test;
+            }
+            document.metadata = json!({"health": {"analyzed_language": "rust", "code_lines": if id == 3 { 200 } else { 10 }}});
+            facts.documents.push(document);
+        }
+        let fixture = Fixture::from_canonical(canonical(facts)?).await?;
+        let database = &fixture.database;
+        database
+            .refresh_current_structural_findings(database.project_id(), Duration::from_secs(30))
+            .await?;
+        let stats = database
+            .current_structural_finding_stats(database.project_id())
+            .await?;
+        assert_eq!(stats.analyzed_symbols(), u64::from(!has_test));
+        assert_eq!(stats.total_findings(), u64::from(!has_test));
+        fixture.runtime.shutdown(&request()?).await?;
+    }
     Ok(())
 }

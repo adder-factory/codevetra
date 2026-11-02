@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [MCP usage](MCP-USAGE.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Last release audit: 2026-11-01 (`v4.0.3`).
+Last release audit: 2026-11-01 (`v4.0.4`).
 
 The installed executable is `codevetra`. Run `codevetra <command> --help` for
 the exact bounds in the installed version. Bounded maintenance and its
@@ -427,10 +427,16 @@ replaces it.
 execution output report `statementTimeoutMs` and `statementTimeoutSource`; the
 caller deadline bounds the operation even when the selected inner timeout is longer.
 
-Refresh keeps compact document references and child metrics in its bounded
-inventory, then reads detailed metrics, operation sites, and clone members
-from the same immutable snapshot as needed. Complete counts and the existing
-workspace limits remain enforced. The CLI and MCP preserve distinct failures:
+Refresh keeps packed document identities, reference counts, and clone keys in
+bounded inventories. Input, reference, and clone stages receive separate native
+read allowances; detector evaluation advances in batches of at most 4096 symbols.
+Every stage requires the original generation, and publication rechecks the full
+input fingerprint. One overall deadline and one retained computation admission
+cover the stages and publication; concurrent computations report capacity rather
+than accumulating inventories. Existing per-request read and workspace limits
+remain enforced. Embedded script metrics in Svelte, Vue, and Astro use their
+JavaScript/TypeScript dialect for source-detector coverage while keeping host-file
+locations. The CLI and MCP preserve distinct failures:
 
 - `biomarker_refresh_capacity_exceeded`: native read or workspace capacity was
   exhausted; no complete result was published.

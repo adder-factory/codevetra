@@ -30,6 +30,7 @@ pub struct NativeDatabase {
     pub(crate) store: AsyncProjectStore,
     pub(crate) project_id: ProjectId,
     pub(crate) root_identity: String,
+    pub(crate) finding_computation: std::sync::Arc<tokio::sync::Mutex<()>>,
     pub(crate) semantic_cache: std::sync::Arc<crate::semantic::native::cache::SemanticCache>,
 }
 
@@ -81,6 +82,7 @@ impl NativeDatabase {
             project_id: ProjectId::from_uuid_v8(bytes),
             root_identity: codevetra_domain::project_root_identity(identity),
             semantic_cache: std::sync::Arc::default(),
+            finding_computation: std::sync::Arc::default(),
         }
     }
 

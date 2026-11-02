@@ -4,7 +4,7 @@
 [Coverage report](LANGUAGE-COVERAGE-REPORT.md) ·
 [Extend support](EXTENDING-EXTRACTORS-RESOLVERS.md)
 
-Last release audit: 2026-11-01 (`v4.0.3`).
+Last release audit: 2026-11-01 (`v4.0.4`).
 
 Use this page to decide whether CodeVetra can extract useful graph structure
 from a project before you install it. A supported language means files are

@@ -98,7 +98,14 @@ fn disposition(
     if document.test || symbol.declaration_only {
         return Disposition::Excluded;
     }
-    if !rule.languages.admits(&file.language) || !rule.scope.admits(&symbol.symbol_kind) {
+    let language = if rule.input == DetectorInput::SourceMetrics {
+        document
+            .analyzed_language
+            .map_or(file.language.as_str(), |language| language.as_str())
+    } else {
+        file.language.as_str()
+    };
+    if !rule.languages.admits(language) || !rule.scope.admits(&symbol.symbol_kind) {
         return Disposition::Unsupported;
     }
     if rule.input == DetectorInput::SourceMetrics && document.analyzed_language.is_none() {

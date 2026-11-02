@@ -35,11 +35,11 @@ abstention instead of presenting stale or incomplete data as certainty.
 > before indexing or reconnecting hosts. Existing RocksDB state is preserved;
 > PostgreSQL-era v2 projects also need a source rebuild. See [Upgrade](#upgrade).
 
-Version [4.0.3](docs/releases/v4.0.3.md) keeps biomarkers current when background
-maintenance removes obsolete summaries and vectors. Real changes to current inputs
-still invalidate cached evidence. Name migration now moves preserved state into a
-real `.codevetra` directory and retires the old compatibility alias and marker.
-See the [migration guide](docs/CODEVETRA-MIGRATION.md) before restarting old hosts.
+Version [4.0.4](docs/releases/v4.0.4.md) completes large-project biomarker
+refreshes through bounded stages and compact inventories. Embedded JavaScript
+and TypeScript metrics in Svelte, Vue, and Astro retain their host-file locations
+and accurate detector coverage. Source and supporting-input changes still
+invalidate the complete result before publication.
 
 ## Start here
 
@@ -429,7 +429,7 @@ audience.
 | Area | Guides |
 | --- | --- |
 | **Set up** | [Agent-assisted installation](docs/AGENT-INSTALL.md) · [Configuration](docs/CONFIGURATION.md) · [MCP usage](docs/MCP-USAGE.md) |
-| **Upgrade** | [Cartograph to CodeVetra](docs/CODEVETRA-MIGRATION.md) · [RocksDB migration](docs/v2/ROCKSDB-MIGRATION.md) · [v4.0.3 release notes](docs/releases/v4.0.3.md) |
+| **Upgrade** | [Cartograph to CodeVetra](docs/CODEVETRA-MIGRATION.md) · [RocksDB migration](docs/v2/ROCKSDB-MIGRATION.md) · [v4.0.4 release notes](docs/releases/v4.0.4.md) |
 | **Use** | [CLI reference](docs/CLI-REFERENCE.md) · [CLI/MCP alignment](docs/cli-mcp-alignment.md) · [Language support matrix](docs/SUPPORT-MATRIX.md) · [Graph export formats](docs/GRAPH-EXPORT-FORMATS.md) |
 | **Operate** | [Storage and operations](docs/STORAGE-BACKENDS.md) · [Performance tuning](docs/PERF-TUNING.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | **Extend** | [Architecture](docs/v2/ARCHITECTURE.md) · [Native extraction](docs/v2/EXTRACTION.md) · [Extending languages and resolvers](docs/EXTENDING-EXTRACTORS-RESOLVERS.md) |

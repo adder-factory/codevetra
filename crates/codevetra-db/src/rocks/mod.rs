@@ -19,6 +19,7 @@ pub use engine::{
     NativeStorageUsage, ProjectStore, PruneReport, RecordChange, RecordPage, RevisionSnapshot,
     RevisionState, RevisionWriter, StateNamespace, StateTransaction, StoredRevision,
 };
+pub(crate) use graph::codec::{uuid as packed_uuid, uuid_text as unpacked_uuid};
 pub use graph::{
     GraphBase, GraphCursor, GraphInfo, GraphLink, GraphNeighborPage, GraphPolicy, GraphPublication,
     GraphPublicationError, GraphPublicationInput, GraphRetention, GraphRevision, GraphSnapshot,

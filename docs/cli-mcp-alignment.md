@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [CLI reference](CLI-REFERENCE.md) ·
 [MCP usage](MCP-USAGE.md) · [Project overview](../README.md)
 
-Last release audit: 2026-11-01 (`v4.0.3`).
+Last release audit: 2026-11-01 (`v4.0.4`).
 
 CodeVetra exposes one native Rust feature surface through human CLI commands
 and 36 bounded MCP tools. Shared schemas generate ordinary CLI adapters where
