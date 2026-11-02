@@ -2481,7 +2481,7 @@ fn extract_anubis(builder: &mut CustomBuilder<'_, '_>) -> Result<(), ExtractErro
         root: None,
         behavior: None,
     };
-    for (line_start, raw_line) in physical_lines(source) {
+    for (index, (line_start, raw_line)) in physical_lines(source).enumerate() {
         builder.check_cancelled()?;
         let line = strip_line_comment(raw_line, "--").trim();
         if line.is_empty() {
@@ -2489,6 +2489,7 @@ fn extract_anubis(builder: &mut CustomBuilder<'_, '_>) -> Result<(), ExtractErro
         }
         let line = AnubisLine {
             start: line_start,
+            number: index.saturating_add(1),
             raw: raw_line,
             text: line,
         };
@@ -2506,6 +2507,8 @@ struct AnubisScanState {
 #[derive(Clone, Copy)]
 struct AnubisLine<'source> {
     start: usize,
+    /// One-based physical line number, the disambiguator of handler names.
+    number: usize,
     raw: &'source str,
     text: &'source str,
 }
@@ -2573,8 +2576,11 @@ fn scan_anubis_declaration(
             .as_ref()
             .map_or_else(|| builder.path().to_owned(), |(_, name)| name.clone());
         let display = format!("{label}:{name}");
+        // Handlers are qualified by the root alone, so v1's line suffix keeps
+        // same-named callbacks of different behavior nodes distinct.
+        let qualified = format!("{prefix}::{display}:{}", line.number);
         builder.add_symbol(
-            CustomSymbolInput::new(SymbolKind::Method, &display, format!("{prefix}::{display}"))
+            CustomSymbolInput::new(SymbolKind::Method, &display, qualified)
                 .at(
                     line.start + raw_offset,
                     line.start + raw_offset + name.len(),
@@ -3004,7 +3010,7 @@ fn extract_osiris(builder: &mut CustomBuilder<'_, '_>) -> Result<(), ExtractErro
         pending_rule: None,
         db_nodes: BTreeMap::new(),
     };
-    for (line_start, raw_line) in physical_lines(source) {
+    for (index, (line_start, raw_line)) in physical_lines(source).enumerate() {
         builder.check_cancelled()?;
         let line = strip_line_comment(raw_line, "//").trim();
         if line.is_empty() {
@@ -3015,6 +3021,7 @@ fn extract_osiris(builder: &mut CustomBuilder<'_, '_>) -> Result<(), ExtractErro
             &mut state,
             OsirisLine {
                 start: line_start,
+                number: index.saturating_add(1),
                 raw: raw_line,
                 text: line,
             },
@@ -3028,6 +3035,7 @@ struct OsirisScanState {
     goal_name: String,
     section: Option<SymbolId>,
     current_rule: Option<SymbolId>,
+    /// The open block's control keyword and the byte offset it starts at.
     pending_rule: Option<(&'static str, usize)>,
     db_nodes: BTreeMap<String, SymbolId>,
 }
@@ -3035,6 +3043,8 @@ struct OsirisScanState {
 #[derive(Clone, Copy)]
 struct OsirisLine<'source> {
     start: usize,
+    /// One-based physical line number.
+    number: usize,
     raw: &'source str,
     text: &'source str,
 }
@@ -3044,6 +3054,8 @@ struct OsirisPredicate<'source> {
     name: &'source str,
     raw_offset: usize,
     line_start: usize,
+    /// One-based line the predicate is written on.
+    line_number: usize,
 }
 
 fn scan_osiris_line(
@@ -3098,7 +3110,8 @@ fn scan_osiris_header(
     if let Some(control) = ["IF", "PROC", "QRY"].into_iter().find(|control| {
         word_after(line.text, control).is_some() || line.text.eq_ignore_ascii_case(control)
     }) {
-        state.pending_rule = Some((control, line.start));
+        let control_start = line.start + line.raw.find(line.text).unwrap_or(0);
+        state.pending_rule = Some((control, control_start));
         state.current_rule = None;
         return Ok(true);
     }
@@ -3118,6 +3131,7 @@ fn scan_osiris_predicates(
             name: predicate,
             raw_offset: line.raw.find(line.text).unwrap_or(0) + relative,
             line_start: line.start,
+            line_number: line.number,
         };
         if begin_pending_osiris_rule(builder, state, predicate)? {
             continue;
@@ -3144,15 +3158,18 @@ fn begin_pending_osiris_rule(
         _ => "rule",
     };
     let owner = state.section.clone().unwrap_or_else(|| state.goal.clone());
+    // As in v1, the block starts at its control keyword and is disambiguated
+    // by the head predicate's line. v1 recorded no end (it defaulted to the
+    // start line); the span here runs through the head predicate's name.
     state.current_rule = Some(
         builder.add_symbol(
             CustomSymbolInput::new(
                 SymbolKind::Method,
                 &format!("{label}:{}", predicate.name),
-                format!("{}::{label}:{declaration_start}", state.goal_name),
+                format!("{}::{label}:{}", state.goal_name, predicate.line_number),
             )
             .at(
-                predicate.line_start + predicate.raw_offset,
+                declaration_start,
                 predicate.line_start + predicate.raw_offset + predicate.name.len(),
             )
             .with_options(SymbolOptions {
@@ -3228,8 +3245,20 @@ fn scan_osiris_string_references(
         .clone()
         .unwrap_or_else(|| state.goal.clone());
     for (offset, value) in quoted_values(line.text) {
+        // As in v1, a string that is one identifier names it whole
+        // (`SysCompleteGoal("Init")`); qualified tokens inside longer
+        // strings are references too.
+        let mut tokens = bg3_tokens::script_string_references(value);
+        let mut known = tokens
+            .iter()
+            .map(|(_, token)| *token)
+            .collect::<BTreeSet<_>>();
         for token in bg3_reference_tokens(value) {
-            let relative = value.find(token).unwrap_or(0);
+            if known.insert(token) {
+                tokens.push((value.find(token).unwrap_or(0), token));
+            }
+        }
+        for (relative, token) in tokens {
             let raw_offset = line.raw.find(line.text).unwrap_or(0) + offset + relative;
             builder.add_reference(
                 CustomReferenceInput::new(Some(owner.clone()), token, ReferenceKind::References)

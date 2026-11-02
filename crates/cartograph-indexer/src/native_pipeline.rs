@@ -16532,8 +16532,11 @@ mod tests {
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
         (28, 259, 281, 134, 259);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
+    // v1 parity: Anubis handlers carry their `:<line>` suffix, an Osiris block
+    // spans from its `IF` line and is named by its head line, and an LSX
+    // resource starts at its `<node>` tag (same projection, new identities).
     const EXPECTED_CUSTOM_FAMILY_DIGEST: &str =
-        "f163e4b694db4069c989cb4828889562976005480f3e9dd3e28cf7b42d6e5557";
+        "7770226ed7d6bbf989b9a7506cf4cd16b2f3d9b4be8fe1e4077a31b796c97b78";
     const EXPECTED_CUSTOM_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
         (13, 49, 44, 32, 49);
     const CUSTOM_FAMILY_FIXTURES: [(&str, &str, SourceLanguage); CUSTOM_FAMILY_FILE_COUNT] = [

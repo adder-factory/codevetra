@@ -3,7 +3,9 @@
 mod dependency_ownership;
 
 use cartograph_domain::{ReferenceKind, SourceLanguage, SymbolKind};
-use cartograph_extract::{ExtractError, NativeExtractor, SourceLimits, SourceSnapshot};
+use cartograph_extract::{
+    ExtractError, ExtractedFile, NativeExtractor, SourceLimits, SourceSnapshot,
+};
 
 const SOURCE_LIMIT: usize = 1024 * 1024;
 const SECRET_SENTINEL: &str = "cartograph_literal_secret_sentinel_7c1f";
@@ -295,6 +297,104 @@ fn vb6_calls_ignore_string_contents_and_keep_member_and_rhs_calls() {
             "{absent} is not a call: {calls:?}"
         );
     }
+}
+
+#[test]
+fn osiris_blocks_start_at_their_control_line_and_are_named_by_their_head_line() {
+    // v1 languages/bg3/osiris.ts: a rule/proc/query node starts on its
+    // `IF`/`PROC`/`QRY` line and is disambiguated by its head predicate's line.
+    let source = "KBSECTION\nIF\nCharacterUsedSkill(_Player, \"Skill\", _)\nTHEN\nDB_Seen(_Player);\n\n  PROC\n  PROC_Target((CHARACTER)_Character)\nTHEN\nDebugText(_Character, \"apply Target_Status now\");\nEXITSECTION\nSysCompleteGoal(\"Blocks\");\n";
+    let extracted = extract_custom(
+        "Story/RawFiles/Goals/Blocks.txt",
+        source,
+        SourceLanguage::Osiris,
+    );
+    for (name, qualified_name, start_line) in [
+        ("rule:CharacterUsedSkill", "Blocks::rule:3", 2),
+        ("proc:PROC_Target", "Blocks::proc:8", 7),
+    ] {
+        let block = extracted
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == SymbolKind::Method && symbol.name == name)
+            .unwrap_or_else(|| panic!("missing {name}: {:?}", extracted.symbols));
+        assert_eq!(block.qualified_name, qualified_name);
+        assert_eq!(block.span.start_line(), start_line, "{name}");
+    }
+    // A string that is one identifier names it whole, as in v1.
+    let string_references = extracted
+        .references
+        .iter()
+        .filter(|reference| reference.kind == ReferenceKind::References)
+        .map(|reference| reference.name.as_str())
+        .collect::<Vec<_>>();
+    for expected in ["Skill", "Target_Status", "Blocks"] {
+        assert!(
+            string_references.contains(&expected),
+            "missing string reference {expected}: {string_references:?}"
+        );
+    }
+    for prose in ["apply", "now", "x"] {
+        assert!(
+            !string_references.contains(&prose),
+            "{prose} is prose: {string_references:?}"
+        );
+    }
+}
+
+#[test]
+fn anubis_handlers_are_disambiguated_by_their_line() {
+    // v1 languages/bg3/anubis.ts names a handler `<root>::<label>:<name>:<line>`
+    // so same-named callbacks of different behavior nodes stay distinct.
+    let source = "game.states.Guard = State {\n  function ()\n    nodes.A = Action {\n      OnEnter = function() end\n    }\n    nodes.B = Action {\n      OnEnter = function() end\n    }\n    events.Alarm = function(e) end\n  end\n}\n";
+    let extracted = extract_custom(
+        "Mods/Demo/Scripts/anubis/node/Guard.ann",
+        source,
+        SourceLanguage::Bg3Anubis,
+    );
+    let handlers = extracted
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.name.contains(':'))
+        .map(|symbol| (symbol.qualified_name.as_str(), symbol.span.start_line()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        handlers,
+        [
+            ("game.states.Guard::callback:OnEnter:4", 4),
+            ("game.states.Guard::callback:OnEnter:7", 7),
+            ("game.states.Guard::event:Alarm:9", 9),
+        ]
+    );
+}
+
+#[test]
+fn bg3_resources_start_at_their_node_tag() {
+    // v1 languages/bg3/resource.ts starts an LSX object's node at its `<node>`
+    // tag, not at the attribute that names it.
+    let source = "<save>\n  <region id=\"Rules\">\n    <node id=\"Ruleset\">\n      <attribute id=\"Secret\" type=\"LSString\" value=\"x\" />\n      <attribute id=\"RuleName\" type=\"LSString\" value=\"Demo_Ruleset\" />\n    </node>\n  </region>\n</save>\n";
+    let extracted = extract_custom(
+        "Public/Demo/Content/Rules.lsx",
+        source,
+        SourceLanguage::Bg3Resource,
+    );
+    let resource = extracted
+        .symbols
+        .iter()
+        .find(|symbol| symbol.kind == SymbolKind::Resource && symbol.name == "Demo_Ruleset")
+        .unwrap_or_else(|| panic!("missing Demo_Ruleset: {:?}", extracted.symbols));
+    assert_eq!(resource.span.start_line(), 3);
+    assert_eq!(resource.span.end_line(), 5);
+}
+
+fn extract_custom(path: &str, source: &str, language: SourceLanguage) -> ExtractedFile {
+    let snapshot = SourceSnapshot::from_bytes(path, source.as_bytes(), limits())
+        .unwrap_or_else(|error| panic!("{path} snapshot failed: {error}"));
+    assert_eq!(snapshot.language(), language, "{path}");
+    NativeExtractor::new(language)
+        .unwrap_or_else(|error| panic!("{path} extractor failed: {error}"))
+        .extract(&snapshot)
+        .unwrap_or_else(|error| panic!("{path} extraction failed: {error}"))
 }
 
 fn limits() -> SourceLimits {
