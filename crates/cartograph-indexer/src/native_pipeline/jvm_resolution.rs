@@ -13,7 +13,7 @@ use std::{
 };
 
 use cartograph_domain::{FileId, ReferenceKind, SourceSpan, SymbolId, SymbolKind, Visibility};
-use cartograph_extract::ImportBindingKind;
+use cartograph_extract::{DeclarationSyntax, ImportBindingKind};
 
 use super::{
     EXTERNAL_REFERENCE_UNRESOLVED_PROVENANCE, FileResolutionContext, ImportBindingScratch,
@@ -107,6 +107,15 @@ pub(super) fn nominal_type(kind: SymbolKind) -> bool {
             | SymbolKind::Trait
             | SymbolKind::TypeAlias
     )
+}
+
+pub(super) fn value_binding_candidate(
+    request: &ResolutionRequest<'_>,
+    candidate: &ResolutionCandidate,
+) -> bool {
+    !(request.language == "kotlin"
+        && request.kind == ReferenceKind::FieldAccess
+        && candidate.declaration_syntax == DeclarationSyntax::KotlinConstructor)
 }
 
 /// Index JVM declarations under their dotted FQN as well as their native name.

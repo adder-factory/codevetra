@@ -8,7 +8,7 @@
 use cartograph_domain::{ReferenceKind, SourceLanguage};
 use tree_sitter::Node;
 
-use crate::{ExtractError, ExtractedReference};
+use crate::{DeclarationSyntax, ExtractError, ExtractedReference};
 
 use super::{
     ExtractionBuilder, PendingReference,
@@ -20,6 +20,17 @@ use super::{
 const MAX_SCOPE_HOPS: usize = 64;
 const MAX_LOOKUP_BYTES: usize = 512;
 const TYPE_PARAMETER_PREFIX: &str = "native-jvm-type-parameter::";
+
+pub(super) fn declaration_syntax(input: (SourceLanguage, Node<'_>)) -> DeclarationSyntax {
+    let (language, node) = input;
+    if language == SourceLanguage::Kotlin
+        && matches!(node.kind(), "primary_constructor" | "secondary_constructor")
+    {
+        DeclarationSyntax::KotlinConstructor
+    } else {
+        DeclarationSyntax::Other
+    }
+}
 
 pub(super) fn record_java_local_type(
     builder: &mut ExtractionBuilder<'_, '_>,

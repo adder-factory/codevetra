@@ -32,9 +32,10 @@ const SATURATING_PARAMETERS: usize = 4_200;
 const FILLING_CALLS: usize = 4_500;
 /// Comment padding that leaves the filling file's core facts no room for
 /// another fact once its optional facts are omitted.
-/// The local-type scope vector adds 24 header bytes; one extra source byte
-/// supplies 32 output bytes without making room for the fallback diagnostic.
-const FILLING_PADDING_BYTES: usize = 9_226;
+/// The local-type and call-scope vectors add 48 header bytes, requiring two
+/// extra source bytes. Core facts cost 1,134,217 of the 1,134,240-byte limit;
+/// the optional reference (1,134,258) and diagnostic (1,134,265) still exceed it.
+const FILLING_PADDING_BYTES: usize = 9_227;
 /// Names of a multi-name Go declaration whose facts fit the output limit.
 const MULTI_NAME_FIELDS: usize = 200;
 /// Names of a long multi-name Go constant declaration in a body.

@@ -615,6 +615,7 @@ fn build_tag_definition(
         implementation: SymbolImplementationFlags::default(),
         export: SymbolExportFlags::default(),
         execution: SymbolExecutionFlags::default(),
+        declaration_syntax: crate::DeclarationSyntax::Other,
         visibility: None,
         structural_digest: input.structural_digest,
         clone_shape_digest,

@@ -1614,6 +1614,10 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
                 async_symbol: pending.async_symbol,
                 static_member: pending.static_member,
             },
+            declaration_syntax: jvm_type_lookup::declaration_syntax((
+                self.context.snapshot.language(),
+                pending.structural_node,
+            )),
             visibility: pending.visibility,
             structural_digest,
             clone_shape_digest,

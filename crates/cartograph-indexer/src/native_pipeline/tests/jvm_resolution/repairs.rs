@@ -130,6 +130,47 @@ fn kotlin_instance_invoke_methods_do_not_hide_constructors() {
 }
 
 #[test]
+fn kotlin_companion_factories_do_not_treat_constructors_as_value_shadows() {
+    let facts = generation(&[(
+        "model/User.kt",
+        r#"package com.acme.app.model
+typealias UserId = String
+abstract class Entity(open val id: UserId)
+interface Auditable
+data class User(override val id: UserId, var name: String): Entity(id), Auditable {
+    companion object {
+        fun create(id: UserId): User = User(id, "anon")
+    }
+}
+class Shadowed(val id: UserId) {
+    companion object {
+        fun Shadowed(id: UserId) {}
+        fun create(id: UserId) = Shadowed(id)
+    }
+}
+"#,
+    )]);
+    let path = "model/User.kt";
+    let caller = capability_symbol(&facts, path, "com.acme.app.model::User::create");
+    let target = capability_symbol(&facts, path, "com.acme.app.model::User");
+    targets(
+        CapabilityReferenceQuery::new(&facts, caller).named("User", ReferenceKind::Instantiates),
+        target,
+        "native-exact-lexical",
+    );
+    assert!(facts.edges().iter().any(|edge| {
+        edge.source_symbol_id == caller.symbol_id
+            && edge.target_symbol_id == target.symbol_id
+            && edge.kind == EdgeKind::Instantiates
+    }));
+    let shadowed = capability_symbol(&facts, path, "com.acme.app.model::Shadowed::create");
+    let reference = CapabilityReferenceQuery::new(&facts, shadowed)
+        .named("Shadowed", ReferenceKind::Instantiates);
+    assert!(reference.target_symbol_id.is_none(), "{reference:?}");
+    assert_eq!(reference.resolution_provenance, "native-unresolved");
+}
+
+#[test]
 fn wildcard_package_names_preserve_callable_ambiguity() {
     let facts = generation(&[
         ("a/Builder.kt", "package a\nclass Builder(value: Int)"),

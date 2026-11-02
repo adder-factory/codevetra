@@ -570,6 +570,7 @@ fn custom_symbol(parts: CustomSymbolParts<'_>) -> Result<ExtractedSymbol, Extrac
             async_symbol: options.async_symbol,
             static_member: options.static_member,
         },
+        declaration_syntax: crate::DeclarationSyntax::Other,
         visibility: options.visibility,
         structural_digest,
         clone_shape_digest,

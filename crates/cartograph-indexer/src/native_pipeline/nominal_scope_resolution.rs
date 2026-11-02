@@ -83,6 +83,7 @@ where
         if query.request.owner == Some(&candidate.symbol_id)
             || candidate.parent_symbol_id.as_ref() != query.scope
             || !is_lexical_candidate(query.request.kind, query.request.name, candidate)
+            || !jvm_resolution::value_binding_candidate(query.request, candidate)
             || !jvm_resolution::lexical_type_visible(query.index, (query.request, candidate))
         {
             continue;

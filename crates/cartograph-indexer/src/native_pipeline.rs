@@ -52,11 +52,11 @@ use cartograph_domain::{
 };
 use cartograph_extract::{
     CloneTokenCount, CloneTokenProfile, Containment, DEFAULT_MAXIMUM_AST_DEPTH,
-    DYNAMIC_DISPATCH_RESOLUTION_PREFIX, DiagnosticCode, DiscoveredSource, DiscoveryLimits,
-    EMBEDDED_SQL_RESOLUTION_PREFIX, ExtractError, ExtractedCallScopeSite, ExtractedFile,
-    ExtractedImportBinding, ExtractedNumericalSite, ExtractedReference, ImportBindingKind,
-    LEXICAL_SCOPE_RESOLUTION_PREFIX, MAXIMUM_AST_DEPTH, MINIMUM_AST_DEPTH, NativeExtractor,
-    PHP_EXACT_RESOLUTION_PREFIX, PYTHON_UNBOUND_IMPORT_RESOLUTION_PREFIX,
+    DYNAMIC_DISPATCH_RESOLUTION_PREFIX, DeclarationSyntax, DiagnosticCode, DiscoveredSource,
+    DiscoveryLimits, EMBEDDED_SQL_RESOLUTION_PREFIX, ExtractError, ExtractedCallScopeSite,
+    ExtractedFile, ExtractedImportBinding, ExtractedNumericalSite, ExtractedReference,
+    ImportBindingKind, LEXICAL_SCOPE_RESOLUTION_PREFIX, MAXIMUM_AST_DEPTH, MINIMUM_AST_DEPTH,
+    NativeExtractor, PHP_EXACT_RESOLUTION_PREFIX, PYTHON_UNBOUND_IMPORT_RESOLUTION_PREFIX,
     RUST_MACRO_RESOLUTION_PREFIX, RUST_SELF_RECEIVER_RESOLUTION_PREFIX, SourceDiscoveryOptions,
     SourceExclusionEvidence, SourceLimits, SourceReadError, SourceReadOptions, SourceRoot,
     SourceSnapshot, TYPE_QUERY_VALUE_RESOLUTION_PREFIX, is_test_source_path,
@@ -4993,6 +4993,7 @@ fn normalize_native_symbol(
         implementation,
         export,
         execution,
+        declaration_syntax,
         visibility,
         structural_digest,
         clone_shape_digest,
@@ -5030,6 +5031,7 @@ fn normalize_native_symbol(
         implementation,
         export,
         execution,
+        declaration_syntax,
         visibility,
         clone_shape_digest,
         clone_token_profile,
@@ -5057,6 +5059,7 @@ struct NativeSymbolFacts {
     implementation: SymbolImplementationFlags,
     export: SymbolExportFlags,
     execution: SymbolExecutionFlags,
+    declaration_syntax: DeclarationSyntax,
     visibility: Option<Visibility>,
     clone_shape_digest: ContentDigest,
     clone_token_profile: Option<CloneTokenProfile>,
@@ -5132,6 +5135,7 @@ struct ResolutionCandidate {
     top_level: bool,
     augmentation: bool,
     static_member: bool,
+    declaration_syntax: DeclarationSyntax,
     declaration_span: (u64, u64),
 }
 
@@ -10378,17 +10382,14 @@ where
             },
             budget,
         )?;
-        push_symbol_candidates(
-            &mut index.candidates,
-            ResolutionCandidateInsertion {
-                key: &symbol.name,
-                symbol,
-                parent_symbol_id: parent_symbol_id.as_ref(),
-                file_ordinal,
-                language: &file.file.language,
-            },
-            budget,
-        )?;
+        let insertion = ResolutionCandidateInsertion {
+            key: &symbol.name,
+            symbol,
+            parent_symbol_id: parent_symbol_id.as_ref(),
+            file_ordinal,
+            language: &file.file.language,
+        };
+        push_symbol_candidates(&mut index.candidates, insertion, budget)?;
         framework_methods::index_method(
             &mut index.framework_methods,
             framework_methods::MethodInput {
@@ -10398,17 +10399,7 @@ where
             },
             budget,
         )?;
-        generic_resolution::index_symbol(
-            &mut index.generic,
-            ResolutionCandidateInsertion {
-                key: &symbol.name,
-                symbol,
-                parent_symbol_id: parent_symbol_id.as_ref(),
-                file_ordinal,
-                language: &file.file.language,
-            },
-            budget,
-        )?;
+        generic_resolution::index_symbol(&mut index.generic, insertion, budget)?;
         if symbol.export.default_export {
             push_default_export(
                 &mut index.default_exports,
@@ -11832,6 +11823,7 @@ fn push_candidate(
         top_level: symbol.input.qualified_name == symbol.name,
         augmentation: symbol.augmentation,
         static_member: symbol.execution.static_member,
+        declaration_syntax: symbol.declaration_syntax,
         declaration_span: (symbol.input.start_byte, symbol.input.end_byte),
     });
     append_candidate_project_index(bucket, language, reservation)?;
@@ -12062,6 +12054,7 @@ fn push_default_export(
         top_level: symbol.input.qualified_name == symbol.name,
         augmentation: symbol.augmentation,
         static_member: symbol.execution.static_member,
+        declaration_syntax: symbol.declaration_syntax,
         declaration_span: (symbol.input.start_byte, symbol.input.end_byte),
     });
     Ok(())
@@ -23770,6 +23763,7 @@ export function secondClone(value: number) {
                     top_level: true,
                     augmentation: false,
                     static_member: false,
+                    declaration_syntax: DeclarationSyntax::Other,
                     declaration_span: (0, 0),
                 }
             })

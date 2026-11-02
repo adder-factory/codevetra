@@ -189,6 +189,16 @@ pub struct ExtractedNumericalSite {
     pub unknowns: String,
 }
 
+/// Syntax facts that disambiguate declarations with the same symbol kind and name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeclarationSyntax {
+    /// No declaration-specific syntax is needed for resolution.
+    #[default]
+    Other,
+    /// A Kotlin primary or secondary constructor, rather than a same-named function.
+    KotlinConstructor,
+}
+
 /// One normalized declaration emitted by a native language extractor.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedSymbol {
@@ -221,6 +231,9 @@ pub struct ExtractedSymbol {
     /// Async and static execution modifiers.
     #[serde(flatten)]
     pub execution: SymbolExecutionFlags,
+    /// Syntax-proven declaration category used for resolution.
+    #[serde(default)]
+    pub declaration_syntax: DeclarationSyntax,
     /// Explicit declaration visibility.
     pub visibility: Option<Visibility>,
     /// Whitespace/comment-independent concrete-syntax digest.
