@@ -50,7 +50,8 @@ pub use model::{
     DiagnosticCode, EMBEDDED_SQL_RESOLUTION_PREFIX, ExtractedFile, ExtractedImportBinding,
     ExtractedNumericalSite, ExtractedReference, ExtractedSymbol, ExtractionDiagnostic,
     ImportBindingKind, LEXICAL_SCOPE_RESOLUTION_PREFIX, PHP_EXACT_RESOLUTION_PREFIX,
-    RUST_MACRO_RESOLUTION_PREFIX, RUST_SELF_RECEIVER_RESOLUTION_PREFIX, SymbolHealthMetrics,
+    PHP_NAMESPACE_SCOPE_MODULE, RUST_MACRO_RESOLUTION_PREFIX, RUST_SELF_RECEIVER_RESOLUTION_PREFIX,
+    SALESFORCE_COMPONENT_MODULE, SALESFORCE_CONTROLLER_MODULE, SymbolHealthMetrics,
     TYPE_QUERY_VALUE_RESOLUTION_PREFIX,
 };
 pub use module_alias::substitute_module_alias;
