@@ -20,6 +20,8 @@ mod jvm_nested_resolution;
 mod jvm_resolution;
 mod module_call_resolution;
 mod namespace_types;
+mod native_bridge_details;
+mod native_event_calls;
 mod nominal_scope_resolution;
 mod pascal_resolution;
 mod php_resolution;
@@ -89,13 +91,13 @@ use cartograph_extract::{
     DiscoveryLimits, EMBEDDED_SQL_RESOLUTION_PREFIX, ExtractError, ExtractedCallScopeSite,
     ExtractedFile, ExtractedImportBinding, ExtractedNumericalSite, ExtractedReceiverEvidence,
     ExtractedReference, ImportBindingKind, JavascriptMemberCallContext, JavascriptMemberReceiver,
-    LEXICAL_SCOPE_RESOLUTION_PREFIX, MAXIMUM_AST_DEPTH, MINIMUM_AST_DEPTH, NativeExtractor,
-    PHP_EXACT_RESOLUTION_PREFIX, PYTHON_UNBOUND_IMPORT_RESOLUTION_PREFIX,
-    RUST_MACRO_RESOLUTION_PREFIX, RUST_SELF_RECEIVER_RESOLUTION_PREFIX, SourceDiscoveryOptions,
-    SourceExclusionEvidence, SourceLimits, SourceReadError, SourceReadOptions, SourceRoot,
-    SourceSnapshot, TYPE_QUERY_VALUE_RESOLUTION_PREFIX, is_test_source_path,
-    native_extraction_reservation, native_extractor_contract_digest, native_read_reservation,
-    substitute_module_alias,
+    LEXICAL_SCOPE_RESOLUTION_PREFIX, MAXIMUM_AST_DEPTH, MINIMUM_AST_DEPTH,
+    NATIVE_MODULE_ALIAS_RESOLUTION_PREFIX, NativeExtractor, PHP_EXACT_RESOLUTION_PREFIX,
+    PYTHON_UNBOUND_IMPORT_RESOLUTION_PREFIX, RUST_MACRO_RESOLUTION_PREFIX,
+    RUST_SELF_RECEIVER_RESOLUTION_PREFIX, SourceDiscoveryOptions, SourceExclusionEvidence,
+    SourceLimits, SourceReadError, SourceReadOptions, SourceRoot, SourceSnapshot,
+    TYPE_QUERY_VALUE_RESOLUTION_PREFIX, is_test_source_path, native_extraction_reservation,
+    native_extractor_contract_digest, native_read_reservation, substitute_module_alias,
 };
 use cartograph_scip::{
     ScipOverlayPlan, ScipOverlayReport, ScipOverlayRequest, apply_scip_overlay_with_cancellation,
@@ -2968,6 +2970,7 @@ struct SpilledResolutionState {
     centrality_enabled: bool,
     centrality: GenerationFacts,
     centrality_budget: ResolveBudget,
+    event_handlers: native_event_calls::HandlerIndex,
     validation_limits: GenerationValidationLimits,
 }
 
@@ -2976,6 +2979,7 @@ struct ResolvedFileFacts {
     facts: GenerationFacts,
     report: ResolutionReport,
     high_water: u64,
+    event_handlers: native_event_calls::HandlerIndex,
 }
 
 struct SpilledFactTransaction<'spill> {
@@ -3137,6 +3141,17 @@ impl<'context> SpilledResolutionFold<'context> {
             .checked_add(resolved.report.unresolved)
             .ok_or_else(ResolveGenerationFailure::generation_capacity_exceeded)?;
         self.state.high_water = self.state.high_water.max(resolved.high_water);
+        self.state
+            .event_handlers
+            .merge(
+                (resolved.event_handlers, &mut self.state.centrality_budget),
+                &mut || self.cancellation.is_cancelled(),
+            )
+            .map_err(|_| ResolveGenerationFailure::generation_capacity_exceeded())?;
+        self.state.high_water = self
+            .state
+            .high_water
+            .max(self.state.centrality_budget.charged_bytes);
         scip_spill::filter_native(
             self.state.overlay.as_ref(),
             &mut resolved.facts,
@@ -3473,6 +3488,7 @@ async fn initialize_spilled_resolution(
         centrality_enabled,
         centrality: GenerationFacts::default(),
         centrality_budget,
+        event_handlers: native_event_calls::HandlerIndex::default(),
         validation_limits,
     })
 }
@@ -3624,6 +3640,7 @@ fn resolve_file_facts(
     let maximum_bytes = config.limits.retained.max_generation_bytes;
     let mut facts = GenerationFacts::default();
     let mut report = ResolutionReport::default();
+    let mut event_handlers = native_event_calls::HandlerIndex::default();
     let working_limit = maximum_bytes
         .checked_mul(RESOLVE_WORKING_MULTIPLIER)
         .ok_or_else(ResolveGenerationFailure::generation_capacity_exceeded)?;
@@ -3635,6 +3652,7 @@ fn resolve_file_facts(
             facts: &mut facts,
             report: &mut report,
             budget: &mut budget,
+            event_handlers: &mut event_handlers,
         };
         output
             .append_file(file, &mut || cancellation.is_cancelled())
@@ -3648,6 +3666,7 @@ fn resolve_file_facts(
         facts,
         report,
         high_water: budget.charged_bytes,
+        event_handlers,
     })
 }
 
@@ -3720,8 +3739,15 @@ fn derive_spilled_fact_batch(
         bound,
     } = request;
     let cancellation = bound.cancellation;
-    let (mut facts, charged) = derive_spilled_facts(&state.index, bound, kind)
-        .map_err(|_| ResolveGenerationFailure::generation_capacity_exceeded())?;
+    let (mut facts, charged) = derive_spilled_facts(
+        &state.index,
+        bound,
+        SpilledDerivedEvidence {
+            kind,
+            event_handlers: &state.event_handlers,
+        },
+    )
+    .map_err(|_| ResolveGenerationFailure::generation_capacity_exceeded())?;
     state.high_water = state.high_water.max(charged);
     scip_spill::filter_native(state.overlay.as_ref(), &mut facts, cancellation)?;
     if generation_facts_are_empty(&facts) {
@@ -3908,10 +3934,16 @@ impl SpilledDerivedFactKind {
     const ALL: [Self; 4] = [Self::Framework, Self::Go, Self::Reexport, Self::Test];
 }
 
+#[derive(Clone, Copy)]
+struct SpilledDerivedEvidence<'evidence> {
+    kind: SpilledDerivedFactKind,
+    event_handlers: &'evidence native_event_calls::HandlerIndex,
+}
+
 fn derive_spilled_facts(
     index: &ResolutionIndex,
     bound: DerivedFactBound<'_>,
-    kind: SpilledDerivedFactKind,
+    evidence: SpilledDerivedEvidence<'_>,
 ) -> Result<(GenerationFacts, u64), StageItemFailure> {
     let DerivedFactBound {
         cancellation,
@@ -3923,7 +3955,7 @@ fn derive_spilled_facts(
     let mut facts = GenerationFacts::default();
     let mut budget = ResolveBudget::new(0, working_limit)?;
     let mut cancelled = || cancellation.is_cancelled();
-    match kind {
+    match evidence.kind {
         SpilledDerivedFactKind::Framework => {
             append_framework_bridge_edges(ResolutionMutation {
                 index,
@@ -3931,6 +3963,15 @@ fn derive_spilled_facts(
                 budget: &mut budget,
                 cancelled: &mut cancelled,
             })?;
+            native_event_calls::append(
+                ResolutionMutation {
+                    index,
+                    facts: &mut facts,
+                    budget: &mut budget,
+                    cancelled: &mut cancelled,
+                },
+                evidence.event_handlers,
+            )?;
         }
         SpilledDerivedFactKind::Go => {
             append_go_structural_edges(GoStructuralEdges {
@@ -5320,6 +5361,8 @@ struct TypeScriptPathMapping {
 
 #[derive(Default)]
 struct ResolutionIndex {
+    native_bridges: native_bridge_details::BridgeIndex,
+    native_event_consumers: native_event_calls::ConsumerIndex,
     javascript_members: javascript_member_resolution::JavascriptMemberIndex,
     javascript_frameworks: javascript_framework_resolution::JavascriptFrameworkIndex,
     candidates: CandidateMap,
@@ -7402,6 +7445,7 @@ struct DerivedResolutionEvidence<'context, Cancel> {
     budget: &'context mut ResolveBudget,
     policy: NativeEvidencePolicy,
     cancelled: &'context mut Cancel,
+    event_handlers: &'context native_event_calls::HandlerIndex,
 }
 
 fn resolve_generation<Cancel>(
@@ -7460,12 +7504,14 @@ where
     let mut facts = GenerationFacts::default();
     reserve_generation_vectors(&mut facts, &extracted, &mut budget)
         .map_err(|_| ResolveGenerationFailure::generation_capacity_exceeded())?;
+    let mut event_handlers = native_event_calls::HandlerIndex::default();
     {
         let mut output = ResolutionOutput {
             index: &index,
             facts: &mut facts,
             report: &mut report,
             budget: &mut budget,
+            event_handlers: &mut event_handlers,
         };
         for file in extracted.files {
             output
@@ -7479,6 +7525,7 @@ where
         budget: &mut budget,
         policy: evidence_policy,
         cancelled: &mut cancelled,
+        event_handlers: &event_handlers,
     })
     .map_err(|_| classify_resolve_failure(&budget))?;
     // Unordered facts are the resolver's bounded working set. Canonical
@@ -7529,6 +7576,7 @@ where
         budget,
         policy,
         cancelled,
+        event_handlers,
     } = input;
     append_framework_bridge_edges(ResolutionMutation {
         index,
@@ -7536,6 +7584,15 @@ where
         budget: &mut *budget,
         cancelled: &mut *cancelled,
     })?;
+    native_event_calls::append(
+        ResolutionMutation {
+            index,
+            facts: &mut *facts,
+            budget: &mut *budget,
+            cancelled: &mut *cancelled,
+        },
+        event_handlers,
+    )?;
     append_go_structural_edges(GoStructuralEdges {
         index,
         facts: &mut *facts,
@@ -8699,6 +8756,12 @@ where
         budget: &mut *budget,
         cancelled: &mut *cancelled,
     })?;
+    native_bridge_details::append(&mut ResolutionMutation {
+        index,
+        facts: &mut *facts,
+        budget: &mut *budget,
+        cancelled: &mut *cancelled,
+    })?;
     append_named_framework_bridges(ResolutionMutation {
         index,
         facts,
@@ -9076,6 +9139,9 @@ where
         cancelled,
         ..
     } = input;
+    if !native_event_calls::resource_fanout_fits(candidates, cancelled)? {
+        return Ok(());
+    }
     for producer in candidates.iter().filter(|candidate| {
         candidate.kind == SymbolKind::Resource
             && candidate
@@ -9506,7 +9572,10 @@ where
             module,
             cancelled,
         })? {
-            let target = objc_alias_method(index, target).unwrap_or(target);
+            let target = native_bridge_details::physical_candidate(
+                index,
+                objc_alias_method(index, target).unwrap_or(target),
+            );
             append_framework_edge(
                 facts,
                 budget,
@@ -9927,6 +9996,8 @@ where
     }
     order.sort_unstable();
     index.candidate_order = order;
+    native_bridge_details::prepare(&mut ResolutionIndexTarget { index, budget }, cancelled)?;
+    native_event_calls::prepare(&mut ResolutionIndexTarget { index, budget }, cancelled)?;
     jvm_resolution::prepare_wildcards(&mut ResolutionIndexTarget { index, budget }, cancelled)
 }
 
@@ -10879,6 +10950,7 @@ struct ResolutionOutput<'a> {
     facts: &'a mut GenerationFacts,
     report: &'a mut ResolutionReport,
     budget: &'a mut ResolveBudget,
+    event_handlers: &'a mut native_event_calls::HandlerIndex,
 }
 
 struct FileDocumentIdentity {
@@ -11103,8 +11175,11 @@ impl<'reference> ReferenceLookup<'reference> {
         let fenced_name = resolution_name
             .and_then(|name| name.strip_prefix(PYTHON_UNBOUND_IMPORT_RESOLUTION_PREFIX));
         let resolution_name = fenced_name.or(resolution_name);
-        let dynamic_dispatch_name =
-            resolution_name.and_then(|name| name.strip_prefix(DYNAMIC_DISPATCH_RESOLUTION_PREFIX));
+        let native_alias_name =
+            native_bridge_details::alias_lookup(resolution_name).map(|_| reference.name.as_str());
+        let dynamic_dispatch_name = resolution_name
+            .and_then(|name| name.strip_prefix(DYNAMIC_DISPATCH_RESOLUTION_PREFIX))
+            .map(|name| native_alias_name.unwrap_or(name));
         let rust_self_receiver_name = resolution_name
             .and_then(|name| name.strip_prefix(RUST_SELF_RECEIVER_RESOLUTION_PREFIX));
         let rust_macro_name =
@@ -11122,6 +11197,7 @@ impl<'reference> ReferenceLookup<'reference> {
             .or(rust_macro_name)
             .or(type_query_value_name)
             .or(lexical_scope_name)
+            .or(native_alias_name)
             .or_else(|| embedded_sql.as_ref().map(|lookup| lookup.table))
             .or_else(|| php_exact.map(php_resolution::PhpExactLookup::key))
             .unwrap_or_else(|| resolution_name.unwrap_or(&reference.name));
@@ -11230,6 +11306,7 @@ where
     if lookup.dynamic_dispatch_name.is_some()
         && let Some(target) = resolution.target.as_mut()
         && target.provenance != generic_resolution::CURRENT_CLASS_PROVENANCE
+        && target.provenance != native_bridge_details::ALIAS_PROVENANCE
     {
         target.confidence = DYNAMIC_DISPATCH_CONFIDENCE;
         target.provenance = DYNAMIC_DISPATCH_PROVENANCE;
@@ -11243,7 +11320,14 @@ where
         },
         cancelled,
     )?;
-    Ok(receiver_resolution::prefer_base(resolution, receiver))
+    Ok(native_bridge_details::physical_resolution(
+        index,
+        (
+            context,
+            reference,
+            receiver_resolution::prefer_base(resolution, receiver),
+        ),
+    ))
 }
 
 /// Honor resolver-prefix routes before the ordinary source-name fallback.
@@ -11259,6 +11343,11 @@ fn resolve_prefixed_reference<Cancel>(
 where
     Cancel: FnMut() -> bool,
 {
+    if let Some(resolution) =
+        native_bridge_details::alias_hint(index, (context, reference), cancelled)?
+    {
+        return Ok(Some(resolution));
+    }
     let resolution = if lookup.rust_macro_name.is_some() {
         ReferenceResolution::unresolved(RUST_MACRO_UNRESOLVED_PROVENANCE)
     } else if let Some(sql) = lookup.embedded_sql {
@@ -11534,6 +11623,13 @@ impl ResolutionOutput<'_> {
             },
             cancelled,
         )?;
+        self.event_handlers
+            .record(native_event_calls::HandlerObservation {
+                consumers: &self.index.native_event_consumers,
+                reference: &reference,
+                resolution: &resolution,
+                budget: self.budget,
+            })?;
         self.count_resolution(resolution.target.is_some())?;
         let source_symbol_id = reference
             .owner
@@ -17098,6 +17194,10 @@ fn usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    mod bridge_details;
+    mod bridge_digest_proof;
+    mod bridge_repairs;
+    mod event_spill;
     mod frameworks;
     mod generic_digest_proof;
     mod generic_repair;
@@ -17223,10 +17323,13 @@ mod tests {
     // and targets for its two existing references. generic_digest_proof removes
     // that one Calls edge and restores those references to reproduce the
     // previous fact set under V22 (8fe8df25...); the extraction facts stay fixed.
+    // Wave 3 adds six ObjC alias -> physical declaration References edges.
+    // bridge_digest_proof deletes those exact links and recovers a4e55aab...
+    // under the unchanged V22 domain; symbols, references and documents match.
     const EXPECTED_GENERIC_FAMILY_DIGEST: &str =
-        "a4e55aab2f0dbbaa33046f1a9975810b75c6cee9ea831482cdda5b958a437e2b";
+        "a4bac4515f50e66b10c1e57ee8b77ef00979ed6f2017756eff42260c9cc8d6e2";
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
-        (28, 260, 284, 135, 260);
+        (28, 260, 290, 135, 260);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
     // v1 parity: Anubis handlers carry their `:<line>` suffix, an Osiris block
     // spans from its `IF` line and is named by its head line, and an LSX
@@ -19771,10 +19874,8 @@ pub fn score(a: u16, b: u16, value: f32) -> f32 {
             "ios/RCTGeolocation.m",
             "ios/RCTGeolocation.m::react-native-method::Geolocation::getCurrentPosition",
         );
-        NamedReferenceAssertion::new(&forward, "startScan").targets(
-            "android/ScannerModule.kt",
-            "android/ScannerModule.kt::react-native-method::Scanner::startScan",
-        );
+        NamedReferenceAssertion::new(&forward, "startScan")
+            .targets("android/ScannerModule.kt", "ScannerModule::startScan");
         NamedReferenceAssertion::new(&forward, "notificationAsync").targets(
             "ios/HapticsModule.swift",
             "ios/HapticsModule.swift::expo-module-method::ExpoHaptics::notificationAsync",
@@ -19783,12 +19884,9 @@ pub fn score(a: u16, b: u16, value: f32) -> f32 {
             "src/NativeDeviceInfo.ts",
             "src/NativeDeviceInfo.ts::turbo-module-spec-method::DeviceInfo::getConstants",
         );
-        assert!(
-            forward
-                .references()
-                .iter()
-                .filter(|reference| reference.reference_name == "addListener")
-                .all(|reference| reference.target_symbol_id.is_none())
+        NamedReferenceAssertion::new(&forward, "addListener").targets(
+            "ios/RCTGeolocation.m",
+            "ios/RCTGeolocation.m::react-native-method::Geolocation::addListener",
         );
 
         let module_spec = capability_symbol(
