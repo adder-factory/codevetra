@@ -476,6 +476,19 @@ cargo test --locked --workspace --all-features
 cargo deny --all-features check
 ```
 
+The [v1 parity oracle](crates/cartograph-extract/tests/v1_parity_oracle.rs)
+checks the immutable v1.1.33 captures by exact identity, committed alignment
+pins, or an explicit pending/intentional ledger row. Ambiguous native keys never
+match by identity. Its `tests/fixtures/v1_parity/` tables are `alignments.jsonl`,
+`divergences.jsonl`, `reasons.jsonl`, `gate_cases.jsonl`, and
+`counterexamples.jsonl`; reasons are shared by ID. The 8,165 distinct captured
+facts currently have 6,040 identity and 1,949 aligned dispositions, 16 pending
+in wave 2, 114 pending in wave 3, and 46 intentional divergences. On a failure,
+read the suggested native facts, verify the frozen source and exact ownership,
+then fix the regression or add precise pins or an evidenced ledger row. Remove
+rows that become identity matches; never change the frozen captures to pass.
+Run `cargo test --locked -p cartograph-extract --test v1_parity_oracle`.
+
 These gates use the exact stable toolchain in `rust-toolchain.toml`. Do not use
 nightly-only tools or diagnostic overrides to clear them. A separate scheduled
 latest-stable canary detects future compiler and Clippy changes without making

@@ -209,6 +209,27 @@ include in its complete source revision. Update importer preflight and live
 cutover tests when expanding support. Otherwise an imported generation could
 appear fresh while unsupported files change or disappear on the next index.
 
+### 8. v1 parity oracle
+
+Keep the [exact v1.1.33 parity
+oracle](../crates/cartograph-extract/tests/v1_parity_oracle.rs) green. Each frozen
+fact has one disposition: unique exact identity, explicit conjunctive alignment
+pins, or a pending/intentional ledger row. Ambiguous keys cannot match by
+identity. Current distinct counts are 6,040 identity, 1,949 aligned, 16 pending
+in wave 2, 114 pending in wave 3, and 46 intentional divergences.
+
+Under `tests/fixtures/v1_parity/`, `alignments.jsonl` pins genuine shape changes;
+`divergences.jsonl` records gaps; `reasons.jsonl` defines shared evidence by ID.
+`gate_cases.jsonl` and `counterexamples.jsonl` replay small and real-extraction
+regressions through the same gate. On failure, read the native suggestions and
+inspect frozen source/capture evidence. Fix the regression, or pin the exact
+typed owner and occurrence (every relationship in a split group); otherwise add
+an evidenced gap/reason. A `v1-target-misresolution-*` alignment preserves only
+the corrected occurrence, not resolved-target parity; resolver proof is
+separate. Remove stale rows, preserve pending waves/IDs, and keep captured JSON
+and corpus sources immutable. Rerun
+`cargo test --locked -p cartograph-extract --test v1_parity_oracle`.
+
 ## Framework facts and bridges
 
 Framework extraction runs only after an explicit, deterministic detection

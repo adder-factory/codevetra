@@ -33,5 +33,23 @@ touches.
 > empty file node is valid only for the deliberately documented structural-file
 > modes; it is not a substitute for an extractor.
 
+## Keep the v1 parity oracle green
+
+For a v1 mode, run the [exact parity
+oracle](../crates/cartograph-extract/tests/v1_parity_oracle.rs). Every frozen fact
+needs a unique identity match, explicit alignment pins, or a pending/intentional
+ledger disposition. The fixture tables are `alignments.jsonl`,
+`divergences.jsonl`, and the shared `reasons.jsonl`; `gate_cases.jsonl` and
+`counterexamples.jsonl` exercise the same gate. Current distinct dispositions:
+6,040 identity, 1,949 aligned, 16 pending in wave 2, 114 pending in wave 3,
+and 46 intentional.
+
+Read failure suggestions, then inspect the frozen source and native ownership.
+Fix an extraction regression or commit unique readable pins/the complete split
+group; use an evidenced ledger reason when no correspondence exists. Remove
+stale rows that now match by identity. Keep captures and corpus source immutable
+and preserve pending wave/gap IDs. Run
+`cargo test --locked -p cartograph-extract --test v1_parity_oracle`.
+
 The current architecture and language inventory are documented in
 [native extraction](v2/EXTRACTION.md) and the [support matrix](SUPPORT-MATRIX.md).

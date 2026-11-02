@@ -63,3 +63,33 @@ ParadeDB language publication tests. These live suites run in
 `.github/workflows/v2-rust.yml` against the pinned database image rather than
 trusting a generated count alone, and `release.yml` refuses to publish a tag
 without a green `v2-rust.yml` run for that exact commit SHA.
+
+### v1 parity oracle
+
+The [exact per-file oracle](../crates/cartograph-extract/tests/v1_parity_oracle.rs)
+checks 8,231 immutable v1.1.33 records across all 73 legacy modes. Repeated
+captures share one disposition, leaving 8,165 distinct selectors:
+
+| Disposition | Distinct facts |
+| --- | ---: |
+| Unique exact identity | 6,040 |
+| Explicit alignment pins | 1,949 |
+| Pending, wave 2 | 16 |
+| Pending, wave 3 | 114 |
+| Intentional divergence | 46 |
+
+Identity requires exactly one native observation with the readable key;
+ambiguous keys never pass. Alignments pin exact native declarations or
+occurrences, requiring every pin in a split relationship group. The ledger
+records pending wave/gap IDs or intentional reason IDs. Corrected
+`v1-target-misresolution-*` alignments preserve occurrences only and do not prove
+resolved-target parity.
+
+The fixture tables are `alignments.jsonl`, `divergences.jsonl`, and shared
+`reasons.jsonl`, with `gate_cases.jsonl` and `counterexamples.jsonl` checking the
+same gate. When it fails, read the suggested native candidates and verify the
+frozen source and exact ownership. Fix the extractor regression, add unique
+pins for a genuine shape difference, or document an uncarried fact in the ledger.
+Remove rows that become identity matches and unused reason definitions; retain
+pending waves/IDs and keep captures/corpus source immutable. Validate with
+`cargo test --locked -p cartograph-extract --test v1_parity_oracle`.
