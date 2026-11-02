@@ -26,6 +26,14 @@ pub enum ExtractionStrategy {
     ShaderFamily,
     /// Ada and VHDL declarations, case-insensitive references, and compilation imports.
     AdaFamily,
+    /// Ruby modules, classes, accessors, constants, visibility sections, and load imports.
+    RubyFamily,
+    /// Lua, Luau, and KHN tables, colon methods, local lists, and `require` imports.
+    LuaFamily,
+    /// R assignment-named functions, constants, and package/source imports.
+    RFamily,
+    /// Nix attribute bindings, inherits, applications, and path imports.
+    NixFamily,
     /// Grammar-backed conservative structural extraction for the remaining v1 language modes.
     GenericStructural,
     /// Bounded native scanners for custom, mixed-markup, and domain-specific v1 modes.
@@ -48,6 +56,10 @@ impl ExtractionStrategy {
                 | Self::JvmDynamicFamily
                 | Self::ShaderFamily
                 | Self::AdaFamily
+                | Self::RubyFamily
+                | Self::LuaFamily
+                | Self::RFamily
+                | Self::NixFamily
                 | Self::GenericStructural
                 | Self::CustomStructural
         )
@@ -133,6 +145,12 @@ const fn grammar_strategy(language: SourceLanguage) -> Option<ExtractionStrategy
         | SourceLanguage::Slang => Some(ExtractionStrategy::CFamily),
         SourceLanguage::Wesl | SourceLanguage::Wgsl => Some(ExtractionStrategy::ShaderFamily),
         SourceLanguage::Ada | SourceLanguage::Vhdl => Some(ExtractionStrategy::AdaFamily),
+        SourceLanguage::Ruby => Some(ExtractionStrategy::RubyFamily),
+        SourceLanguage::Lua | SourceLanguage::Luau | SourceLanguage::Khn => {
+            Some(ExtractionStrategy::LuaFamily)
+        }
+        SourceLanguage::R => Some(ExtractionStrategy::RFamily),
+        SourceLanguage::Nix => Some(ExtractionStrategy::NixFamily),
         SourceLanguage::Bash
         | SourceLanguage::Fish
         | SourceLanguage::PowerShell
@@ -158,18 +176,12 @@ const fn fallback_strategy(language: SourceLanguage) -> ExtractionStrategy {
         | SourceLanguage::GraphQl
         | SourceLanguage::Hcl
         | SourceLanguage::Html
-        | SourceLanguage::Khn
         | SourceLanguage::Lean
-        | SourceLanguage::Lua
-        | SourceLanguage::Luau
-        | SourceLanguage::Nix
         | SourceLanguage::ObjectiveC
         | SourceLanguage::Pascal
         | SourceLanguage::Php
         | SourceLanguage::Prisma
-        | SourceLanguage::R
         | SourceLanguage::ReScript
-        | SourceLanguage::Ruby
         | SourceLanguage::Solidity
         | SourceLanguage::Sql
         | SourceLanguage::Swift

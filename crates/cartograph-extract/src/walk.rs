@@ -25,14 +25,19 @@ mod embedded_sql;
 mod generic_family;
 mod graphql_family;
 mod jvm_dynamic_family;
+mod lua_family;
 mod managed_family;
 mod module_system;
+mod nix_family;
 mod numerical;
 mod polyglot;
 mod prisma_family;
+mod r_family;
 mod references;
+mod ruby_family;
 mod rust_macro;
 mod schema;
+mod script_support;
 mod shader_family;
 mod shell_family;
 mod sql_family;
@@ -316,6 +321,8 @@ struct ExtractionBuilder<'source, 'cancel> {
     explicit_exports: BTreeSet<String>,
     explicit_default_exports: BTreeSet<String>,
     commonjs_shadowing: module_system::CommonJsShadowing,
+    /// Source-order walk state of the dynamic scripting families.
+    script: script_support::ScriptState,
     maximum_ast_depth: usize,
     /// Whether any synthesized name exceeded its canonical bound and had to be
     /// deterministically shortened for this file.
@@ -682,6 +689,10 @@ pub(super) struct PendingReference<'tree> {
 #[derive(Clone, Copy)]
 enum ExtractionFamily {
     Ada,
+    Ruby,
+    Lua,
+    R,
+    Nix,
     Shader,
     Shell,
     C,
@@ -703,6 +714,11 @@ const SHELL_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::Zsh,
 ];
 const ADA_LANGUAGES: &[SourceLanguage] = &[SourceLanguage::Ada, SourceLanguage::Vhdl];
+const LUA_LANGUAGES: &[SourceLanguage] = &[
+    SourceLanguage::Lua,
+    SourceLanguage::Luau,
+    SourceLanguage::Khn,
+];
 const C_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::C,
     SourceLanguage::Cpp,
@@ -729,17 +745,11 @@ const GENERIC_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::FSharp,
     SourceLanguage::Hcl,
     SourceLanguage::Html,
-    SourceLanguage::Khn,
     SourceLanguage::Lean,
-    SourceLanguage::Lua,
-    SourceLanguage::Luau,
-    SourceLanguage::Nix,
     SourceLanguage::ObjectiveC,
     SourceLanguage::Pascal,
     SourceLanguage::Php,
-    SourceLanguage::R,
     SourceLanguage::ReScript,
-    SourceLanguage::Ruby,
     SourceLanguage::Solidity,
     SourceLanguage::Swift,
     SourceLanguage::VbNet,
@@ -774,6 +784,34 @@ const fn family_slice_structural(family: ExtractionFamily) -> Option<FamilySlice
             visit_declaration: ada_family::visit_declaration,
             visit_usage: |builder, node, depth| {
                 ada_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        ExtractionFamily::Ruby => FamilySlice {
+            visit_declaration: ruby_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                ruby_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        ExtractionFamily::Lua => FamilySlice {
+            visit_declaration: lua_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                lua_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        ExtractionFamily::R => FamilySlice {
+            visit_declaration: r_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                r_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        ExtractionFamily::Nix => FamilySlice {
+            visit_declaration: nix_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                nix_family::capture_usage(builder, node)?;
                 builder.visit_named_children(node, depth)
             },
         },
@@ -870,6 +908,8 @@ const fn family_slice(family: ExtractionFamily) -> Option<FamilySlice> {
 fn extraction_family(language: SourceLanguage) -> ExtractionFamily {
     if ADA_LANGUAGES.contains(&language) {
         ExtractionFamily::Ada
+    } else if LUA_LANGUAGES.contains(&language) {
+        ExtractionFamily::Lua
     } else if SHELL_LANGUAGES.contains(&language) {
         ExtractionFamily::Shell
     } else if C_LANGUAGES.contains(&language) {
@@ -889,6 +929,9 @@ fn extraction_family(language: SourceLanguage) -> ExtractionFamily {
             SourceLanguage::GraphQl => ExtractionFamily::GraphQl,
             SourceLanguage::Wesl | SourceLanguage::Wgsl => ExtractionFamily::Shader,
             SourceLanguage::Prisma => ExtractionFamily::Prisma,
+            SourceLanguage::Ruby => ExtractionFamily::Ruby,
+            SourceLanguage::R => ExtractionFamily::R,
+            SourceLanguage::Nix => ExtractionFamily::Nix,
             SourceLanguage::Sql => ExtractionFamily::Sql,
             _ => ExtractionFamily::Unsupported,
         }
@@ -1121,6 +1164,7 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
             explicit_exports: BTreeSet::new(),
             explicit_default_exports: BTreeSet::new(),
             commonjs_shadowing: module_system::CommonJsShadowing::default(),
+            script: script_support::ScriptState::default(),
             maximum_ast_depth,
             shortened_canonical_names: false,
         })

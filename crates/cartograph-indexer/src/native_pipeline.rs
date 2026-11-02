@@ -1,4 +1,5 @@
 mod scip_spill;
+mod script_modules;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -11901,6 +11902,15 @@ where
     {
         return Ok(Some(resolution));
     }
+    if request.kind == ReferenceKind::Imports
+        && request.owner.is_none()
+        && script_modules::binds_loads_exactly(request.language)
+        && let Some(resolution) = import_reference_resolution(resolve_module_import_file_reference(
+            index, request, cancelled,
+        )?)
+    {
+        return Ok(Some(resolution));
+    }
     if request.owner.is_none()
         && request.kind == ReferenceKind::References
         && let Some(resolution) = import_reference_resolution(resolve_import(
@@ -13652,6 +13662,11 @@ fn resolve_module_file<'a>(
     modules: &'a ModulePathIndex,
     request: ModuleResolutionRequest<'_>,
 ) -> Option<&'a FileId> {
+    match script_modules::resolve_script_module(modules, request) {
+        ModuleResolutionAttempt::Resolved(file_id) => return Some(file_id),
+        ModuleResolutionAttempt::Rejected => return None,
+        ModuleResolutionAttempt::NotMatched => {}
+    }
     match resolve_compilation_unit_module(modules, request) {
         ModuleResolutionAttempt::Resolved(file_id) => return Some(file_id),
         ModuleResolutionAttempt::Rejected => return None,
@@ -15792,6 +15807,7 @@ fn usize_to_u64(value: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     mod rust_receivers;
+    mod script_modules;
 
     use std::assert_matches;
     use std::{cell::Cell, collections::BTreeSet, fmt::Write as _, fs, time::Duration};
@@ -15876,9 +15892,9 @@ mod tests {
         (14, 33, 19, 6, 33);
     const GENERIC_FAMILY_FILE_COUNT: usize = 28;
     const EXPECTED_GENERIC_FAMILY_DIGEST: &str =
-        "f77a991e7c6b2e8df0794af6be859648fd1e084e0511f1fbf675acb363eb3f6f";
+        "94b235e139fd655485e9a0fd932e7dd5cb0c245256167c102c6b478390b218f8";
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
-        (28, 220, 213, 64, 220);
+        (28, 226, 219, 66, 226);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
     const EXPECTED_CUSTOM_FAMILY_DIGEST: &str =
         "461cec8cccf24f4374a440ca7c8884d547b82653a89427859197af63ff968573";
