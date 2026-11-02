@@ -4721,7 +4721,9 @@ const fn degraded_file_reason(diagnostic: DiagnosticCode) -> Option<&'static str
         DiagnosticCode::InvalidSpan => Some("extraction_invalid_span"),
         DiagnosticCode::ParserStopped => Some("extraction_parser_stopped"),
         DiagnosticCode::NestingLimitExceeded => Some("nesting_limit_exceeded"),
-        DiagnosticCode::SyntaxError | DiagnosticCode::CanonicalNameTruncated => None,
+        DiagnosticCode::SyntaxError
+        | DiagnosticCode::CanonicalNameTruncated
+        | DiagnosticCode::OptionalFactsOmitted => None,
     }
 }
 
@@ -15791,6 +15793,7 @@ fn usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    mod polyglot_parity;
     mod rust_receivers;
 
     use std::assert_matches;
