@@ -1,5 +1,6 @@
 //! Framework bindings must identify one target and preserve uncertainty.
 
+mod fwjs;
 mod repairs;
 
 use super::*;
