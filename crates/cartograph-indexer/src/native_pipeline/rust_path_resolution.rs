@@ -25,6 +25,7 @@ pub(super) struct PathIndex {
     pub(super) modules: HashMap<FileId, HashMap<String, Option<ModuleEdge>>>,
     pub(super) roots: super::rust_root_ownership::RootIndex,
     pub(super) facades: super::rust_facade_resolution::FacadeIndex,
+    pub(super) use_scopes: super::rust_use_bindings::ImplScopes,
 }
 
 pub(super) struct ModuleEdge {
@@ -44,6 +45,7 @@ where
     if file.file.language != "rust" {
         return Ok(());
     }
+    super::rust_use_bindings::index_file(target, file, cancelled)?;
     let mut public = HashMap::new();
     for symbol in &file.symbols {
         if cancelled() {
@@ -133,7 +135,7 @@ where
     {
         return Ok(None);
     }
-    let explicit = match explicit_path(request, cancelled)? {
+    let explicit = match explicit_path(index, request, cancelled)? {
         ExplicitPath::Absent => None,
         ExplicitPath::Unique(path) => Some(path),
         ExplicitPath::Ambiguous => return Ok(None),
@@ -161,6 +163,7 @@ where
 }
 
 fn explicit_path<Cancel>(
+    index: &ResolutionIndex,
     request: &ResolutionRequest<'_>,
     cancelled: &mut Cancel,
 ) -> Result<ExplicitPath, StageItemFailure>
@@ -182,6 +185,9 @@ where
         else {
             continue;
         };
+        if !super::rust_use_bindings::allows(index, (request, binding), cancelled)? {
+            return Ok(ExplicitPath::Absent);
+        }
         if retained.is_some()
             || binding.module_specifier.len().saturating_add(suffix.len()) > MAXIMUM_PATH_BYTES
         {
@@ -243,6 +249,7 @@ where
         |candidate| {
             candidate.qualified_name == name
                 && reference_kind_candidate(request.kind, candidate)
+                && super::rust_use_bindings::visible(index, request, candidate)
                 && rust_module_candidate_visible(RustCandidateVisibility {
                     index,
                     candidate,

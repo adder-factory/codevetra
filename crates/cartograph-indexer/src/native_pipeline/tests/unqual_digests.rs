@@ -1,8 +1,10 @@
-//! Removing the Lua subfeature restores the previous locked digest fact by fact.
+//! V22 retains the merged tracks' facts while reconstructing the removed Lua
+//! subfeature: three symbol flags, three document records and two provenances.
 use super::{
-    CanonicalGenerationFacts, GenerationFacts, PipelineStage, SERIAL_WORKERS, SearchDocumentInput,
-    SymbolExportFlags, TEST_GENERATION_BYTES, build, capability_symbol,
-    generation_validation_limits, tempdir, validate_generation_facts, write_generic_family_project,
+    CanonicalGenerationFacts, EXPECTED_GENERIC_FAMILY_DIGEST, GenerationFacts, PipelineStage,
+    SERIAL_WORKERS, SearchDocumentInput, SymbolExportFlags, TEST_GENERATION_BYTES, build,
+    capability_symbol, generation_validation_limits, tempdir, validate_generation_facts,
+    write_generic_family_project,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -52,13 +54,10 @@ async fn deleting_lua_proof_restores_the_legacy_digest_fact_by_fact() {
         .unwrap_or_else(|error| panic!("legacy fact validation failed: {error}"));
     assert_eq!(
         legacy.digest().as_str(),
-        "c2c3847a84085c19b78f83541590d2237335a50364890a37cbf30d32c835a381"
+        "e6cdcadd772f9e15bf24636830f1c3ea9de3f7e178c8b85d9e5d7081ecf4749b"
     );
     assert_eq!(current.edges(), legacy.edges());
-    assert_eq!(
-        current.digest().as_str(),
-        "fca1307d9daa8f86212a323289ec33fdffb7936c33575b32a7180d8eb285880d"
-    );
+    assert_eq!(current.digest().as_str(), EXPECTED_GENERIC_FAMILY_DIGEST);
 }
 
 fn raw_facts(facts: &CanonicalGenerationFacts) -> GenerationFacts {

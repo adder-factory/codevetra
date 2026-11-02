@@ -426,6 +426,19 @@ fn rust_custom_library_and_binary_targets_follow_their_declared_modules() {
 #[test]
 fn unqual_production_functions_respect_code_health_limits() {
     let modules = [
+        ("reference_tiers.rs", include_str!("../reference_tiers.rs")),
+        (
+            "rust_use_bindings.rs",
+            include_str!("../rust_use_bindings.rs"),
+        ),
+        (
+            "rust_local_types.rs",
+            include_str!("../rust_local_types.rs"),
+        ),
+        (
+            "rust_use_guards.rs",
+            include_str!("../../../../cartograph-extract/src/walk/polyglot/rust_use_guards.rs"),
+        ),
         (
             "declaration_resolution.rs",
             include_str!("../declaration_resolution.rs"),

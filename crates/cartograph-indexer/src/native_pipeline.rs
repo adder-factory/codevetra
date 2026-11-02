@@ -30,6 +30,7 @@ mod qualtype_generics;
 mod qualtype_resolution;
 mod qualtype_source;
 mod receiver_resolution;
+mod reference_tiers;
 mod rescript_resolution;
 mod resource_resolution;
 mod rust_dependency_paths;
@@ -37,6 +38,7 @@ mod rust_facade_resolution;
 mod rust_local_types;
 mod rust_path_resolution;
 mod rust_root_ownership;
+mod rust_use_bindings;
 mod salesforce_resolution;
 mod scip_spill;
 mod script_modules;
@@ -12318,6 +12320,9 @@ impl ImportCandidateFilter<'_, '_> {
         if &candidate.file_id != self.module_file_id || !candidate.export.exported {
             return false;
         }
+        if !rust_use_bindings::visible(self.index, self.reference, candidate) {
+            return false;
+        }
         if !reference_kind_candidate(self.reference.kind, candidate) {
             return false;
         }
@@ -12687,35 +12692,7 @@ where
     if let Some(resolution) = resolve_declaration_reference(index, request, cancelled)? {
         return Ok(resolution);
     }
-    if let Some(resolution) = javascript_member_resolution::guard(index, request, cancelled)? {
-        return Ok(resolution);
-    }
-    if let Some(resolution) = generic_resolution::resolve_casefold_local(index, request, cancelled)?
-    {
-        return Ok(resolution);
-    }
-    if let Some(resolution) = generic_resolution::resolve_class_scope(index, request, cancelled)? {
-        return Ok(resolution);
-    }
-    if let Some(resolution) = codeigniter_resolution::resolve(index, request, cancelled)? {
-        return Ok(resolution);
-    }
-    if let Some(resolution) = enum_resolution::resolve(index, request, cancelled)? {
-        return Ok(resolution);
-    }
-    if let Some(resolution) = csharp_constructors::resolve(index, request, cancelled)? {
-        return Ok(resolution);
-    }
-    if let Some(target) = resource_resolution::resolve(index, request, cancelled)? {
-        return Ok(ReferenceResolution::resolved(target));
-    }
-    if let Some(resolution) = module_call_resolution::qualified(index, request, cancelled)? {
-        return Ok(resolution);
-    }
-    if let Some(target) = resolve_lexical(index, request, cancelled)? {
-        return declaration_resolution::prefer_definition(index, (request, target), cancelled);
-    }
-    if let Some(resolution) = qualtype_resolution::resolve(index, request, cancelled)? {
+    if let Some(resolution) = reference_tiers::resolve(index, request, cancelled)? {
         return Ok(resolution);
     }
     if request.import_bindings.fallback_blocked {
@@ -14053,6 +14030,9 @@ where
         ImportBindingMatch::Ambiguous => return Ok(ImportResolution::Unresolved),
         ImportBindingMatch::Unique(binding, imported_name) => (binding, imported_name),
     };
+    if !rust_use_bindings::allows(index, (reference, binding), cancelled)? {
+        return Ok(ImportResolution::NotBound);
+    }
     if reference.language == SourceLanguage::Php.as_str() {
         return php_resolution::resolve_use_binding(
             php_resolution::PhpUseBinding {
@@ -14262,6 +14242,7 @@ where
         candidates,
         |candidate| {
             &candidate.file_id == module_file_id
+                && rust_use_bindings::visible(index, reference, candidate)
                 && rust_module_candidate_visible(RustCandidateVisibility {
                     index,
                     candidate,
@@ -14276,12 +14257,14 @@ where
         candidate = select_candidate(
             project_candidates,
             |candidate| {
-                rust_module_candidate_visible(RustCandidateVisibility {
-                    index,
-                    candidate,
-                    target_name: &target_name,
-                    source_path: reference.file_path,
-                }) && reference_kind_candidate(reference.kind, candidate)
+                rust_use_bindings::visible(index, reference, candidate)
+                    && rust_module_candidate_visible(RustCandidateVisibility {
+                        index,
+                        candidate,
+                        target_name: &target_name,
+                        source_path: reference.file_path,
+                    })
+                    && reference_kind_candidate(reference.kind, candidate)
                     && index
                         .modules
                         .files
@@ -17068,6 +17051,7 @@ mod tests {
     mod qualified_types;
     mod receiver_types;
     mod rust_receivers;
+    mod rust_use_bindings;
     mod script_modules;
     mod unqual_digests;
     mod unqual_repair;
