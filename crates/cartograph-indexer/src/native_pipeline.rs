@@ -11193,7 +11193,19 @@ where
             .as_deref()
             .is_some_and(jvm_resolution::syntax_abstention)
     {
-        return Ok(ReferenceResolution::unresolved(UNRESOLVED_PROVENANCE));
+        let receiver = receiver_resolution::resolve(
+            index,
+            receiver_resolution::ReceiverQuery {
+                context,
+                reference,
+                import_binding_scratch,
+            },
+            cancelled,
+        )?;
+        return Ok(receiver_resolution::prefer_base(
+            ReferenceResolution::unresolved(UNRESOLVED_PROVENANCE),
+            receiver,
+        ));
     }
     let lookup = ReferenceLookup::classify(reference);
     let binding_name =
@@ -17118,6 +17130,10 @@ mod tests {
     mod rust_use_bindings;
     mod rust_use_regressions;
     mod script_modules;
+    mod types_digest_proof;
+    mod types_scope_repair;
+    mod types_shadowing;
+    mod types_track;
     mod unqual_digests;
     mod unqual_repair;
     mod unqual_resolution;
@@ -17223,10 +17239,13 @@ mod tests {
     // and targets for its two existing references. generic_digest_proof removes
     // that one Calls edge and restores those references to reproduce the
     // previous fact set under V22 (8fe8df25...); the extraction facts stay fixed.
+    // Explicit constructor receivers add process -> Container::add in Ruby
+    // and Dart. types_digest_proof removes both Calls edges, restores the two
+    // references and recomputes centrality to reproduce a4e55aab... exactly.
     const EXPECTED_GENERIC_FAMILY_DIGEST: &str =
-        "a4e55aab2f0dbbaa33046f1a9975810b75c6cee9ea831482cdda5b958a437e2b";
+        "c0eb3df89b28d59cfacbccd9c63f2fe3db0f05a59f88864c52a549c67757f6a3";
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
-        (28, 260, 284, 135, 260);
+        (28, 260, 286, 135, 260);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
     // v1 parity: Anubis handlers carry their `:<line>` suffix, an Osiris block
     // spans from its `IF` line and is named by its head line, and an LSX

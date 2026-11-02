@@ -78,6 +78,7 @@ pub(crate) mod specifier_safety;
 mod sql_family;
 mod swift_family;
 pub(crate) mod syntax;
+mod tagged_receivers;
 mod type_contracts;
 mod value_references;
 mod vbnet_family;
@@ -245,6 +246,9 @@ fn enrich_visited(
     javascript_reads::enrich_binding_tables(builder, root)?;
     explicit_receivers::enrich(builder, root)
 }
+
+/// OCaml's tag extraction shares the same bounded receiver-evidence collector.
+pub(crate) use tagged_receivers::enrich as enrich_tagged_receivers;
 
 fn collect_extraction_diagnostics(
     builder: &mut ExtractionBuilder<'_, '_>,

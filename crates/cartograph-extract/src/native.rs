@@ -170,6 +170,7 @@ impl NativeExtractor {
                 },
                 cancelled,
             )?;
+            let extracted = walk::enrich_tagged_receivers(snapshot, (root, extracted), cancelled)?;
             let extracted = framework::enrich(
                 framework::FrameworkInput::new(snapshot, extracted).with_root(root),
                 cancelled,
