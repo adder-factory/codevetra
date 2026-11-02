@@ -16527,15 +16527,20 @@ mod tests {
     // Pascal now has a dedicated family: fixture.pas extracts its full structure
     // (2 -> 9 symbols, the projection's +7) and its runtime calls (`SetLength`,
     // `Length`, `High`) stay unresolved as external references.
+    // ABAP declares classes and methods at their IMPLEMENTATION blocks, so
+    // fixture.abap's class and method move there (same counts, new spans,
+    // and the method now owns its body).
     const EXPECTED_GENERIC_FAMILY_DIGEST: &str =
-        "684133dd6a9325d5911eea61312c79ad3c757d6d4a7d7040a7fdf7a9cdff9c92";
+        "679c6c1642b96f3736aeb8436dda7ec20f34d9db3d6967bb5f03564577e6829c";
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
         (28, 259, 281, 134, 259);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
     const EXPECTED_CUSTOM_FAMILY_DIGEST: &str =
-        "f163e4b694db4069c989cb4828889562976005480f3e9dd3e28cf7b42d6e5557";
+        "ccbda699bde99004e3042e4cbb1485175b46dfc38ccb102edf8df70d21f9d439";
+    // A Liquid `{% render %}` partner is a Component as well as an Import
+    // (+1 symbol and its containment).
     const EXPECTED_CUSTOM_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
-        (13, 49, 44, 32, 49);
+        (13, 50, 45, 32, 50);
     const CUSTOM_FAMILY_FIXTURES: [(&str, &str, SourceLanguage); CUSTOM_FAMILY_FILE_COUNT] = [
         (
             "force-app/main/default/aura/OrderPanel/OrderPanel.cmp",

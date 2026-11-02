@@ -1080,6 +1080,99 @@ class ModernBlock {}
     }
 }
 
+/// A flow-mapping tag (`{ name: x, priority: 10 }`) ends its `name` at the
+/// next comma, and a scalar `'@service:method'` factory names the service
+/// once: the suffix after `:` is the factory method. In a `[@service, method]`
+/// sequence the colon belongs to the service id, quoted scalars are decoded,
+/// and a quote escape never truncates a value into a different name. A
+/// non-ASCII service id is never cut to an ASCII prefix, and a rejected `factory` scalar names
+/// nothing.
+#[test]
+fn drupal_service_flow_tags_and_scalar_factories_name_only_their_target() {
+    let services = extract(
+        "modules/custom/demo/demo.services.yml",
+        r#"
+services:
+  demo.listener:
+    class: Drupal\demo\Listener
+    tags:
+      - { name: event_subscriber, priority: 10 }
+      - { name: 'cache.bin', default_backend: cache.backend.memory }
+  demo.made:
+    factory: '@demo.factory:create'
+  demo.static:
+    factory: 'Drupal\demo\Factory::create'
+  demo.tenant:
+    factory: ['@tenant:cache', 'create']
+    arguments:
+      - { factory: '@tenant:cache' }
+  demo.escaped_factory:
+    factory: "Drupal\\demo\\Escaped::create"
+  demo.escaped:
+    class: "Drupal\\demo\\Escaped"
+    tags:
+      - { name: 'kernel''listener' }
+      - { name: "bad\tescape" }
+  demo.unicode:
+    factory: '@café:create'
+    arguments: ['@café', '@plain', '@caf€']
+  demo.unterminated:
+    factory: '@svc:create
+  demo.bad_escape:
+    configurator: "@svc\x:configure"
+"#,
+        SourceLanguage::Yaml,
+    );
+    let tags = services
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.qualified_name.contains("::drupal-tag-provider::"))
+        .map(|symbol| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tags,
+        [
+            "drupal-tag:kernel'listener",
+            "drupal-tag:cache.bin",
+            "drupal-tag:event_subscriber"
+        ],
+        "provider tags are ordered by service id"
+    );
+    let names_on = |line: u32| {
+        services
+            .references
+            .iter()
+            .filter(|reference| reference.span.start_line() == line)
+            .map(|reference| reference.name.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names_on(9), ["demo.factory"]);
+    assert_eq!(names_on(11), ["Drupal\\demo\\Factory"]);
+    assert_eq!(names_on(13), ["tenant:cache"]);
+    assert_eq!(names_on(15), ["tenant:cache"]);
+    let escaped_factory = services
+        .references
+        .iter()
+        .find(|reference| reference.span.start_line() == 17)
+        .unwrap_or_else(|| panic!("missing escaped factory: {:?}", services.references));
+    assert_eq!(escaped_factory.name, "Drupal\\demo\\Escaped");
+    let raw_class = r"Drupal\\demo\\Escaped";
+    assert_eq!(
+        escaped_factory.span.end_byte() - escaped_factory.span.start_byte(),
+        u64::try_from(raw_class.len()).unwrap_or(u64::MAX),
+        "the span covers the raw escaped class text"
+    );
+    assert_eq!(names_on(19), ["Drupal\\demo\\Escaped"]);
+    // A non-ASCII service id is never named as a shorter ASCII prefix
+    // (`caf`) that would bind a different service; framework signals are
+    // ASCII-only, so it abstains.
+    assert_eq!(names_on(24), Vec::<&str>::new());
+    assert_eq!(names_on(25), ["plain"]);
+    // A rejected `factory`/`configurator` scalar names nothing.
+    assert_eq!(names_on(27), Vec::<&str>::new());
+    assert_eq!(names_on(29), Vec::<&str>::new());
+}
+
 #[test]
 fn codeigniter_controller_routes_and_loaded_resource_calls_keep_convention_identity() {
     let extracted = extract(

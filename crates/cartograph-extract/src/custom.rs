@@ -885,13 +885,10 @@ fn extract_liquid_tag(
             };
             let module = format!("{folder}/{partner}.liquid");
             let qualified = format!("{}::{command}:{partner}", builder.path());
-            let kind = if command == "section" {
-                SymbolKind::Component
-            } else {
-                SymbolKind::Import
-            };
+            // Every partner tag is both a rendered component and an import
+            // site, as in v1.1.33; the component owns the import reference.
             let id = builder.add_symbol(
-                CustomSymbolInput::new(kind, partner, qualified)
+                CustomSymbolInput::new(SymbolKind::Component, partner, qualified.clone())
                     .at(start, end)
                     .with_options(SymbolOptions {
                         body_search_text: format!("{command} {partner}"),
@@ -903,21 +900,14 @@ fn extract_liquid_tag(
                     .binding(partner, partner)
                     .at(start, end),
             )?;
-            if command == "section" {
-                // Sections are both a rendered component and an import site.
-                builder.add_symbol(
-                    CustomSymbolInput::new(
-                        SymbolKind::Import,
-                        partner,
-                        format!("{}::{command}:{partner}", builder.path()),
-                    )
+            builder.add_symbol(
+                CustomSymbolInput::new(SymbolKind::Import, partner, qualified)
                     .at(start, end)
                     .with_options(SymbolOptions {
                         body_search_text: format!("{command} {partner}"),
                         ..SymbolOptions::default()
                     }),
-                )?;
-            }
+            )?;
         }
         "assign" | "capture" => {
             let Some((_, name)) = first_identifier(remainder) else {
