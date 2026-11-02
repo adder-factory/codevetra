@@ -311,7 +311,7 @@ fn imported_static_calls_target_the_method_and_respect_value_shadowing() {
     targets(
         CapabilityReferenceQuery::new(&facts, run).named("Builder.create", ReferenceKind::Calls),
         capability_symbol(&facts, "src/builder.ts", "Builder::create"),
-        "native-qualified-member",
+        "native-import-binding",
     );
     assert!(
         CapabilityReferenceQuery::new(&facts, run)

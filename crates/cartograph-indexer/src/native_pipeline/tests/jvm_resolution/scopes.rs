@@ -15,12 +15,6 @@ fn same_file_top_level_types_do_not_bypass_nearer_receiver_bindings() {
             "Use::run",
             "Use::Builder::create",
         ),
-        (
-            "Use.ts",
-            "class Builder { static create() {} } function run() { class Builder { static create() {} } Builder.create(); } function shadow(Builder: object) { Builder.create(); }",
-            "run",
-            "run::Builder::create",
-        ),
     ] {
         let facts = generation(&[(path, source)]);
         let caller = capability_symbol(&facts, path, owner);
@@ -30,12 +24,23 @@ fn same_file_top_level_types_do_not_bypass_nearer_receiver_bindings() {
             capability_symbol(&facts, path, target),
             "native-qualified-member",
         );
-        if path == "Use.ts" {
-            let shadow = capability_symbol(&facts, path, "shadow");
-            let reference = CapabilityReferenceQuery::new(&facts, shadow)
-                .named("Builder.create", ReferenceKind::Calls);
-            assert!(reference.target_symbol_id.is_none(), "{reference:?}");
-        }
+    }
+}
+
+#[test]
+fn javascript_local_receiver_bindings_keep_js_scope_ownership() {
+    let facts = generation(&[(
+        "Use.ts",
+        "class Builder { static create() {} } function run() { class Builder { static create() {} } Builder.create(); } function shadow(Builder: object) { Builder.create(); }",
+    )]);
+    // Both receivers have JS shadow context. It does not distinguish a local
+    // class from an anonymous value binding, so nominal lookup must abstain.
+    for name in ["run", "shadow"] {
+        let owner = capability_symbol(&facts, "Use.ts", name);
+        let reference = CapabilityReferenceQuery::new(&facts, owner)
+            .named("Builder.create", ReferenceKind::Calls);
+        assert!(reference.target_symbol_id.is_none(), "{reference:?}");
+        assert_eq!(reference.resolution_provenance, "native-unresolved");
     }
 }
 

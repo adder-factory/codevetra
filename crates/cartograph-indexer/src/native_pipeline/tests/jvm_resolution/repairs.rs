@@ -104,12 +104,12 @@ fn named_imports_cannot_drop_intermediate_receiver_members() {
         CapabilityReferenceQuery::new(&facts, capability_symbol(&facts, "use.ts", "run"))
             .named("Builder.child.create", ReferenceKind::Calls);
     assert!(reference.target_symbol_id.is_none(), "{reference:?}");
-    assert_eq!(reference.resolution_provenance, "native-unresolved-import");
+    assert_eq!(reference.resolution_provenance, "native-dynamic-unresolved");
     targets(
         CapabilityReferenceQuery::new(&facts, capability_symbol(&facts, "use.ts", "direct"))
             .named("Builder.create", ReferenceKind::Calls),
         capability_symbol(&facts, "builder.ts", "Builder::create"),
-        "native-qualified-member",
+        "native-import-binding",
     );
 }
 

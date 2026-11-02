@@ -10,8 +10,9 @@ use super::{
     RESOLUTION_MAP_NODE_ALLOWANCE, ReferenceDispatch, ReferenceResolution, ResolutionCandidate,
     ResolutionIndex, ResolutionRequest, ResolveBudget, ResolvedTarget, StageItemFailure,
     UNRESOLVED_IMPORT_PROVENANCE, binding_matches_reference_name, javascript_family_name,
-    jvm_resolution, nominal_scope_resolution, resolution_candidates_for_file, resolve_reference,
-    select_candidate, unresolved_reference_provenance, usize_to_u64,
+    javascript_member_resolution, jvm_resolution, nominal_scope_resolution,
+    resolution_candidates_for_file, resolve_reference, select_candidate,
+    unresolved_reference_provenance, usize_to_u64,
 };
 
 const MAX_OWNER_HOPS: usize = 64;
@@ -160,6 +161,24 @@ pub(super) fn resolve<Cancel>(
 where
     Cancel: FnMut() -> bool,
 {
+    // JS owns receiver guards and import provenance; this tier only contributes
+    // positive nominal targets after the receiver evidence permits them.
+    let javascript = javascript_family_name(request.language);
+    if javascript && javascript_member_resolution::shadowed_receiver(index, request) {
+        return Ok(None);
+    }
+    let resolution = resolve_nominal(index, request, cancelled)?;
+    Ok(resolution.filter(|resolution| !javascript || resolution.target.is_some()))
+}
+
+fn resolve_nominal<Cancel>(
+    index: &ResolutionIndex,
+    request: &ResolutionRequest<'_>,
+    cancelled: &mut Cancel,
+) -> Result<Option<ReferenceResolution>, StageItemFailure>
+where
+    Cancel: FnMut() -> bool,
+{
     if request.kind != ReferenceKind::Calls || !member_language(request.language) {
         return Ok(None);
     }
@@ -228,6 +247,12 @@ where
             return Err(StageItemFailure);
         }
         if binding.kind == ImportBindingKind::Namespace && binding.local_name == receiver {
+            return Ok(ImportReceiverRoute::Base);
+        }
+        if javascript_family_name(request.language)
+            && binding.kind == ImportBindingKind::Named
+            && binding.local_name == receiver
+        {
             return Ok(ImportReceiverRoute::Base);
         }
         if matches!(
