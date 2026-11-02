@@ -26,6 +26,10 @@ pub enum ExtractionStrategy {
     ShaderFamily,
     /// Ada and VHDL declarations, case-insensitive references, and compilation imports.
     AdaFamily,
+    /// VB.NET block declarations, typed members, `Imports`, and invocation references.
+    VbNetFamily,
+    /// Salesforce Apex: the Java-shaped managed family plus triggers and SOQL/SOSL objects.
+    ApexFamily,
     /// Grammar-backed conservative structural extraction for the remaining v1 language modes.
     GenericStructural,
     /// Bounded native scanners for custom, mixed-markup, and domain-specific v1 modes.
@@ -48,6 +52,8 @@ impl ExtractionStrategy {
                 | Self::JvmDynamicFamily
                 | Self::ShaderFamily
                 | Self::AdaFamily
+                | Self::VbNetFamily
+                | Self::ApexFamily
                 | Self::GenericStructural
                 | Self::CustomStructural
         )
@@ -133,6 +139,8 @@ const fn grammar_strategy(language: SourceLanguage) -> Option<ExtractionStrategy
         | SourceLanguage::Slang => Some(ExtractionStrategy::CFamily),
         SourceLanguage::Wesl | SourceLanguage::Wgsl => Some(ExtractionStrategy::ShaderFamily),
         SourceLanguage::Ada | SourceLanguage::Vhdl => Some(ExtractionStrategy::AdaFamily),
+        SourceLanguage::VbNet => Some(ExtractionStrategy::VbNetFamily),
+        SourceLanguage::Apex => Some(ExtractionStrategy::ApexFamily),
         SourceLanguage::Bash
         | SourceLanguage::Fish
         | SourceLanguage::PowerShell
@@ -148,7 +156,6 @@ const fn grammar_strategy(language: SourceLanguage) -> Option<ExtractionStrategy
 const fn fallback_strategy(language: SourceLanguage) -> ExtractionStrategy {
     match language {
         SourceLanguage::Abap
-        | SourceLanguage::Apex
         | SourceLanguage::ArkTs
         | SourceLanguage::Astro
         | SourceLanguage::Clojure
@@ -173,7 +180,6 @@ const fn fallback_strategy(language: SourceLanguage) -> ExtractionStrategy {
         | SourceLanguage::Solidity
         | SourceLanguage::Sql
         | SourceLanguage::Swift
-        | SourceLanguage::VbNet
         | SourceLanguage::Yaml => ExtractionStrategy::GenericStructural,
         SourceLanguage::Aura
         | SourceLanguage::Bg3Anubis
@@ -236,6 +242,8 @@ mod tests {
             SourceLanguage::Kotlin,
             SourceLanguage::Scala,
             SourceLanguage::Groovy,
+            SourceLanguage::VbNet,
+            SourceLanguage::Apex,
         ] {
             assert!(
                 LanguageSpec::for_language(language)

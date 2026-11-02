@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod ada_family;
+mod apex_family;
 mod c_family;
 mod declarations;
 mod dynamic_dispatch;
@@ -38,6 +39,7 @@ mod shell_family;
 mod sql_family;
 pub(crate) mod syntax;
 mod value_references;
+mod vbnet_family;
 
 use syntax::{
     body_search_text, callable_signature, clone_token_profile, collect_diagnostics, contains_jsx,
@@ -682,6 +684,8 @@ pub(super) struct PendingReference<'tree> {
 #[derive(Clone, Copy)]
 enum ExtractionFamily {
     Ada,
+    Apex,
+    VbNet,
     Shader,
     Shell,
     C,
@@ -720,7 +724,6 @@ const JVM_DYNAMIC_LANGUAGES: &[SourceLanguage] = &[
 ];
 const GENERIC_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::Abap,
-    SourceLanguage::Apex,
     SourceLanguage::ArkTs,
     SourceLanguage::Astro,
     SourceLanguage::Clojure,
@@ -742,7 +745,6 @@ const GENERIC_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::Ruby,
     SourceLanguage::Solidity,
     SourceLanguage::Swift,
-    SourceLanguage::VbNet,
     SourceLanguage::Yaml,
 ];
 const POLYGLOT_LANGUAGES: &[SourceLanguage] = &[
@@ -774,6 +776,20 @@ const fn family_slice_structural(family: ExtractionFamily) -> Option<FamilySlice
             visit_declaration: ada_family::visit_declaration,
             visit_usage: |builder, node, depth| {
                 ada_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        ExtractionFamily::Apex => FamilySlice {
+            visit_declaration: apex_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                apex_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        ExtractionFamily::VbNet => FamilySlice {
+            visit_declaration: vbnet_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                vbnet_family::capture_usage(builder, node)?;
                 builder.visit_named_children(node, depth)
             },
         },
@@ -890,6 +906,8 @@ fn extraction_family(language: SourceLanguage) -> ExtractionFamily {
             SourceLanguage::Wesl | SourceLanguage::Wgsl => ExtractionFamily::Shader,
             SourceLanguage::Prisma => ExtractionFamily::Prisma,
             SourceLanguage::Sql => ExtractionFamily::Sql,
+            SourceLanguage::VbNet => ExtractionFamily::VbNet,
+            SourceLanguage::Apex => ExtractionFamily::Apex,
             _ => ExtractionFamily::Unsupported,
         }
     }
