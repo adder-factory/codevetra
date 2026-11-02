@@ -98,6 +98,14 @@ pub struct ExtractedFile {
     pub containments: Vec<Containment>,
     /// Source-ordered unresolved structural references.
     pub references: Vec<ExtractedReference>,
+    /// Syntax-proven value shadows or object declarations that forbid a
+    /// nominal receiver or constructor interpretation at the recorded span.
+    /// Kept separate so source-visible reference lookup identities remain stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolution_abstentions: Vec<SourceSpan>,
+    /// Java local type declarations paired with their exact enclosing block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_type_scopes: Vec<(SourceSpan, SourceSpan)>,
     /// Source-ordered, privacy-safe static numerical evidence sites.
     pub numerical_sites: Vec<ExtractedNumericalSite>,
     /// Source-ordered ES module bindings used by project-wide resolution.

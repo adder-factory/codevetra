@@ -1,5 +1,9 @@
+mod jvm_nested_resolution;
+mod jvm_resolution;
+mod nominal_scope_resolution;
 mod pascal_resolution;
 mod php_resolution;
+mod qualified_member_resolution;
 mod scip_spill;
 mod script_modules;
 
@@ -4772,6 +4776,8 @@ struct NativeFileFacts {
     symbols: Vec<NativeSymbolFacts>,
     containments: Vec<Containment>,
     references: Vec<ExtractedReference>,
+    resolution_abstentions: Vec<SourceSpan>,
+    local_type_scopes: Vec<(SourceSpan, SourceSpan)>,
     numerical_sites: Vec<ExtractedNumericalSite>,
     import_bindings: Vec<ExtractedImportBinding>,
     has_inline_tests: bool,
@@ -4792,6 +4798,8 @@ impl NativeFileFacts {
             symbols,
             containments,
             references,
+            resolution_abstentions,
+            local_type_scopes,
             numerical_sites,
             import_bindings,
             has_inline_tests,
@@ -4819,6 +4827,8 @@ impl NativeFileFacts {
             symbols: normalized_symbols,
             containments,
             references,
+            resolution_abstentions,
+            local_type_scopes,
             numerical_sites,
             import_bindings,
             has_inline_tests,
@@ -4833,6 +4843,8 @@ impl NativeFileFacts {
             .saturating_add(vector_capacity_bytes(&self.symbols))
             .saturating_add(vector_capacity_bytes(&self.containments))
             .saturating_add(vector_capacity_bytes(&self.references))
+            .saturating_add(vector_capacity_bytes(&self.resolution_abstentions))
+            .saturating_add(vector_capacity_bytes(&self.local_type_scopes))
             .saturating_add(vector_capacity_bytes(&self.numerical_sites))
             .saturating_add(vector_capacity_bytes(&self.import_bindings))
             .saturating_add(usize_to_u64(self.test_search_text.capacity()));
@@ -5099,6 +5111,8 @@ struct ResolutionCandidate {
     export: SymbolExportFlags,
     top_level: bool,
     augmentation: bool,
+    static_member: bool,
+    declaration_span: (u64, u64),
 }
 
 #[derive(Clone)]
@@ -5229,6 +5243,8 @@ struct ResolutionIndex {
     rust_named_re_exports: Vec<RustNamedReExport>,
     test_files: Vec<TestFileEvidence>,
     php: php_resolution::PhpResolutionIndex,
+    jvm: jvm_resolution::JvmResolutionIndex,
+    types: qualified_member_resolution::TypeIndex,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -9755,7 +9771,7 @@ where
     }
     order.sort_unstable();
     index.candidate_order = order;
-    Ok(())
+    jvm_resolution::prepare_wildcards(&mut ResolutionIndexTarget { index, budget }, cancelled)
 }
 
 fn ordered_resolution_candidates(
@@ -10406,6 +10422,7 @@ where
         if symbol.input.symbol_kind == "import" {
             continue;
         }
+        qualified_member_resolution::index_type(&mut index.types, symbol, budget)?;
         let parent_symbol_id = index.parents.get(&symbol.input.symbol_id).cloned();
         index_compilation_unit(
             &mut index.modules,
@@ -10444,12 +10461,18 @@ where
             index_project_export(&mut index.exports, symbol, budget)?;
         }
     }
+    qualified_member_resolution::index_ancestors(index, file, cancelled)?;
     php_resolution::index_file(
         php_resolution::PhpFileIndexInput {
             index: &mut index.php,
             file,
             budget,
         },
+        cancelled,
+    )?;
+    jvm_resolution::index_file(
+        &mut ResolutionIndexTarget { index, budget },
+        file,
         cancelled,
     )?;
     index_project_reexports(index, file, budget)
@@ -10467,10 +10490,12 @@ fn push_symbol_candidates(
     let qualified_name = insertion.symbol.input.qualified_name.as_str();
     let alias = framework_resolution_alias(insertion.symbol, insertion.language)
         .filter(|alias| *alias != name && *alias != qualified_name);
+    let jvm_alias = jvm_resolution::candidate_alias(insertion)?;
     let keys = [
         Some(name),
         (qualified_name != name).then_some(qualified_name),
         alias,
+        jvm_alias.as_deref(),
     ];
     for key in keys.into_iter().flatten() {
         push_candidate(
@@ -11012,6 +11037,14 @@ where
         reference,
         import_binding_scratch,
     } = query;
+    if jvm_resolution::reference_abstains(index, (&context.identity.file_id, reference.span))
+        || reference
+            .resolution_name
+            .as_deref()
+            .is_some_and(jvm_resolution::syntax_abstention)
+    {
+        return Ok(ReferenceResolution::unresolved(UNRESOLVED_PROVENANCE));
+    }
     let lookup = ReferenceLookup::classify(reference);
     let mut resolution = if lookup.rust_macro_name.is_some() {
         ReferenceResolution::unresolved(RUST_MACRO_UNRESOLVED_PROVENANCE)
@@ -11045,8 +11078,10 @@ where
                     file_id: &context.identity.file_id,
                     file_path: &context.identity.path,
                     language: &context.identity.language,
-                    import_bindings: import_binding_scratch
-                        .select(context.import_bindings, lookup.lookup_name),
+                    import_bindings: jvm_resolution::select_import_bindings(
+                        (context, &lookup, reference.kind),
+                        import_binding_scratch,
+                    ),
                     owner: reference.owner.as_ref(),
                     name: lookup.lookup_name,
                     dispatch: lookup.dispatch(),
@@ -11101,6 +11136,8 @@ impl ResolutionOutput<'_> {
             symbols,
             containments,
             references,
+            resolution_abstentions: _,
+            local_type_scopes: _,
             numerical_sites,
             import_bindings,
             has_inline_tests: _,
@@ -11262,7 +11299,11 @@ impl ResolutionOutput<'_> {
             .unwrap_or_else(|| context.file_symbol_id.clone());
         if let Some(target) = resolution.target.as_ref()
             && source_symbol_id != target.symbol_id
-            && let Some(edge_kind) = reference_edge_kind(reference.kind, target.kind)
+            && let Some(edge_kind) = reference_edge_kind(
+                reference.kind,
+                target.kind,
+                self.index.types.kind(&source_symbol_id),
+            )
         {
             self.facts.edges.push(EdgeInput {
                 source_symbol_id,
@@ -11767,6 +11808,8 @@ fn push_candidate(
         export: symbol.export,
         top_level: symbol.input.qualified_name == symbol.name,
         augmentation: symbol.augmentation,
+        static_member: symbol.execution.static_member,
+        declaration_span: (symbol.input.start_byte, symbol.input.end_byte),
     });
     append_candidate_project_index(bucket, language, reservation)?;
     append_candidate_file_range(bucket, file_ordinal, reservation)
@@ -11995,6 +12038,8 @@ fn push_default_export(
         export: symbol.export,
         top_level: symbol.input.qualified_name == symbol.name,
         augmentation: symbol.augmentation,
+        static_member: symbol.execution.static_member,
+        declaration_span: (symbol.input.start_byte, symbol.input.end_byte),
     });
     Ok(())
 }
@@ -12435,6 +12480,12 @@ where
         return resolve_def_use(index, request, cancelled);
     }
     if let Some(resolution) = resolve_terraform_address(index, request, cancelled)? {
+        return Ok(resolution);
+    }
+    if let Some(resolution) = qualified_member_resolution::resolve(index, request, cancelled)? {
+        return Ok(resolution);
+    }
+    if let Some(resolution) = jvm_resolution::resolve_reference(index, request, cancelled)? {
         return Ok(resolution);
     }
     if let Some(resolution) = resolve_declaration_reference(index, request, cancelled)? {
@@ -16364,6 +16415,7 @@ fn c_include_family_name(language: &str) -> bool {
 
 fn resolution_languages_compatible(source: &str, target: &str) -> bool {
     source == target
+        || (jvm_resolution::language(source) && jvm_resolution::language(target))
         || (javascript_family_name(source) && javascript_family_name(target))
         || (matches!(source, "svelte" | "vue" | "astro" | "html") && javascript_family_name(target))
         || (javascript_family_name(source) && matches!(target, "svelte" | "vue" | "astro"))
@@ -16463,13 +16515,13 @@ const REFERENCE_EDGE_KINDS: &[(ReferenceKind, EdgeKind)] = &[
     (ReferenceKind::DefUse, EdgeKind::DefUse),
 ];
 
-fn reference_edge_kind(kind: ReferenceKind, target_kind: SymbolKind) -> Option<EdgeKind> {
+fn reference_edge_kind(
+    kind: ReferenceKind,
+    target_kind: SymbolKind,
+    source_kind: Option<SymbolKind>,
+) -> Option<EdgeKind> {
     if kind == ReferenceKind::Inherits {
-        match target_kind {
-            SymbolKind::Interface | SymbolKind::Trait => Some(EdgeKind::Implements),
-            SymbolKind::Class | SymbolKind::Struct => Some(EdgeKind::Extends),
-            _ => None,
-        }
+        qualified_member_resolution::inheritance_edge_kind(target_kind, source_kind)
     } else {
         REFERENCE_EDGE_KINDS
             .iter()
@@ -16715,6 +16767,7 @@ fn usize_to_u64(value: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     mod javascript_parity;
+    mod jvm_resolution;
     mod pascal_units;
     mod php_namespaces;
     mod polyglot_parity;
@@ -23615,6 +23668,8 @@ export function secondClone(value: number) {
                     export: SymbolExportFlags::named(true),
                     top_level: true,
                     augmentation: false,
+                    static_member: false,
+                    declaration_span: (0, 0),
                 }
             })
             .collect::<Vec<_>>();

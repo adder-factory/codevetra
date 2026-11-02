@@ -1,5 +1,7 @@
 use std::mem::size_of;
 
+use cartograph_domain::SourceSpan;
+
 use crate::{
     Containment, ExtractError, ExtractedFile, ExtractedImportBinding, ExtractedNumericalSite,
     ExtractedReference, ExtractedSymbol, ExtractionDiagnostic, SourceSnapshot,
@@ -179,6 +181,16 @@ impl ExtractedFile {
                 self.references.iter().try_fold(bytes, |total, reference| {
                     total.checked_add(reference_string_bytes(reference))
                 })
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(vector_bytes::<SourceSpan>(
+                    self.resolution_abstentions.capacity(),
+                ))
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(vector_bytes::<(SourceSpan, SourceSpan)>(
+                    self.local_type_scopes.capacity(),
+                ))
             })
             .and_then(|bytes| {
                 bytes.checked_add(vector_bytes::<ExtractedNumericalSite>(

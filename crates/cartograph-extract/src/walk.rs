@@ -42,10 +42,12 @@ mod javascript_scopes;
 mod javascript_state;
 mod javascript_types;
 mod jvm_dynamic_family;
+mod jvm_type_lookup;
 mod lean_family;
 mod lisp_family;
 mod lua_family;
 mod managed_family;
+mod managed_value_lookup;
 mod module_system;
 mod nix_family;
 mod numerical;
@@ -304,6 +306,8 @@ fn finish_extraction(
         symbols: builder.facts.symbols,
         containments: builder.facts.containments,
         references: builder.facts.references,
+        resolution_abstentions: builder.facts.resolution_abstentions,
+        local_type_scopes: builder.facts.local_type_scopes,
         numerical_sites: builder.facts.numerical_sites,
         import_bindings: builder.facts.import_bindings,
         has_inline_tests,
@@ -618,6 +622,8 @@ struct ExtractionFacts {
     symbols: Vec<ExtractedSymbol>,
     containments: Vec<Containment>,
     references: Vec<ExtractedReference>,
+    resolution_abstentions: Vec<cartograph_domain::SourceSpan>,
+    local_type_scopes: Vec<(cartograph_domain::SourceSpan, cartograph_domain::SourceSpan)>,
     numerical_sites: Vec<crate::ExtractedNumericalSite>,
     import_bindings: Vec<ExtractedImportBinding>,
 }
