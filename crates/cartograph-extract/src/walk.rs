@@ -28,6 +28,7 @@ mod jvm_dynamic_family;
 mod managed_family;
 mod module_system;
 mod numerical;
+mod objc_family;
 mod polyglot;
 mod prisma_family;
 mod references;
@@ -36,6 +37,7 @@ mod schema;
 mod shader_family;
 mod shell_family;
 mod sql_family;
+mod swift_family;
 pub(crate) mod syntax;
 mod value_references;
 
@@ -83,6 +85,7 @@ pub(crate) struct WalkInput<'tree> {
     root: Node<'tree>,
     parse_status: FileParseStatus,
     maximum_ast_depth: usize,
+    syntax_source: Option<&'tree str>,
 }
 
 impl<'tree> WalkInput<'tree> {
@@ -95,13 +98,23 @@ impl<'tree> WalkInput<'tree> {
             root,
             parse_status,
             maximum_ast_depth,
+            syntax_source: None,
+        }
+    }
+
+    /// The text the tree was parsed from when a span-preserving pre-parse
+    /// rewrite changed it; every byte offset still addresses the snapshot.
+    pub(crate) const fn with_syntax_source(self, syntax_source: &'tree str) -> Self {
+        Self {
+            syntax_source: Some(syntax_source),
+            ..self
         }
     }
 }
 
-pub(crate) fn extract(
-    snapshot: &SourceSnapshot,
-    input: WalkInput<'_>,
+pub(crate) fn extract<'source>(
+    snapshot: &'source SourceSnapshot,
+    input: WalkInput<'source>,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<ExtractedFile, ExtractError> {
     let strategy = LanguageSpec::for_language(snapshot.language()).strategy();
@@ -109,6 +122,9 @@ pub(crate) fn extract(
         return Err(ExtractError::UnsupportedLanguage);
     }
     let mut builder = ExtractionBuilder::new(snapshot, input.maximum_ast_depth, cancelled)?;
+    if let Some(syntax_source) = input.syntax_source {
+        builder.context.source = syntax_source;
+    }
     if strategy != ExtractionStrategy::ParserOnly {
         enrich_extraction(&mut builder, input.root)?;
     }
@@ -465,6 +481,9 @@ fn owner_for_node(builder: &ExtractionBuilder<'_, '_>, node: Node<'_>) -> Option
 
 struct ExtractionContext<'source, 'cancel> {
     snapshot: &'source SourceSnapshot,
+    /// Text the walker reads: the snapshot itself, or its span-preserving
+    /// pre-parse rewrite. Framework enrichment always reads the snapshot.
+    source: &'source str,
     cancelled: &'cancel mut dyn FnMut() -> bool,
     budget: ExtractionBudget,
 }
@@ -682,6 +701,8 @@ pub(super) struct PendingReference<'tree> {
 #[derive(Clone, Copy)]
 enum ExtractionFamily {
     Ada,
+    Objc,
+    Swift,
     Shader,
     Shell,
     C,
@@ -734,14 +755,12 @@ const GENERIC_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::Lua,
     SourceLanguage::Luau,
     SourceLanguage::Nix,
-    SourceLanguage::ObjectiveC,
     SourceLanguage::Pascal,
     SourceLanguage::Php,
     SourceLanguage::R,
     SourceLanguage::ReScript,
     SourceLanguage::Ruby,
     SourceLanguage::Solidity,
-    SourceLanguage::Swift,
     SourceLanguage::VbNet,
     SourceLanguage::Yaml,
 ];
@@ -774,6 +793,20 @@ const fn family_slice_structural(family: ExtractionFamily) -> Option<FamilySlice
             visit_declaration: ada_family::visit_declaration,
             visit_usage: |builder, node, depth| {
                 ada_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        ExtractionFamily::Objc => FamilySlice {
+            visit_declaration: objc_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                objc_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        ExtractionFamily::Swift => FamilySlice {
+            visit_declaration: swift_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                swift_family::capture_usage(builder, node)?;
                 builder.visit_named_children(node, depth)
             },
         },
@@ -887,6 +920,8 @@ fn extraction_family(language: SourceLanguage) -> ExtractionFamily {
     } else {
         match language {
             SourceLanguage::GraphQl => ExtractionFamily::GraphQl,
+            SourceLanguage::ObjectiveC => ExtractionFamily::Objc,
+            SourceLanguage::Swift => ExtractionFamily::Swift,
             SourceLanguage::Wesl | SourceLanguage::Wgsl => ExtractionFamily::Shader,
             SourceLanguage::Prisma => ExtractionFamily::Prisma,
             SourceLanguage::Sql => ExtractionFamily::Sql,
@@ -1211,9 +1246,7 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
         let span = span_for(pending.span_node)?;
         let docstring = self.context.jsdoc(pending.doc_anchor)?;
         let body_search = match pending.body_node {
-            Some(body) => {
-                body_search_text(body, self.context.snapshot.source(), self.context.cancelled)?
-            }
+            Some(body) => body_search_text(body, self.context.source, self.context.cancelled)?,
             None => syntax::BodySearchText::default(),
         };
         let health = syntax::symbol_health_metrics(
@@ -1226,13 +1259,13 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
                 docstring: docstring.as_deref(),
                 language: self.context.snapshot.language(),
                 async_symbol: pending.async_symbol,
-                source: self.context.snapshot.source(),
+                source: self.context.source,
             },
             self.context.cancelled,
         )?;
         let structural_digest = structural_digest(
             pending.structural_node,
-            self.context.snapshot.source(),
+            self.context.source,
             self.context.cancelled,
         )?;
         let clone_shape_digest =
@@ -1244,7 +1277,7 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
         .then(|| {
             clone_token_profile(
                 pending.structural_node,
-                self.context.snapshot.source(),
+                self.context.source,
                 self.context.cancelled,
             )
         })
@@ -1436,6 +1469,7 @@ impl<'source, 'cancel> ExtractionContext<'source, 'cancel> {
     ) -> Result<Self, ExtractError> {
         Ok(Self {
             snapshot,
+            source: snapshot.source(),
             cancelled,
             budget: ExtractionBudget::new(snapshot)?,
         })
@@ -1449,8 +1483,8 @@ impl<'source, 'cancel> ExtractionContext<'source, 'cancel> {
         }
     }
 
-    fn source(&self) -> &str {
-        self.snapshot.source()
+    const fn source(&self) -> &'source str {
+        self.source
     }
 
     fn owned_text(&mut self, node: Node<'_>) -> Result<String, ExtractError> {
@@ -1480,7 +1514,7 @@ impl<'source, 'cancel> ExtractionContext<'source, 'cancel> {
     }
 
     fn callable_signature(&mut self, node: Node<'_>) -> Result<Option<String>, ExtractError> {
-        let source = self.snapshot.source();
+        let source = self.source;
         let signature = callable_signature(node, source, &mut *self.cancelled)?;
         if let Some(value) = &signature {
             self.budget.ensure_string_length(value.len())?;
@@ -1511,7 +1545,7 @@ impl<'source, 'cancel> ExtractionContext<'source, 'cancel> {
         if self.snapshot.language() == SourceLanguage::GraphQl {
             return graphql_family::description_from_context(self, node);
         }
-        let source = self.snapshot.source();
+        let source = self.source;
         let docstring = jsdoc(node, source, &mut *self.cancelled)?;
         if let Some(value) = &docstring {
             self.budget.ensure_string_length(value.len())?;

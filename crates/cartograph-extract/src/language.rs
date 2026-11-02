@@ -26,6 +26,10 @@ pub enum ExtractionStrategy {
     ShaderFamily,
     /// Ada and VHDL declarations, case-insensitive references, and compilation imports.
     AdaFamily,
+    /// Objective-C classes, protocols, full-selector methods, message sends, and the C subset.
+    ObjcFamily,
+    /// Swift type kinds, members, visibility, and parameter/return type references.
+    SwiftFamily,
     /// Grammar-backed conservative structural extraction for the remaining v1 language modes.
     GenericStructural,
     /// Bounded native scanners for custom, mixed-markup, and domain-specific v1 modes.
@@ -48,6 +52,8 @@ impl ExtractionStrategy {
                 | Self::JvmDynamicFamily
                 | Self::ShaderFamily
                 | Self::AdaFamily
+                | Self::ObjcFamily
+                | Self::SwiftFamily
                 | Self::GenericStructural
                 | Self::CustomStructural
         )
@@ -133,6 +139,8 @@ const fn grammar_strategy(language: SourceLanguage) -> Option<ExtractionStrategy
         | SourceLanguage::Slang => Some(ExtractionStrategy::CFamily),
         SourceLanguage::Wesl | SourceLanguage::Wgsl => Some(ExtractionStrategy::ShaderFamily),
         SourceLanguage::Ada | SourceLanguage::Vhdl => Some(ExtractionStrategy::AdaFamily),
+        SourceLanguage::ObjectiveC => Some(ExtractionStrategy::ObjcFamily),
+        SourceLanguage::Swift => Some(ExtractionStrategy::SwiftFamily),
         SourceLanguage::Bash
         | SourceLanguage::Fish
         | SourceLanguage::PowerShell
@@ -163,7 +171,6 @@ const fn fallback_strategy(language: SourceLanguage) -> ExtractionStrategy {
         | SourceLanguage::Lua
         | SourceLanguage::Luau
         | SourceLanguage::Nix
-        | SourceLanguage::ObjectiveC
         | SourceLanguage::Pascal
         | SourceLanguage::Php
         | SourceLanguage::Prisma
@@ -172,7 +179,6 @@ const fn fallback_strategy(language: SourceLanguage) -> ExtractionStrategy {
         | SourceLanguage::Ruby
         | SourceLanguage::Solidity
         | SourceLanguage::Sql
-        | SourceLanguage::Swift
         | SourceLanguage::VbNet
         | SourceLanguage::Yaml => ExtractionStrategy::GenericStructural,
         SourceLanguage::Aura
