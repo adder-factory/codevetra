@@ -1,6 +1,7 @@
 //! Framework bindings must identify one target and preserve uncertainty.
 
 mod repairs;
+mod routes;
 
 use super::*;
 
