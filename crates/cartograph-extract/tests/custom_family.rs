@@ -264,6 +264,68 @@ fn vb6_declare_routines_are_imports_and_bare_statements_are_calls() {
 }
 
 #[test]
+fn vb6_containers_start_with_the_file_and_withevents_fields_keep_their_names() {
+    // The module/class/form is the whole file: its symbol starts on line 1
+    // (the designer header belongs to it), so every member lies inside it.
+    let form = "VERSION 5.00\nBegin VB.Form frmMain\n   Caption = \"Billing\"\nEnd\nAttribute VB_Name = \"frmMain\"\nOption Explicit\n\nPrivate WithEvents mCustomer As Customer\nDim WithEvents mTimer As Timer\n\nPrivate Sub Form_Load()\n    mCustomer.Load\nEnd Sub\n";
+    let extracted = extract_vb6("legacy/frmMain.frm", form);
+    let symbol = |kind: SymbolKind, name: &str| {
+        extracted
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == kind && symbol.qualified_name == name)
+            .unwrap_or_else(|| panic!("missing {kind:?} {name}: {:?}", extracted.symbols))
+    };
+    let container = symbol(SymbolKind::Component, "frmMain");
+    assert_eq!(container.span.start_line(), 1);
+    let field = symbol(SymbolKind::Field, "frmMain::mCustomer");
+    assert_eq!(field.span.start_line(), 8);
+    symbol(SymbolKind::Field, "frmMain::mTimer");
+    for member in extracted
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.id != container.id)
+    {
+        assert!(
+            container.span.start_byte() <= member.span.start_byte()
+                && member.span.end_byte() <= container.span.end_byte(),
+            "{} lies outside its container",
+            member.qualified_name
+        );
+    }
+    assert!(
+        extracted
+            .symbols
+            .iter()
+            .all(|symbol| !symbol.name.eq_ignore_ascii_case("WithEvents")),
+        "the WithEvents modifier became a symbol: {:?}",
+        extracted.symbols
+    );
+
+    let class = extract_vb6(
+        "legacy/Customer.cls",
+        "VERSION 1.0 CLASS\nBEGIN\n  MultiUse = -1  'True\nEND\nAttribute VB_Name = \"Customer\"\nPublic Balance As Currency\n",
+    );
+    let customer = class
+        .symbols
+        .iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class && symbol.name == "Customer")
+        .unwrap_or_else(|| panic!("missing class: {:?}", class.symbols));
+    assert_eq!(customer.span.start_line(), 1);
+}
+
+/// Extract one VB6 source through the production entry points.
+fn extract_vb6(path: &str, source: &str) -> cartograph_extract::ExtractedFile {
+    let snapshot = SourceSnapshot::from_bytes(path, source.as_bytes(), limits())
+        .unwrap_or_else(|error| panic!("VB6 snapshot failed: {error}"));
+    assert_eq!(snapshot.language(), SourceLanguage::Vb6);
+    NativeExtractor::new(SourceLanguage::Vb6)
+        .unwrap_or_else(|error| panic!("VB6 extractor failed: {error}"))
+        .extract(&snapshot)
+        .unwrap_or_else(|error| panic!("VB6 extraction failed: {error}"))
+}
+
+#[test]
 fn vb6_calls_ignore_string_contents_and_keep_member_and_rhs_calls() {
     let source = "Attribute VB_Name = \"Module1\"\nPublic Sub Run()\n    MsgBox \"Use (Fake) it's quoted\"\n    obj.Save arg\n    total = Other(i)\n    Me.Caption = \"y\"\n    Retry:\n    Notify \"x\" ' Trailing(comment)\n    Rem Remark(ignored) entirely\n    Primary Nested(i)\n    Call form.Submit(1)\nEnd Sub\n";
     let snapshot = SourceSnapshot::from_bytes("legacy/Module1.bas", source.as_bytes(), limits())

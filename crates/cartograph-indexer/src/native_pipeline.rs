@@ -16533,7 +16533,7 @@ mod tests {
         (28, 259, 281, 134, 259);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
     const EXPECTED_CUSTOM_FAMILY_DIGEST: &str =
-        "f163e4b694db4069c989cb4828889562976005480f3e9dd3e28cf7b42d6e5557";
+        "e011a84ff7df7bf2664eb5c12d883ae7ac3d851acbbce4f2ca58e52e2605afe3";
     const EXPECTED_CUSTOM_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
         (13, 49, 44, 32, 49);
     const CUSTOM_FAMILY_FIXTURES: [(&str, &str, SourceLanguage); CUSTOM_FAMILY_FILE_COUNT] = [

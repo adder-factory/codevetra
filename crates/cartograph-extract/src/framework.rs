@@ -2189,7 +2189,16 @@ fn play_route(line: &str) -> Option<RouteMatch<'_>> {
         return None;
     }
     let path = parts.next()?;
-    let handler = parts.next();
+    // A handler may declare its parameters (`Users.show(id: Long)`) or an empty
+    // list (`Users.create()`); the action is the text before the list.
+    let handler = parts
+        .next()
+        .map(|handler| {
+            handler
+                .split_once('(')
+                .map_or(handler, |(action, _)| action)
+        })
+        .filter(|action| !action.is_empty());
     let path_start = indent + trimmed.find(path)?;
     Some(RouteMatch {
         method,

@@ -925,6 +925,125 @@ public class OrdersController {
 }
 
 #[test]
+fn class_level_mappings_never_become_constructor_routes() {
+    // A Kotlin primary constructor sits between the class annotations and the
+    // class body, so the class-level `@RequestMapping` used to be read as the
+    // constructor's own mapping and published as `ANY /users/users`.
+    let kotlin = extract(
+        "src/UserController.kt",
+        r#"
+import org.springframework.web.bind.annotation.GetMapping
+import org.springframework.web.bind.annotation.RequestMapping
+
+@RestController
+@RequestMapping("/users")
+class UserController(private val userService: UserService) {
+    @GetMapping("/{id}")
+    fun show(id: String): String = id
+}
+"#,
+        SourceLanguage::Kotlin,
+    );
+    let kotlin_routes = route_names(&kotlin);
+    assert_eq!(kotlin_routes, ["GET /users/{id}"], "{kotlin_routes:?}");
+
+    let aspnet = extract(
+        "Controllers/OrdersController.cs",
+        r#"
+[Route("api/[controller]")]
+public class OrdersController(IOrderService orders) : ControllerBase {
+  [HttpGet("{id}")]
+  public void GetOne() {}
+}
+"#,
+        SourceLanguage::CSharp,
+    );
+    let aspnet_routes = route_names(&aspnet);
+    assert_eq!(aspnet_routes, ["GET /api/Orders/{id}"], "{aspnet_routes:?}");
+
+    // A body method that happens to share the class name is still a handler.
+    let java = extract(
+        "src/Orders.java",
+        "@RequestMapping(value = {\"/x\"})\nclass Orders {\n  @GetMapping(\"/same\")\n  public String Orders() { return \"\"; }\n}\n",
+        SourceLanguage::Java,
+    );
+    assert_eq!(route_names(&java), ["GET /same"]);
+    let kotlin_body = extract(
+        "src/Orders.kt",
+        "@RequestMapping(\"/o\")\nclass Orders /* don't { */ {\n    @GetMapping(\"/same\")\n    fun Orders(): String = \"\"\n}\n",
+        SourceLanguage::Kotlin,
+    );
+    assert_eq!(route_names(&kotlin_body), ["GET /o/same"]);
+}
+
+#[test]
+fn pathless_method_mappings_are_located_at_their_own_annotation() {
+    // `[HttpPost]` / `@GetMapping` without a path inherit the class path, but
+    // the route is declared by the method's annotation, not the class's.
+    let aspnet = extract(
+        "Controllers/OrdersController.cs",
+        "[Route(\"api/[controller]\")]\npublic class OrdersController : ControllerBase {\n  [HttpGet(\"{id}\")]\n  public void GetOne() {}\n\n  [HttpPost]\n  public void Create() {}\n}\n",
+        SourceLanguage::CSharp,
+    );
+    assert_eq!(
+        route_lines(&aspnet),
+        [("GET /api/Orders/{id}", 3), ("POST /api/Orders", 6)]
+    );
+    let spring = extract(
+        "src/OrdersController.java",
+        "@RequestMapping(\"/api\")\npublic class OrdersController {\n  @GetMapping\n  public void list() {}\n\n  @PostMapping()\n  public void create() {}\n}\n",
+        SourceLanguage::Java,
+    );
+    assert_eq!(route_lines(&spring), [("GET /api", 3), ("POST /api", 6)]);
+}
+
+#[test]
+fn play_route_handlers_keep_their_controller_action_with_arguments() {
+    // Play handlers may declare their parameters (`show(id: Long)`, which also
+    // splits on the space) or an empty list (`create()`); the action is the
+    // same per-file handler reference either way.
+    let extracted = extract(
+        "conf/routes",
+        "GET     /                       controllers.HomeController.index\nGET     /users/:id              controllers.Users.show(id: Long)\nPOST    /users                  controllers.Users.create()\n",
+        SourceLanguage::Yaml,
+    );
+    let handlers = extracted
+        .references
+        .iter()
+        .filter(|reference| reference.kind == ReferenceKind::Calls)
+        .map(|reference| (reference.name.as_str(), reference.span.start_line()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        handlers,
+        [
+            ("controllers.HomeController.index", 1),
+            ("controllers.Users.show", 2),
+            ("controllers.Users.create", 3),
+        ]
+    );
+}
+
+/// Route symbol names and start lines of one extraction, in source order.
+fn route_lines(extracted: &cartograph_extract::ExtractedFile) -> Vec<(&str, u32)> {
+    extracted
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Route)
+        .map(|symbol| (symbol.name.as_str(), symbol.span.start_line()))
+        .collect()
+}
+
+/// Route symbol names of one extraction, in source order.
+fn route_names(extracted: &cartograph_extract::ExtractedFile) -> Vec<&str> {
+    extracted
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Route)
+        .map(|symbol| symbol.name.as_str())
+        .collect()
+}
+
+#[test]
 fn rails_routes_expand_resources_compose_namespaces_and_keep_handler_identity() {
     let extracted = extract(
         "config/routes.rb",

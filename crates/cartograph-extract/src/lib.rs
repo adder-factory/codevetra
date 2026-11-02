@@ -2,6 +2,7 @@
 
 mod bounded_name;
 mod budget;
+mod code_scan;
 mod custom;
 mod discovery;
 mod discovery_policy;
