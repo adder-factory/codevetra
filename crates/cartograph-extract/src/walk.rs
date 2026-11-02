@@ -18,9 +18,11 @@ use crate::{
 };
 
 mod ada_family;
+mod astro_family;
 mod c_family;
 mod declarations;
 mod dynamic_dispatch;
+pub(crate) mod embedded_script;
 mod embedded_sql;
 mod generic_family;
 mod graphql_family;
@@ -120,9 +122,25 @@ fn enrich_extraction(
     builder: &mut ExtractionBuilder<'_, '_>,
     root: Node<'_>,
 ) -> Result<(), ExtractError> {
-    module_system::collect_explicit_exports(builder, root)?;
-    shader_family::collect_wesl_imports(builder)?;
+    prepare_extraction(builder, root)?;
     builder.visit(root, 0)?;
+    enrich_visited(builder, root)
+}
+
+/// Module facts that must be known before any declaration is emitted.
+fn prepare_extraction(
+    builder: &mut ExtractionBuilder<'_, '_>,
+    root: Node<'_>,
+) -> Result<(), ExtractError> {
+    module_system::collect_explicit_exports(builder, root)?;
+    shader_family::collect_wesl_imports(builder)
+}
+
+/// Enrichers that read the declarations the visit emitted.
+fn enrich_visited(
+    builder: &mut ExtractionBuilder<'_, '_>,
+    root: Node<'_>,
+) -> Result<(), ExtractError> {
     numerical::enrich(builder, root)?;
     dynamic_dispatch::enrich(builder, root)?;
     schema::enrich(builder, root)?;
@@ -155,6 +173,7 @@ fn collect_extraction_diagnostics(
             span: None,
         });
     }
+    diagnostics.append(&mut builder.embedded.diagnostics);
     for _ in &diagnostics {
         builder
             .context
@@ -172,6 +191,19 @@ fn finish_extraction(
     let snapshot = builder.context.snapshot;
     let output_limit = builder.context.budget.output_limit();
     let has_inline_tests = has_inline_tests(&mut builder, input.root)?;
+    // An embedded script region that failed to parse, or a template
+    // expression too deep to walk, leaves a diagnostic even when the host
+    // grammar parsed cleanly; such a file is partial.
+    let parse_status = if diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.code,
+            DiagnosticCode::SyntaxError | DiagnosticCode::NestingLimitExceeded
+        )
+    }) {
+        FileParseStatus::Partial
+    } else {
+        input.parse_status
+    };
     let file = ExtractedFile {
         file_id: snapshot.file_id().clone(),
         path: snapshot.path().clone(),
@@ -179,7 +211,7 @@ fn finish_extraction(
         content_hash: snapshot.content_hash().clone(),
         byte_size: snapshot.byte_size(),
         line_count: snapshot.line_count(),
-        parse_status: input.parse_status,
+        parse_status,
         symbols: builder.facts.symbols,
         containments: builder.facts.containments,
         references: builder.facts.references,
@@ -320,6 +352,8 @@ struct ExtractionBuilder<'source, 'cancel> {
     /// Whether any synthesized name exceeded its canonical bound and had to be
     /// deterministically shortened for this file.
     shortened_canonical_names: bool,
+    /// Embedded-region state; empty for a standalone file.
+    embedded: embedded_script::EmbeddedScope,
 }
 
 fn visit_container(
@@ -461,6 +495,7 @@ fn owner_for_node(builder: &ExtractionBuilder<'_, '_>, node: Node<'_>) -> Option
                 .saturating_sub(symbol.span.start_byte())
         })
         .map(|symbol| symbol.id.clone())
+        .or_else(|| builder.embedded.module_owner(&builder.owners))
 }
 
 struct ExtractionContext<'source, 'cancel> {
@@ -682,6 +717,7 @@ pub(super) struct PendingReference<'tree> {
 #[derive(Clone, Copy)]
 enum ExtractionFamily {
     Ada,
+    Astro,
     Shader,
     Shell,
     C,
@@ -722,7 +758,6 @@ const GENERIC_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::Abap,
     SourceLanguage::Apex,
     SourceLanguage::ArkTs,
-    SourceLanguage::Astro,
     SourceLanguage::Clojure,
     SourceLanguage::CommonLisp,
     SourceLanguage::Dart,
@@ -850,6 +885,10 @@ const fn family_slice_declarative(family: ExtractionFamily) -> Option<FamilySlic
             visit_declaration: visit_javascript_declaration,
             visit_usage: visit_javascript_usage,
         },
+        ExtractionFamily::Astro => FamilySlice {
+            visit_declaration: astro_family::visit_declaration,
+            visit_usage: |builder, node, depth| builder.visit_named_children(node, depth),
+        },
         _ => return None,
     };
     Some(slice)
@@ -885,13 +924,19 @@ fn extraction_family(language: SourceLanguage) -> ExtractionFamily {
     } else if JAVASCRIPT_LANGUAGES.contains(&language) {
         ExtractionFamily::JavaScript
     } else {
-        match language {
-            SourceLanguage::GraphQl => ExtractionFamily::GraphQl,
-            SourceLanguage::Wesl | SourceLanguage::Wgsl => ExtractionFamily::Shader,
-            SourceLanguage::Prisma => ExtractionFamily::Prisma,
-            SourceLanguage::Sql => ExtractionFamily::Sql,
-            _ => ExtractionFamily::Unsupported,
-        }
+        single_language_family(language)
+    }
+}
+
+/// Families that each extract one language or one language pair.
+const fn single_language_family(language: SourceLanguage) -> ExtractionFamily {
+    match language {
+        SourceLanguage::GraphQl => ExtractionFamily::GraphQl,
+        SourceLanguage::Astro => ExtractionFamily::Astro,
+        SourceLanguage::Wesl | SourceLanguage::Wgsl => ExtractionFamily::Shader,
+        SourceLanguage::Prisma => ExtractionFamily::Prisma,
+        SourceLanguage::Sql => ExtractionFamily::Sql,
+        _ => ExtractionFamily::Unsupported,
     }
 }
 
@@ -925,7 +970,9 @@ fn visit_javascript_usage(
     node: Node<'_>,
     depth: usize,
 ) -> Result<(), ExtractError> {
-    module_system::capture_commonjs_assignment(builder, node)?;
+    if !builder.embedded.usage_only {
+        module_system::capture_commonjs_assignment(builder, node)?;
+    }
     match node.kind() {
         "call_expression" => {
             if !module_system::capture_dynamic_import(builder, node)? {
@@ -1123,6 +1170,7 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
             commonjs_shadowing: module_system::CommonJsShadowing::default(),
             maximum_ast_depth,
             shortened_canonical_names: false,
+            embedded: embedded_script::EmbeddedScope::default(),
         })
     }
 
@@ -1131,7 +1179,9 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
         if depth > self.maximum_ast_depth {
             return Err(ExtractError::NestingLimit);
         }
-        if self.visit_declaration(node, depth)? {
+        // A template expression only uses names: its declarations are walked
+        // for their references but declare nothing.
+        if !self.embedded.usage_only && self.visit_declaration(node, depth)? {
             return Ok(());
         }
         self.visit_usage(node, depth)
@@ -1250,7 +1300,7 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
         })
         .transpose()?
         .flatten();
-        let top_level = self.owners.is_empty();
+        let top_level = self.owners.len() <= self.embedded.module_scope_owners;
         let explicit_export = top_level && self.explicit_exports.contains(&pending.name);
         let explicit_default = top_level && self.explicit_default_exports.contains(&pending.name);
         Ok(ExtractedSymbol {

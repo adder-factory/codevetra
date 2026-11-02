@@ -26,6 +26,9 @@ pub enum ExtractionStrategy {
     ShaderFamily,
     /// Ada and VHDL declarations, case-insensitive references, and compilation imports.
     AdaFamily,
+    /// Astro components: a file-level component, frontmatter and template
+    /// expressions through the JavaScript-family walker, and component-use references.
+    AstroFamily,
     /// Grammar-backed conservative structural extraction for the remaining v1 language modes.
     GenericStructural,
     /// Bounded native scanners for custom, mixed-markup, and domain-specific v1 modes.
@@ -48,6 +51,7 @@ impl ExtractionStrategy {
                 | Self::JvmDynamicFamily
                 | Self::ShaderFamily
                 | Self::AdaFamily
+                | Self::AstroFamily
                 | Self::GenericStructural
                 | Self::CustomStructural
         )
@@ -133,6 +137,7 @@ const fn grammar_strategy(language: SourceLanguage) -> Option<ExtractionStrategy
         | SourceLanguage::Slang => Some(ExtractionStrategy::CFamily),
         SourceLanguage::Wesl | SourceLanguage::Wgsl => Some(ExtractionStrategy::ShaderFamily),
         SourceLanguage::Ada | SourceLanguage::Vhdl => Some(ExtractionStrategy::AdaFamily),
+        SourceLanguage::Astro => Some(ExtractionStrategy::AstroFamily),
         SourceLanguage::Bash
         | SourceLanguage::Fish
         | SourceLanguage::PowerShell
@@ -150,7 +155,6 @@ const fn fallback_strategy(language: SourceLanguage) -> ExtractionStrategy {
         SourceLanguage::Abap
         | SourceLanguage::Apex
         | SourceLanguage::ArkTs
-        | SourceLanguage::Astro
         | SourceLanguage::Clojure
         | SourceLanguage::CommonLisp
         | SourceLanguage::Dart
