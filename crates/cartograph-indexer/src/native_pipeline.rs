@@ -1,3 +1,4 @@
+mod generic_resolution;
 mod pascal_resolution;
 mod php_resolution;
 mod scip_spill;
@@ -37,14 +38,14 @@ use cartograph_domain::{
 use cartograph_extract::{
     CloneTokenCount, CloneTokenProfile, Containment, DEFAULT_MAXIMUM_AST_DEPTH,
     DYNAMIC_DISPATCH_RESOLUTION_PREFIX, DiagnosticCode, DiscoveredSource, DiscoveryLimits,
-    EMBEDDED_SQL_RESOLUTION_PREFIX, ExtractError, ExtractedFile, ExtractedImportBinding,
-    ExtractedNumericalSite, ExtractedReference, ImportBindingKind, LEXICAL_SCOPE_RESOLUTION_PREFIX,
-    MAXIMUM_AST_DEPTH, MINIMUM_AST_DEPTH, NativeExtractor, PHP_EXACT_RESOLUTION_PREFIX,
-    RUST_MACRO_RESOLUTION_PREFIX, RUST_SELF_RECEIVER_RESOLUTION_PREFIX, SourceDiscoveryOptions,
-    SourceExclusionEvidence, SourceLimits, SourceReadError, SourceReadOptions, SourceRoot,
-    SourceSnapshot, TYPE_QUERY_VALUE_RESOLUTION_PREFIX, is_test_source_path,
-    native_extraction_reservation, native_extractor_contract_digest, native_read_reservation,
-    substitute_module_alias,
+    EMBEDDED_SQL_RESOLUTION_PREFIX, ExtractError, ExtractedCallScopeSite, ExtractedFile,
+    ExtractedImportBinding, ExtractedNumericalSite, ExtractedReference, ImportBindingKind,
+    LEXICAL_SCOPE_RESOLUTION_PREFIX, MAXIMUM_AST_DEPTH, MINIMUM_AST_DEPTH, NativeExtractor,
+    PHP_EXACT_RESOLUTION_PREFIX, RUST_MACRO_RESOLUTION_PREFIX,
+    RUST_SELF_RECEIVER_RESOLUTION_PREFIX, SourceDiscoveryOptions, SourceExclusionEvidence,
+    SourceLimits, SourceReadError, SourceReadOptions, SourceRoot, SourceSnapshot,
+    TYPE_QUERY_VALUE_RESOLUTION_PREFIX, is_test_source_path, native_extraction_reservation,
+    native_extractor_contract_digest, native_read_reservation, substitute_module_alias,
 };
 use cartograph_scip::{
     ScipOverlayPlan, ScipOverlayReport, ScipOverlayRequest, apply_scip_overlay_with_cancellation,
@@ -4752,6 +4753,7 @@ fn append_degraded_files(
 fn compact_clone_file(mut file: NativeFileFacts) -> NativeFileFacts {
     file.containments = Vec::new();
     file.references = Vec::new();
+    file.call_scope_sites = Vec::new();
     file.numerical_sites = Vec::new();
     file.import_bindings = Vec::new();
     file.test_search_text = String::new();
@@ -4772,6 +4774,7 @@ struct NativeFileFacts {
     symbols: Vec<NativeSymbolFacts>,
     containments: Vec<Containment>,
     references: Vec<ExtractedReference>,
+    call_scope_sites: Vec<ExtractedCallScopeSite>,
     numerical_sites: Vec<ExtractedNumericalSite>,
     import_bindings: Vec<ExtractedImportBinding>,
     has_inline_tests: bool,
@@ -4792,6 +4795,7 @@ impl NativeFileFacts {
             symbols,
             containments,
             references,
+            call_scope_sites,
             numerical_sites,
             import_bindings,
             has_inline_tests,
@@ -4819,6 +4823,7 @@ impl NativeFileFacts {
             symbols: normalized_symbols,
             containments,
             references,
+            call_scope_sites,
             numerical_sites,
             import_bindings,
             has_inline_tests,
@@ -4833,6 +4838,9 @@ impl NativeFileFacts {
             .saturating_add(vector_capacity_bytes(&self.symbols))
             .saturating_add(vector_capacity_bytes(&self.containments))
             .saturating_add(vector_capacity_bytes(&self.references))
+            .saturating_add(generic_resolution::call_scope_owned_bytes(
+                &self.call_scope_sites,
+            ))
             .saturating_add(vector_capacity_bytes(&self.numerical_sites))
             .saturating_add(vector_capacity_bytes(&self.import_bindings))
             .saturating_add(usize_to_u64(self.test_search_text.capacity()));
@@ -5229,6 +5237,7 @@ struct ResolutionIndex {
     rust_named_re_exports: Vec<RustNamedReExport>,
     test_files: Vec<TestFileEvidence>,
     php: php_resolution::PhpResolutionIndex,
+    generic: generic_resolution::GenericResolutionIndex,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -10254,6 +10263,11 @@ where
         }
         insert_parent(&mut index.parents, containment, budget)?;
     }
+    generic_resolution::index_calls(
+        &mut index.generic,
+        (&file.call_scope_sites, budget),
+        cancelled,
+    )?;
     Ok(())
 }
 
@@ -10418,6 +10432,17 @@ where
         )?;
         push_symbol_candidates(
             &mut index.candidates,
+            ResolutionCandidateInsertion {
+                key: &symbol.name,
+                symbol,
+                parent_symbol_id: parent_symbol_id.as_ref(),
+                file_ordinal,
+                language: &file.file.language,
+            },
+            budget,
+        )?;
+        generic_resolution::index_symbol(
+            &mut index.generic,
             ResolutionCandidateInsertion {
                 key: &symbol.name,
                 symbol,
@@ -10741,6 +10766,7 @@ struct FileResolutionContext<'a> {
     identity: &'a FileDocumentIdentity,
     file_symbol_id: &'a SymbolId,
     import_bindings: &'a FileImportBindingIndex<'a>,
+    current_receivers: &'a generic_resolution::ReceiverSites,
 }
 
 struct FileImportBindingIndex<'a> {
@@ -11037,6 +11063,10 @@ where
             },
             cancelled,
         )?
+    } else if let Some(resolution) =
+        generic_resolution::resolve_receiver(index, (context, reference), cancelled)?
+    {
+        resolution
     } else {
         resolve_reference_or_source_name(
             index,
@@ -11060,6 +11090,7 @@ where
     };
     if lookup.dynamic_dispatch_name.is_some()
         && let Some(target) = resolution.target.as_mut()
+        && target.provenance != generic_resolution::CURRENT_CLASS_PROVENANCE
     {
         target.confidence = DYNAMIC_DISPATCH_CONFIDENCE;
         target.provenance = DYNAMIC_DISPATCH_PROVENANCE;
@@ -11101,6 +11132,7 @@ impl ResolutionOutput<'_> {
             symbols,
             containments,
             references,
+            call_scope_sites: _,
             numerical_sites,
             import_bindings,
             has_inline_tests: _,
@@ -11137,10 +11169,16 @@ impl ResolutionOutput<'_> {
         let import_binding_index = FileImportBindingIndex::new(&import_bindings, self.budget)?;
         let mut import_binding_scratch =
             ImportBindingScratch::new(import_bindings.len(), self.budget)?;
+        let current_receivers = generic_resolution::ReceiverSites::new(
+            &references,
+            (&identity.language, self.index, self.budget),
+            cancelled,
+        )?;
         let context = FileResolutionContext {
             identity: &identity,
             file_symbol_id: &file_symbol_id,
             import_bindings: &import_binding_index,
+            current_receivers: &current_receivers,
         };
         for reference in references {
             if cancelled() {
@@ -11261,7 +11299,9 @@ impl ResolutionOutput<'_> {
             .clone()
             .unwrap_or_else(|| context.file_symbol_id.clone());
         if let Some(target) = resolution.target.as_ref()
-            && source_symbol_id != target.symbol_id
+            && (source_symbol_id != target.symbol_id || reference.kind == ReferenceKind::Calls)
+            && (target.provenance != generic_resolution::CURRENT_CLASS_PROVENANCE
+                || context.current_receivers.lookup(&reference).is_none())
             && let Some(edge_kind) = reference_edge_kind(reference.kind, target.kind)
         {
             self.facts.edges.push(EdgeInput {
@@ -12440,6 +12480,13 @@ where
     if let Some(resolution) = resolve_declaration_reference(index, request, cancelled)? {
         return Ok(resolution);
     }
+    if let Some(resolution) = generic_resolution::resolve_casefold_local(index, request, cancelled)?
+    {
+        return Ok(resolution);
+    }
+    if let Some(resolution) = generic_resolution::resolve_class_scope(index, request, cancelled)? {
+        return Ok(resolution);
+    }
     if let Some(target) = resolve_lexical(index, request, cancelled)? {
         return Ok(ReferenceResolution::resolved(target));
     }
@@ -12473,6 +12520,11 @@ where
     }
     if project_fallback_allowed(index, request)
         && let Some(target) = resolve_project(index, request, cancelled)?
+    {
+        return Ok(ReferenceResolution::resolved(target));
+    }
+    if project_fallback_allowed(index, request)
+        && let Some(target) = generic_resolution::resolve_name_fallback(index, request, cancelled)?
     {
         return Ok(ReferenceResolution::resolved(target));
     }
@@ -13050,7 +13102,8 @@ where
                 (is_lexical_candidate(request.kind, request.name, candidate)
                     || swift_implicit_member_call(request, candidate))
                     && &candidate.file_id == request.file_id
-                    && request.owner != Some(&candidate.symbol_id)
+                    && (request.owner != Some(&candidate.symbol_id)
+                        || generic_resolution::recursive_owner_call(index, request, candidate))
                     && candidate.parent_symbol_id.as_ref() == scope
             },
             cancelled,
@@ -14992,6 +15045,9 @@ fn resolve_project<Cancel>(
 where
     Cancel: FnMut() -> bool,
 {
+    if let Some(target) = generic_resolution::resolve_casefold_project(index, request, cancelled)? {
+        return Ok(Some(target));
+    }
     let source = project_source_context(index, request)?;
     if let Some(target) = resolve_apple_bridge(AppleBridgeQuery {
         index,
@@ -15085,7 +15141,10 @@ where
         candidates: ProjectResolutionCandidates::new(candidate_bucket, source, request.name)?,
         cancelled,
     })?;
-    Ok(candidate.map(framework_convention_target))
+    if let Some(candidate) = candidate {
+        return Ok(Some(framework_convention_target(candidate)));
+    }
+    generic_resolution::resolve_proximity(index, request, cancelled)
 }
 
 struct PhpRouteFallbackQuery<'context, 'request, Cancel> {
@@ -16714,6 +16773,9 @@ fn usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    mod generic_digest_proof;
+    mod generic_repair;
+    mod generic_resolution;
     mod javascript_parity;
     mod pascal_units;
     mod php_namespaces;
@@ -16818,10 +16880,14 @@ mod tests {
     // Box::Box is concrete: declaration_only is false in the symbol and its
     // document metadata. Restoring only those two booleans to true restores
     // the intermediate 36d77193... digest exactly; all counts stay unchanged.
+    // Resolution adds CounterView::build -> CounterView::increment (ArkTS)
+    // and targets for its two existing references. generic_digest_proof removes
+    // that one Calls edge and restores those references to reproduce fca1307d...
+    // exactly; the canonical per-file extraction facts stay fixed.
     const EXPECTED_GENERIC_FAMILY_DIGEST: &str =
-        "fca1307d9daa8f86212a323289ec33fdffb7936c33575b32a7180d8eb285880d";
+        "743e17050215dd8bfbda5f74c73428a2a907d78460fa3a0534952e6153411143";
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
-        (28, 260, 283, 135, 260);
+        (28, 260, 284, 135, 260);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
     // v1 parity: Anubis handlers carry their `:<line>` suffix, an Osiris block
     // spans from its `IF` line and is named by its head line, and an LSX
@@ -19865,13 +19931,19 @@ pub fn score(a: u16, b: u16, value: f32) -> f32 {
         let run = capability_symbol(&forward, "Sources/Feed.swift", "Feed::run");
         let recursion =
             CapabilityReferenceQuery::new(&forward, run).named("run", ReferenceKind::Calls);
-        assert!(recursion.target_symbol_id.is_none());
+        assert_eq!(recursion.target_symbol_id.as_ref(), Some(&run.symbol_id));
+        assert_eq!(recursion.resolution_provenance, EXACT_LEXICAL_PROVENANCE);
         let bridged = capability_symbol(&forward, "Sources/Bridged.swift", "Bridged::recur");
         let bridged_recursion =
             CapabilityReferenceQuery::new(&forward, bridged).named("recur", ReferenceKind::Calls);
-        assert!(
-            bridged_recursion.target_symbol_id.is_none(),
-            "implicit self never selects a synthetic bridge alias: {bridged_recursion:?}"
+        assert_eq!(
+            bridged_recursion.target_symbol_id.as_ref(),
+            Some(&bridged.symbol_id),
+            "unexpected recursive binding: {bridged_recursion:?}"
+        );
+        assert_eq!(
+            bridged_recursion.resolution_provenance,
+            EXACT_LEXICAL_PROVENANCE
         );
     }
 
@@ -21119,14 +21191,12 @@ pub fn score(a: u16, b: u16, value: f32) -> f32 {
         let first = build_capability_generation_with_budget(
             &fixtures,
             false,
-            false,
-            MEGA_TEST_GENERATION_BYTES,
+            (false, MEGA_TEST_GENERATION_BYTES),
         );
         let second = build_capability_generation_with_budget(
             &fixtures,
             false,
-            false,
-            MEGA_TEST_GENERATION_BYTES,
+            (false, MEGA_TEST_GENERATION_BYTES),
         );
         assert_eq!(first.digest(), second.digest());
 
@@ -21672,63 +21742,24 @@ pub fn score(a: u16, b: u16, value: f32) -> f32 {
         build_capability_generation_with_budget(
             fixtures,
             reverse,
-            wider_partial_band,
-            TEST_GENERATION_BYTES,
+            (wider_partial_band, TEST_GENERATION_BYTES),
         )
     }
 
     fn build_capability_generation_with_budget(
         fixtures: &[(&str, &str)],
         reverse: bool,
-        wider_partial_band: bool,
-        maximum_bytes: u64,
+        (wider_partial_band, maximum_bytes): (bool, u64),
     ) -> CanonicalGenerationFacts {
-        let source_limits = SourceLimits::new(TEST_SOURCE_BYTES)
-            .unwrap_or_else(|error| panic!("capability source limits failed: {error}"));
-        let mut extracted = fixtures
-            .iter()
-            .map(|(path, source)| {
-                let snapshot =
-                    cartograph_extract::SourceSnapshot::from_bytes_for_capability_validation(
-                        path,
-                        source.as_bytes(),
-                        source_limits,
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!("capability snapshot failed for {path}: {error}")
-                    });
-                NativeExtractor::new_for_capability_validation(snapshot.language())
-                    .and_then(|mut extractor| extractor.extract(&snapshot))
-                    .unwrap_or_else(|error| {
-                        panic!("capability extraction failed for {path}: {error}")
-                    })
-            })
-            .collect::<Vec<_>>();
-        if reverse {
-            extracted.reverse();
-        }
-        let mut accumulator = NativeFactAccumulator::new(maximum_bytes);
-        for file in extracted {
-            accumulator
-                .push(file)
-                .unwrap_or_else(|_| panic!("capability facts exceeded the modeled input limit"));
-        }
-        let (facts, _) = resolve_generation(
-            ResolveGenerationRequest {
-                extracted: accumulator,
+        generic_repair::build_generation(
+            generic_repair::CapabilityGenerationRequest {
+                fixtures,
+                reverse,
+                wider_partial_band,
                 maximum_bytes,
-                source_root: test_source_root(),
-                evidence_policy: FULL_TEST_EVIDENCE,
-                clone_policy: NativeClonePolicy { wider_partial_band },
             },
+            |_| {},
             || false,
-        )
-        .unwrap_or_else(|_| panic!("capability resolution exceeded its declared budget"));
-        let validation_limits = generation_validation_limits(maximum_bytes, PipelineStage::Reduce)
-            .unwrap_or_else(|error| panic!("capability validation limits failed: {error}"));
-        validate_generation_facts(facts, validation_limits, || false).map_or_else(
-            |error| panic!("capability canonicalization failed: {error}"),
-            |(facts, _)| facts,
         )
     }
 

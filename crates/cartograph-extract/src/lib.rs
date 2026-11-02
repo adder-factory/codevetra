@@ -46,12 +46,12 @@ pub use discovery_policy::{
 pub use grammars::NativeGrammar;
 pub use language::{ExtractionStrategy, LanguageSpec};
 pub use model::{
-    CloneTokenCount, CloneTokenProfile, Containment, DYNAMIC_DISPATCH_RESOLUTION_PREFIX,
-    DiagnosticCode, EMBEDDED_SQL_RESOLUTION_PREFIX, ExtractedFile, ExtractedImportBinding,
-    ExtractedNumericalSite, ExtractedReference, ExtractedSymbol, ExtractionDiagnostic,
-    ImportBindingKind, LEXICAL_SCOPE_RESOLUTION_PREFIX, PHP_EXACT_RESOLUTION_PREFIX,
-    RUST_MACRO_RESOLUTION_PREFIX, RUST_SELF_RECEIVER_RESOLUTION_PREFIX, SymbolHealthMetrics,
-    TYPE_QUERY_VALUE_RESOLUTION_PREFIX,
+    CallScopeKind, CloneTokenCount, CloneTokenProfile, Containment,
+    DYNAMIC_DISPATCH_RESOLUTION_PREFIX, DiagnosticCode, EMBEDDED_SQL_RESOLUTION_PREFIX,
+    ExtractedCallScopeSite, ExtractedFile, ExtractedImportBinding, ExtractedNumericalSite,
+    ExtractedReference, ExtractedSymbol, ExtractionDiagnostic, ImportBindingKind,
+    LEXICAL_SCOPE_RESOLUTION_PREFIX, PHP_EXACT_RESOLUTION_PREFIX, RUST_MACRO_RESOLUTION_PREFIX,
+    RUST_SELF_RECEIVER_RESOLUTION_PREFIX, SymbolHealthMetrics, TYPE_QUERY_VALUE_RESOLUTION_PREFIX,
 };
 pub use module_alias::substitute_module_alias;
 pub use native::{
