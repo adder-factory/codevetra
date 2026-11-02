@@ -16526,11 +16526,13 @@ mod tests {
     const GENERIC_FAMILY_FILE_COUNT: usize = 28;
     // Pascal now has a dedicated family: fixture.pas extracts its full structure
     // (2 -> 9 symbols, the projection's +7) and its runtime calls (`SetLength`,
-    // `Length`, `High`) stay unresolved as external references.
+    // `Length`, `High`) stay unresolved as external references. The SQL
+    // function body's `INSERT INTO box` now references and resolves to table
+    // `box`, as v1 recorded (the projection's +1 reference and +1 edge).
     const EXPECTED_GENERIC_FAMILY_DIGEST: &str =
-        "684133dd6a9325d5911eea61312c79ad3c757d6d4a7d7040a7fdf7a9cdff9c92";
+        "6b212692ff353f369c3d97ea3316e0285062f2f0fabb8c9ba3b015bcd2bdeabd";
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
-        (28, 259, 281, 134, 259);
+        (28, 259, 282, 135, 259);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
     const EXPECTED_CUSTOM_FAMILY_DIGEST: &str =
         "f163e4b694db4069c989cb4828889562976005480f3e9dd3e28cf7b42d6e5557";
