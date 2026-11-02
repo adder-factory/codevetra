@@ -32,8 +32,10 @@ const CALL_TARGET_KINDS: &[&str] = &[
     "value_identifier_path",
     "member_expression",
 ];
-/// Deepest parenthesization unwrapped around an aliased module path.
-const MAX_MODULE_PARENTHESES: usize = 4;
+/// Comments are named nodes, so child selection skips them explicitly.
+const COMMENT_KIND: &str = "comment";
+/// Deepest parenthesization unwrapped around an aliased module path or a callee.
+const MAX_PARENTHESES: usize = 4;
 /// Node kinds naming the module an `open`, `include`, or alias refers to.
 const MODULE_PATH_KINDS: &[&str] = &[
     "module_identifier",
@@ -78,8 +80,10 @@ pub(super) fn capture_usage(
     node: Node<'_>,
 ) -> Result<(), ExtractError> {
     let target = match node.kind() {
+        // `(helper)(x)` calls the parenthesized callee.
         "call_expression" => node
             .child_by_field_name("function")
+            .map(|target| unparenthesized(target, "parenthesized_expression"))
             .filter(|target| CALL_TARGET_KINDS.contains(&target.kind())),
         // A call on the right of a pipe is captured as its own call expression.
         "pipe_expression" => named_children(node)
@@ -396,7 +400,9 @@ fn visit_let_function(
             )?;
         }
     }
-    let body: Vec<Node<'_>> = function.child_by_field_name("body").into_iter().collect();
+    // Default values run when the function is called, so they are its calls.
+    let mut body = parameters.map(default_values).unwrap_or_default();
+    body.extend(function.child_by_field_name("body"));
     visit_in_scope(
         builder,
         ScopeVisit {
@@ -407,6 +413,21 @@ fn visit_let_function(
             depth: input.depth,
         },
     )
+}
+
+/// The default-value expressions of `(~label=value)` parameters.
+fn default_values(parameters: Node<'_>) -> Vec<Node<'_>> {
+    named_children(parameters)
+        .flat_map(named_children)
+        .filter(|parameter| parameter.kind() == "labeled_parameter")
+        .flat_map(|parameter| {
+            let mut cursor = parameter.walk();
+            parameter
+                .children_by_field_name("default_value", &mut cursor)
+                .filter(Node::is_named)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// A type expression whose names are referenced by `owner`.
@@ -602,15 +623,16 @@ struct ModuleScope<'scope> {
     depth: usize,
 }
 
-/// The module expression inside `(Module.Path)` parentheses, unwrapped up to
-/// [`MAX_MODULE_PARENTHESES`] levels.
-fn unparenthesized(definition: Node<'_>) -> Node<'_> {
-    let mut current = definition;
-    for _ in 0..MAX_MODULE_PARENTHESES {
-        if current.kind() != "parenthesized_module_expression" {
+/// The expression inside `(...)` parentheses of kind `wrapper`, such as a
+/// `(Module.Path)` alias or a `(callee)`, unwrapped up to [`MAX_PARENTHESES`]
+/// levels.
+fn unparenthesized<'tree>(node: Node<'tree>, wrapper: &str) -> Node<'tree> {
+    let mut current = node;
+    for _ in 0..MAX_PARENTHESES {
+        if current.kind() != wrapper {
             break;
         }
-        match named_children(current).next() {
+        match named_children(current).find(|inner| inner.kind() != COMMENT_KIND) {
             Some(inner) => current = inner,
             None => break,
         }
@@ -624,7 +646,7 @@ fn visit_module_definition(
     scope: ModuleScope<'_>,
     definition: Node<'_>,
 ) -> Result<(), ExtractError> {
-    let definition = unparenthesized(definition);
+    let definition = unparenthesized(definition, "parenthesized_module_expression");
     if MODULE_PATH_KINDS.contains(&definition.kind()) {
         let Some(target) = bounded_name(builder.context.text(definition)) else {
             return Ok(());

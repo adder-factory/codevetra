@@ -26,6 +26,14 @@ pub enum ExtractionStrategy {
     ShaderFamily,
     /// Ada and VHDL declarations, case-insensitive references, and compilation imports.
     AdaFamily,
+    /// Clojure and Common Lisp list-form declarations, imports, and list-head calls.
+    LispFamily,
+    /// Lean imports, structures, inductives, definitions, theorems, and abbreviations.
+    LeanFamily,
+    /// `ReScript` opens, variants, records, externals, callable lets, and modules.
+    ReScriptFamily,
+    /// Solidity contract members, modifiers, enum values, state variables, and pragmas.
+    SolidityFamily,
     /// Grammar-backed conservative structural extraction for the remaining v1 language modes.
     GenericStructural,
     /// Bounded native scanners for custom, mixed-markup, and domain-specific v1 modes.
@@ -48,6 +56,10 @@ impl ExtractionStrategy {
                 | Self::JvmDynamicFamily
                 | Self::ShaderFamily
                 | Self::AdaFamily
+                | Self::LispFamily
+                | Self::LeanFamily
+                | Self::ReScriptFamily
+                | Self::SolidityFamily
                 | Self::GenericStructural
                 | Self::CustomStructural
         )
@@ -133,6 +145,12 @@ const fn grammar_strategy(language: SourceLanguage) -> Option<ExtractionStrategy
         | SourceLanguage::Slang => Some(ExtractionStrategy::CFamily),
         SourceLanguage::Wesl | SourceLanguage::Wgsl => Some(ExtractionStrategy::ShaderFamily),
         SourceLanguage::Ada | SourceLanguage::Vhdl => Some(ExtractionStrategy::AdaFamily),
+        SourceLanguage::Clojure | SourceLanguage::CommonLisp => {
+            Some(ExtractionStrategy::LispFamily)
+        }
+        SourceLanguage::Lean => Some(ExtractionStrategy::LeanFamily),
+        SourceLanguage::ReScript => Some(ExtractionStrategy::ReScriptFamily),
+        SourceLanguage::Solidity => Some(ExtractionStrategy::SolidityFamily),
         SourceLanguage::Bash
         | SourceLanguage::Fish
         | SourceLanguage::PowerShell
@@ -151,15 +169,12 @@ const fn fallback_strategy(language: SourceLanguage) -> ExtractionStrategy {
         | SourceLanguage::Apex
         | SourceLanguage::ArkTs
         | SourceLanguage::Astro
-        | SourceLanguage::Clojure
-        | SourceLanguage::CommonLisp
         | SourceLanguage::Dart
         | SourceLanguage::FSharp
         | SourceLanguage::GraphQl
         | SourceLanguage::Hcl
         | SourceLanguage::Html
         | SourceLanguage::Khn
-        | SourceLanguage::Lean
         | SourceLanguage::Lua
         | SourceLanguage::Luau
         | SourceLanguage::Nix
@@ -168,9 +183,7 @@ const fn fallback_strategy(language: SourceLanguage) -> ExtractionStrategy {
         | SourceLanguage::Php
         | SourceLanguage::Prisma
         | SourceLanguage::R
-        | SourceLanguage::ReScript
         | SourceLanguage::Ruby
-        | SourceLanguage::Solidity
         | SourceLanguage::Sql
         | SourceLanguage::Swift
         | SourceLanguage::VbNet

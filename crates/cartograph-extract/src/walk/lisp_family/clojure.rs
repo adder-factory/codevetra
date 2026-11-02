@@ -43,10 +43,15 @@ const NON_CALL_HEADS: &[&str] = &[
     "var",
 ];
 
+/// Qualifier naming `clojure.core`, whose operators a head may spell in full
+/// (`clojure.core/defn`) without changing meaning.
+const CORE_NAMESPACE_PREFIX: &str = "clojure.core/";
 /// Most multi-arity parameter vectors folded into one signature.
 const MAX_ARITIES: usize = 16;
 /// Prefix of the implicit argument names of a `#(...)` anonymous function.
 const ANONYMOUS_ARGUMENT_PREFIX: char = '%';
+/// Suffix of the implicit rest argument, `%&`.
+const ANONYMOUS_REST_SUFFIX: &str = "&";
 
 /// What a Clojure list form does, decided by its head symbol.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,11 +74,32 @@ fn form(head: &str) -> Form {
         "defprotocol" => Form::Definition(SymbolKind::Interface),
         "letfn" => Form::LocalFunctions,
         "comment" | "quote" => Form::Data,
-        _ if NON_CALL_HEADS.contains(&head) || head.starts_with(ANONYMOUS_ARGUMENT_PREFIX) => {
-            Form::NonCall
-        }
+        _ if NON_CALL_HEADS.contains(&head) => Form::NonCall,
         _ => Form::Call,
     }
+}
+
+/// Whether `head` is an implicit `#(...)` argument: `%`, `%&`, or `%N` (an
+/// empty digit run is the bare `%`).
+/// Any other symbol starting with `%`, such as `%helper`, is an ordinary name.
+fn is_anonymous_argument(head: &str) -> bool {
+    head.strip_prefix(ANONYMOUS_ARGUMENT_PREFIX)
+        .is_some_and(|suffix| {
+            suffix == ANONYMOUS_REST_SUFFIX || suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+/// Whether `node` lies inside a `#(...)` anonymous function. The walk is
+/// bounded by the tree depth the walker already accepted.
+fn within_anonymous_function(node: Node<'_>) -> bool {
+    let mut current = Some(node);
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "anon_fn_lit" {
+            return true;
+        }
+        current = ancestor.parent();
+    }
+    false
 }
 
 /// Symbol text without reader metadata, keeping any `ns/` qualifier.
@@ -103,7 +129,16 @@ pub(super) fn visit_list(
     else {
         return Ok(false);
     };
-    match form(head) {
+    // An implicit argument is a parameter only inside `#(...)`; elsewhere `%`
+    // is an ordinary symbol. A call keeps the head as written; only the
+    // operator classification ignores a `clojure.core/` qualifier.
+    let operator = head.strip_prefix(CORE_NAMESPACE_PREFIX).unwrap_or(head);
+    let form = if is_anonymous_argument(head) && within_anonymous_function(node) {
+        Form::NonCall
+    } else {
+        form(operator)
+    };
+    match form {
         Form::Namespace => {
             visit_namespace(builder, node, &forms)?;
             Ok(true)
@@ -113,7 +148,7 @@ pub(super) fn visit_list(
             Definition {
                 node,
                 forms: &forms,
-                private_head: head == "defn-",
+                private_head: operator == "defn-",
                 kind,
                 depth,
             },

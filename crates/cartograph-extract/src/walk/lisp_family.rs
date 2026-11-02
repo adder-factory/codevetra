@@ -13,10 +13,7 @@ use tree_sitter::Node;
 
 use crate::ExtractError;
 
-use super::{
-    ExtractionBuilder,
-    syntax::{descendants, named_children},
-};
+use super::{ExtractionBuilder, syntax::named_children};
 
 /// Index of the first form after a list's head: a definition's name, a binding
 /// form's bindings, or an import form's first argument.
@@ -33,6 +30,9 @@ const NON_FORM_KINDS: &[&str] = &[
 ];
 /// Reader forms whose contents are evaluated inside a syntax-quoted template.
 const UNQUOTE_KINDS: &[&str] = &["unquoting_lit", "unquote_splicing_lit"];
+/// Quoting level directly inside the template being visited; an unquote at
+/// this level is evaluated when the template is.
+const TEMPLATE_LEVEL: usize = 1;
 
 /// Dispatch one Clojure or Common Lisp node; `false` lets the walker descend.
 pub(super) fn visit_declaration(
@@ -42,11 +42,11 @@ pub(super) fn visit_declaration(
 ) -> Result<bool, ExtractError> {
     match (builder.context.snapshot.language(), node.kind()) {
         // Quoted data and discarded forms are never evaluated, so nothing in
-        // them declares or calls anything. Clojure reader metadata annotates
-        // a form (type hints, docs, flags); it is read structurally where it
-        // matters and is never walked as code.
-        (_, "quoting_lit" | "dis_expr")
-        | (SourceLanguage::Clojure, "meta_lit" | "old_meta_lit") => Ok(true),
+        // them declares or calls anything.
+        (_, "quoting_lit" | "dis_expr") => Ok(true),
+        // Only metadata on a collection literal is evaluated; metadata on an
+        // invocation or a symbol (type hints, flags) is never walked as code.
+        (SourceLanguage::Clojure, "meta_lit" | "old_meta_lit") => Ok(!annotates_collection(node)),
         (_, "syn_quoting_lit") => {
             visit_syntax_quote(builder, node, depth)?;
             Ok(true)
@@ -62,6 +62,14 @@ pub(super) fn visit_declaration(
     }
 }
 
+/// Whether reader metadata is attached to a vector, map, or set literal, whose
+/// metadata the compiler evaluates.
+fn annotates_collection(metadata: Node<'_>) -> bool {
+    metadata
+        .parent()
+        .is_some_and(|annotated| matches!(annotated.kind(), "vec_lit" | "map_lit" | "set_lit"))
+}
+
 /// Direct child forms of a list, without comments, discarded forms, or the
 /// reader metadata that may precede a list's head.
 fn form_children(node: Node<'_>) -> Vec<Node<'_>> {
@@ -70,39 +78,68 @@ fn form_children(node: Node<'_>) -> Vec<Node<'_>> {
         .collect()
 }
 
-/// A syntax-quoted template is data except for its unquoted forms, which the
-/// macro evaluates; only those are visited.
+/// A syntax-quoted template is data except for the unquoted forms that belong
+/// to it, which the macro evaluates; only those are visited.
+///
+/// Each nested template opens a quoting level and each unquote closes one, so
+/// an unquote belongs to this template only when it closes the outermost
+/// level: `,(ghost)` inside an inner template is data until the inner
+/// template itself is evaluated, while `,,x` evaluates `x` here. The cursor
+/// walk tracks the level without allocating and never enters discarded forms
+/// or the forms an evaluated unquote already visits.
 fn visit_syntax_quote(
     builder: &mut ExtractionBuilder<'_, '_>,
     template: Node<'_>,
     depth: usize,
 ) -> Result<(), ExtractError> {
     let child_depth = depth.saturating_add(1);
-    for node in descendants(template) {
+    let mut cursor = template.walk();
+    let mut level = TEMPLATE_LEVEL;
+    if !cursor.goto_first_child() {
+        return Ok(());
+    }
+    loop {
         builder.context.ensure_active()?;
-        if !UNQUOTE_KINDS.contains(&node.kind()) || nested_in_unquote(node, template) {
+        let node = cursor.node();
+        let evaluated = level == TEMPLATE_LEVEL && UNQUOTE_KINDS.contains(&node.kind());
+        if evaluated {
+            for form in named_children(node) {
+                builder.visit(form, child_depth)?;
+            }
+        }
+        if !evaluated && node.kind() != "dis_expr" && cursor.goto_first_child() {
+            level = entered_level(level, node.kind());
             continue;
         }
-        for evaluated in named_children(node) {
-            builder.visit(evaluated, child_depth)?;
+        // Advance to the next sibling, leaving finished parents and restoring
+        // the level each of them changed on the way in.
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() || cursor.node().id() == template.id() {
+                return Ok(());
+            }
+            level = left_level(level, cursor.node().kind());
         }
     }
-    Ok(())
 }
 
-/// Whether an unquote lies inside another unquote of the same template, which
-/// the outer unquote's own visit already covers, or inside a discarded form,
-/// which is never read.
-fn nested_in_unquote(unquote: Node<'_>, template: Node<'_>) -> bool {
-    let mut current = unquote.parent();
-    while let Some(ancestor) = current {
-        if ancestor.id() == template.id() {
-            return false;
-        }
-        if ancestor.kind() == "dis_expr" || UNQUOTE_KINDS.contains(&ancestor.kind()) {
-            return true;
-        }
-        current = ancestor.parent();
+/// The quoting level inside a node of kind `kind` entered at `level`.
+fn entered_level(level: usize, kind: &str) -> usize {
+    if kind == "syn_quoting_lit" {
+        level.saturating_add(1)
+    } else if UNQUOTE_KINDS.contains(&kind) {
+        level.saturating_sub(1)
+    } else {
+        level
     }
-    false
+}
+
+/// The quoting level around a node of kind `kind` whose inside was at `level`.
+fn left_level(level: usize, kind: &str) -> usize {
+    if kind == "syn_quoting_lit" {
+        level.saturating_sub(1)
+    } else if UNQUOTE_KINDS.contains(&kind) {
+        level.saturating_add(1)
+    } else {
+        level
+    }
 }

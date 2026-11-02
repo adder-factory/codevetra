@@ -15876,9 +15876,9 @@ mod tests {
         (14, 33, 19, 6, 33);
     const GENERIC_FAMILY_FILE_COUNT: usize = 28;
     const EXPECTED_GENERIC_FAMILY_DIGEST: &str =
-        "f77a991e7c6b2e8df0794af6be859648fd1e084e0511f1fbf675acb363eb3f6f";
+        "8637f03a80dac83d2de01fe6243873ee3c9e67ec1d342181e06e489472dd655f";
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
-        (28, 220, 213, 64, 220);
+        (28, 225, 226, 80, 225);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
     const EXPECTED_CUSTOM_FAMILY_DIGEST: &str =
         "461cec8cccf24f4374a440ca7c8884d547b82653a89427859197af63ff968573";
@@ -20344,6 +20344,119 @@ export function secondClone(value: number) {
             .unwrap_or_else(|| panic!("missing ambiguous VHDL import"));
         assert!(import.target_symbol_id.is_none());
         assert_eq!(import.resolution_provenance, UNRESOLVED_IMPORT_PROVENANCE);
+    }
+
+    const BORROWED_LANGUAGE_FIXTURES: [(&str, &str); 7] = [
+        ("clj/demo/util.clj", "(ns demo.util)\n(defn helper [x] x)\n"),
+        (
+            "clj/demo/core.clj",
+            "(ns demo.core\n  (:require [demo.util :refer [helper]]))\n(defn- local [x] x)\n(defn greet [n] (local (helper n)))\n",
+        ),
+        (
+            "lisp/util.lisp",
+            "(defpackage :demo.util (:use :cl))\n(in-package :demo.util)\n(defun twice (x) x)\n",
+        ),
+        (
+            "lisp/core.lisp",
+            "(defpackage :demo.core (:use :cl) (:import-from :demo.util #:twice))\n(in-package :demo.core)\n(defun run (n) (twice n))\n",
+        ),
+        ("res/Utils.res", "let shout = (x) => x\n"),
+        (
+            "res/App.res",
+            "open Utils\nlet local = (x) => x\nlet run = () => local(shout(1))\n",
+        ),
+        (
+            "sol/Vault.sol",
+            "contract Vault {\n  function helper(uint a) private returns (uint) { return a; }\n  function deposit(uint a) public returns (uint) { return helper(a); }\n  function apply(function(uint) internal pure returns (uint) helper, uint a) internal pure returns (uint) { return helper(a); }\n}\n",
+        ),
+    ];
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn borrowed_language_calls_resolve_through_lexical_and_project_rules() {
+        let directory = tempdir()
+            .unwrap_or_else(|error| panic!("could not create borrowed-language fixture: {error}"));
+        for (path, source) in BORROWED_LANGUAGE_FIXTURES {
+            let target = directory.path().join(path);
+            fs::create_dir_all(
+                target
+                    .parent()
+                    .unwrap_or_else(|| panic!("borrowed-language fixture had no parent: {path}")),
+            )
+            .unwrap_or_else(|error| panic!("could not create {path} parent: {error}"));
+            fs::write(target, source)
+                .unwrap_or_else(|error| panic!("could not write {path}: {error}"));
+        }
+
+        let serial = build(directory.path(), SERIAL_WORKERS).await;
+        let parallel = build(directory.path(), PARALLEL_WORKERS).await;
+        assert_eq!(serial.facts().digest(), parallel.facts().digest());
+        let facts = ModuleResolverFacts {
+            facts: serial.facts(),
+        };
+        for (caller_path, caller, name, target_path, target, provenance) in [
+            (
+                "clj/demo/core.clj",
+                "greet",
+                "local",
+                "clj/demo/core.clj",
+                "local",
+                EXACT_SAME_FILE_PROVENANCE,
+            ),
+            // Explicitly referred and imported names bind nothing, so they
+            // resolve through the project-wide rule like v1's by-name lookup.
+            (
+                "clj/demo/core.clj",
+                "greet",
+                "helper",
+                "clj/demo/util.clj",
+                "helper",
+                EXACT_PROJECT_PROVENANCE,
+            ),
+            (
+                "lisp/core.lisp",
+                "run",
+                "twice",
+                "lisp/util.lisp",
+                "twice",
+                EXACT_PROJECT_PROVENANCE,
+            ),
+            (
+                "res/App.res",
+                "run",
+                "local",
+                "res/App.res",
+                "local",
+                EXACT_SAME_FILE_PROVENANCE,
+            ),
+            (
+                "res/App.res",
+                "run",
+                "shout",
+                "res/Utils.res",
+                "shout",
+                EXACT_PROJECT_PROVENANCE,
+            ),
+            (
+                "sol/Vault.sol",
+                "Vault::deposit",
+                "helper",
+                "sol/Vault.sol",
+                "Vault::helper",
+                EXACT_SAME_FILE_PROVENANCE,
+            ),
+        ] {
+            let call = facts.reference(&facts.symbol(caller_path, caller), name);
+            assert_eq!(
+                call.target_symbol_id.as_ref(),
+                Some(&facts.symbol(target_path, target)),
+                "{caller_path}:{caller} -> {name}"
+            );
+            assert_eq!(call.resolution_provenance, provenance, "{caller}->{name}");
+        }
+        // A parameter that shadows a contract member stays unresolved instead
+        // of reaching the same-named member.
+        let shadowed = facts.reference(&facts.symbol("sol/Vault.sol", "Vault::apply"), "helper");
+        assert_eq!(shadowed.target_symbol_id, None, "Vault::apply -> helper");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

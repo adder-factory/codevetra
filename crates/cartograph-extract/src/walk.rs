@@ -22,19 +22,24 @@ mod c_family;
 mod declarations;
 mod dynamic_dispatch;
 mod embedded_sql;
+mod family_support;
 mod generic_family;
 mod graphql_family;
 mod jvm_dynamic_family;
+mod lean_family;
+mod lisp_family;
 mod managed_family;
 mod module_system;
 mod numerical;
 mod polyglot;
 mod prisma_family;
 mod references;
+mod rescript_family;
 mod rust_macro;
 mod schema;
 mod shader_family;
 mod shell_family;
+mod solidity_family;
 mod sql_family;
 pub(crate) mod syntax;
 mod value_references;
@@ -682,6 +687,10 @@ pub(super) struct PendingReference<'tree> {
 #[derive(Clone, Copy)]
 enum ExtractionFamily {
     Ada,
+    Lisp,
+    Lean,
+    ReScript,
+    Solidity,
     Shader,
     Shell,
     C,
@@ -723,14 +732,11 @@ const GENERIC_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::Apex,
     SourceLanguage::ArkTs,
     SourceLanguage::Astro,
-    SourceLanguage::Clojure,
-    SourceLanguage::CommonLisp,
     SourceLanguage::Dart,
     SourceLanguage::FSharp,
     SourceLanguage::Hcl,
     SourceLanguage::Html,
     SourceLanguage::Khn,
-    SourceLanguage::Lean,
     SourceLanguage::Lua,
     SourceLanguage::Luau,
     SourceLanguage::Nix,
@@ -738,9 +744,7 @@ const GENERIC_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::Pascal,
     SourceLanguage::Php,
     SourceLanguage::R,
-    SourceLanguage::ReScript,
     SourceLanguage::Ruby,
-    SourceLanguage::Solidity,
     SourceLanguage::Swift,
     SourceLanguage::VbNet,
     SourceLanguage::Yaml,
@@ -855,6 +859,36 @@ const fn family_slice_declarative(family: ExtractionFamily) -> Option<FamilySlic
     Some(slice)
 }
 
+/// Slices for the dedicated borrowed-language families split out of the generic walker.
+const fn family_slice_borrowed(family: ExtractionFamily) -> Option<FamilySlice> {
+    let slice = match family {
+        ExtractionFamily::Lisp => FamilySlice {
+            visit_declaration: lisp_family::visit_declaration,
+            visit_usage: |builder, node, depth| builder.visit_named_children(node, depth),
+        },
+        ExtractionFamily::Lean => FamilySlice {
+            visit_declaration: lean_family::visit_declaration,
+            visit_usage: |builder, node, depth| builder.visit_named_children(node, depth),
+        },
+        ExtractionFamily::ReScript => FamilySlice {
+            visit_declaration: rescript_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                rescript_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        ExtractionFamily::Solidity => FamilySlice {
+            visit_declaration: solidity_family::visit_declaration,
+            visit_usage: |builder, node, depth| {
+                solidity_family::capture_usage(builder, node)?;
+                builder.visit_named_children(node, depth)
+            },
+        },
+        _ => return None,
+    };
+    Some(slice)
+}
+
 /// Entry points for one extraction family, or `None` for unsupported source.
 ///
 /// The families are split across two lookups for the same reason the grammar
@@ -862,6 +896,9 @@ const fn family_slice_declarative(family: ExtractionFamily) -> Option<FamilySlic
 /// single highest-fan-out symbol in the crate.
 const fn family_slice(family: ExtractionFamily) -> Option<FamilySlice> {
     if let Some(slice) = family_slice_structural(family) {
+        return Some(slice);
+    }
+    if let Some(slice) = family_slice_borrowed(family) {
         return Some(slice);
     }
     family_slice_declarative(family)
@@ -886,6 +923,10 @@ fn extraction_family(language: SourceLanguage) -> ExtractionFamily {
         ExtractionFamily::JavaScript
     } else {
         match language {
+            SourceLanguage::Clojure | SourceLanguage::CommonLisp => ExtractionFamily::Lisp,
+            SourceLanguage::Lean => ExtractionFamily::Lean,
+            SourceLanguage::ReScript => ExtractionFamily::ReScript,
+            SourceLanguage::Solidity => ExtractionFamily::Solidity,
             SourceLanguage::GraphQl => ExtractionFamily::GraphQl,
             SourceLanguage::Wesl | SourceLanguage::Wgsl => ExtractionFamily::Shader,
             SourceLanguage::Prisma => ExtractionFamily::Prisma,

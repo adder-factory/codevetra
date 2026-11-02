@@ -38,7 +38,6 @@ const NON_CALL_HEADS: &[&str] = &[
     "setf",
     "setq",
     "tagbody",
-    "the",
     "throw",
     "unless",
     "unwind-protect",
@@ -47,8 +46,13 @@ const NON_CALL_HEADS: &[&str] = &[
 
 /// Deepest reader-quote nesting unwrapped while naming a form.
 const MAX_QUOTE_NESTING: usize = 4;
-/// Package prefix that form heads may carry without changing meaning.
-const PACKAGE_PREFIX: &str = "cl:";
+/// Prefixes naming the standard `COMMON-LISP` package, which form heads may
+/// carry without changing meaning; longest first so `::` is stripped whole.
+const STANDARD_PACKAGE_PREFIXES: &[&str] = &["common-lisp::", "common-lisp:", "cl::", "cl:"];
+/// The symbol naming the empty list, which is also an empty lambda list.
+const EMPTY_LIST: &str = "nil";
+/// Reader syntax that preserves the case of the characters it escapes.
+const CASE_PRESERVING_MARKERS: &[char] = &['|', '"', '\\'];
 /// Scope-map key prefix that keeps package lookups apart from other scope facts.
 const NAMESPACE_SCOPE_PREFIX: &str = "lisp-namespace:";
 /// Lambda-list keywords after which a nested list carries a default value.
@@ -58,7 +62,9 @@ const DEFAULTING_LAMBDA_KEYWORDS: &[&str] = &["&optional", "&key", "&aux"];
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Form {
     Namespace,
-    Function,
+    /// A `defun`-family list; `true` when method qualifiers may precede the
+    /// lambda list.
+    Function(bool),
     Named(SymbolKind, bool),
     Import(ImportShape),
     Binding(BindingLayout),
@@ -85,7 +91,8 @@ fn form(key: &str) -> Form {
         "defpackage" | "in-package" => Form::Namespace,
         // The grammar only recognizes lower-case `defun`-family keywords; the
         // reader folds case, so other spellings define functions too.
-        "defun" | "defmacro" | "defgeneric" | "defmethod" => Form::Function,
+        "defun" | "defmacro" | "defgeneric" => Form::Function(false),
+        "defmethod" => Form::Function(true),
         "defvar" | "defparameter" | "defconstant" => Form::Named(SymbolKind::Constant, true),
         "defclass" | "define-condition" => Form::Named(SymbolKind::Class, false),
         "defstruct" => Form::Named(SymbolKind::Struct, false),
@@ -103,7 +110,8 @@ fn form(key: &str) -> Form {
 enum BindingLayout {
     /// `(let ((name init)...) body)`: each binding's leading elements are names.
     Bindings(usize),
-    /// `(lambda (names...) body)`: the second form only names variables.
+    /// `(lambda (names...) body)`: the second form only names variables, or
+    /// a type that `(the type form)` declares.
     Names,
     /// `(dolist (name list) body)`: the second form starts with a name.
     Spec,
@@ -138,6 +146,7 @@ const BINDING_LAYOUTS: &[(&str, BindingLayout)] = &[
     ("restart-bind", BindingLayout::Bindings(1)),
     ("restart-case", BindingLayout::Clauses(2)),
     ("symbol-macrolet", BindingLayout::Bindings(1)),
+    ("the", BindingLayout::Names),
     ("typecase", BindingLayout::Clauses(1)),
 ];
 
@@ -208,6 +217,27 @@ fn clean_designator(text: &str) -> Option<&str> {
     bounded_name(text)
 }
 
+/// The operator a head designator names, lower-cased and free of a standard
+/// package prefix, as the reader interns it.
+///
+/// The reader upcases an unescaped symbol, so its spelling is irrelevant. An
+/// escaped symbol (`|defun|`) keeps its exact case and names a standard
+/// operator only when spelled in upper case; any other escaped spelling is an
+/// ordinary function, so it has no operator key. Escaped text never carries a
+/// package prefix, since its colons are literal.
+fn operator_key(raw: &str, head: &str) -> Option<String> {
+    let lowered = head.to_ascii_lowercase();
+    if raw.contains(CASE_PRESERVING_MARKERS) {
+        // An escaped colon is part of the name, never a package separator.
+        return (head == head.to_ascii_uppercase()).then_some(lowered);
+    }
+    let key = STANDARD_PACKAGE_PREFIXES
+        .iter()
+        .find_map(|prefix| lowered.strip_prefix(prefix))
+        .unwrap_or(&lowered);
+    Some(key.to_owned())
+}
+
 /// Declare, import, or record the call a list form makes.
 pub(super) fn visit_list(
     builder: &mut ExtractionBuilder<'_, '_>,
@@ -222,8 +252,7 @@ pub(super) fn visit_list(
     else {
         return Ok(false);
     };
-    let lowered = head.to_ascii_lowercase();
-    let key = lowered.strip_prefix(PACKAGE_PREFIX).unwrap_or(&lowered);
+    let key = operator_key(source_text(source, head_node), head);
     let named = NamedForm {
         node,
         forms: &forms,
@@ -231,10 +260,10 @@ pub(super) fn visit_list(
         visit_rest: true,
         depth,
     };
-    match form(key) {
+    match key.as_deref().map_or(Form::Call, form) {
         Form::Namespace => visit_namespace(builder, named),
-        Form::Function => {
-            visit_function_list(builder, named)?;
+        Form::Function(qualified) => {
+            visit_function_list(builder, named, qualified)?;
             Ok(true)
         }
         Form::Named(kind, visit_rest) => visit_named(
@@ -382,7 +411,14 @@ fn visit_namespace(
         return Ok(false);
     };
     let options = forms.get(AFTER_NAME..).unwrap_or_default();
-    match package_occurrence(builder, node, name)? {
+    let package = PackageForm {
+        node,
+        raw: forms
+            .get(AFTER_HEAD)
+            .map_or("", |name| source_text(source, *name)),
+        name,
+    };
+    match package_occurrence(builder, package)? {
         PackageOccurrence::Declared(owner) => visit_in_scope(
             builder,
             ScopeVisit {
@@ -410,14 +446,28 @@ enum PackageOccurrence {
     Reentered,
 }
 
+/// A package form, the source spelling of its designator, and the name it
+/// designates.
+#[derive(Clone, Copy)]
+struct PackageForm<'tree, 'text> {
+    node: Node<'tree>,
+    raw: &'text str,
+    name: &'text str,
+}
+
 /// The package a `defpackage` or `in-package` form names, emitted once per file.
 fn package_occurrence(
     builder: &mut ExtractionBuilder<'_, '_>,
-    node: Node<'_>,
-    name: &str,
+    input: PackageForm<'_, '_>,
 ) -> Result<PackageOccurrence, ExtractError> {
-    // Package designators are case-insensitive: `:app` and `"APP"` name one package.
-    let key = format!("{NAMESPACE_SCOPE_PREFIX}{}", name.to_ascii_lowercase());
+    let PackageForm { node, raw, name } = input;
+    // Package names compare exactly, but the reader upcases an unescaped
+    // symbol designator: `:app` and `"APP"` name one package, `"app"` another.
+    let key = if raw.contains(CASE_PRESERVING_MARKERS) {
+        format!("{NAMESPACE_SCOPE_PREFIX}{name}")
+    } else {
+        format!("{NAMESPACE_SCOPE_PREFIX}{}", name.to_ascii_uppercase())
+    };
     if builder.native_scope_symbols.contains_key(&key) {
         return Ok(PackageOccurrence::Reentered);
     }
@@ -531,17 +581,25 @@ pub(super) fn visit_defun(
 }
 
 /// A `defun`-family list in a spelling the grammar does not recognize, such as
-/// `(DEFUN NAME (PARAMS) BODY...)`: the name, any method qualifiers, the
-/// lambda list, then the body.
+/// `(DEFUN NAME (PARAMS) BODY...)`: the name, any method qualifiers when
+/// `qualified`, the lambda list, then the body.
 fn visit_function_list(
     builder: &mut ExtractionBuilder<'_, '_>,
     input: NamedForm<'_, '_>,
+    qualified: bool,
 ) -> Result<(), ExtractError> {
     let NamedForm {
         node, forms, depth, ..
     } = input;
     let rest = forms.get(AFTER_NAME..).unwrap_or_default();
-    let lambda_index = rest.iter().position(|form| form.kind() != "kwd_lit");
+    // A method's qualifiers (`:before`, `+`, ...) are atoms, so its lambda list
+    // is the first list (`NIL` included); any other definition's comes first.
+    let source = builder.context.snapshot.source();
+    let lambda_index = if qualified {
+        rest.iter().position(|form| is_list_form(source, *form))
+    } else {
+        (!rest.is_empty()).then_some(0)
+    };
     let lambda_list = lambda_index
         .and_then(|index| rest.get(index))
         .copied()
@@ -557,6 +615,12 @@ fn visit_function_list(
             depth,
         },
     )
+}
+
+/// Whether a form is a list, including the empty list spelled `NIL`.
+fn is_list_form(source: &str, form: Node<'_>) -> bool {
+    form.kind() == "list_lit"
+        || (form.kind() == "sym_lit" && source_text(source, form).eq_ignore_ascii_case(EMPTY_LIST))
 }
 
 /// One function definition, however the grammar parsed it.
@@ -579,11 +643,17 @@ fn emit_function(
     input: FunctionForm<'_, '_>,
 ) -> Result<(), ExtractError> {
     let source = builder.context.snapshot.source();
+    // Default-value forms run when the function is called, before its body.
+    let mut evaluated = input
+        .lambda_list
+        .map(|list| lambda_list_defaults(source, list))
+        .unwrap_or_default();
+    evaluated.extend_from_slice(input.body);
     let Some(name) = input
         .name
         .and_then(|name| designator(source, name, Designator::Symbol))
     else {
-        for form in input.body {
+        for form in &evaluated {
             builder.visit(*form, input.depth.saturating_add(1))?;
         }
         return Ok(());
@@ -606,11 +676,47 @@ fn emit_function(
                 signature,
                 shape: DeclarationShape::plain(SymbolKind::Function, exported),
             },
-            children: input.body,
+            children: &evaluated,
             depth: input.depth,
         },
     )?;
     Ok(())
+}
+
+/// The default-value forms of a lambda list: everything after the variable
+/// in a `(var init supplied-p)` parameter that follows `&optional`, `&key`, or
+/// `&aux` (in any case). The variable itself, or a `((:key var) ...)` pair,
+/// only names a binding.
+fn lambda_list_defaults<'tree>(source: &str, list: Node<'tree>) -> Vec<Node<'tree>> {
+    if list.kind() != "list_lit" {
+        return Vec::new();
+    }
+    let mut defaults = false;
+    let mut forms = Vec::new();
+    for parameter in form_children(list) {
+        match parameter.kind() {
+            "sym_lit" => {
+                if let Some(keyword) = lambda_keyword(source_text(source, parameter)) {
+                    defaults = keyword;
+                }
+            }
+            "list_lit" if defaults => {
+                forms.extend(form_children(parameter).into_iter().skip(AFTER_HEAD));
+            }
+            _ => {}
+        }
+    }
+    forms
+}
+
+/// For a lambda-list keyword, whether the parameters after it may carry
+/// default values; `None` for an ordinary parameter name.
+fn lambda_keyword(text: &str) -> Option<bool> {
+    text.starts_with('&').then(|| {
+        DEFAULTING_LAMBDA_KEYWORDS
+            .iter()
+            .any(|keyword| keyword.eq_ignore_ascii_case(text))
+    })
 }
 
 /// Whether a lambda list names only parameters and specializers.
@@ -626,11 +732,8 @@ fn plain_lambda_list(source: &str, list: Node<'_>) -> bool {
     for parameter in form_children(list) {
         match parameter.kind() {
             "sym_lit" => {
-                let text = source_text(source, parameter);
-                if text.starts_with('&') {
-                    defaults = DEFAULTING_LAMBDA_KEYWORDS
-                        .iter()
-                        .any(|keyword| keyword.eq_ignore_ascii_case(text));
+                if let Some(keyword) = lambda_keyword(source_text(source, parameter)) {
+                    defaults = keyword;
                 }
             }
             "list_lit"

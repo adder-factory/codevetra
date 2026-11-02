@@ -1104,6 +1104,10 @@ fn common_lisp_definitions_are_recognized_in_any_letter_case() {
 (DEFMETHOD SPEAK :BEFORE ((A ANIMAL)) (NOTIFY A))
 (CL:DEFMACRO WITH-LOG (EXPR) (LIST EXPR))
 (DEFUN (SETF SLOT) (V X) (STORE V X))
+(DEFMETHOD SCORE + ((S INTEGER)) (TALLY S))
+(COMMON-LISP:DEFUN QUALIFIED (Q) (CHECK Q))
+(CL::DEFUN DOUBLE (D) (CHECK D))
+(DEFMETHOD EMPTY NIL (FILL-IN))
 ";
     let extracted = extract("src/upper.lisp", source);
 
@@ -1119,10 +1123,24 @@ fn common_lisp_definitions_are_recognized_in_any_letter_case() {
         "a method qualifier is not the lambda list"
     );
     symbol(&extracted, SymbolKind::Function, "WITH-LOG");
+    let score = symbol(&extracted, SymbolKind::Function, "SCORE");
+    assert_eq!(
+        score.signature.as_deref(),
+        Some("((S INTEGER))"),
+        "a non-keyword method qualifier is skipped, not read as the lambda list"
+    );
+    let qualified = symbol(&extracted, SymbolKind::Function, "QUALIFIED");
+    assert_eq!(qualified.signature.as_deref(), Some("(Q)"));
+    symbol(&extracted, SymbolKind::Function, "DOUBLE");
+    let empty = symbol(&extracted, SymbolKind::Function, "EMPTY");
+    assert_eq!(empty.signature, None, "NIL is the empty lambda list");
     for (call, owner) in [
+        ("FILL-IN", empty),
         ("STRING-UPCASE", greet),
         ("Helper", mixed),
         ("NOTIFY", speak),
+        ("TALLY", score),
+        ("CHECK", qualified),
     ] {
         assert!(
             has_reference(
@@ -1148,25 +1166,70 @@ fn common_lisp_definitions_are_recognized_in_any_letter_case() {
         "V",
         "SETF",
         ":BEFORE",
+        "S",
+        "Q",
+        "CL::DEFUN",
+        "COMMON-LISP:DEFUN",
     ] {
         assert_eq!(call_count(&extracted, not_call), 0, "{not_call}");
     }
-    assert_eq!(
-        extracted
-            .symbols
-            .iter()
-            .filter(|symbol| symbol.kind == SymbolKind::Function)
-            .count(),
-        4,
-        "{:?}",
-        names(&extracted)
+    assert_eq!(function_count(&extracted), 8, "{:?}", names(&extracted));
+}
+
+#[test]
+fn common_lisp_escaped_heads_keep_their_exact_spelling() {
+    let source = r"(defun |defun| (x y) (+ x y))
+(defun shadow-op (x y) (|defun| x y))
+(defun upper-escape (u) (|DEFUN| esc (u) (inner u)))
+(defun |COMMON-LISP:DEFUN| (x) x)
+(defun literal-colon (x) (|COMMON-LISP:DEFUN| x))
+";
+    let extracted = extract("src/escaped.lisp", source);
+
+    symbol(&extracted, SymbolKind::Function, "defun");
+    let shadow_op = symbol(&extracted, SymbolKind::Function, "shadow-op");
+    assert!(
+        has_reference(
+            &extracted,
+            Expected::new(ReferenceKind::Calls, "defun", Some(shadow_op))
+        ),
+        "an escaped lower-case |defun| is an ordinary function"
     );
+    assert_eq!(
+        symbol(&extracted, SymbolKind::Function, "esc").qualified_name,
+        "upper-escape::esc",
+        "an escaped upper-case |DEFUN| is the standard operator"
+    );
+    let literal_colon = symbol(&extracted, SymbolKind::Function, "literal-colon");
+    assert!(
+        has_reference(
+            &extracted,
+            Expected::new(
+                ReferenceKind::Calls,
+                "COMMON-LISP:DEFUN",
+                Some(literal_colon)
+            )
+        ),
+        "an escaped colon is part of the name, not a package separator"
+    );
+    assert_eq!(
+        call_count(&extracted, "COMMON-LISP:DEFUN"),
+        1,
+        "only the escaped call is a call"
+    );
+    for not_call in ["x", "u", "DEFUN", "|DEFUN|", "esc"] {
+        assert_eq!(call_count(&extracted, not_call), 0, "{not_call}");
+    }
+    assert_eq!(function_count(&extracted), 6, "{:?}", names(&extracted));
 }
 
 #[test]
 fn common_lisp_packages_fold_case_and_declarations_are_not_calls() {
     let source = r#"(defpackage :app (:use :cl))
 (in-package "APP")
+(defpackage "lower")
+(defpackage "LOWER")
+(in-package #:lower)
 (declaim (inline fast))
 (defun fast (x) (declare (ignore x) (optimize speed)) (work))
 "#;
@@ -1179,8 +1242,8 @@ fn common_lisp_packages_fold_case_and_declarations_are_not_calls() {
             .filter(|symbol| symbol.kind == SymbolKind::Namespace)
             .map(|symbol| symbol.name.as_str())
             .collect::<Vec<_>>(),
-        ["app"],
-        "package designators are case-insensitive"
+        ["app", "lower", "LOWER"],
+        "symbol designators are read in upper case; string designators keep their case"
     );
     assert_eq!(call_count(&extracted, "work"), 1);
     for not_call in ["inline", "ignore", "optimize", "declare", "declaim"] {
@@ -1190,21 +1253,28 @@ fn common_lisp_packages_fold_case_and_declarations_are_not_calls() {
 
 #[test]
 fn clojure_anonymous_functions_and_metadata_prefixed_lists_call_their_heads() {
-    let source = r"(defn run [m xs]
+    let source = r"(defn %helper [x] x)
+(defn run [m xs]
   (map #(helper %) xs)
   (-> 1 #(inc %))
   #(% 1)
   ^String (get m :k)
   #^String (fetch m)
   ^{:x (ghost)} (real)
+  #(%1 %2 %&)
+  (%helper xs)
+  (% xs)
+  ^{:x (hinted)} m
   (outer ^{:y (phantom)} [1]))
 (defn outer-fn [] (defn inner-fn [] 1))
 ";
     let extracted = extract("src/anon.clj", source);
 
     let run = symbol(&extracted, SymbolKind::Function, "run");
+    // Metadata on a collection literal is evaluated, so `phantom` is a call;
+    // metadata on an invocation (`ghost`) is not.
     for call in [
-        "map", "helper", "->", "inc", "get", "fetch", "real", "outer",
+        "map", "helper", "->", "inc", "get", "fetch", "real", "outer", "phantom",
     ] {
         assert!(
             has_reference(
@@ -1214,7 +1284,19 @@ fn clojure_anonymous_functions_and_metadata_prefixed_lists_call_their_heads() {
             "{call}"
         );
     }
-    for not_call in ["ghost", "phantom", "String", "%", ":x"] {
+    assert!(
+        has_reference(
+            &extracted,
+            Expected::new(ReferenceKind::Calls, "%helper", Some(run))
+        ),
+        "only the implicit arguments %, %N, and %& are not calls"
+    );
+    assert_eq!(
+        call_count(&extracted, "%"),
+        1,
+        "% is an implicit argument only inside #(...); elsewhere it is a symbol"
+    );
+    for not_call in ["ghost", "hinted", "String", "%1", "%&", ":x"] {
         assert_eq!(
             call_count(&extracted, not_call),
             0,
@@ -1260,9 +1342,13 @@ fn lean_grouped_field_binders_declare_every_name_but_constructor_parameters_do_n
 fn rescript_parenthesized_module_alias_references_its_target() {
     let extracted = extract(
         "src/Alias.res",
-        "module Alias = (Belt.Array)\nmodule Plain = Belt.List\n",
+        "module Alias = (Belt.Array)\nmodule Plain = Belt.List\nmodule Noted = (/* note */ Belt.Map)\n",
     );
-    for (module, target) in [("Alias", "Belt.Array"), ("Plain", "Belt.List")] {
+    for (module, target) in [
+        ("Alias", "Belt.Array"),
+        ("Plain", "Belt.List"),
+        ("Noted", "Belt.Map"),
+    ] {
         let owner = symbol(&extracted, SymbolKind::Namespace, module);
         assert!(
             has_reference(
@@ -1301,6 +1387,133 @@ fn solidity_named_return_parameters_shadow_contract_members() {
         "a named return shadows the member"
     );
     assert_eq!(resolution("direct"), Some(Some("Vault::helper")));
+}
+
+#[test]
+fn common_lisp_defaults_run_but_type_specifiers_and_inner_templates_do_not() {
+    let source = r"(defun run (a &optional (x (seed)) &key ((:k kk) (other)) &aux (z (third)))
+  (the (unsigned-byte 8) (helper a x kk z)))
+(DEFUN UP (A &OPTIONAL (B (SEED2) B-P) &REST R &KEY C) (WORK A B R C))
+(defun plain ((s stream) n) (emit s n))
+(defmacro make (x) `(outer `(inner ,(ghost) ,,x) ,(real) ,@(splice) #_,(gone)))
+";
+    let extracted = extract("src/defaults.lisp", source);
+
+    let run = symbol(&extracted, SymbolKind::Function, "run");
+    let up = symbol(&extracted, SymbolKind::Function, "UP");
+    let plain = symbol(&extracted, SymbolKind::Function, "plain");
+    let make = symbol(&extracted, SymbolKind::Function, "make");
+    for (call, owner) in [
+        ("seed", run),
+        ("other", run),
+        ("third", run),
+        ("helper", run),
+        ("SEED2", up),
+        ("WORK", up),
+        ("emit", plain),
+        ("real", make),
+        ("splice", make),
+    ] {
+        assert!(
+            has_reference(
+                &extracted,
+                Expected::new(ReferenceKind::Calls, call, Some(owner))
+            ),
+            "{call} is called by its definition"
+        );
+        assert_eq!(call_count(&extracted, call), 1, "{call}");
+    }
+    // A type specifier, a defaulted variable or keyword pair, a supplied-p
+    // variable, a specializer, an inner template's own unquote, and a
+    // discarded form are never calls.
+    for not_call in [
+        "unsigned-byte",
+        "the",
+        "x",
+        ":k",
+        "B",
+        "B-P",
+        "s",
+        "stream",
+        "ghost",
+        "inner",
+        "outer",
+        "gone",
+    ] {
+        assert_eq!(call_count(&extracted, not_call), 0, "{not_call}");
+    }
+    assert_eq!(
+        up.signature, None,
+        "a defaulted lambda list is not retained"
+    );
+}
+
+#[test]
+fn clojure_core_qualified_operators_and_nested_templates_are_read_structurally() {
+    let source = r"(clojure.core/defn run [x] (helper x))
+(clojure.core/defn- hidden [y] (clojure.core/map inc y))
+(defmacro m [x] `(do `(inner ~(ghost)) ~(real) ~@(splice) (f ~x)))
+";
+    let extracted = extract("src/core.clj", source);
+
+    let run = symbol(&extracted, SymbolKind::Function, "run");
+    assert_eq!(run.signature.as_deref(), Some("[x]"));
+    assert!(run.export.exported);
+    let hidden = symbol(&extracted, SymbolKind::Function, "hidden");
+    assert_eq!(hidden.visibility, Some(Visibility::Private));
+    assert!(!hidden.export.exported);
+    let m = symbol(&extracted, SymbolKind::Function, "m");
+    for (call, owner) in [
+        ("helper", run),
+        ("clojure.core/map", hidden),
+        ("real", m),
+        ("splice", m),
+    ] {
+        assert!(
+            has_reference(
+                &extracted,
+                Expected::new(ReferenceKind::Calls, call, Some(owner))
+            ),
+            "{call} is called by its definition"
+        );
+    }
+    for not_call in [
+        "clojure.core/defn",
+        "clojure.core/defn-",
+        "x",
+        "ghost",
+        "inner",
+        "f",
+    ] {
+        assert_eq!(call_count(&extracted, not_call), 0, "{not_call}");
+    }
+}
+
+#[test]
+fn rescript_parameter_defaults_and_parenthesized_callees_are_calls() {
+    let extracted = extract(
+        "src/Defaults.res",
+        "let run = (~x=seed(), ~y: int=other(2), z) => (helper)(x + y + z)\n",
+    );
+
+    let run = symbol(&extracted, SymbolKind::Function, "run");
+    for call in ["seed", "other", "helper"] {
+        assert!(
+            has_reference(
+                &extracted,
+                Expected::new(ReferenceKind::Calls, call, Some(run))
+            ),
+            "{call} is called by run"
+        );
+        assert_eq!(call_count(&extracted, call), 1, "{call}");
+    }
+    for not_call in ["x", "y", "z", "(helper)"] {
+        assert_eq!(call_count(&extracted, not_call), 0, "{not_call}");
+    }
+    assert_eq!(
+        run.signature, None,
+        "a signature with default values is not retained"
+    );
 }
 
 fn snapshot(path: &str, source: &str) -> SourceSnapshot {
@@ -1352,6 +1565,15 @@ fn references_of(extracted: &ExtractedFile, kind: ReferenceKind) -> Vec<&str> {
         .filter(|reference| reference.kind == kind)
         .map(|reference| reference.name.as_str())
         .collect()
+}
+
+/// Number of extracted Function symbols.
+fn function_count(extracted: &ExtractedFile) -> usize {
+    extracted
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Function)
+        .count()
 }
 
 fn call_count(extracted: &ExtractedFile, name: &str) -> usize {
