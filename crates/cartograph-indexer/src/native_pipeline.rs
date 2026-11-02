@@ -1,6 +1,16 @@
+mod codeigniter_resolution;
+mod csharp_constructors;
+mod enum_resolution;
+mod namespace_types;
 mod pascal_resolution;
 mod php_resolution;
 mod python_resolution;
+mod python_type_variables;
+mod qualtype_generics;
+mod qualtype_resolution;
+mod qualtype_source;
+mod rescript_resolution;
+mod rust_local_types;
 mod scip_spill;
 mod script_modules;
 
@@ -5231,6 +5241,7 @@ struct ResolutionIndex {
     rust_named_re_exports: Vec<RustNamedReExport>,
     test_files: Vec<TestFileEvidence>,
     php: php_resolution::PhpResolutionIndex,
+    qualtype: qualtype_resolution::TypeIndex,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -7580,6 +7591,9 @@ async fn build_spilled_resolution_preparation(
                 budget: &mut state.budget,
                 cancelled: &mut cancelled,
             };
+            block_in_place(|| {
+                qualtype_resolution::index_syntax(&mut state.index, &file, &mut context)
+            })?;
             index_typescript_alias_file(&mut state.index.modules, &file, &mut context)?;
             let before = state.compact.retained_bytes;
             let diagnostics = state.compact.diagnostics;
@@ -9716,6 +9730,7 @@ where
             budget: context.budget,
             cancelled: context.cancelled,
         })?;
+        qualtype_resolution::index_syntax(&mut index, file, &mut context)?;
     }
     index_typescript_aliases(&mut index.modules, extracted, &mut context)?;
     index_rust_workspace_packages(RustWorkspacePackageIndexInput {
@@ -10398,6 +10413,11 @@ where
     if cancelled() {
         return Err(StageItemFailure);
     }
+    qualtype_resolution::index_file(
+        &mut ResolutionIndexTarget { index, budget },
+        file,
+        cancelled,
+    )?;
     let file_ordinal = *index
         .file_ordinals
         .get(&file.file.file_id)
@@ -12463,8 +12483,20 @@ where
     if let Some(resolution) = resolve_declaration_reference(index, request, cancelled)? {
         return Ok(resolution);
     }
+    if let Some(resolution) = codeigniter_resolution::resolve(index, request, cancelled)? {
+        return Ok(resolution);
+    }
+    if let Some(resolution) = enum_resolution::resolve(index, request, cancelled)? {
+        return Ok(resolution);
+    }
+    if let Some(resolution) = csharp_constructors::resolve(index, request, cancelled)? {
+        return Ok(resolution);
+    }
     if let Some(target) = resolve_lexical(index, request, cancelled)? {
         return Ok(ReferenceResolution::resolved(target));
+    }
+    if let Some(resolution) = qualtype_resolution::resolve(index, request, cancelled)? {
+        return Ok(resolution);
     }
     if request.import_bindings.fallback_blocked {
         return Ok(ReferenceResolution::unresolved(
@@ -16765,6 +16797,7 @@ mod tests {
     mod php_namespaces;
     mod polyglot_parity;
     mod python_imports;
+    mod qualified_types;
     mod rust_receivers;
     mod script_modules;
     mod v1_resolution_oracle;
