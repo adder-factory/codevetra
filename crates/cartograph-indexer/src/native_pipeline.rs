@@ -4946,7 +4946,9 @@ impl NativeFileFacts {
                 ));
         }
         for call in &self.javascript_member_calls {
-            if let JavascriptMemberReceiver::Constructor(name) = &call.receiver {
+            if let JavascriptMemberReceiver::Constructor(name)
+            | JavascriptMemberReceiver::UnprovenConstructor(name) = &call.receiver
+            {
                 bytes = bytes.saturating_add(usize_to_u64(name.capacity()));
             }
         }
@@ -12772,10 +12774,16 @@ fn resolve_reference<Cancel>(
 where
     Cancel: FnMut() -> bool,
 {
-    match rust_path_guards::resolve(index, request, cancelled)? {
+    if let Some(resolution) =
+        receiver_resolution::resolve_constructor_redirect(index, request, cancelled)?
+    {
+        return Ok(resolution);
+    }
+    let base = match rust_path_guards::resolve(index, request, cancelled)? {
         Some(resolution) => Ok(resolution),
         None => resolve_reference_body(index, request, cancelled),
-    }
+    }?;
+    generic_resolution::refine_member(index, (request, base), cancelled)
 }
 
 fn resolve_reference_body<Cancel>(
@@ -17106,6 +17114,7 @@ mod tests {
     mod javascript_modules;
     mod javascript_parity;
     mod jvm_resolution;
+    mod members;
     mod pascal_units;
     mod php_namespaces;
     mod polyglot_parity;
