@@ -24,6 +24,7 @@ mod dynamic_dispatch;
 mod embedded_sql;
 mod generic_family;
 mod graphql_family;
+mod hcl_family;
 mod jvm_dynamic_family;
 mod managed_family;
 mod module_system;
@@ -35,6 +36,7 @@ mod rust_macro;
 mod schema;
 mod shader_family;
 mod shell_family;
+mod specifier_safety;
 mod sql_family;
 pub(crate) mod syntax;
 mod value_references;
@@ -688,6 +690,7 @@ enum ExtractionFamily {
     Managed,
     JvmDynamic,
     GraphQl,
+    Hcl,
     Prisma,
     Sql,
     Generic,
@@ -727,7 +730,6 @@ const GENERIC_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::CommonLisp,
     SourceLanguage::Dart,
     SourceLanguage::FSharp,
-    SourceLanguage::Hcl,
     SourceLanguage::Html,
     SourceLanguage::Khn,
     SourceLanguage::Lean,
@@ -824,6 +826,10 @@ const fn family_slice_declarative(family: ExtractionFamily) -> Option<FamilySlic
             visit_declaration: graphql_family::visit_declaration,
             visit_usage: |builder, node, depth| builder.visit_named_children(node, depth),
         },
+        ExtractionFamily::Hcl => FamilySlice {
+            visit_declaration: hcl_family::visit_declaration,
+            visit_usage: |builder, node, depth| builder.visit_named_children(node, depth),
+        },
         ExtractionFamily::Prisma => FamilySlice {
             visit_declaration: prisma_family::visit_declaration,
             visit_usage: |builder, node, depth| builder.visit_named_children(node, depth),
@@ -887,6 +893,7 @@ fn extraction_family(language: SourceLanguage) -> ExtractionFamily {
     } else {
         match language {
             SourceLanguage::GraphQl => ExtractionFamily::GraphQl,
+            SourceLanguage::Hcl => ExtractionFamily::Hcl,
             SourceLanguage::Wesl | SourceLanguage::Wgsl => ExtractionFamily::Shader,
             SourceLanguage::Prisma => ExtractionFamily::Prisma,
             SourceLanguage::Sql => ExtractionFamily::Sql,
@@ -1161,8 +1168,18 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
     }
 
     fn emit_symbol(&mut self, pending: PendingSymbol<'_>) -> Result<SymbolId, ExtractError> {
-        self.context.ensure_active()?;
         let qualified_name = self.qualified_name(&pending.name)?;
+        self.emit_symbol_with_qualified_name(pending, qualified_name)
+    }
+
+    /// Emit a symbol whose language-defined qualified name is not the lexical
+    /// `::` join of its enclosing qualifiers (for example Terraform `var.x`).
+    fn emit_symbol_with_qualified_name(
+        &mut self,
+        pending: PendingSymbol<'_>,
+        qualified_name: String,
+    ) -> Result<SymbolId, ExtractError> {
+        self.context.ensure_active()?;
         let qualified_name = self.bound_canonical_name(
             qualified_name,
             crate::bounded_name::MAX_CANONICAL_QUALIFIED_NAME_BYTES,
