@@ -1,5 +1,5 @@
 //! Remove the two receiver calls and restore centrality, retaining the bridge
-//! delta. Removing that delta afterwards reconstructs the exact V22 base facts.
+//! delta. Removing that delta reconstructs the V22 base facts, rehashed under V23.
 
 use super::{
     CanonicalGenerationFacts, CapabilityReferenceQuery, EdgeKind, GENERIC_FAMILY_FIXTURES,
@@ -9,8 +9,8 @@ use super::{
 };
 
 const PREVIOUS_RECEIVER_DIGEST: &str =
-    "a4e55aab2f0dbbaa33046f1a9975810b75c6cee9ea831482cdda5b958a437e2b";
-const BRIDGE_ONLY_DIGEST: &str = "a4bac4515f50e66b10c1e57ee8b77ef00979ed6f2017756eff42260c9cc8d6e2";
+    "04a9f9b9e4b108c1728a10565c0fc81cba23f10f625c351307f2be56d85c21d9";
+const BRIDGE_ONLY_DIGEST: &str = "afc77153d56af2f93f22e1d8abbc75c702874033d3d2fd78f01c0e1f6224f04b";
 const EXPECTED_RECEIVER_CONFIDENCE: f32 = 0.95;
 const RECEIVER_DELTA: &[(&str, u64, u64, &str)] = &[
     ("generic/fixture.rb", 293, 296, "native-unresolved"),
