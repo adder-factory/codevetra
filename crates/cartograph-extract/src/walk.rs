@@ -65,7 +65,7 @@ mod script_support;
 mod shader_family;
 mod shell_family;
 mod solidity_family;
-mod specifier_safety;
+pub(crate) mod specifier_safety;
 mod sql_family;
 mod swift_family;
 pub(crate) mod syntax;
@@ -1522,10 +1522,11 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
 
     fn extracted_symbol(
         &mut self,
-        pending: PendingSymbol<'_>,
+        mut pending: PendingSymbol<'_>,
         id: &SymbolId,
         qualified_name: String,
     ) -> Result<ExtractedSymbol, ExtractError> {
+        self.context.screen_signature(&mut pending)?;
         let span = span_for(pending.span_node)?;
         let docstring = self.context.jsdoc(pending.doc_anchor)?;
         let body_search = match pending.body_node {
@@ -1803,6 +1804,49 @@ impl<'source, 'cancel> ExtractionContext<'source, 'cancel> {
             self.budget.ensure_string_length(value.len())?;
         }
         Ok(signature)
+    }
+
+    fn screen_signature(&mut self, pending: &mut PendingSymbol<'_>) -> Result<(), ExtractError> {
+        let Some(signature) = pending.signature.as_deref() else {
+            return Ok(());
+        };
+        if signature
+            .split_whitespace()
+            .any(specifier_safety::specifier_may_carry_credential)
+            || self.signature_has_unsupported_literal(pending.structural_node, signature)?
+        {
+            pending.signature = None;
+        }
+        Ok(())
+    }
+
+    /// An undecoded literal escape cannot establish safe retained signature text.
+    /// Only escapes in complete literals retained by the signature affect it.
+    fn signature_has_unsupported_literal(
+        &mut self,
+        node: Node<'_>,
+        signature: &str,
+    ) -> Result<bool, ExtractError> {
+        if !signature.contains('\\') {
+            return Ok(false);
+        }
+        for (visited, candidate) in syntax::descendants_including_root(node).enumerate() {
+            self.ensure_active()?;
+            if visited >= MAX_BOUNDED_AST_VISITS {
+                return Err(ExtractError::OutputLimit);
+            }
+            if candidate.kind() == "escape_sequence"
+                && candidate.parent().is_some_and(|literal| {
+                    matches!(
+                        literal.kind(),
+                        "string" | "string_literal" | "template_string"
+                    ) && signature.contains(self.text(literal))
+                })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn assignment_signature(&mut self, node: Node<'_>) -> Result<Option<String>, ExtractError> {

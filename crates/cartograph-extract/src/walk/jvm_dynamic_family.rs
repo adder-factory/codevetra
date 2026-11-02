@@ -7,7 +7,9 @@ use tree_sitter::Node;
 use crate::{ExtractError, ExtractedImportBinding, ImportBindingKind, code_scan::CodeScan};
 
 use super::{
-    ExtractionBuilder, PendingReference, PendingSymbol, current_owner_kind_in, references,
+    ExtractionBuilder, PendingReference, PendingSymbol, current_owner_kind_in,
+    family_support::screened_name,
+    references,
     syntax::{children, descendants_including_root, named_children, span_for},
     with_root_scope,
 };
@@ -257,7 +259,9 @@ fn visit_groovy_recovered_enum(
     else {
         return Ok(false);
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(false);
+    };
     let id = emit_jvm_symbol(
         builder,
         PendingSymbol {
@@ -336,7 +340,9 @@ fn visit_persistent_namespace(
     let Some(name_node) = name_node else {
         return Ok(());
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let id = emit_namespace(builder, node, name.clone())?;
     builder.owners.push(id);
     builder.native_owner_kinds.push(SymbolKind::Namespace);
@@ -355,7 +361,9 @@ fn visit_scala_package(
     let Some(body) = node.child_by_field_name("body") else {
         return visit_persistent_namespace(builder, node, Some(name_node));
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let id = emit_namespace(builder, node, name.clone())?;
     builder.owners.push(id);
     builder.native_owner_kinds.push(SymbolKind::Namespace);
@@ -511,6 +519,7 @@ fn visit_groovy_import(
 fn safe_import_target(target: &str) -> bool {
     !target.is_empty()
         && target.len() <= MAX_REFERENCE_TARGET_BYTES
+        && !super::specifier_safety::specifier_may_carry_credential(target)
         && target
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'$'))
@@ -599,6 +608,12 @@ fn preceding_jvm_doc(
     let Some(raw) = raw_jvm_doc(prefix, lower_bound) else {
         return Ok(None);
     };
+    if raw
+        .split_whitespace()
+        .any(super::specifier_safety::specifier_may_carry_credential)
+    {
+        return Ok(None);
+    }
     let raw = builder.context.copy_text(raw)?;
     normalize_doc(builder, &raw)
 }
@@ -704,6 +719,12 @@ fn emit_binding(
         imported,
         local,
     } = input;
+    if [module, imported, local]
+        .into_iter()
+        .any(super::specifier_safety::specifier_may_carry_credential)
+    {
+        return Ok(());
+    }
     builder.emit_import_binding(ExtractedImportBinding {
         kind,
         module_specifier: builder.context.copy_text(module)?,
@@ -733,7 +754,9 @@ fn visit_kotlin_container(
     };
     let body =
         named_children(node).find(|child| matches!(child.kind(), "class_body" | "enum_class_body"));
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let visibility = jvm_visibility(builder, node)?;
     let id = emit_container(
         builder,
@@ -791,7 +814,9 @@ fn visit_scala_container(
         "class_definition" | "object_definition" => SymbolKind::Class,
         _ => return builder.visit_named_children(node, depth),
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let visibility = jvm_visibility(builder, node)?;
     let id = emit_container(
         builder,
@@ -853,7 +878,9 @@ fn visit_groovy_container(
     } else {
         SymbolKind::Class
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let visibility = jvm_visibility(builder, node)?;
     let id = emit_container(
         builder,
@@ -1137,7 +1164,9 @@ fn emit_kotlin_callable(
         kind,
         depth,
     } = input;
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let return_type = kotlin_return_type(node, parameters);
     let body = named_children(node).find(|child| child.kind() == "function_body");
     let visibility = jvm_visibility(builder, node)?;
@@ -1194,7 +1223,9 @@ fn visit_scala_callable(
     let Some(name_node) = node.child_by_field_name("name") else {
         return builder.visit_named_children(node, depth);
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let kind = if current_owner_kind_in(builder, JVM_TYPE_OWNER_KINDS) {
         SymbolKind::Method
     } else {
@@ -1262,7 +1293,9 @@ fn visit_groovy_callable(
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return builder.visit_named_children(node, depth);
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let kind = if current_owner_kind_in(builder, JVM_TYPE_OWNER_KINDS) {
         SymbolKind::Method
     } else {
@@ -1339,7 +1372,9 @@ fn visit_groovy_constructor(
     let Some(arguments) = node.child_by_field_name("args") else {
         return Ok(());
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let signature = groovy_recovered_constructor_signature(builder, arguments)?;
     let visibility = jvm_visibility(builder, node)?;
     let body = descendants_including_root(arguments)
@@ -1527,7 +1562,9 @@ fn emit_kotlin_property_symbol(
         return Ok(None);
     };
     let keyword = if immutable { "val" } else { "var" };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(None);
+    };
     let kind = if class_scope {
         SymbolKind::Field
     } else if immutable {
@@ -1585,7 +1622,9 @@ fn emit_scala_class_parameter(
     let Some(name_node) = node.child_by_field_name("name") else {
         return Ok(());
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let type_node = node.child_by_field_name("type");
     let keyword = if direct_keyword(builder, node, "var")? {
         "var"
@@ -1642,7 +1681,9 @@ fn visit_scala_binding(
     let Some(name_node) = scala_pattern_name(pattern) else {
         return builder.visit_named_children(node, depth);
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let class_scope = current_owner_kind_in(builder, JVM_TYPE_OWNER_KINDS);
     let immutable = node.kind() == "val_definition";
     let kind = if class_scope {
@@ -1712,7 +1753,9 @@ fn visit_groovy_binding(
     let Some(name_node) = node.child_by_field_name("name") else {
         return builder.visit_named_children(node, depth);
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let class_scope = current_owner_kind_in(builder, JVM_TYPE_OWNER_KINDS);
     let kind = if class_scope {
         SymbolKind::Field
@@ -1820,7 +1863,9 @@ fn emit_type_alias(
         name_node,
         target,
     } = input;
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let visibility = jvm_visibility(builder, node)?;
     let id = emit_jvm_symbol(
         builder,
@@ -1865,7 +1910,9 @@ fn visit_enum_member(
     let Some(name_node) = name_node else {
         return builder.visit_named_children(node, depth);
     };
-    let name = builder.context.owned_text(name_node)?;
+    let Some(name) = screened_name(builder, name_node)? else {
+        return Ok(());
+    };
     let id = emit_jvm_symbol(
         builder,
         PendingSymbol {
@@ -2428,7 +2475,10 @@ fn normalize_reference(
     builder: &ExtractionBuilder<'_, '_>,
     raw: &str,
 ) -> Result<Option<String>, ExtractError> {
-    if raw.is_empty() || raw.len() > MAX_REFERENCE_TARGET_BYTES {
+    if raw.is_empty()
+        || raw.len() > MAX_REFERENCE_TARGET_BYTES
+        || super::specifier_safety::specifier_may_carry_credential(raw)
+    {
         return Ok(None);
     }
     let mut normalized = String::new();

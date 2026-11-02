@@ -65,7 +65,15 @@ pub(super) fn description_from_context(
         .or_else(|| raw.strip_circumfix('"', '"'))
         .unwrap_or(raw)
         .trim();
-    if stripped.is_empty() {
+    let unsupported_escape = if raw.starts_with("\"\"\"") {
+        stripped.contains("\\\"\"\"")
+    } else {
+        stripped.contains('\\')
+    };
+    if stripped.is_empty()
+        || unsupported_escape
+        || super::specifier_safety::specifier_may_carry_credential(stripped)
+    {
         Ok(None)
     } else {
         context.copy_text(stripped).map(Some)

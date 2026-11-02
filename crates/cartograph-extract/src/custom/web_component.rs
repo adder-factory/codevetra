@@ -286,6 +286,9 @@ fn scan_form_action(
     let Some((offset, value)) = tag_attribute(tag, FORM_ACTION_ATTRIBUTE) else {
         return Ok(());
     };
+    if super::specifier_may_carry_credential(value) {
+        return Ok(());
+    }
     if builder.snapshot.language() == SourceLanguage::Svelte && value.contains('{') {
         return Ok(());
     }

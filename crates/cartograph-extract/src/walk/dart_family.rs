@@ -19,6 +19,7 @@ use crate::{ExtractError, ExtractedImportBinding, ImportBindingKind, SymbolExpor
 use super::{
     ExtractionBuilder, NamedDeclaration, NodeRange, PendingReference, PendingSymbol, SymbolScope,
     in_symbol_scope, references, safe_assignment_signature,
+    specifier_safety::specifier_may_carry_credential,
     syntax::{children, has_child_kind, named_child_of_kind, named_children, span_for},
     widen_symbol_span, with_root_scope,
 };
@@ -1047,7 +1048,7 @@ fn exported_names(
     }))
 }
 
-/// The unquoted URI, rejecting interpolated, multi-line, or oversized text.
+/// The unquoted URI, rejecting escapes, interpolation, multi-line or oversized text.
 fn directive_module(
     builder: &mut ExtractionBuilder<'_, '_>,
     uri: Node<'_>,
@@ -1056,7 +1057,8 @@ fn directive_module(
     let unquoted = raw.trim_matches(|character| matches!(character, '\'' | '"'));
     if unquoted.is_empty()
         || unquoted.len() > MAXIMUM_URI_BYTES
-        || unquoted.contains(['$', '\'', '"', '\n', '\r', '\0'])
+        || unquoted.contains(['$', '\\', '\'', '"', '\n', '\r', '\0'])
+        || specifier_may_carry_credential(unquoted)
     {
         return Ok(None);
     }
