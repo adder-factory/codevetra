@@ -16,6 +16,163 @@ fn generation(fixtures: &[(&str, &str)]) -> CanonicalGenerationFacts {
 }
 
 #[test]
+fn expo_bridge_member_calls_keep_explicit_native_resolution() {
+    let facts = generation(&[
+        (
+            "js/settings.ts",
+            "import { requireNativeModule } from 'expo-modules-core';\nconst ExpoSettings = requireNativeModule('ExpoSettings');\nexport async function applyTheme() { ExpoSettings.getTheme(); ExpoSettings.spaced(); ExpoSettings.plainMethod(); return ExpoSettings.setTheme('light'); }\n",
+        ),
+        (
+            "android/SettingsModule.kt",
+            "import expo.modules.kotlin.modules.Module\nimport expo.modules.kotlin.modules.ModuleDefinition\nclass SettingsModule : Module() { fun plainMethod() {} override fun definition() = ModuleDefinition { Name(\"ExpoSettings\"); Function(\"getTheme\") { \"dark\" }; Function (\"spaced\") { 1 }; AsyncFunction(\"setTheme\") { theme: String -> theme.uppercase() } } }\n",
+        ),
+    ]);
+    let owner = capability_symbol(&facts, "js/settings.ts", "applyTheme");
+    for method in ["getTheme", "spaced", "setTheme"] {
+        assert_native_bridge_member(
+            &facts,
+            (owner, method),
+            (
+                "android/SettingsModule.kt",
+                &format!("android/SettingsModule.kt::expo-module-method::ExpoSettings::{method}"),
+            ),
+        );
+    }
+    assert_unexported_bridge_member(&facts, owner);
+}
+
+#[test]
+fn react_native_destructured_and_qualified_members_keep_native_resolution() {
+    let facts = generation(&[
+        (
+            "src/native.js",
+            "import { NativeModules } from 'react-native';\nconst { RNThing } = NativeModules;\nexport async function loadThing() { const value = await RNThing.doSomething('a'); const other = await NativeModules.RNThing.getThing(); await RNThing.plainMethod(); return [value, other]; }\n",
+        ),
+        (
+            "ios/RN/RNThing.m",
+            "#import <React/RCTBridgeModule.h>\n@implementation RNThing\nRCT_EXPORT_MODULE()\nRCT_EXPORT_METHOD(doSomething:(NSString *)name) {}\nRCT_REMAP_METHOD(getThing, getThingWithResolver:(RCTPromiseResolveBlock)resolve) {}\n- (void)plainMethod {}\n@end\n",
+        ),
+    ]);
+    for (owner, method) in [
+        ("loadThing::value", "doSomething"),
+        ("loadThing::other", "getThing"),
+    ] {
+        let owner = capability_symbol(&facts, "src/native.js", owner);
+        assert_native_bridge_member(
+            &facts,
+            (owner, method),
+            (
+                "ios/RN/RNThing.m",
+                &format!("ios/RN/RNThing.m::react-native-method::RNThing::{method}"),
+            ),
+        );
+    }
+    let owner = capability_symbol(&facts, "src/native.js", "loadThing");
+    assert_unexported_bridge_member(&facts, owner);
+}
+
+fn assert_unexported_bridge_member(
+    facts: &CanonicalGenerationFacts,
+    owner: &super::super::SymbolInput,
+) {
+    let reference =
+        CapabilityReferenceQuery::new(facts, owner).named("plainMethod", ReferenceKind::Calls);
+    assert_eq!(reference.target_symbol_id, None);
+    assert_eq!(
+        reference.resolution_provenance,
+        DYNAMIC_DISPATCH_UNRESOLVED_PROVENANCE
+    );
+}
+
+fn assert_native_bridge_member(
+    facts: &CanonicalGenerationFacts,
+    (owner, name): (&super::super::SymbolInput, &str),
+    (path, qualified): (&str, &str),
+) {
+    let target = capability_symbol(facts, path, qualified);
+    let references = facts
+        .references()
+        .iter()
+        .filter(|reference| {
+            reference.owner_symbol_id.as_ref() == Some(&owner.symbol_id)
+                && reference.reference_name == name
+                && reference.reference_kind == ReferenceKind::Calls.as_str()
+                && reference.resolution_provenance == DYNAMIC_DISPATCH_PROVENANCE
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(references.len(), 1, "{name}: {:?}", facts.references());
+    assert_eq!(
+        references[0].target_symbol_id.as_ref(),
+        Some(&target.symbol_id)
+    );
+    assert!((references[0].confidence - 0.65).abs() < f32::EPSILON);
+}
+
+const EXPO_COLLISION_MODULE: (&str, &str) = (
+    "android/SettingsModule.kt",
+    "import expo.modules.kotlin.modules.Module\nimport expo.modules.kotlin.modules.ModuleDefinition\nclass SettingsModule : Module() { override fun definition() = ModuleDefinition { Name(\"ExpoSettings\"); Function(\"map\") { 1 }; Function(\"set\") { 1 }; Function(\"getTheme\") { \"dark\" } } }\n",
+);
+
+#[test]
+fn native_bridge_homonyms_cannot_capture_builtin_receivers() {
+    let facts = generation(&[
+        EXPO_COLLISION_MODULE,
+        (
+            "src/use.ts",
+            "export function use() { return [1, 2].map(x => x); }\n",
+        ),
+    ]);
+    let owner = capability_symbol(&facts, "src/use.ts", "use");
+    let reference = CapabilityReferenceQuery::new(&facts, owner).named("map", ReferenceKind::Calls);
+    assert_eq!(reference.target_symbol_id, None);
+    assert_eq!(
+        reference.resolution_provenance,
+        DYNAMIC_DISPATCH_UNRESOLVED_PROVENANCE
+    );
+}
+
+#[test]
+fn native_bridge_homonyms_cannot_capture_shadowed_import_receivers() {
+    let facts = generation(&[
+        EXPO_COLLISION_MODULE,
+        ("src/cache.ts", "export class Cache { static set() {} }\n"),
+        (
+            "src/use.ts",
+            "import { Cache } from './cache';\nexport function use(Cache: { set(): void }) { Cache.set(); }\n",
+        ),
+    ]);
+    let owner = capability_symbol(&facts, "src/use.ts", "use");
+    for name in ["Cache.set", "set"] {
+        let reference =
+            CapabilityReferenceQuery::new(&facts, owner).named(name, ReferenceKind::Calls);
+        assert_eq!(reference.target_symbol_id, None);
+        assert_eq!(
+            reference.resolution_provenance,
+            DYNAMIC_DISPATCH_UNRESOLVED_PROVENANCE
+        );
+    }
+}
+
+#[test]
+fn native_bridge_homonyms_keep_exact_namespace_import_targets() {
+    let facts = generation(&[
+        EXPO_COLLISION_MODULE,
+        ("src/tools.ts", "export function getTheme() {}\n"),
+        (
+            "src/use.ts",
+            "import * as tools from './tools';\nexport function use() { tools.getTheme(); }\n",
+        ),
+    ]);
+    let owner = capability_symbol(&facts, "src/use.ts", "use");
+    let target = capability_symbol(&facts, "src/tools.ts", "getTheme");
+    let reference =
+        CapabilityReferenceQuery::new(&facts, owner).named("getTheme", ReferenceKind::Calls);
+    assert_eq!(reference.target_symbol_id.as_ref(), Some(&target.symbol_id));
+    assert_eq!(reference.resolution_provenance, DYNAMIC_DISPATCH_PROVENANCE);
+    assert!((reference.confidence - 0.65).abs() < f32::EPSILON);
+}
+
+#[test]
 fn builtin_member_calls_never_bind_to_project_homonyms() {
     let facts = generation(&[
         (

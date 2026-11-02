@@ -14,12 +14,12 @@ use super::{
     ProjectResolutionCandidates, ProjectResolutionQuery, RESOLUTION_MAP_NODE_ALLOWANCE,
     ReferenceDispatch, ReferenceKind, ReferenceResolution, ResolutionCandidate, ResolutionIndex,
     ResolutionIndexFileInput, ResolutionRequest, ResolveBudget, ResolvedTarget, StageItemFailure,
-    SymbolId, SymbolKind, UNRESOLVED_IMPORT_PROVENANCE, Visibility,
+    SymbolId, SymbolKind, UNRESOLVED_IMPORT_PROVENANCE, Visibility, framework_resolution_alias,
     import_binding_is_project_local, is_project_candidate, javascript_family_name,
-    javascript_intrinsic_reference, matched_import_binding, project_resolved_target,
-    project_source_context, reference_import_scope, reference_kind_candidate,
-    resolution_candidates_for_file, resolve_import, resolve_lexical, resolve_lexical_scope,
-    select_candidate, try_clone_text, usize_to_u64,
+    javascript_intrinsic_reference, matched_import_binding, native_bridge_target_language,
+    project_resolved_target, project_source_context, reference_import_scope,
+    reference_kind_candidate, resolution_candidates_for_file, resolve_import, resolve_lexical,
+    resolve_lexical_scope, select_candidate, try_clone_text, usize_to_u64,
 };
 
 #[derive(Default)]
@@ -739,6 +739,9 @@ fn receiver_import<Cancel>(
 where
     Cancel: FnMut() -> bool,
 {
+    if native_modules_import(&query, cancelled)? {
+        return Ok(None);
+    }
     let ReceiverImportQuery {
         index,
         qualified,
@@ -802,6 +805,42 @@ where
     }
 }
 
+fn native_modules_import<Cancel>(
+    query: &ReceiverImportQuery<'_, '_>,
+    cancelled: &mut Cancel,
+) -> Result<bool, StageItemFailure>
+where
+    Cancel: FnMut() -> bool,
+{
+    if query.dispatch != ReferenceDispatch::Dynamic
+        || !native_bridge_lookup(query.index, query.member)
+    {
+        return Ok(false);
+    }
+    let ImportBindingMatch::Unique(binding, _) =
+        matched_import_binding(query.qualified, ImportReferenceSite::Usage, cancelled)?
+    else {
+        return Ok(false);
+    };
+    if binding.kind != ImportBindingKind::Named
+        || binding.module_specifier != "react-native"
+        || binding.imported_name != "NativeModules"
+        || import_binding_is_project_local(query.index, binding, query.qualified)
+    {
+        return Ok(false);
+    }
+    // This external import names the native registry, so the existing bridge
+    // tiers own its dynamic member lookup after the receiver guards have run.
+    let suffix = query
+        .qualified
+        .name
+        .strip_prefix(&binding.local_name)
+        .and_then(|suffix| suffix.strip_prefix('.'));
+    Ok(suffix
+        .and_then(|suffix| suffix.split_once('.'))
+        .is_some_and(|(module, member)| !module.is_empty() && member == query.member))
+}
+
 fn imported_static_member<'index>(
     query: &ReceiverImportQuery<'index, '_>,
     target: &ResolvedTarget,
@@ -830,7 +869,9 @@ pub(super) fn resolve_project<Cancel>(
 where
     Cancel: FnMut() -> bool,
 {
-    if !javascript_family_name(query.request.language) {
+    if !javascript_family_name(query.request.language)
+        || native_bridge_lookup(query.index, query.request.name)
+    {
         return Ok(None);
     }
     if query.request.dispatch != ReferenceDispatch::Dynamic {
@@ -847,6 +888,18 @@ where
         ReferenceResolution::unresolved(DYNAMIC_DISPATCH_UNRESOLVED_PROVENANCE),
         |candidate| ReferenceResolution::resolved(project_resolved_target(candidate)),
     )))
+}
+
+pub(super) fn native_bridge_symbol(symbol: &NativeSymbolFacts, language: &str) -> bool {
+    (javascript_family_name(language) || native_bridge_target_language(language))
+        && framework_resolution_alias(symbol, language).is_some()
+}
+
+fn native_bridge_lookup(index: &ResolutionIndex, name: &str) -> bool {
+    index
+        .candidates
+        .get(name)
+        .is_some_and(|bucket| bucket.native_bridge_member)
 }
 
 pub(super) fn accessible_member(candidate: &ResolutionCandidate) -> bool {

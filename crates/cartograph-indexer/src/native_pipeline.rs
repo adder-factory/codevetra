@@ -5169,6 +5169,7 @@ struct ResolutionCandidateRange {
 
 #[derive(Default)]
 struct ResolutionCandidateBucket {
+    native_bridge_member: bool,
     candidates: Vec<ResolutionCandidate>,
     by_file: Vec<ResolutionCandidateRange>,
     globally_visible: Vec<usize>,
@@ -11720,6 +11721,8 @@ fn push_candidate(
         candidates.insert(try_clone_text(key)?, ResolutionCandidateBucket::default());
     }
     let bucket = candidates.get_mut(key).ok_or(StageItemFailure)?;
+    bucket.native_bridge_member |=
+        javascript_member_resolution::native_bridge_symbol(symbol, language);
     let reservation = reserve_candidate_insertion(
         bucket,
         CandidateReservationInput {
