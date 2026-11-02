@@ -26,6 +26,8 @@ pub enum ExtractionStrategy {
     ShaderFamily,
     /// Ada and VHDL declarations, case-insensitive references, and compilation imports.
     AdaFamily,
+    /// Pascal and Delphi units, types, members, implementation bodies, and `uses` imports.
+    PascalFamily,
     /// Grammar-backed conservative structural extraction for the remaining v1 language modes.
     GenericStructural,
     /// Bounded native scanners for custom, mixed-markup, and domain-specific v1 modes.
@@ -48,6 +50,7 @@ impl ExtractionStrategy {
                 | Self::JvmDynamicFamily
                 | Self::ShaderFamily
                 | Self::AdaFamily
+                | Self::PascalFamily
                 | Self::GenericStructural
                 | Self::CustomStructural
         )
@@ -133,6 +136,7 @@ const fn grammar_strategy(language: SourceLanguage) -> Option<ExtractionStrategy
         | SourceLanguage::Slang => Some(ExtractionStrategy::CFamily),
         SourceLanguage::Wesl | SourceLanguage::Wgsl => Some(ExtractionStrategy::ShaderFamily),
         SourceLanguage::Ada | SourceLanguage::Vhdl => Some(ExtractionStrategy::AdaFamily),
+        SourceLanguage::Pascal => Some(ExtractionStrategy::PascalFamily),
         SourceLanguage::Bash
         | SourceLanguage::Fish
         | SourceLanguage::PowerShell
@@ -164,7 +168,6 @@ const fn fallback_strategy(language: SourceLanguage) -> ExtractionStrategy {
         | SourceLanguage::Luau
         | SourceLanguage::Nix
         | SourceLanguage::ObjectiveC
-        | SourceLanguage::Pascal
         | SourceLanguage::Php
         | SourceLanguage::Prisma
         | SourceLanguage::R

@@ -28,6 +28,7 @@ mod jvm_dynamic_family;
 mod managed_family;
 mod module_system;
 mod numerical;
+mod pascal_family;
 mod polyglot;
 mod prisma_family;
 mod references;
@@ -682,6 +683,7 @@ pub(super) struct PendingReference<'tree> {
 #[derive(Clone, Copy)]
 enum ExtractionFamily {
     Ada,
+    Pascal,
     Shader,
     Shell,
     C,
@@ -735,7 +737,6 @@ const GENERIC_LANGUAGES: &[SourceLanguage] = &[
     SourceLanguage::Luau,
     SourceLanguage::Nix,
     SourceLanguage::ObjectiveC,
-    SourceLanguage::Pascal,
     SourceLanguage::Php,
     SourceLanguage::R,
     SourceLanguage::ReScript,
@@ -776,6 +777,10 @@ const fn family_slice_structural(family: ExtractionFamily) -> Option<FamilySlice
                 ada_family::capture_usage(builder, node)?;
                 builder.visit_named_children(node, depth)
             },
+        },
+        ExtractionFamily::Pascal => FamilySlice {
+            visit_declaration: pascal_family::visit_declaration,
+            visit_usage: |builder, node, depth| builder.visit_named_children(node, depth),
         },
         ExtractionFamily::Shader => FamilySlice {
             visit_declaration: shader_family::visit_declaration,
@@ -890,6 +895,7 @@ fn extraction_family(language: SourceLanguage) -> ExtractionFamily {
             SourceLanguage::Wesl | SourceLanguage::Wgsl => ExtractionFamily::Shader,
             SourceLanguage::Prisma => ExtractionFamily::Prisma,
             SourceLanguage::Sql => ExtractionFamily::Sql,
+            SourceLanguage::Pascal => ExtractionFamily::Pascal,
             _ => ExtractionFamily::Unsupported,
         }
     }
