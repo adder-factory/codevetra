@@ -1,0 +1,24 @@
+[package]
+name = "codevetra-shuttle-checks"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "MIT"
+publish = false
+
+# This development harness has its own locked dependency graph. None of its
+# scheduler/runtime replacements are dependencies of the shipped workspace.
+[workspace]
+
+[dependencies]
+shuttle = "=0.9.10"
+tokio = { package = "shuttle-tokio", version = "=1.0.0", features = ["shuttle", "rt", "sync", "time", "macros"] }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+debug = 0
+
+[lints.rust]
+unsafe_code = "forbid"

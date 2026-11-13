@@ -29,6 +29,13 @@ allow = [
   "Zlib",
 ]
 
+# zstd-sys 2.1.3 now declares the BSD-2-Clause legacy decoder notice.
+# Exact-version review: all upstream license texts are packaged in the storage bundle.
+[[licenses.exceptions]]
+name = "zstd-sys"
+version = "=2.1.3"
+allow = ["BSD-2-Clause"]
+
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"

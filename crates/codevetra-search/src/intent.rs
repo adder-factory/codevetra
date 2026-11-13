@@ -95,6 +95,8 @@ const NON_DEFINITION_TERMS: &[&str] = &[
     "property",
     "variable",
     "variables",
+    "member",
+    "members",
 ];
 
 /// Deterministic coding-task category used to select retrieval and graph policy.
@@ -172,6 +174,11 @@ impl TaskIntent {
     /// Select a deterministic result preference while honoring explicit auxiliary-code tasks.
     #[must_use]
     pub fn retrieval_preference(self, task: &str) -> RetrievalPreference {
+        // A single identifier or path is an explicit lookup, even when it names
+        // a fixture or leaf declaration. Preserve lexical relevance for it.
+        if task.split_ascii_whitespace().count() == 1 {
+            return RetrievalPreference::Neutral;
+        }
         let normalized = normalize(task);
         let tokens = normalized.split_ascii_whitespace().collect::<Vec<_>>();
         let explicitly_auxiliary = contains_term(
@@ -185,10 +192,10 @@ impl TaskIntent {
                 "examples",
                 "fixture",
                 "fixtures",
-                "test",
-                "tests",
             ],
-        ) || contains_term(&tokens, NON_DEFINITION_TERMS);
+        ) || contains_term(&tokens, NON_DEFINITION_TERMS)
+            || (contains_term(&tokens, &["test", "tests"])
+                && !requests_implementation_with_tests(&tokens));
         if explicitly_auxiliary {
             return RetrievalPreference::Neutral;
         }
@@ -245,9 +252,26 @@ fn contains_term(tokens: &[&str], candidates: &[&str]) -> bool {
         .any(|token| candidates.iter().any(|candidate| token == candidate))
 }
 
+fn requests_implementation_with_tests(tokens: &[&str]) -> bool {
+    let implementation = tokens
+        .iter()
+        .position(|token| matches!(*token, "implementation" | "behavior" | "behaviour"));
+    let tests = tokens
+        .iter()
+        .position(|token| matches!(*token, "test" | "tests"));
+    implementation
+        .zip(tests)
+        .is_some_and(|(implementation, tests)| {
+            implementation < tests && tokens[implementation..tests].contains(&"and")
+        })
+}
+
 fn asks_for_tests(tokens: &[&str]) -> bool {
     tokens.array_windows().any(|&[first, second]| {
-        matches!(first, "which" | "what" | "select") && matches!(second, "test" | "tests")
+        matches!(
+            first,
+            "which" | "what" | "select" | "find" | "locate" | "show"
+        ) && matches!(second, "test" | "tests")
     })
 }
 
@@ -390,6 +414,34 @@ mod tests {
                 .retrieval_preference("diagnose semantic neighbor decoding failure"),
             RetrievalPreference::ProductionDefinitions,
         );
+    }
+
+    #[test]
+    fn implementation_with_regression_tests_keeps_definition_preference() {
+        let task = "Explain how hybrid search decides semantic retrieval is ready, what happens when current-generation embeddings are missing, and identify the implementation and regression tests to inspect before changing that behavior.";
+        assert_eq!(
+            TaskIntent::classify(task).retrieval_preference(task),
+            RetrievalPreference::ProductionDefinitions,
+        );
+        for task in [
+            "owner_ipc_fixture",
+            "SemanticReadiness::Ready",
+            "src/fixtures/owner.rs",
+            "find tests for owner IPC",
+            "explain how this test works",
+            "trace the test implementation",
+            "explain the test implementation and assertions",
+            "find the enum member Ready",
+            "find the parameter request",
+            "inspect the fixture implementation",
+            "select tests for hybrid search",
+        ] {
+            assert_eq!(
+                TaskIntent::classify(task).retrieval_preference(task),
+                RetrievalPreference::Neutral,
+                "{task}"
+            );
+        }
     }
 
     #[test]

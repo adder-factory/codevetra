@@ -321,7 +321,7 @@ fn decode_response(body: &[u8], expected: usize, model: &str) -> Result<RerankBa
     if raw.iter().any(|score| !score.is_finite()) {
         return Err(RerankError::InvalidResponse);
     }
-    let normalized = normalize_scores(&raw);
+    let normalized = normalize_scores(&raw).ok_or(RerankError::InvalidResponse)?;
     let mut scores = vec![None; expected];
     for (row, score) in response.results.into_iter().zip(normalized) {
         let slot = scores
@@ -341,23 +341,40 @@ fn decode_response(body: &[u8], expected: usize, model: &str) -> Result<RerankBa
     })
 }
 
-fn normalize_scores(scores: &[f32]) -> Vec<f32> {
+mod score;
+
+fn normalize_scores(scores: &[f32]) -> Option<Vec<f32>> {
     if scores.iter().all(|score| (0.0..=1.0).contains(score)) {
-        return scores.to_vec();
+        return Some(scores.to_vec());
     }
     let minimum = scores.iter().copied().fold(f32::INFINITY, f32::min);
     let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    if minimum.total_cmp(&maximum).is_eq() {
-        return vec![1.0; scores.len()];
-    }
     scores
         .iter()
-        .map(|score| (score - minimum) / (maximum - minimum))
+        .map(|score| {
+            score::normalize_score(*score, minimum, maximum)
+                .and_then(|value| num_traits::ToPrimitive::to_f32(&value))
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finite_extreme_logits_normalize_to_finite_unit_scores() {
+        let scores = super::normalize_scores(&[-f32::MAX, 0.0, f32::MAX]);
+        assert_eq!(scores, Some(vec![0.0, 0.5, 1.0]));
+    }
+
+    #[test]
+    fn binary64_rounding_carry_keeps_normalization_in_range() {
+        // This exact half-ulp case exposed an incorrect CBMC 6.11 SMT model.
+        // Black-box input also exercises the target CPU's arithmetic here.
+        let minimum = std::hint::black_box(f32::from_bits(0x2480_0000));
+        let normalized = super::score::normalize_score(0.5, minimum, 1.0);
+        assert_eq!(normalized.map(f64::to_bits), Some(0x3fdf_ffff_ffff_ffff));
+    }
+
     use std::{
         io::{Read as _, Write as _},
         net::TcpListener,

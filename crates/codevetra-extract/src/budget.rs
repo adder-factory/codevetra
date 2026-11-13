@@ -1,5 +1,8 @@
 use std::mem::size_of;
 
+mod arithmetic;
+pub use arithmetic::{native_extraction_reservation, native_output_limit, native_read_reservation};
+
 use codevetra_domain::SourceSpan;
 
 use crate::{
@@ -12,43 +15,13 @@ use crate::{
 // The transient construction budget charges two vector-growth slots per fact so an allocation
 // cannot outrun supervisor accounting. It is deliberately separate from the smaller retained
 // output ceiling checked against the completed file.
-const PARSER_RESERVATION_MULTIPLIER: u64 = 64;
-const MINIMUM_PARSER_RESERVATION_BYTES: u64 = 1024 * 1024;
-const READ_RESERVATION_MULTIPLIER: u64 = 2;
-const MINIMUM_READ_RESERVATION_BYTES: u64 = 128 * 1024;
 // Dense schemas can emit several bounded graph facts per source token. The completed output stays
 // below the independent 64x construction reservation while admitting generated API fixtures.
-const OUTPUT_LIMIT_MULTIPLIER: u64 = 32;
-const MINIMUM_OUTPUT_LIMIT_BYTES: u64 = 256 * 1024;
 const MINIMUM_FACT_LIMIT: u64 = 1024;
 const MINIMUM_STRING_LIMIT_BYTES: u64 = 4096;
 const MAXIMUM_FACT_STRING_BYTES: u64 = 256 * 1024;
 const MAXIMUM_QUALIFIER_SEPARATOR_BYTES: u64 = 512;
 const VECTOR_GROWTH_ALLOWANCE: u64 = 2;
-
-/// Conservative in-flight reservation for source, Tree-sitter, and bounded Rust facts.
-#[must_use]
-pub fn native_extraction_reservation(source_bytes: u64) -> Option<u64> {
-    source_bytes
-        .checked_mul(PARSER_RESERVATION_MULTIPLIER)
-        .and_then(|bytes| bytes.checked_add(MINIMUM_PARSER_RESERVATION_BYTES))
-}
-
-/// Conservative in-flight reservation for streamed UTF-8 validation and hashing.
-#[must_use]
-pub fn native_read_reservation(source_bytes: u64) -> Option<u64> {
-    source_bytes
-        .checked_mul(READ_RESERVATION_MULTIPLIER)
-        .and_then(|bytes| bytes.checked_add(MINIMUM_READ_RESERVATION_BYTES))
-}
-
-/// Hard per-file limit for modeled Rust-owned extraction output.
-#[must_use]
-pub fn native_output_limit(source_bytes: u64) -> Option<u64> {
-    source_bytes
-        .checked_mul(OUTPUT_LIMIT_MULTIPLIER)
-        .and_then(|bytes| bytes.checked_add(MINIMUM_OUTPUT_LIMIT_BYTES))
-}
 
 pub(crate) struct ExtractionBudget {
     retained_output_limit: u64,

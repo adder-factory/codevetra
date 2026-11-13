@@ -186,6 +186,24 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --all-features --no-deps
 
+      - name: Test formal verifier containment
+        if: needs.classify.outputs.full == 'true'
+        run: |
+          python3 scripts/test-formal-sandbox.py
+          python3 scripts/test-formal-sandbox.py --live
+
+      - name: Install pinned formal verifiers in bounded sandbox
+        if: needs.classify.outputs.full == 'true'
+        run: scripts/verify-formal.sh setup
+
+      - name: Kani and Verus production contract suite
+        if: needs.classify.outputs.full == 'true'
+        run: scripts/verify-formal.sh
+
+      - name: Shuttle production async interleavings
+        if: needs.classify.outputs.full == 'true'
+        run: scripts/verify-formal.sh shuttle
+
       - name: Dependency advisories, licenses, bans, and sources
         if: needs.classify.outputs.full == 'true'
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -193,6 +211,15 @@ jobs:
           rust-version: '1.99.1'
           command: check
           arguments: --all-features
+
+      - name: Shuttle dependency advisories, licenses, bans, and sources
+        if: needs.classify.outputs.full == 'true'
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: '1.99.1'
+          manifest-path: verification/shuttle/Cargo.toml
+          command: check
+          arguments: --locked --config verification/shuttle/deny.toml
 
       - name: Native dependency shape
         if: needs.classify.outputs.full == 'true'

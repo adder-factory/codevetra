@@ -10,7 +10,7 @@ use crate::{CONTEXT_ANCHOR_MAXIMUM_BYTES, RetrievalError};
 
 const MAXIMUM_FUSED_RESULTS: u16 = 100;
 const MAXIMUM_RERANK_MODEL_BYTES: usize = 256;
-const RECIPROCAL_RANK_OFFSET: f64 = 60.0;
+mod rank;
 
 /// Retrieval policy requested by a caller before any channel work begins.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -429,7 +429,7 @@ impl ChannelCandidate {
         rank: u16,
         raw_score: f64,
     ) -> Result<Self, RetrievalError> {
-        if rank == 0 || rank > MAXIMUM_FUSED_RESULTS {
+        if !rank::valid_rank(rank, MAXIMUM_FUSED_RESULTS) {
             return Err(invalid("channel_rank"));
         }
         if !raw_score.is_finite() {
@@ -1066,7 +1066,7 @@ fn channel_contribution(
 }
 
 fn reciprocal_rank(rank: u16) -> f64 {
-    1.0 / (RECIPROCAL_RANK_OFFSET + f64::from(rank))
+    rank::reciprocal_rank(rank)
 }
 
 fn fused_item(mut accumulator: FusionAccumulator) -> FusedSearchItem {
@@ -1124,15 +1124,21 @@ fn preference_tier(item: &FusedSearchItem, preference: RetrievalPreference) -> u
         return 0;
     }
     let document = item.document();
-    if document.document_kind() == DocumentKind::Test
-        || codevetra_domain::is_test_source_path(document.path().as_str())
-    {
+    definition_tier(
+        document.path().as_str(),
+        document.document_kind() == DocumentKind::Test,
+        document.symbol_kind(),
+    )
+}
+
+pub(crate) fn definition_tier(path: &str, is_test: bool, kind: Option<SymbolKind>) -> u8 {
+    if is_test || codevetra_domain::is_test_source_path(path) {
         return 3;
     }
-    if is_auxiliary_path(document.path().as_str()) {
+    if is_auxiliary_path(path) {
         return 2;
     }
-    match document.symbol_kind() {
+    match kind {
         Some(SymbolKind::Parameter | SymbolKind::Import) => 2,
         Some(
             SymbolKind::Property

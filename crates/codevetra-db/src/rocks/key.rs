@@ -1,5 +1,15 @@
 use super::{Result, RocksError};
 
+mod encoding;
+
+pub(super) fn escape(bytes: &[u8]) -> Vec<u8> {
+    encoding::escape(bytes)
+}
+
+pub(super) fn successor(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    encoding::successor(bytes)
+}
+
 const MAXIMUM_KEY_BYTES: usize = 4_096;
 
 /// Versioned record namespaces with independent `RocksDB` compaction policies.
@@ -73,65 +83,13 @@ impl RecordKey {
     }
 }
 
-pub(super) fn escape(bytes: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(bytes.len().saturating_add(2));
-    for &byte in bytes {
-        encoded.push(byte);
-        if byte == 0 {
-            encoded.push(255);
-        }
-    }
-    encoded
-}
-
 pub(super) fn decode(encoded: &[u8]) -> Result<(RecordKey, u64)> {
-    let mut decoded = Vec::new();
-    let mut index = 0_usize;
-    while let Some(&byte) = encoded.get(index) {
-        index += 1;
-        if byte != 0 {
-            decoded.push(byte);
-        } else {
-            match encoded.get(index) {
-                Some(255) => decoded.push(0),
-                Some(0) => {
-                    index += 1;
-                    let sequence: [u8; 8] = encoded
-                        .get(index..)
-                        .and_then(|bytes| bytes.try_into().ok())
-                        .ok_or(RocksError::Corrupt {
-                            field: "record_key",
-                        })?;
-                    let key = RecordKey::new(decoded).map_err(|_| RocksError::Corrupt {
-                        field: "record_key",
-                    })?;
-                    return Ok((key, !u64::from_be_bytes(sequence)));
-                }
-                _ => {
-                    return Err(RocksError::Corrupt {
-                        field: "record_key",
-                    });
-                }
-            }
-            index += 1;
-        }
-        if decoded.len() > MAXIMUM_KEY_BYTES {
-            break;
-        }
-    }
-    Err(RocksError::Corrupt {
+    let invalid = || RocksError::Corrupt {
         field: "record_key",
-    })
-}
-
-pub(super) fn successor(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
-    while let Some(last) = bytes.pop() {
-        if let Some(next) = last.checked_add(1) {
-            bytes.push(next);
-            return Some(bytes);
-        }
-    }
-    None
+    };
+    let (bytes, sequence) = encoding::decode(encoded).ok_or_else(invalid)?;
+    let key = RecordKey::new(bytes).map_err(|_| invalid())?;
+    Ok((key, sequence))
 }
 
 #[cfg(test)]

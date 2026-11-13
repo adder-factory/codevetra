@@ -24,6 +24,7 @@ provenance live on GitHub Releases.
 
 | Version | Date | Schema · Contract | Headline |
 | --- | --- | --- | --- |
+| [v4.0.5](releases/v4.0.5.md) | 2026-11-13 | Rocks v1 · V27 | Implementation-query ordering, compact context metadata, symbol-impact arguments, boundary fixes, and bounded formal verification |
 | [v4.0.4](releases/v4.0.4.md) | 2026-11-01 | Rocks v1 · V27 | Complete large-graph biomarkers with bounded stages, compact inventories, and embedded-script metrics |
 | [v4.0.3](releases/v4.0.3.md) | 2026-11-01 | Rocks v1 · V27 | Biomarker cache stability during maintenance and physical canonical state migration |
 | [v4.0.2](releases/v4.0.2.md) | 2026-11-01 | Rocks v1 · V27 | Bounded large-project biomarker refreshes, actionable refresh failures, and CLI/MCP surface validation |

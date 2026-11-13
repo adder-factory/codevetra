@@ -128,6 +128,26 @@ v1.1.33 binary under an isolated `HOME`; v2 and CI never run that binary.
 See [the coverage report](docs/LANGUAGE-COVERAGE-REPORT.md#v1-parity-oracle)
 for the key contract, current disposition counts and update procedure.
 
+The full quality gate also runs `scripts/verify-formal.sh` with pinned Kani and
+Verus, plus `scripts/verify-formal.sh shuttle` for randomized async schedules;
+see [formal verification](docs/FORMAL-VERIFICATION.md) for installation,
+production source binding, and the exact scope of the proofs.
+
+Never run Kani, CBMC, Verus, or solver experiments directly on the host. Use
+`scripts/verify-formal.sh` for the gate, or its `kani <source> --harness <name>`
+subcommand for one experimental proof. The shared runner enforces a 4 GiB
+aggregate container memory limit, zero swap, two CPUs, 128 processes, one run
+per user, and a five-minute proof deadline. `setup` provisions pinned tools
+inside the same limits with a separate fifteen-minute deadline. It refuses
+missing containment; never bypass that refusal, enlarge limits, overlap
+retries, or treat a timeout/OOM as a passing proof. Preserve failed-run logs
+and simplify or split the proof before retrying. Docker is a development-only
+verification boundary, not a CodeVetra runtime or storage dependency.
+For small diagnostics, `--memory-mib` may lower the enforced budget; it cannot
+raise the 4 GiB ceiling. Kani is restricted to SAT solvers because the pinned
+CBMC 6.11 SMT floating-point lowering has a reproduced rounding defect; do not
+restore Z3 through command-line flags or per-harness solver annotations.
+
 These gates use the exact stable toolchain in `rust-toolchain.toml`. Do not use
 nightly-only tools or diagnostic overrides to clear them. A separate scheduled
 latest-stable canary detects future compiler and Clippy changes without making

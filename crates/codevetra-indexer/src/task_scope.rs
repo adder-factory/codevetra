@@ -1,3 +1,5 @@
+mod admission;
+
 use std::{
     collections::BTreeMap,
     future::{Future, poll_fn},
@@ -364,15 +366,8 @@ impl TaskRegistry {
         if self.tracked_tasks() >= self.max_tasks {
             return Err(ScopedTaskError::TaskCapacityExceeded);
         }
-        let next_reserved = self
-            .reserved_bytes
-            .checked_add(reserved_bytes)
-            .ok_or(ScopedTaskError::ByteCapacityExceeded)?;
-        if next_reserved > self.max_bytes {
-            Err(ScopedTaskError::ByteCapacityExceeded)
-        } else {
-            Ok(next_reserved)
-        }
+        admission::reserve(self.reserved_bytes, reserved_bytes, self.max_bytes)
+            .ok_or(ScopedTaskError::ByteCapacityExceeded)
     }
 
     fn tracked_tasks(&self) -> usize {

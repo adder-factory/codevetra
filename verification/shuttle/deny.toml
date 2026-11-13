@@ -1,0 +1,32 @@
+# The checker is a development-only Linux workspace; it is never linked into
+# CodeVetra or included in its release archives.
+[graph]
+targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.9
+unused-allowed-license = "deny"
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+workspace-default-features = "allow"
+external-default-features = "allow"
+skip = [
+  # Tokio's instrumented macros use syn 2 while current Tokio macros use syn 3.
+  # Both are build-time dependencies in this isolated checker workspace.
+  { crate = "syn@2.0.119", reason = "shuttle-tokio-macros-impl 0.1.0 requires syn 2; tokio-macros 2.7.2 requires syn 3" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

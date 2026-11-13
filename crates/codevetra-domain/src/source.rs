@@ -4,13 +4,14 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
+mod coordinates;
 mod go_manifest;
+mod path;
 mod telephony;
 mod test_paths;
 
 pub use test_paths::is_test_source_path;
 
-const MAX_NORMALIZED_PATH_BYTES: usize = 4_096;
 const LITERAL_SIGNATURE_KEYWORDS: &[&str] = &[
     "default",
     "false",
@@ -1515,35 +1516,9 @@ impl NormalizedPath {
     /// Returns [`InvalidNormalizedPath`] when `raw` is empty, absolute,
     /// parent-escaping, contains a NUL byte, or exceeds the path bound.
     pub fn parse(raw: &str) -> Result<Self, InvalidNormalizedPath> {
-        if raw.is_empty()
-            || raw.len() > MAX_NORMALIZED_PATH_BYTES
-            || raw.contains('\0')
-            || raw.starts_with(['/', '\\'])
-            || has_windows_drive_prefix(raw)
-        {
-            return Err(InvalidNormalizedPath);
-        }
-
-        let mut canonical = String::new();
-        canonical
-            .try_reserve_exact(raw.len())
-            .map_err(|_| InvalidNormalizedPath)?;
-        for component in raw.split(['/', '\\']) {
-            match component {
-                "" | "." => {}
-                ".." => return Err(InvalidNormalizedPath),
-                value => {
-                    if !canonical.is_empty() {
-                        canonical.push('/');
-                    }
-                    canonical.push_str(value);
-                }
-            }
-        }
-        if canonical.is_empty() || canonical.len() > MAX_NORMALIZED_PATH_BYTES {
-            return Err(InvalidNormalizedPath);
-        }
-        Ok(Self(canonical))
+        path::normalize_path(raw)
+            .map(Self)
+            .ok_or(InvalidNormalizedPath)
     }
 
     /// Canonical project-relative path text.
@@ -1616,7 +1591,7 @@ impl SourcePosition {
     ///
     /// Returns [`InvalidSourceSpan`] when `line` is zero.
     pub const fn new(byte: u64, line: u32, column: u32) -> Result<Self, InvalidSourceSpan> {
-        if line == 0 {
+        if !coordinates::valid_position(line) {
             return Err(InvalidSourceSpan);
         }
         Ok(Self { byte, line, column })
@@ -1656,10 +1631,14 @@ impl SourceSpan {
         start: SourcePosition,
         end: SourcePosition,
     ) -> Result<Self, InvalidSourceSpan> {
-        let invalid = start.byte >= end.byte
-            || end.line < start.line
-            || (start.line == end.line && end.column < start.column);
-        if invalid {
+        if !coordinates::valid_span(
+            start.byte,
+            end.byte,
+            start.line,
+            end.line,
+            start.column,
+            end.column,
+        ) {
             return Err(InvalidSourceSpan);
         }
         Ok(Self { start, end })
@@ -2002,13 +1981,14 @@ impl_stable_as_str!(
     Self::Inherits => "inherits",
 );
 
-fn has_windows_drive_prefix(raw: &str) -> bool {
-    let bytes = raw.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relative_prefix_cannot_hide_a_windows_drive() {
+        assert!(super::NormalizedPath::parse("./C:private").is_err());
+        assert!(super::NormalizedPath::parse(".\\D:\\private").is_err());
+    }
+
     use std::assert_matches;
     use std::collections::BTreeSet;
 

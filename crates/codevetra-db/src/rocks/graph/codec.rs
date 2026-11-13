@@ -1,5 +1,8 @@
 use std::io;
 
+mod arithmetic;
+use arithmetic::nibble;
+
 use codevetra_domain::{EdgeKind, SymbolId};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -11,14 +14,11 @@ pub(super) const BLOCK_CAPACITY: usize = 128;
 pub(super) const BLOCK_HEADER: &[u8] = b"CGA1";
 
 pub(super) fn radix_prefix(entry: &[u8; ENTRY_BYTES], depth: usize) -> Result<[u8; ENTRY_BYTES]> {
-    if depth > ENTRY_BYTES * 8 {
-        return Err(corrupt());
-    }
+    let (bytes, remainder) = arithmetic::radix_geometry(depth, ENTRY_BYTES).ok_or_else(corrupt)?;
     let mut prefix = [0; ENTRY_BYTES];
-    let bytes = depth / 8;
     prefix[..bytes].copy_from_slice(&entry[..bytes]);
-    if !depth.is_multiple_of(8) {
-        prefix[bytes] = entry[bytes] & (u8::MAX << (8 - depth % 8));
+    if remainder != 0 {
+        prefix[bytes] = arithmetic::prefix_byte(entry[bytes], remainder).ok_or_else(corrupt)?;
     }
     Ok(prefix)
 }
@@ -41,14 +41,6 @@ pub(crate) fn uuid(raw: &str) -> Result<[u8; ID_BYTES]> {
         return Err(corrupt());
     }
     Ok(bytes)
-}
-
-fn nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
 }
 
 pub(super) fn symbol(bytes: &[u8]) -> Result<SymbolId> {

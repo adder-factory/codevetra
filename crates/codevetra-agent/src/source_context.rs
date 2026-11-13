@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::{ProjectCancellation, ProjectError, ProjectRuntime};
 
 mod allocation;
+mod window;
 pub use allocation::{
     SourceAllocation, SourceAllocationOptions, SourceSelection, SourceSelectionPolicy,
 };
@@ -851,8 +852,10 @@ fn extract_file_excerpt(
         if start > source.len() || !source.is_char_boundary(start) {
             return Err(ProjectError::InvalidOptions);
         }
-        let end =
-            source.floor_char_boundary(start.saturating_add(limit as usize).min(source.len()));
+        let end = source.floor_char_boundary(
+            window::byte_end(start, limit as usize, source.len())
+                .ok_or(ProjectError::InvalidOptions)?,
+        );
         if start < source.len() && start == end {
             return Err(ProjectError::InvalidOptions);
         }
@@ -915,8 +918,8 @@ fn extract_excerpt(input: ExcerptRequest<'_>) -> Result<SourceExcerpt, ProjectEr
         options,
     } = input;
     let context = u32::from(options.context_lines);
-    let requested_start = symbol_start.saturating_sub(context).max(1);
-    let requested_end = symbol_end.saturating_add(context);
+    let requested_start = window::context_start(symbol_start, context);
+    let requested_end = window::context_end(symbol_end, context);
     let mut text = String::new();
     text.try_reserve(options.maximum_bytes)
         .map_err(|_| ProjectError::SourceContextUnavailable)?;

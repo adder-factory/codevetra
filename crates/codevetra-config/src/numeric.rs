@@ -1,5 +1,7 @@
 use serde_json::{Map, Value};
 
+mod predicate;
+
 /// Inclusive upper bound for a positive configuration integer, with the exact
 /// rejection its section reports.
 #[derive(Clone, Copy)]
@@ -24,7 +26,7 @@ pub fn optional_bounded_u64<E>(
         .map(|value| {
             value
                 .as_u64()
-                .filter(|value| (1..=maximum).contains(value))
+                .filter(|value| predicate::positive_bounded(*value, maximum))
                 .ok_or(invalid)
         })
         .transpose()

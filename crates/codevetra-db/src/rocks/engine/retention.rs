@@ -369,7 +369,12 @@ impl ProjectStore {
             let eligible = match revision.state {
                 RevisionState::Current => false,
                 RevisionState::Superseded
-                    if revision.sequence >= previous_floor && retained < keep_superseded =>
+                    if super::lifecycle::keep_superseded(
+                        revision.sequence,
+                        previous_floor,
+                        retained,
+                        keep_superseded,
+                    ) =>
                 {
                     retained += 1;
                     floor = floor.min(revision.sequence);
@@ -423,13 +428,12 @@ impl VersionTraversal {
         // Leave room for counters, the JSON cursor (binary keys can expand
         // fourfold), and a pending tombstone. Long-key batches commit bounded
         // progress instead of repeatedly attempting oversized transactions.
-        self.batch
-            .size_in_bytes()
-            .saturating_add(self.decrements.len().saturating_mul(96))
-            .saturating_add(128 * 1_024)
-            .saturating_add(key_bytes.saturating_mul(2))
-            .saturating_add(256)
-            <= maximum_batch_bytes
+        super::super::arithmetic::retention_batch_fits(
+            self.batch.size_in_bytes(),
+            self.decrements.len(),
+            key_bytes,
+            maximum_batch_bytes,
+        )
     }
 
     fn visit_version(
@@ -455,7 +459,7 @@ impl VersionTraversal {
             cursor.kept_anchor = false;
         }
         let published = is_published(snapshot, meta, sequence)?;
-        if !published || (sequence < cursor.floor && cursor.kept_anchor) {
+        if super::lifecycle::remove_version(published, sequence, cursor.floor, cursor.kept_anchor) {
             batch.delete_cf(family, encoded_key);
             decrement(decrements, sequence)?;
             report.versions_removed += 1;

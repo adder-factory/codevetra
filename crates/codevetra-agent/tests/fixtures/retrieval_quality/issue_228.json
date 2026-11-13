@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "issue-228-semantic-readiness",
+      "split": "development",
+      "query": "Explain how hybrid search decides semantic retrieval is ready, what happens when current-generation embeddings are missing, and identify the implementation and regression tests to inspect before changing that behavior.",
+      "targets": [
+        {
+          "path": "crates/codevetra-search/src/hybrid.rs",
+          "symbol": "retrieval_fallback"
+        }
+      ]
+    },
+    {
+      "id": "issue-228-cancelled-index",
+      "split": "development",
+      "query": "How does a cancelled indexing job stop background work and wait for workers to finish?",
+      "targets": [
+        {
+          "path": "crates/codevetra-cli/src/supervised_index.rs",
+          "symbol": "run_cancellable_index"
+        }
+      ]
+    },
+    {
+      "id": "issue-228-owner-ipc",
+      "split": "development",
+      "query": "owner IPC",
+      "targets": [
+        {
+          "path": "crates/codevetra-cli/src/rocks_cli/owner.rs",
+          "symbol": "OwnerProxy"
+        }
+      ]
+    }
+  ]
+}

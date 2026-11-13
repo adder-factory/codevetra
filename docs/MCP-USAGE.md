@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [CLI reference](CLI-REFERENCE.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Last release audit: 2026-11-01 (`v4.0.4`).
+Last release audit: 2026-11-13 (`v4.0.5`).
 
 CodeVetra v2 exposes a compact native stdio MCP server. Its core returns
 bounded, generation-scoped evidence and never makes the database a source of
@@ -740,3 +740,26 @@ partial prefix. Agent-level cancellation retains completed definitions with `par
 set and `fresh` false because the final generation check was not completed. Transport
 cancellation returns the protocol's cancelled request after native work is reaped;
 clients must not interpret either outcome as a complete trace.
+
+### Context diagnostics and affected command suggestions
+
+Normal JSON and Markdown context responses with `explain: false` keep the full
+selected evidence and source allocation, including omitted source ranges. The
+`packet.retrieval` summary retains mode, execution, semantic readiness, reranker,
+fallback, generation and truncation. It reports `candidateCount` and
+`omittedCandidates` instead of repeating `items`; selected evidence carries
+`channels` and `rerankScore`. Use `explain: true` for complete candidate records.
+`maxNodes` bounds selected evidence and source windows, independently of the
+wider internal retrieval window. Omitted diagnostics do not mean no candidates
+were retrieved.
+
+Implementation questions that also request regression tests prefer production
+definitions. Test-selection and explicit fixture, parameter, field or enum-member
+queries retain neutral ordering; exact-identifier lookup remains unchanged.
+Plain BM25 searches apply the preference over a bounded 100-candidate window
+before limiting the result. Hybrid fusion keeps raw lexical channel ranks and
+applies its preference after channel fusion; this is not a semantic-model change.
+
+`codevetra_affected` accepts omitted or false `includeCommands` in symbol mode.
+`includeCommands: true`, `files` and `filter` require files mode without `symbolId`;
+invalid combinations identify the field and correction without echoing values.

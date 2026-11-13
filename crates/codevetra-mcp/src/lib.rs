@@ -4,6 +4,7 @@
 //! services can be adapted later without allowing MCP transport code to reach
 //! through crate boundaries into database or indexing internals.
 
+mod byte_budget;
 mod cancellation;
 mod error;
 mod profile;

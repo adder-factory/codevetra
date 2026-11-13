@@ -595,6 +595,7 @@ impl<'query> ExactPathQuery<'query> {
 pub struct LexicalQuery {
     query: String,
     limit: u16,
+    preference: crate::RetrievalPreference,
 }
 
 impl LexicalQuery {
@@ -608,10 +609,14 @@ impl LexicalQuery {
         Ok(Self {
             query: validate_query(query.into())?,
             limit,
+            preference: crate::RetrievalPreference::Neutral,
         })
     }
 
     /// Expand a natural-language code search with bounded deterministic identifier aliases.
+    ///
+    /// Select an intent-aware definition preference for standalone BM25 results.
+    /// Fusion retains raw lexical ranks and applies preference after combining channels.
     /// # Errors
     ///
     /// Returns an error if the source query is empty, contains a NUL byte,
@@ -620,6 +625,7 @@ impl LexicalQuery {
         validate_limit(limit, MAX_CANDIDATES, "candidate_limit")?;
         let query = validate_query(query.into())?;
         Ok(Self {
+            preference: TaskIntent::classify(&query).retrieval_preference(&query),
             query: crate::query::expand_code_query(&query),
             limit,
         })
@@ -627,6 +633,10 @@ impl LexicalQuery {
 
     pub(crate) fn query(&self) -> &str {
         &self.query
+    }
+
+    pub(crate) const fn preference(&self) -> crate::RetrievalPreference {
+        self.preference
     }
 
     pub(crate) const fn limit(&self) -> u16 {
@@ -640,6 +650,7 @@ impl fmt::Debug for LexicalQuery {
             .debug_struct("LexicalQuery")
             .field("query", &Redacted)
             .field("limit", &self.limit)
+            .field("preference", &self.preference)
             .finish()
     }
 }

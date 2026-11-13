@@ -8377,7 +8377,6 @@ impl GraphTools<'_> {
         request: AffectedExecution<'_>,
         symbol: SymbolId,
     ) -> Result<ToolResult, ToolError> {
-        reject_present(request.arguments, &["files", "filter", "includeCommands"])?;
         let traversal = TraversalRequest::new(
             request.project_id.clone(),
             [symbol],
@@ -19415,6 +19414,25 @@ fn parse_affected_request(
             "allowStale",
         ],
     )?;
+    let include_commands = optional_bool(arguments, "includeCommands")?.unwrap_or(false);
+    if optional_bounded_text(arguments, "symbolId", 64)?.is_some() {
+        for field in ["files", "filter"] {
+            if arguments.contains_key(field) {
+                return Err(safe_error(
+                    ToolErrorCode::InvalidArguments,
+                    format!(
+                        "Argument {field} is unavailable with symbolId; omit {field} or use files mode without symbolId"
+                    ),
+                ));
+            }
+        }
+        if include_commands {
+            return Err(safe_error(
+                ToolErrorCode::InvalidArguments,
+                "Argument includeCommands=true is unavailable with symbolId; omit includeCommands, set it to false, or use files mode without symbolId",
+            ));
+        }
+    }
     Ok(ParsedAffectedRequest {
         depth: optional_integer(
             arguments,
@@ -19693,7 +19711,7 @@ fn test_tool_definition(
                 },
                 "depth": {"type": "integer", "minimum": 1, "maximum": GRAPH_MAXIMUM_DEPTH},
                 "filter": {"type": "string", "minLength": 1, "maxLength": TESTS_FOR_MAXIMUM_FILTER_BYTES},
-                "includeCommands": {"type": "boolean", "default": false},
+                "includeCommands": {"type": "boolean", "default": false, "description": "Repository command suggestions in files mode only. With symbolId, omit this field or set false; true is rejected."},
                 "maxNodes": {"type": "integer", "minimum": 1, "maximum": GRAPH_MAXIMUM_NODES},
                 "limit": {"type": "integer", "minimum": 1, "maximum": TESTS_FOR_MAXIMUM_LIMIT},
                 "allowStale": {"type": "boolean"}
@@ -22739,13 +22757,56 @@ fn compact_affected_test(test: &AffectedTest) -> Value {
     })
 }
 
+fn context_packet_projection(packet: &ContextPacket, explain: bool) -> Result<Value, ToolError> {
+    let mut projection = serde_json::to_value(packet).map_err(|_| ToolError::internal())?;
+    if explain {
+        return Ok(projection);
+    }
+    let retrieval = packet.retrieval();
+    let selected = packet
+        .evidence()
+        .iter()
+        .filter_map(EvidenceItem::document_id)
+        .collect::<BTreeSet<_>>();
+    let omitted = retrieval
+        .items()
+        .iter()
+        .filter(|item| !selected.contains(item.document().document_id()))
+        .count();
+    let summary = projection["retrieval"]
+        .as_object_mut()
+        .ok_or_else(ToolError::internal)?;
+    summary.remove("items");
+    summary.insert("projection".to_owned(), json!("selected_evidence"));
+    summary.insert("candidateCount".to_owned(), json!(retrieval.items().len()));
+    summary.insert("omittedCandidates".to_owned(), json!(omitted));
+    summary.insert(
+        "completeCandidatesAvailableWith".to_owned(),
+        json!("explain=true"),
+    );
+    let rows = projection["evidence"]
+        .as_array_mut()
+        .ok_or_else(ToolError::internal)?;
+    for (row, evidence) in rows.iter_mut().zip(packet.evidence()) {
+        if let Some(item) = retrieval
+            .items()
+            .iter()
+            .find(|item| Some(item.document().document_id()) == evidence.document_id())
+        {
+            row["channels"] = json!(item.contributions());
+            row["rerankScore"] = json!(item.rerank_score());
+        }
+    }
+    Ok(projection)
+}
+
 fn context_markdown_result(evidence: ContextEvidence<'_, '_>) -> Result<ToolResult, ToolError> {
     fresh_json_result(
         evidence.freshness,
         &json!({
             "format": "markdown",
             "boundaryCoverage": codevetra_domain::BOUNDARY_COVERAGE,
-            "packet": evidence.packet,
+            "packet": context_packet_projection(evidence.packet, evidence.parsed.presentation.explain)?,
             "sourceWindows": evidence.source_windows.contexts(),
             "sourceWindowStatus": evidence.source_windows.status(),
             "explain": evidence.parsed.presentation.explain,
@@ -22760,7 +22821,7 @@ fn context_json_result(evidence: ContextEvidence<'_, '_>) -> Result<ToolResult, 
         &json!({
             "format": "json",
             "boundaryCoverage": codevetra_domain::BOUNDARY_COVERAGE,
-            "packet": evidence.packet,
+            "packet": context_packet_projection(evidence.packet, evidence.parsed.presentation.explain)?,
             "sourceWindows": evidence.source_windows.contexts(),
             "sourceWindowStatus": evidence.source_windows.status(),
             "includeCode": evidence.parsed.presentation.include_code,
@@ -31193,7 +31254,118 @@ pub fn target(value: u32) -> u32 {
         drop(runtime);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bm25_prefers_production_with_small_limit_and_preserves_exact_leaf_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        std::fs::create_dir_all(project.path().join("src"))?;
+        std::fs::create_dir_all(project.path().join("tests/fixtures"))?;
+        std::fs::write(
+            project.path().join("src/owner.rs"),
+            "pub struct OwnerProxy;\nimpl OwnerProxy { pub fn owner_ipc(&self, owner_ipc_parameter: usize) -> usize { owner_ipc_parameter } }\npub enum OwnerState { Ready }\n",
+        )?;
+        std::fs::write(
+            project.path().join("tests/fixtures/owner.rs"),
+            "pub fn owner_ipc_fixture(owner_ipc: usize) -> usize { owner_ipc }\n",
+        )?;
+        let runtime = Arc::new(ProjectRuntime::open(project.path()).await?);
+        runtime
+            .index(IndexOptions::default().with_history_refresh(false))
+            .await?;
+        let handler = CodeVetraMcpHandler::new(runtime.clone())?;
+        let ranked = execute_live_tool(
+            &handler,
+            FIND_TOOL,
+            json!({"by": "bm25", "query": "owner IPC", "limit": 1}),
+        )
+        .await;
+        let first = &ranked["structuredContent"]["evidence"][0];
+        assert_eq!(first["path"], "src/owner.rs", "{ranked}");
+        assert!(
+            matches!(first["symbol_kind"].as_str(), Some("method" | "struct")),
+            "{ranked}"
+        );
+        for name in ["Ready", "owner_ipc_parameter", "owner_ipc_fixture"] {
+            let exact = execute_live_tool(
+                &handler,
+                FIND_TOOL,
+                json!({"by": "name", "mode": "exact", "query": name, "limit": 5}),
+            )
+            .await;
+            assert!(
+                exact["structuredContent"]["evidence"]["rows"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty()),
+                "{exact}"
+            );
+        }
+        let fixture = execute_live_tool(
+            &handler,
+            FIND_TOOL,
+            json!({"by": "bm25", "query": "owner_ipc_fixture", "limit": 1}),
+        )
+        .await;
+        assert_eq!(
+            fixture["structuredContent"]["evidence"][0]["path"], "tests/fixtures/owner.rs",
+            "{fixture}"
+        );
+        Ok(())
+    }
+
+    async fn verify_context_projection(handler: &CodeVetraMcpHandler) {
+        let mut responses = Vec::new();
+        for explain in [false, true] {
+            responses.push(execute_live_tool(handler, CONTEXT_TOOL,
+                json!({"task": "how does root call leaf", "format": "json", "maxNodes": 2,
+                    "workingTree": "off", "retrievalMode": "deterministic", "code": true, "explain": explain})
+            ).await);
+        }
+        let brief = &responses[0]["structuredContent"]["evidence"];
+        let full = &responses[1]["structuredContent"]["evidence"];
+        assert_eq!(brief["sourceWindows"], full["sourceWindows"]);
+        assert!(
+            brief["sourceWindows"]
+                .as_array()
+                .is_some_and(|windows| !windows.is_empty())
+        );
+        assert_eq!(brief["packet"]["generation"], full["packet"]["generation"]);
+        assert_eq!(brief["packet"]["confidence"], full["packet"]["confidence"]);
+        assert_eq!(
+            brief["packet"]["retrieval"]["fallback"],
+            full["packet"]["retrieval"]["fallback"]
+        );
+        assert!(brief["packet"]["retrieval"].get("items").is_none());
+        let candidates = full["packet"]["retrieval"]["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing full candidates"));
+        assert_eq!(
+            brief["packet"]["retrieval"]["candidateCount"],
+            candidates.len()
+        );
+        assert!(
+            brief["packet"]["retrieval"]["omittedCandidates"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        assert!(
+            brief["packet"]["evidence"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["channels"].is_array()))
+        );
+        let brief_bytes = serde_json::to_vec(&responses[0])
+            .unwrap_or_else(|error| panic!("brief encoding: {error}"));
+        let full_bytes = serde_json::to_vec(&responses[1])
+            .unwrap_or_else(|error| panic!("full encoding: {error}"));
+        assert!(
+            brief_bytes.len() < full_bytes.len(),
+            "brief={} full={}",
+            brief_bytes.len(),
+            full_bytes.len()
+        );
+    }
+
     async fn verify_agent_context_surfaces(handler: &CodeVetraMcpHandler) {
+        verify_context_projection(handler).await;
         execute_live_tool(
             handler,
             SESSION_TOOL,
@@ -31504,6 +31676,39 @@ pub fn target(value: u32) -> u32 {
         .await;
     }
 
+    #[test]
+    fn affected_symbol_accepts_default_and_explains_mode_conflicts() {
+        for commands in [None, Some(false)] {
+            let mut arguments = Map::from_iter([(
+                "symbolId".to_owned(),
+                json!("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            )]);
+            if let Some(commands) = commands {
+                arguments.insert("includeCommands".to_owned(), json!(commands));
+            }
+            assert!(parse_affected_request(&arguments).is_ok());
+        }
+        for (field, value) in [
+            ("includeCommands", json!(true)),
+            ("files", json!(["private/path.rs"])),
+            ("filter", json!("private*")),
+        ] {
+            let arguments = Map::from_iter([
+                (
+                    "symbolId".to_owned(),
+                    json!("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                ),
+                (field.to_owned(), value),
+            ]);
+            let error = parse_affected_request(&arguments)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {field}"));
+            assert!(error.wire_message().contains(field));
+            assert!(error.wire_message().contains("symbolId"));
+            assert!(!error.wire_message().contains("private"));
+        }
+    }
+
     async fn verify_agent_graph_and_test_surfaces(
         handler: &CodeVetraMcpHandler,
         root_symbol_id: &SymbolId,
@@ -31537,6 +31742,9 @@ pub fn target(value: u32) -> u32 {
         for arguments in [
             json!({"files": ["src/lib.rs"], "includeCommands": true, "depth": 3}),
             json!({"symbolId": root_symbol_id.as_str()}),
+            json!({"symbolId": root_symbol_id.as_str(), "includeCommands": false}),
+            json!({"files": ["src/lib.rs"], "includeCommands": false}),
+            json!({"files": ["src/lib.rs"]}),
         ] {
             execute_live_tool(handler, AFFECTED_TOOL, arguments).await;
         }

@@ -7,6 +7,7 @@
 /// Exact native storage engine version reviewed with the Rust adapter.
 pub const ENGINE_VERSION: &str = "11.12.0";
 
+mod arithmetic;
 mod engine;
 mod graph;
 mod key;

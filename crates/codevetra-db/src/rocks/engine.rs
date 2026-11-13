@@ -24,6 +24,7 @@ const ACTIVE_KEY: &[u8] = b"active";
 pub(super) const MAXIMUM_RECORD_BYTES: usize = 32 * 1_048_576;
 const META: &str = "default";
 
+mod lifecycle;
 mod lookup;
 mod ownership;
 pub(in crate::rocks) use lookup::PointReaders;
@@ -166,17 +167,13 @@ pub struct RecordPage {
 
 impl RecordChange {
     pub(super) fn admission_bytes(&self) -> Result<usize> {
-        self.key
-            .as_bytes()
-            .len()
-            .checked_mul(5)
-            .and_then(|bytes| {
-                bytes.checked_add(self.value.as_ref().map_or(0, Vec::len).checked_mul(3)?)
-            })
-            .and_then(|bytes| bytes.checked_add(128))
-            .ok_or(RocksError::Limit {
-                resource: "worker_bytes",
-            })
+        super::arithmetic::change_reservation(
+            self.key.as_bytes().len(),
+            self.value.as_ref().map_or(0, Vec::len),
+        )
+        .ok_or(RocksError::Limit {
+            resource: "worker_bytes",
+        })
     }
 
     /// Stage a value. Empty values are distinct from deletions.
@@ -498,7 +495,7 @@ impl ProjectStore {
         if revision.state != RevisionState::Ready {
             return Err(RocksError::Transition);
         }
-        if self.optional_sequence(CURRENT_KEY)? != revision.base_sequence {
+        if !lifecycle::same_base(self.optional_sequence(CURRENT_KEY)?, revision.base_sequence) {
             return Err(RocksError::GenerationChanged);
         }
         let meta = self.meta()?;
@@ -535,7 +532,12 @@ impl ProjectStore {
         let _serial = self.lock_mutation()?;
         let mut active = self.lock_writer()?;
         if !active.as_ref().is_some_and(|active| {
-            active.sequence == writer.sequence && active.fence == writer.fence
+            lifecycle::owns_writer(
+                active.sequence,
+                &active.fence,
+                writer.sequence,
+                &writer.fence,
+            )
         }) {
             return Err(RocksError::FenceLost);
         }
@@ -1060,9 +1062,15 @@ fn put_revision(
 
 fn validate_fence(active: Option<&ActiveWriter>, writer: &RevisionWriter) -> Result<()> {
     if active.is_some_and(|active| {
-        active.sequence == writer.sequence
-            && active.fence == writer.fence
-            && active.expires_at > Instant::now()
+        lifecycle::can_mutate_writer(
+            lifecycle::owns_writer(
+                active.sequence,
+                &active.fence,
+                writer.sequence,
+                &writer.fence,
+            ),
+            active.expires_at > Instant::now(),
+        )
     }) {
         Ok(())
     } else {

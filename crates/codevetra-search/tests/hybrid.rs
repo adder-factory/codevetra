@@ -8,7 +8,7 @@ use codevetra_search::{
     ChannelCandidate, ChannelResults, HybridSearchInput, LexicalComponent, RerankReport,
     RerankState, RetrievalAbstention, RetrievalChannel, RetrievalChannels, RetrievalDocument,
     RetrievalDocumentInput, RetrievalExecution, RetrievalFallback, RetrievalPreference, SearchMode,
-    SemanticReadiness, fuse_search,
+    SemanticReadiness, TaskIntent, fuse_search,
 };
 use serde as _;
 use tempfile as _;
@@ -833,4 +833,60 @@ fn paths(packet: &codevetra_search::HybridSearchPacket) -> Vec<&str> {
         .iter()
         .map(|item| item.document().path().as_str())
         .collect()
+}
+
+#[test]
+fn implementation_and_test_queries_preserve_raw_channels_with_definition_ranking() {
+    let candidates = vec![
+        typed_candidate(
+            "a",
+            "src/hybrid.rs",
+            DocumentKind::Symbol,
+            SymbolKind::EnumMember,
+            (1, 20.0),
+        ),
+        typed_candidate(
+            "b",
+            "src/hybrid.rs",
+            DocumentKind::Symbol,
+            SymbolKind::Parameter,
+            (2, 19.0),
+        ),
+        typed_candidate(
+            "c",
+            "tests/fixtures/hybrid.rs",
+            DocumentKind::Symbol,
+            SymbolKind::Function,
+            (3, 18.0),
+        ),
+        typed_candidate(
+            "z",
+            "src/hybrid.rs",
+            DocumentKind::Symbol,
+            SymbolKind::Function,
+            (4, 17.0),
+        ),
+    ];
+    for task in [
+        "Explain the implementation and regression tests for hybrid search",
+        "owner IPC",
+    ] {
+        for mode in [SearchMode::Deterministic, SearchMode::Hybrid] {
+            let channels = RetrievalChannels::new()
+                .with_channel(channel(RetrievalChannel::Lexical, candidates.clone()))
+                .and_then(|channels| {
+                    channels.with_channel(channel(RetrievalChannel::Semantic, candidates.clone()))
+                })
+                .unwrap_or_else(|error| panic!("channels: {error}"));
+            let ranked = input(mode, SemanticReadiness::Ready)
+                .with_preference(TaskIntent::classify(task).retrieval_preference(task))
+                .with_channels(channels);
+            let packet = fuse_search(ranked).unwrap_or_else(|error| panic!("fusion: {error}"));
+            let first = &packet.items()[0];
+            assert_eq!(first.document().symbol_kind(), Some(SymbolKind::Function));
+            assert_eq!(first.document().path().as_str(), "src/hybrid.rs");
+            assert_eq!(first.contributions()[0].rank(), 4);
+            assert_eq!(packet.items().len(), 4);
+        }
+    }
 }

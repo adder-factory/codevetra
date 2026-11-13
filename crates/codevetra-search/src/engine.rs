@@ -333,6 +333,10 @@ impl DeterministicRetriever {
     }
 
     /// Current-generation native BM25 with ordered field provenance.
+    ///
+    /// Code-search queries apply their intent preference over at most 100
+    /// candidates before the result limit, retaining original BM25 scores.
+    /// Raw lexical queries preserve score order.
     /// # Errors
     ///
     /// Retries only publication races within the original request; all other
@@ -426,14 +430,33 @@ impl DeterministicRetriever {
     }
 
     async fn bm25_at(&self, input: LexicalAtInput<'_>) -> Result<Vec<SearchHit>, RetrievalError> {
-        self.database
+        let prefer_definitions =
+            input.query.preference() == crate::RetrievalPreference::ProductionDefinitions;
+        let candidate_limit = if prefer_definitions {
+            100
+        } else {
+            input.query.limit()
+        };
+        let mut hits = self
+            .database
             .search_current_code(SearchQuery::new(
                 CurrentGenerationLookup::new(&input.project_id, &input.expected_generation_id),
                 input.query.query(),
-                input.query.limit(),
+                candidate_limit,
             ))
-            .await
-            .map_err(Into::into)
+            .await?;
+        if prefer_definitions {
+            // Stable sorting preserves BM25 score and identity order within each tier.
+            hits.sort_by_key(|hit| {
+                crate::hybrid::definition_tier(
+                    hit.path(),
+                    hit.document_kind() == "test",
+                    hit.symbol_kind(),
+                )
+            });
+        }
+        hits.truncate(usize::from(input.query.limit()));
+        Ok(hits)
     }
 
     /// Adapt current BM25 results into a channel that can run concurrently with semantics.
@@ -446,7 +469,9 @@ impl DeterministicRetriever {
         project_id: ProjectId,
         query: LexicalQuery,
     ) -> Result<ChannelResults, RetrievalError> {
-        let hits = self.bm25(project_id, query).await?;
+        // Fusion applies intent preference after retaining the raw lexical ranks.
+        let raw_query = LexicalQuery::new(query.query(), query.limit())?;
+        let hits = self.bm25(project_id, raw_query).await?;
         lexical_results(&hits)
     }
 
@@ -459,11 +484,12 @@ impl DeterministicRetriever {
         &self,
         request: GenerationLexicalRequest,
     ) -> Result<ChannelResults, RetrievalError> {
+        let raw_query = LexicalQuery::new(request.query.query(), request.query.limit())?;
         let hits = self
             .bm25_at(LexicalAtInput {
                 project_id: request.project_id,
                 expected_generation_id: request.expected_generation_id,
-                query: &request.query,
+                query: &raw_query,
             })
             .await?;
         lexical_results(&hits)

@@ -1,5 +1,7 @@
 //! Bounded cold-orphan collection in the same snapshot as the current graph.
 
+mod policy;
+
 use super::{NativeDatabase, decode, storage_error};
 use crate::{
     AgentArtifactKind, AgentArtifactScope, RegisteredEmbeddingModel, StorageError,
@@ -16,7 +18,6 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 
 const PAGE: u16 = 64;
-const GRACE_SECONDS: i64 = 600;
 
 /// Committed, bounded progress; continuation requires another maintenance call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -203,7 +204,7 @@ fn cold(
         return Ok(false);
     };
     let first = i64::from_be_bytes(first[..8].try_into().map_err(|_| corrupt())?);
-    if timestamp.saturating_sub(first) < GRACE_SECONDS {
+    if !policy::grace_elapsed(timestamp, first) {
         return Ok(false);
     }
     tx.delete(Ns::Metadata, marker.as_bytes())?;

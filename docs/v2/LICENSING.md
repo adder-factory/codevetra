@@ -1,6 +1,6 @@
 # Native storage distribution notices
 
-This notice describes CodeVetra `v4.0.4`, RocksDB 11.12.0, and its
+This notice describes CodeVetra `v4.0.5`, RocksDB 11.12.0, and its
 `rust-rocksdb` 0.54.0 binding.
 CodeVetra code remains MIT licensed. The executable now includes native
 RocksDB and compression libraries; their upstream terms remain in force.
@@ -17,7 +17,8 @@ Each release archive contains exactly:
 The storage license bundle reproduces the pinned upstream texts for
 `rust-rocksdb` (Apache-2.0), RocksDB 11.12.0 (Apache-2.0 selected), LevelDB
 portions (BSD-3-Clause), LZ4 1.10.0 library (BSD-2-Clause), and Zstandard 1.5.7
-library (BSD-3-Clause), plus lz4_flex 0.14.0 (MIT) for publication blocks.
+library (BSD-3-Clause), the zstd-sys 2.1.3 binding and its legacy decoder
+notices (BSD-3-Clause AND BSD-2-Clause), plus lz4_flex 0.14.0 (MIT) for publication blocks.
 Disabled Snappy/bzip2/zlib features are not part of this
 storage build. Other Rust dependencies retain their declared licenses and
 remain subject to the strict dependency license/advisory gate.

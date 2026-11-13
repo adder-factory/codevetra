@@ -1,0 +1,5 @@
+# Preserve old local verifier artifacts without publishing binaries or source maps.
+# New runs generate these only inside the disposable sandbox.
+/kani/*.out
+/kani/*.rlib
+/kani/*.json

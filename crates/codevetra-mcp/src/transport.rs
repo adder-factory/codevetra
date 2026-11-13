@@ -60,8 +60,9 @@ impl BoundedPayload<'_> {
         if *self.overflowed {
             return;
         }
-        let remaining = self.maximum_bytes.saturating_sub(self.line.len());
-        if payload_bytes > remaining {
+        if crate::byte_budget::admit_bytes(self.line.len(), payload_bytes, self.maximum_bytes)
+            .is_none()
+        {
             *self.overflowed = true;
             return;
         }

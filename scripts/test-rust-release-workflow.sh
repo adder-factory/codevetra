@@ -448,6 +448,37 @@ for native_contract in \
     fail "native RocksDB matrix omitted required proof: $native_contract"
 done
 
+# Formal proofs are part of the required complete quality result.
+formal_has_exact_command() {
+  awk -v required="$1" '
+    { sub(/^[[:space:]]+/, ""); if ($0 == required) found = 1 }
+    END { exit !found }
+  ' <<<"$2"
+}
+if formal_has_exact_command 'run: scripts/verify-formal.sh' \
+  '        run: scripts/verify-formal.sh setup'; then
+  fail 'formal setup alone was mistaken for proof execution'
+fi
+for formal_contract in \
+  'python3 scripts/test-formal-sandbox.py --live' \
+  'run: scripts/verify-formal.sh setup' \
+  'run: scripts/verify-formal.sh shuttle' \
+  'manifest-path: verification/shuttle/Cargo.toml' \
+  'arguments: --locked --config verification/shuttle/deny.toml' \
+  'run: scripts/verify-formal.sh'; do
+  formal_has_exact_command "$formal_contract" "$quality_block" || \
+    fail "quality job omitted required formal verification: $formal_contract"
+done
+for formal_install_contract in \
+  'cargo install --locked kani-verifier --version 0.68.0' \
+  'cargo kani setup --use-local-bundle' \
+  'verus-0.2026.11.02.8bf68ee-' \
+  'sha256sum --check --strict'; do
+  grep -Fq -- "$formal_install_contract" "$ROOT/scripts/formal/setup.sh" || \
+    fail "bounded formal installer omitted required pin/check: $formal_install_contract"
+done
+python3 "$ROOT/scripts/test-formal-sandbox.py"
+
 attestation_block="$(job_block "$VALIDATION" attest-main-gate)"
 grep -Fq "needs.classify.outputs.full == 'true'" <<<"$attestation_block" || \
   fail 'documentation-only validation can create release gate attestation'

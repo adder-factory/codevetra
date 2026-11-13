@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+mod wire;
+
 use crate::model::{
     CODEVETRA_EDGES_FIELD, CodeVetraScipEdge, MAXIMUM_DOCUMENTS, MAXIMUM_OCCURRENCES,
     MAXIMUM_RELATIONSHIPS, MAXIMUM_SCIP_BYTES, MAXIMUM_STRING_BYTES, MAXIMUM_SYMBOLS,
@@ -11,14 +13,11 @@ const WIRE_VARINT: u8 = 0;
 const WIRE_I64: u8 = 1;
 const WIRE_LEN: u8 = 2;
 const WIRE_I32: u8 = 5;
-const MAXIMUM_VARINT_BYTES: usize = 10;
 const PROTOBUF_TAG_SHIFT: u32 = 3;
 const PROTOBUF_WIRE_TYPE_MASK: u64 = 7;
 const FIXED_64_BYTES: usize = 8;
 const FIXED_32_BYTES: usize = 4;
-const VARINT_VALUE_BITS: usize = 64;
 const VARINT_PAYLOAD_BITS: usize = 7;
-const VARINT_FINAL_SHIFT: usize = 63;
 const VARINT_PAYLOAD_MASK: u8 = 0x7f;
 const VARINT_CONTINUATION_BIT: u8 = 0x80;
 
@@ -96,10 +95,7 @@ impl Writer {
     }
 
     fn tag(&mut self, field: u32, wire: u8) -> Result<(), ScipError> {
-        if field == 0 {
-            return Err(ScipError::InvalidData);
-        }
-        self.varint((u64::from(field) << 3) | u64::from(wire))
+        self.varint(wire::field_tag(field, wire).ok_or(ScipError::InvalidData)?)
     }
 
     fn uint32(&mut self, field: u32, value: u32) -> Result<(), ScipError> {
@@ -119,16 +115,18 @@ impl Writer {
     }
 
     fn bytes(&mut self, field: u32, value: &[u8]) -> Result<(), ScipError> {
-        let next = self
-            .bytes
-            .len()
-            .checked_add(value.len())
-            .ok_or(ScipError::LimitExceeded)?;
-        if next > MAXIMUM_SCIP_BYTES {
-            return Err(ScipError::LimitExceeded);
-        }
+        let tag = wire::field_tag(field, WIRE_LEN).ok_or(ScipError::InvalidData)?;
+        let length = u64::try_from(value.len()).map_err(|_| ScipError::LimitExceeded)?;
+        wire::delimited_end(
+            self.bytes.len(),
+            wire::varint_length(tag),
+            wire::varint_length(length),
+            value.len(),
+            MAXIMUM_SCIP_BYTES,
+        )
+        .ok_or(ScipError::LimitExceeded)?;
         self.tag(field, WIRE_LEN)?;
-        self.varint(u64::try_from(value.len()).map_err(|_| ScipError::LimitExceeded)?)?;
+        self.varint(length)?;
         self.bytes.extend_from_slice(value);
         Ok(())
     }
@@ -442,7 +440,7 @@ fn decode_message(bytes: &[u8]) -> Result<Message<'_>, ScipError> {
             u32::try_from(tag >> PROTOBUF_TAG_SHIFT).map_err(|_| ScipError::InvalidWireData)?;
         let wire =
             u8::try_from(tag & PROTOBUF_WIRE_TYPE_MASK).map_err(|_| ScipError::InvalidWireData)?;
-        if field == 0 {
+        if wire::field_tag(field, wire).is_none() {
             return Err(ScipError::InvalidWireData);
         }
         let value = match wire {
@@ -455,25 +453,19 @@ fn decode_message(bytes: &[u8]) -> Result<Message<'_>, ScipError> {
                 let (length, next) = read_varint(bytes, position)?;
                 let length = usize::try_from(length).map_err(|_| ScipError::LimitExceeded)?;
                 position = next;
-                let end = position
-                    .checked_add(length)
-                    .filter(|end| *end <= bytes.len())
+                let end = wire::cursor_end(position, length, bytes.len())
                     .ok_or(ScipError::InvalidWireData)?;
                 let value = &bytes[position..end];
                 position = end;
                 Some(WireValue::Bytes(value))
             }
             WIRE_I64 => {
-                position = position
-                    .checked_add(FIXED_64_BYTES)
-                    .filter(|end| *end <= bytes.len())
+                position = wire::cursor_end(position, FIXED_64_BYTES, bytes.len())
                     .ok_or(ScipError::InvalidWireData)?;
                 None
             }
             WIRE_I32 => {
-                position = position
-                    .checked_add(FIXED_32_BYTES)
-                    .filter(|end| *end <= bytes.len())
+                position = wire::cursor_end(position, FIXED_32_BYTES, bytes.len())
                     .ok_or(ScipError::InvalidWireData)?;
                 None
             }
@@ -487,24 +479,7 @@ fn decode_message(bytes: &[u8]) -> Result<Message<'_>, ScipError> {
 }
 
 fn read_varint(bytes: &[u8], start: usize) -> Result<(u64, usize), ScipError> {
-    let mut value = 0_u64;
-    let mut position = start;
-    for shift in (0..VARINT_VALUE_BITS)
-        .step_by(VARINT_PAYLOAD_BITS)
-        .take(MAXIMUM_VARINT_BYTES)
-    {
-        let byte = *bytes.get(position).ok_or(ScipError::InvalidWireData)?;
-        position = position.checked_add(1).ok_or(ScipError::InvalidWireData)?;
-        let payload = u64::from(byte & VARINT_PAYLOAD_MASK);
-        if shift == VARINT_FINAL_SHIFT && payload > 1 {
-            return Err(ScipError::InvalidWireData);
-        }
-        value |= payload << shift;
-        if byte & VARINT_CONTINUATION_BIT == 0 {
-            return Ok((value, position));
-        }
-    }
-    Err(ScipError::InvalidWireData)
+    wire::read_varint(bytes, start).ok_or(ScipError::InvalidWireData)
 }
 
 fn byte_values<'a>(message: &'a Message<'a>, field: u32) -> Result<Vec<&'a [u8]>, ScipError> {
@@ -597,6 +572,16 @@ fn packed_u32(message: &Message<'_>, field: u32) -> Result<Vec<u32>, ScipError> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn length_delimited_header_is_inside_the_output_budget() {
+        let mut writer = super::Writer {
+            bytes: vec![0; super::MAXIMUM_SCIP_BYTES - 3],
+        };
+        // Field 16 needs two tag bytes, plus one length byte and one payload byte.
+        assert!(writer.bytes(16, &[1]).is_err());
+        assert!(writer.bytes.len() <= super::MAXIMUM_SCIP_BYTES);
+    }
+
     use super::*;
 
     #[test]

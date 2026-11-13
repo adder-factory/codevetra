@@ -34,3 +34,19 @@ tasks.
 > signed tags, and GitHub provenance. Those release gates complement these
 > benchmarks; they do not make a historical measurement current. See
 > [release evidence](../ARCHITECTURE.md#release-evidence).
+
+## Retrieval issue regression cases
+
+`crates/codevetra-agent/tests/fixtures/retrieval_quality/issue_228.json` contains
+three public, independently labeled implementation queries from issue #228.
+They are development regressions, not held-out evidence. Use
+`scripts/evaluate-retrieval.py --cases <that file> --binary <binary> --project
+<isolated snapshot> --output <new report> --label <before-or-after>` for each
+binary against the same source and model configuration. The runner separately
+reports BM25 and hybrid observations, preserves reranker/fallback evidence and
+rejects stale sources, missing labels or incomplete semantic readiness.
+
+The deterministic regression suite tests production-versus-enum/parameter/fixture
+ordering, retained raw channel ranks, a one-result BM25 limit, and exact leaf
+lookup. These tests establish those behaviors, not an improvement percentage on
+real model rankings. No paired model benchmark is claimed by adding the cases.

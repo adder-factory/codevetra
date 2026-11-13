@@ -2,6 +2,8 @@ use std::{fmt, str::FromStr};
 
 use serde::Serialize;
 
+mod bits;
+
 /// Immutable advertised/callable authorization ceiling for one server process.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -81,7 +83,7 @@ impl ToolProfiles {
     /// Combine profile membership without allocation.
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
+        Self(bits::union(self.0, other.0))
     }
 
     /// Return whether this membership set authorizes a tool in `profile`.
@@ -94,7 +96,7 @@ impl ToolProfiles {
             ToolProfile::ReadOnly => Self::READ_ONLY.0,
             ToolProfile::Review => Self::REVIEW.0,
         };
-        self.0 & bit != 0
+        bits::includes(self.0, bit)
     }
 
     pub(crate) const fn is_empty(self) -> bool {

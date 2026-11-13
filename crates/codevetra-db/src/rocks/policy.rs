@@ -33,11 +33,12 @@ impl Default for StorePolicy {
 
 impl StorePolicy {
     pub(super) fn validate(self) -> Result<Self> {
-        if !(8 * MIB..=MIB * 4_096).contains(&self.cache_bytes)
-            || !(4 * MIB..=self.cache_bytes).contains(&self.memtable_bytes)
-            || !(MIB..=64 * MIB).contains(&self.maximum_batch_bytes)
-            || !(1..=100_000).contains(&self.maximum_batch_rows)
-        {
+        if !super::arithmetic::valid_store_policy(
+            self.cache_bytes,
+            self.memtable_bytes,
+            self.maximum_batch_bytes,
+            self.maximum_batch_rows,
+        ) {
             return Err(RocksError::Limit { resource: "policy" });
         }
         Ok(self)
@@ -105,14 +106,13 @@ impl ReadBudget {
     }
 
     pub(super) fn reservation_bytes(&self) -> Result<u32> {
-        self.workspace_bytes
-            .checked_mul(2)
-            .and_then(|bytes| bytes.checked_add(super::engine::MAXIMUM_RECORD_BYTES))
-            .and_then(|bytes| bytes.checked_add(4_096))
-            .and_then(|bytes| u32::try_from(bytes).ok())
-            .ok_or(RocksError::Limit {
-                resource: "worker_bytes",
-            })
+        super::arithmetic::worker_reservation(
+            self.workspace_bytes,
+            super::engine::MAXIMUM_RECORD_BYTES,
+        )
+        .ok_or(RocksError::Limit {
+            resource: "worker_bytes",
+        })
     }
 
     /// Check cancellation and time during CPU work without consuming a row.

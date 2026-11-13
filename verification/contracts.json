@@ -1,0 +1,450 @@
+{
+  "schema": 1,
+  "modules": [
+    {
+      "module": "byte_budget",
+      "source": "crates/codevetra-mcp/src/byte_budget.rs",
+      "functions": [
+        {
+          "name": "admit_bytes",
+          "signature": "fn admit_bytes(current: usize, additional: usize, maximum: usize) -> Option<usize>",
+          "ensures": [
+            "match result { Some(n) => n as int == current as int + additional as int && n <= maximum, None => current as int + additional as int > maximum as int }"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "coordinates",
+      "source": "crates/codevetra-domain/src/source/coordinates.rs",
+      "functions": [
+        {
+          "name": "valid_position",
+          "signature": "fn valid_position(line: u32) -> bool",
+          "ensures": [
+            "result <==> line > 0"
+          ]
+        },
+        {
+          "name": "valid_span",
+          "signature": "fn valid_span(\n    start_byte: u64,\n    end_byte: u64,\n    start_line: u32,\n    end_line: u32,\n    start_column: u32,\n    end_column: u32,\n) -> bool",
+          "ensures": [
+            "result <==> start_line > 0 && start_byte < end_byte && (start_line < end_line || (start_line == end_line && start_column <= end_column))"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "config",
+      "source": "crates/codevetra-config/src/numeric/predicate.rs",
+      "functions": [
+        {
+          "name": "positive_bounded",
+          "signature": "fn positive_bounded(value: u64, maximum: u64) -> bool",
+          "ensures": [
+            "result <==> value >= 1 && value <= maximum"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "extraction",
+      "source": "crates/codevetra-extract/src/budget/arithmetic.rs",
+      "functions": [
+        {
+          "name": "scaled_reservation",
+          "signature": "fn scaled_reservation(source_bytes: u64, multiplier: u64, minimum: u64) -> Option<u64>",
+          "ensures": [
+            "match result { Some(n) => n as int == source_bytes as int * multiplier as int + minimum as int, None => source_bytes as int * multiplier as int + minimum as int > u64::MAX as int }"
+          ]
+        },
+        {
+          "name": "native_extraction_reservation",
+          "signature": "fn native_extraction_reservation(source_bytes: u64) -> Option<u64>",
+          "ensures": [
+            "match result { Some(n) => n as int == source_bytes as int * 64 + 1048576, None => source_bytes as int * 64 + 1048576 > u64::MAX as int }"
+          ]
+        },
+        {
+          "name": "native_read_reservation",
+          "signature": "fn native_read_reservation(source_bytes: u64) -> Option<u64>",
+          "ensures": [
+            "match result { Some(n) => n as int == source_bytes as int * 2 + 131072, None => source_bytes as int * 2 + 131072 > u64::MAX as int }"
+          ]
+        },
+        {
+          "name": "native_output_limit",
+          "signature": "fn native_output_limit(source_bytes: u64) -> Option<u64>",
+          "ensures": [
+            "match result { Some(n) => n as int == source_bytes as int * 32 + 262144, None => source_bytes as int * 32 + 262144 > u64::MAX as int }"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "storage",
+      "source": "crates/codevetra-db/src/rocks/arithmetic.rs",
+      "functions": [
+        {
+          "name": "worker_reservation",
+          "signature": "fn worker_reservation(workspace: usize, record: usize) -> Option<u32>",
+          "ensures": [
+            "match result { Some(n) => n as int == workspace as int * 2 + record as int + 4096, None => workspace as int * 2 + record as int + 4096 > u32::MAX as int }"
+          ]
+        },
+        {
+          "name": "change_reservation",
+          "signature": "fn change_reservation(key: usize, value: usize) -> Option<usize>",
+          "ensures": [
+            "match result { Some(n) => n as int == key as int * 5 + value as int * 3 + 128, None => key as int * 5 + value as int * 3 + 128 > usize::MAX as int }"
+          ]
+        },
+        {
+          "name": "retention_batch_fits",
+          "signature": "fn retention_batch_fits(\n    batch: usize,\n    counters: usize,\n    key: usize,\n    maximum: usize,\n) -> bool",
+          "ensures": [
+            "result <==> batch as int + counters as int * 96 + 131072 + key as int * 2 + 256 <= maximum as int"
+          ]
+        },
+        {
+          "name": "valid_store_policy",
+          "signature": "fn valid_store_policy(cache: usize, memtable: usize, batch: usize, rows: usize) -> bool",
+          "ensures": [
+            "result <==> 8388608 <= cache <= 4294967296 && 4194304 <= memtable <= cache && 1048576 <= batch <= 67108864 && 1 <= rows <= 100000"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "lifecycle",
+      "source": "crates/codevetra-db/src/rocks/engine/lifecycle.rs",
+      "functions": [
+        {
+          "name": "owns_writer",
+          "signature": "fn owns_writer(\n    active_sequence: u64,\n    active_fence: &[u8; 32],\n    sequence: u64,\n    fence: &[u8; 32],\n) -> bool",
+          "verus": false
+        },
+        {
+          "name": "can_mutate_writer",
+          "signature": "fn can_mutate_writer(owned: bool, unexpired: bool) -> bool",
+          "ensures": [
+            "result <==> owned && unexpired"
+          ]
+        },
+        {
+          "name": "same_base",
+          "signature": "fn same_base(current: Option<u64>, base: Option<u64>) -> bool",
+          "ensures": [
+            "result <==> current == base"
+          ]
+        },
+        {
+          "name": "keep_superseded",
+          "signature": "fn keep_superseded(sequence: u64, previous_floor: u64, retained: u8, keep: u8) -> bool",
+          "ensures": [
+            "result <==> sequence >= previous_floor && retained < keep"
+          ]
+        },
+        {
+          "name": "remove_version",
+          "signature": "fn remove_version(\n    published: bool,\n    sequence: u64,\n    floor: u64,\n    kept_anchor: bool,\n) -> bool",
+          "ensures": [
+            "!result <==> published && (sequence >= floor || !kept_anchor)"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "orphans",
+      "source": "crates/codevetra-db/src/native_database/retention/policy.rs",
+      "functions": [
+        {
+          "name": "grace_elapsed",
+          "signature": "fn grace_elapsed(timestamp: i64, first: i64) -> bool",
+          "ensures": [
+            "result <==> timestamp as int - first as int >= 600"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "tasks",
+      "source": "crates/codevetra-indexer/src/task_scope/admission.rs",
+      "functions": [
+        {
+          "name": "reserve",
+          "signature": "fn reserve(current: u64, additional: u64, maximum: u64) -> Option<u64>",
+          "ensures": [
+            "match result { Some(n) => additional > 0 && n as int == current as int + additional as int && n <= maximum, None => additional == 0 || current as int + additional as int > maximum as int }"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "windows",
+      "source": "crates/codevetra-agent/src/source_context/window.rs",
+      "functions": [
+        {
+          "name": "byte_end",
+          "signature": "fn byte_end(start: usize, length: usize, total: usize) -> Option<usize>",
+          "ensures": [
+            "match result { Some(n) => start <= total && n as int == (if start as int + length as int > total as int { total as int } else { start as int + length as int }), None => start > total }"
+          ]
+        },
+        {
+          "name": "context_start",
+          "signature": "fn context_start(line: u32, context: u32) -> u32",
+          "ensures": [
+            "result as int == (if (line as int - context as int) < 1 { 1 } else { line as int - context as int })"
+          ]
+        },
+        {
+          "name": "context_end",
+          "signature": "fn context_end(line: u32, context: u32) -> u32",
+          "ensures": [
+            "result as int == (if line as int + context as int > u32::MAX as int { u32::MAX as int } else { line as int + context as int })"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "tokens",
+      "source": "crates/codevetra-cli/src/mcp_budget/arithmetic.rs",
+      "functions": [
+        {
+          "name": "estimate_tokens",
+          "signature": "fn estimate_tokens(chars: usize) -> usize",
+          "ensures": [
+            "result as int == (chars as int + 3) / 4"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "wire",
+      "source": "crates/codevetra-scip/src/codec/wire.rs",
+      "functions": [
+        {
+          "name": "varint_length",
+          "signature": "fn varint_length(value: u64) -> usize",
+          "verus": false
+        },
+        {
+          "name": "delimited_end",
+          "signature": "fn delimited_end(\n    current: usize,\n    tag_bytes: usize,\n    length_bytes: usize,\n    payload: usize,\n    maximum: usize,\n) -> Option<usize>",
+          "ensures": [
+            "match result { Some(n) => n as int == current as int + tag_bytes as int + length_bytes as int + payload as int && n <= maximum, None => current as int + tag_bytes as int + length_bytes as int + payload as int > maximum as int }"
+          ]
+        },
+        {
+          "name": "field_tag",
+          "signature": "fn field_tag(field: u32, wire: u8) -> Option<u64>",
+          "verus": false
+        },
+        {
+          "name": "cursor_end",
+          "signature": "fn cursor_end(position: usize, length: usize, total: usize) -> Option<usize>",
+          "ensures": [
+            "match result { Some(n) => n as int == position as int + length as int && n <= total, None => position as int + length as int > total as int }"
+          ]
+        },
+        {
+          "name": "read_varint",
+          "signature": "fn read_varint(bytes: &[u8], start: usize) -> Option<(u64, usize)>",
+          "verus": false
+        }
+      ]
+    },
+    {
+      "module": "scores",
+      "source": "crates/codevetra-llm/src/rerank/score.rs",
+      "functions": [
+        {
+          "name": "normalize_score",
+          "signature": "fn normalize_score(score: f32, minimum: f32, maximum: f32) -> Option<f64>",
+          "verus": false
+        }
+      ]
+    },
+    {
+      "module": "ranks",
+      "source": "crates/codevetra-search/src/hybrid/rank.rs",
+      "functions": [
+        {
+          "name": "valid_rank",
+          "signature": "fn valid_rank(rank: u16, maximum: u16) -> bool",
+          "ensures": [
+            "result <==> rank >= 1 && rank <= maximum"
+          ]
+        },
+        {
+          "name": "reciprocal_rank",
+          "signature": "fn reciprocal_rank(rank: u16) -> f64",
+          "verus": false
+        }
+      ]
+    },
+    {
+      "module": "paths",
+      "source": "crates/codevetra-domain/src/source/path.rs",
+      "functions": [
+        {
+          "name": "drive_prefix",
+          "signature": "fn drive_prefix(first: u8, second: u8) -> bool",
+          "verus": false
+        },
+        {
+          "name": "normalize_path",
+          "signature": "fn normalize_path(raw: &str) -> Option<String>",
+          "verus": false
+        },
+        {
+          "name": "normalize_bytes",
+          "signature": "fn normalize_bytes(raw: &[u8]) -> Option<Vec<u8>>",
+          "verus": false
+        },
+        {
+          "name": "append_component",
+          "signature": "fn append_component(canonical: &mut Vec<u8>, component: &[u8]) -> Option<()>",
+          "verus": false
+        }
+      ]
+    },
+    {
+      "module": "keys",
+      "source": "crates/codevetra-db/src/rocks/key/encoding.rs",
+      "functions": [
+        {
+          "name": "escape",
+          "signature": "fn escape(bytes: &[u8]) -> Vec<u8>",
+          "verus": false
+        },
+        {
+          "name": "decode",
+          "signature": "fn decode(encoded: &[u8]) -> Option<(Vec<u8>, u64)>",
+          "verus": false
+        },
+        {
+          "name": "successor",
+          "signature": "fn successor(mut bytes: Vec<u8>) -> Option<Vec<u8>>",
+          "verus": false
+        }
+      ]
+    },
+    {
+      "module": "graph",
+      "source": "crates/codevetra-db/src/rocks/graph/codec/arithmetic.rs",
+      "functions": [
+        {
+          "name": "radix_geometry",
+          "signature": "fn radix_geometry(depth: usize, bytes: usize) -> Option<(usize, usize)>",
+          "ensures": [
+            "match result { Some((whole, remainder)) => whole as int * 8 + remainder as int == depth as int && remainder < 8 && whole <= bytes && (remainder == 0 || whole < bytes), None => depth as int > bytes as int * 8 }"
+          ]
+        },
+        {
+          "name": "prefix_byte",
+          "signature": "fn prefix_byte(byte: u8, bits: usize) -> Option<u8>",
+          "verus": false
+        },
+        {
+          "name": "nibble",
+          "signature": "fn nibble(byte: u8) -> Option<u8>",
+          "ensures": [
+            "match result { Some(n) => n < 16 && (if n < 10 { byte as int == n as int + 48 } else { byte as int == n as int + 87 }), None => !((48 <= byte <= 57) || (97 <= byte <= 102)) }"
+          ]
+        }
+      ]
+    },
+    {
+      "module": "profiles",
+      "source": "crates/codevetra-mcp/src/profile/bits.rs",
+      "functions": [
+        {
+          "name": "union",
+          "signature": "fn union(left: u8, right: u8) -> u8",
+          "verus": false
+        },
+        {
+          "name": "includes",
+          "signature": "fn includes(membership: u8, profile: u8) -> bool",
+          "verus": false
+        }
+      ]
+    }
+  ],
+  "kani": [
+    {
+      "source": "verification/kani/bit_fields.rs",
+      "required": [
+        "graph_prefix_geometry",
+        "graph_prefix_bits",
+        "graph_hex_digits",
+        "explicit_profile_membership"
+      ],
+      "experimental": {}
+    },
+    {
+      "source": "verification/kani/byte_budget.rs",
+      "required": [
+        "admission_is_exact_and_cannot_overflow"
+      ],
+      "experimental": {}
+    },
+    {
+      "source": "verification/kani/contracts.rs",
+      "required": [
+        "source_coordinates",
+        "configuration_integer",
+        "extraction_reservations",
+        "storage_reservations",
+        "retention_budget",
+        "storage_policy",
+        "writer_fences",
+        "publication_base",
+        "retention_decisions",
+        "orphan_grace",
+        "task_byte_admission",
+        "source_windows",
+        "token_rounding",
+        "protobuf_admission",
+        "protobuf_varint_length",
+        "protobuf_field_tags",
+        "protobuf_decoder",
+        "finite_score_rejection",
+        "finite_score_endpoints"
+      ],
+      "experimental": {
+        "retrieval_rank_bounds": "Floating point division; bounded proof has not completed.",
+        "finite_score_normalization": "Complete SAT proof remains unverified; earlier SMT evidence is not trusted after the reproduced CBMC 6.11 rounding defect.",
+        "finite_score_interior": "Original SMT failure has no recovered witness; reduced rounding counterexample is demonstrably false. General SAT run reached its 60-second deadline."
+      }
+    },
+    {
+      "source": "verification/kani/structures.rs",
+      "required": [
+        "windows_drive_prefix",
+        "storage_prefix_successor"
+      ],
+      "experimental": {
+        "canonical_path_is_relative_and_idempotent": "Allocation-heavy path composition; bounded proof has not completed.",
+        "storage_key_round_trip": "Allocation-heavy encoding/decoding composition exceeded the 4 GiB limit.",
+        "storage_decoder_rejects_malformed_keys_safely": "Allocation-heavy malformed input composition; bounded proof has not completed."
+      }
+    },
+    {
+      "source": "verification/kani/floating_point.rs",
+      "required": [
+        "binary64_rounding_carry_reproducer",
+        "production_rounding_carry_reproducer"
+      ],
+      "experimental": {
+        "widening_preserves_finite_order": "Diagnostic lemma; no production correctness claim.",
+        "widened_differences_are_positive_and_ordered": "Diagnostic lemma; no production correctness claim.",
+        "positive_ordered_division_stays_in_unit_interval": "Diagnostic lemma; no production correctness claim.",
+        "widened_difference_is_positive_and_finite": "Diagnostic lemma; no production correctness claim.",
+        "widened_subtraction_is_monotone": "Diagnostic lemma; no production correctness claim."
+      }
+    }
+  ]
+}

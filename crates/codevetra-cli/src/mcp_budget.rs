@@ -1,10 +1,12 @@
 use std::collections::BTreeSet;
 
+mod arithmetic;
+use arithmetic::estimate_tokens;
+
 use codevetra_mcp::{ToolDefinition, ToolProfile};
 use num_traits::ToPrimitive as _;
 use serde::Serialize;
 
-const TOKEN_CHARACTER_ESTIMATE: usize = 4;
 const TOOL_COUNT_LIMIT: usize = 37;
 const TOOLS_LIST_CHARACTER_LIMIT: usize = 65_000;
 const COMBINED_CHARACTER_LIMIT: usize = 68_000;
@@ -222,10 +224,6 @@ const fn metric(chars: usize) -> LoadMetric {
         chars,
         estimated_tokens: estimate_tokens(chars),
     }
-}
-
-const fn estimate_tokens(chars: usize) -> usize {
-    chars.saturating_add(TOKEN_CHARACTER_ESTIMATE - 1) / TOKEN_CHARACTER_ESTIMATE
 }
 
 const fn profile_name(profile: ToolProfile) -> &'static str {
