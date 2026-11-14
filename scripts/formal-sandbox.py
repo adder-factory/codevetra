@@ -211,7 +211,25 @@ def snapshot(destination):
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
+        target.chmod(0o644)
+    # The container drops DAC_OVERRIDE and may have a different UID from the
+    # host. Publish this allowlisted public-source copy with explicit read and
+    # traversal permissions, independent of the host's umask. Original source
+    # and private evidence permissions remain untouched.
+    for path in destination.rglob('*'):
+        if path.is_dir():
+            path.chmod(0o755)
+    destination.chmod(0o755)
     return digest.hexdigest()
+
+
+def print_failure_output(report_dir):
+    with (report_dir / 'output.log').open('rb') as output:
+        output.seek(0, os.SEEK_END)
+        output.seek(max(0, output.tell() - 8192))
+        tail = output.read(8192).decode('utf-8', errors='replace')
+    # Escape terminal controls and keep CI diagnostics bounded.
+    print(json.dumps({'verifier_output_tail': tail}), file=sys.stderr)
 
 
 def parse_args(argv=None):
@@ -291,6 +309,8 @@ def main(argv=None):
                                    memory=args.memory_mib * 1024**2,
                                    publish_image=frozen_image if setup else None)
         print(json.dumps(report, indent=2))
+        if report['outcome'] != 'passed':
+            print_failure_output(report_dir)
         return 0 if report['outcome'] == 'passed' else 1
 
 

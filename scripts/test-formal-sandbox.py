@@ -163,6 +163,35 @@ class AdmissionTests(unittest.TestCase):
             self.assertFalse(list(source.rglob('*.out')))
             self.assertFalse((source / '.codevetra').exists())
 
+    def test_snapshot_is_readable_without_container_dac_override(self):
+        original = sandbox.ROOT / 'scripts/formal/entry.sh'
+        original_mode = original.stat().st_mode
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            previous = os.umask(0o077)
+            try:
+                sandbox.snapshot(source)
+            finally:
+                os.umask(previous)
+            self.assertEqual(source.stat().st_mode & 0o777, 0o755)
+            for path in source.rglob('*'):
+                expected = 0o755 if path.is_dir() else 0o644
+                self.assertEqual(path.stat().st_mode & 0o777, expected, str(path))
+        self.assertEqual(original.stat().st_mode, original_mode)
+
+    def test_failure_output_is_bounded_and_escapes_terminal_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory)
+            (report / 'output.log').write_bytes(b'omitted' * 2000 + b'\x1b[31mPermission denied\n')
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                sandbox.print_failure_output(report)
+            rendered = stderr.getvalue()
+            self.assertNotIn('\x1b', rendered)
+            tail = json.loads(rendered)['verifier_output_tail']
+            self.assertEqual(len(tail.encode()), 8192)
+            self.assertTrue(tail.endswith('Permission denied\n'))
+
     def test_missing_kernel_enforcement_is_rejected(self):
         info = {'OSType': 'linux', 'CgroupVersion': '2', 'MemoryLimit': True,
                 'SwapLimit': True, 'PidsLimit': True, 'MemTotal': 16 * 1024**3}
