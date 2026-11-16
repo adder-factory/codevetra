@@ -341,12 +341,16 @@ jobs:
             target/
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
-  windows-portability:
-    name: Windows strict compile portability
+  windows-checks:
+    name: Windows ${{ matrix.check }} checks
     needs: classify
     if: needs.classify.outputs.full == 'true'
     runs-on: windows-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [clippy, migration]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -362,8 +366,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: codevetra-rust-${{ runner.os }}-v2-windows-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-windows-${{ matrix.check }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            codevetra-rust-${{ runner.os }}-v2-windows-${{ matrix.check }}-
             codevetra-rust-${{ runner.os }}-v2-windows-
 
       - name: Resolve native binding library
@@ -376,13 +381,16 @@ jobs:
           "LIBCLANG_PATH=$nativeClang" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Windows release path privacy regression
+        if: matrix.check == 'migration'
         shell: pwsh
         run: scripts/test-windows-rust-release-paths.ps1
 
       - name: Windows physical name migration and original-lock preservation
+        if: matrix.check == 'migration'
         run: cargo test --locked -p codevetra-config name_migration -- --nocapture
 
       - name: Windows state migration coverage
+        if: matrix.check == 'migration'
         shell: pwsh
         run: |
           rustup component add llvm-tools-preview
@@ -393,6 +401,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Preserve Windows state migration coverage
+        if: matrix.check == 'migration'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-config-coverage-${{ github.sha }}
@@ -400,12 +409,15 @@ jobs:
           if-no-files-found: error
 
       - name: Windows all-target, all-feature Clippy
+        if: matrix.check == 'clippy'
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Windows native name migration admission
+        if: matrix.check == 'migration'
         run: cargo llvm-cov test --locked -p codevetra-db --lib --lcov --output-path target/windows-native.lcov name_migration_admission -- --nocapture
 
       - name: Preserve Windows native migration coverage
+        if: matrix.check == 'migration'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-native-coverage-${{ github.sha }}
@@ -425,6 +437,31 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  windows-portability:
+    name: Windows strict compile portability
+    needs: [classify, windows-checks]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Cold Clippy and coverage builds have independent bounded jobs; this
+      # protected context requires both before main can be attested.
+      - name: Require complete Windows validation
+        env:
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          FULL_GATE: ${{ needs.classify.outputs.full }}
+          DOCS_ONLY: ${{ needs.classify.outputs.docs_only }}
+          WINDOWS_RESULT: ${{ needs.windows-checks.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CLASSIFY_RESULT" == success ]] || exit 1
+          if [[ "$FULL_GATE" == true ]]; then
+            [[ "$DOCS_ONLY" == false && "$WINDOWS_RESULT" == success ]] || exit 1
+          else
+            [[ "$FULL_GATE" == false && "$DOCS_ONLY" == true && "$WINDOWS_RESULT" == skipped ]] || exit 1
+          fi
 
   macos-portability:
     name: macOS strict compile portability
