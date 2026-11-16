@@ -279,8 +279,7 @@ fn page_rank_partitions(graph: &PageRankGraph, workers: usize) -> Vec<Vec<usize>
             .iter()
             .enumerate()
             .min_by_key(|(index, load)| (**load, *index))
-            .map(|(index, _)| index)
-            .unwrap_or_default();
+            .map_or_default(|(index, _)| index);
         loads[worker] =
             loads[worker].saturating_add(graph.in_offsets[target + 1] - graph.in_offsets[target]);
         partitions[worker].push(target);
@@ -544,8 +543,7 @@ impl BrandesScratch {
             self.stack[stack_top] = node;
             stack_top += 1;
             let next_distance = self.distance[node].saturating_add(1);
-            for target_index in graph.out_offsets[node]..graph.out_offsets[node + 1] {
-                let target = graph.targets[target_index];
+            for &target in &graph.targets[graph.out_offsets[node]..graph.out_offsets[node + 1]] {
                 if self.distance[target] < 0 {
                     self.distance[target] = next_distance;
                     self.queue[queue_tail] = target;

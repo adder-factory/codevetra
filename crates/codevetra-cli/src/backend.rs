@@ -1867,8 +1867,7 @@ fn render_rows(status: &BackendStatusReport) {
         let pid = row
             .pid_record
             .as_ref()
-            .map(|record| format!(" pid={}", record.pid))
-            .unwrap_or_default();
+            .map_or_default(|record| format!(" pid={}", record.pid));
         println!(
             "{marker} **{}** — {:?} at {}{pid}",
             row.spec.labels.join("/"),

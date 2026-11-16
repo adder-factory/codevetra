@@ -1209,13 +1209,12 @@ async fn profile_tool_names(
 fn tool_names(response: &Value) -> Vec<&str> {
     response["result"]["tools"]
         .as_array()
-        .map(|tools| {
+        .map_or_default(|tools| {
             tools
                 .iter()
                 .filter_map(|tool| tool["name"].as_str())
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 fn assert_error(response: &Value, numeric_code: i64, stable_code: &str) {

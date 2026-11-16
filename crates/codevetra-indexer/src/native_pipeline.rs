@@ -4225,8 +4225,7 @@ where
     let explicit_names = index
         .exports
         .get(source_file)
-        .map(|exports| exports.keys().map(String::as_str).collect::<BTreeSet<_>>())
-        .unwrap_or_default();
+        .map_or_default(|exports| exports.keys().map(String::as_str).collect::<BTreeSet<_>>());
     let mut visible = VisibleExportMap::new();
     for re_export in index
         .re_exports
@@ -12834,8 +12833,7 @@ fn module_file_match<'a>(
     importing_language: &str,
 ) -> ModuleFileMatch<'a> {
     let mut matched = candidates
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .map_or_default(Vec::as_slice)
         .iter()
         .filter(|file_id| {
             files.get(*file_id).is_some_and(|target| {

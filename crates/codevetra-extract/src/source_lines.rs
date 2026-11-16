@@ -84,7 +84,21 @@ pub(crate) fn physical_lines(source: &str) -> impl Iterator<Item = (usize, &str)
     source.split_inclusive('\n').map(move |raw| {
         let start = offset;
         offset = offset.saturating_add(raw.len());
-        let line = raw.strip_suffix('\n').unwrap_or(raw);
-        (start, line.strip_suffix('\r').unwrap_or(line))
+        (start, raw.trim_suffix('\n').trim_suffix('\r'))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::physical_lines;
+
+    #[test]
+    fn line_terminators_preserve_byte_offsets_and_content_carriage_returns() {
+        assert_eq!(
+            physical_lines("é\r\r\nx\nlast\r").collect::<Vec<_>>(),
+            [(0, "é\r"), (5, "x"), (7, "last")]
+        );
+        assert_eq!(physical_lines("\n").collect::<Vec<_>>(), [(0, "")]);
+        assert!(physical_lines("").next().is_none());
+    }
 }

@@ -1113,8 +1113,7 @@ fn relationship_edge_kind(
 
 fn qualified_name(symbol: &ScipSymbolInformation) -> String {
     let parsed = parse_scip_symbol(&symbol.symbol)
-        .map(|parsed| descriptors_to_qualified_name(&parsed.descriptors))
-        .unwrap_or_default();
+        .map_or_default(|parsed| descriptors_to_qualified_name(&parsed.descriptors));
     let value = if parsed.is_empty() {
         if symbol.display_name.is_empty() {
             "(anonymous)"

@@ -511,7 +511,7 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ========================================================================
-lz4_flex 0.14.0 / MIT
+lz4_flex 0.14.2 / MIT
 ========================================================================
 
 The MIT License (MIT)

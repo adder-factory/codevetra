@@ -1469,9 +1469,7 @@ fn registration_change(
                 )
         },
         wrapper: executable.and_then(|executable| executable.wrapper.clone()),
-        from: executable
-            .map(|executable| executable.path.clone())
-            .unwrap_or_default(),
+        from: executable.map_or_default(|executable| executable.path.clone()),
         to: chosen.to_owned(),
         manual_step: None,
     };

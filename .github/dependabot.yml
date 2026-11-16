@@ -16,6 +16,22 @@ updates:
           - minor
           - patch
 
+  - package-ecosystem: cargo
+    directory: /verification/shuttle
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:15'
+      timezone: America/Toronto
+    open-pull-requests-limit: 5
+    groups:
+      compatible-shuttle-updates:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -1,6 +1,6 @@
 //! Project-owned operations survive a dropped request until their work is reaped.
 
-use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, mem::DropGuard, sync::Arc, time::Duration};
 
 use codevetra_db::rocks::{RocksError, StorageRequest};
 use tokio::{
@@ -37,19 +37,6 @@ impl OperationRegistry {
                 }
             };
             self.controls.remove(&id);
-        }
-    }
-}
-
-struct CancelOnDrop {
-    control: StorageRequest,
-    armed: bool,
-}
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        if self.armed {
-            self.control.cancel();
         }
     }
 }
@@ -181,12 +168,9 @@ impl RocksProjectRuntime {
             });
             registry.controls.insert(handle.id(), token);
         }
-        let mut cancellation = CancelOnDrop {
-            control: request.clone(),
-            armed: true,
-        };
+        let cancellation = DropGuard::new(request.clone(), |control| control.cancel());
         let result = receiver.await.map_err(|_| operation_error())?;
-        cancellation.armed = false;
+        DropGuard::dismiss(cancellation);
         result
     }
 
@@ -261,6 +245,26 @@ mod tests {
     use super::*;
     use std::sync::{Condvar, Mutex};
 
+    #[tokio::test]
+    async fn delivered_results_preserve_the_request_for_reuse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let request = StorageRequest::new(Duration::from_secs(30))?;
+        let runtime = RocksProjectRuntime::open(root.path(), &request).await?;
+        for fail in [false, true] {
+            let result = runtime
+                .owned_operation(&request, move |_, _| async move {
+                    if fail { Err(operation_error()) } else { Ok(42) }
+                })
+                .await;
+            assert_eq!(result.is_err(), fail);
+            request.check()?;
+        }
+        runtime.shutdown().await?;
+        request.check()?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn feature_index_waits_for_the_watcher_within_the_original_request()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -330,6 +334,7 @@ mod tests {
             })
             .await;
         assert!(failed.is_err());
+        assert!(matches!(request.check(), Err(RocksError::Cancelled)));
         assert!(runtime.shutdown().await.is_err());
         // The original owner remains alive, but its completed failed task
         // must not prevent releasing the primary database and worker pool.

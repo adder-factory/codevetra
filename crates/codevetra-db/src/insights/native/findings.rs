@@ -154,8 +154,7 @@ impl NativeDatabase {
         }
         Ok(computation::prepare(self, timeout)
             .await?
-            .map(|prepared| prepared.stats)
-            .unwrap_or_default())
+            .map_or_default(|prepared| prepared.stats))
     }
 
     /// Read an info-or-worse ranked page from a complete current detector relation.

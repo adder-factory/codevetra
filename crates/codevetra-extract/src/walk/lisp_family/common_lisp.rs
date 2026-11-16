@@ -367,7 +367,7 @@ fn visit_binding_form(
     let introducer = input.forms.get(AFTER_HEAD).copied();
     let (body, clause_skip) = match input.layout {
         BindingLayout::Bindings(skip) => {
-            for binding in introducer.map(form_children).unwrap_or_default() {
+            for binding in introducer.map_or_default(form_children) {
                 if binding.kind() == "list_lit" {
                     visit_forms_after(builder, FormsAfter::new(binding, skip, child_depth))?;
                 }
@@ -686,8 +686,7 @@ fn emit_function(
     // Default-value forms run when the function is called, before its body.
     let mut evaluated = input
         .lambda_list
-        .map(|list| lambda_list_defaults(source, list))
-        .unwrap_or_default();
+        .map_or_default(|list| lambda_list_defaults(source, list));
     evaluated.extend_from_slice(input.body);
     let Some(name) = input
         .name

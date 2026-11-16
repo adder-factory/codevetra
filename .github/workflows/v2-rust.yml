@@ -206,17 +206,17 @@ jobs:
 
       - name: Dependency advisories, licenses, bans, and sources
         if: needs.classify.outputs.full == 'true'
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
-          rust-version: '1.99.1'
+          rust-version: '1.100.0'
           command: check
           arguments: --all-features
 
       - name: Shuttle dependency advisories, licenses, bans, and sources
         if: needs.classify.outputs.full == 'true'
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
-          rust-version: '1.99.1'
+          rust-version: '1.100.0'
           manifest-path: verification/shuttle/Cargo.toml
           command: check
           arguments: --locked --config verification/shuttle/deny.toml
@@ -483,8 +483,8 @@ jobs:
           scripts/build-linux-rust-release.sh
           x86_64-unknown-linux-gnu
           linux-x64
-          rust:1.99.1-trixie@sha256:d841af61827b29b3efa46f5363e8f2e972b379cc0463c319e8f320d9f0c8eb0c
-          debian:13-slim@sha256:1e1a22175fbf1b32157ddaf0219e1db4e5401fab2b94ed285add64d18587cd2d
+          rust:1.100.0-trixie@sha256:ebc54bef33ec8f9a5cd05799366010f35efbb73b354fb4f2cb086ec6b9460ef5
+          debian:13-slim@sha256:7378260c0a098d27ac206225db5e7d92b8c7c84ea7afccc86eeb513756bbd392
 
   rocksdb:
     name: RocksDB native (${{ matrix.shard }})

@@ -6,14 +6,14 @@ apt-get install -y -qq --no-install-recommends ca-certificates curl unzip python
 case "$(uname -m)" in
   aarch64)
     target=aarch64-unknown-linux-gnu
-    rustup_sha=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+    rustup_sha=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282
     kani_sha=0042d2688bf1550270def4a79c96aaeea138631818cb4ab5480120f2d51a942c
     verus_arch=arm64
     verus_sha=bc28850dd5efd1679a4cf4ffd3309921c3523c69fa4757079e5d12d4122d400d
     ;;
   x86_64)
     target=x86_64-unknown-linux-gnu
-    rustup_sha=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+    rustup_sha=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
     kani_sha=32e2b484d73ede0bbf64a2cf0879c4259422497d8aec4ee67d448de9ae7843d3
     verus_arch=x86
     verus_sha=f3a0119292df8855e4435da8130bee1873b0e6a60c306accf81a08ea687bba3c
@@ -25,12 +25,15 @@ fetch() {
     --connect-timeout 15 --max-time 180 "$1" --output "$2"
   echo "$3  $2" | sha256sum --check --strict
 }
-fetch "https://static.rust-lang.org/rustup/archive/1.28.2/$target/rustup-init" /tmp/rustup-init "$rustup_sha"
+fetch "https://static.rust-lang.org/rustup/archive/1.29.3/$target/rustup-init" /tmp/rustup-init "$rustup_sha"
 chmod +x /tmp/rustup-init
-/tmp/rustup-init -y --profile minimal --default-toolchain 1.99.1 --no-modify-path
+/tmp/rustup-init -y --profile minimal --default-toolchain 1.100.0 --no-modify-path
 export PATH="/root/.cargo/bin:$PATH"
 rustup set auto-self-update disable
-rustup component add --toolchain 1.99.1 clippy rustfmt
+rustup component add --toolchain 1.100.0 clippy rustfmt
+# This Verus release links against its own compiler libraries. Keep that
+# dependency explicit without changing the production/Shuttle default.
+rustup toolchain install 1.99.1 --profile minimal
 export CARGO_BUILD_JOBS=1
 cargo install --locked kani-verifier --version 0.68.0
 fetch "https://github.com/model-checking/kani/releases/download/kani-0.68.0/kani-0.68.0-$target.tar.gz" /tmp/kani.tar.gz "$kani_sha"

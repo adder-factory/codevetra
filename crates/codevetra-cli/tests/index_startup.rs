@@ -82,8 +82,7 @@ fn collect_stderr(child: &mut Child) -> (Arc<Mutex<Vec<u8>>>, JoinHandle<()>) {
 
 fn text(seen: &Mutex<Vec<u8>>) -> String {
     seen.lock()
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
+        .map_or_default(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 async fn reached_startup(seen: &Mutex<Vec<u8>>, supervised: bool) {

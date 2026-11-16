@@ -470,6 +470,7 @@ for formal_contract in \
     fail "quality job omitted required formal verification: $formal_contract"
 done
 for formal_install_contract in \
+  'rustup toolchain install 1.99.1 --profile minimal' \
   'cargo install --locked kani-verifier --version 0.68.0' \
   'cargo kani setup --use-local-bundle' \
   'verus-0.2026.11.02.8bf68ee-' \
@@ -602,7 +603,7 @@ grep -Fq '#[cfg(not(target_pointer_width = "64"))]' "$CLI_SOURCE" || \
   fail 'the native CLI does not fail closed on 32-bit targets'
 grep -Fq 'CodeVetra v4 supports only 64-bit operating systems.' "$CLI_SOURCE" || \
   fail 'the 32-bit compile failure is not actionable'
-grep -Fq "rust:1.99.1-trixie@sha256:" "$VALIDATION" || \
+grep -Fq "rust:1.100.0-trixie@sha256:" "$VALIDATION" || \
   fail 'Linux validation does not build on current stable Debian'
 grep -Fq "rustup toolchain install \"\$CODEVETRA_RELEASE_TOOLCHAIN\" --profile minimal" "$LINUX_BUILD_HELPER" || \
   fail 'Linux builds do not install the exact reviewed compiler independently of the base image'
@@ -612,7 +613,7 @@ grep -Fq "rust-version: '$rust_toolchain'" "$VALIDATION" || \
   fail 'cargo-deny does not use the pinned stable Rust toolchain'
 grep -Fq 'debian:13-slim@sha256:' "$VALIDATION" || \
   fail 'Linux validation does not smoke on current stable Debian'
-grep -Fq "rust:1.99.1-trixie@sha256:" "$RELEASE" || \
+grep -Fq "rust:1.100.0-trixie@sha256:" "$RELEASE" || \
   fail 'Linux releases do not build on current stable Debian'
 grep -Fq 'debian:13-slim@sha256:' "$RELEASE" || \
   fail 'Linux releases do not smoke on current stable Debian'

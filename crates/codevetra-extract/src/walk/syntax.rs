@@ -1546,10 +1546,7 @@ fn is_magic_number(raw: &str, language: SourceLanguage) -> bool {
     }
     let unsigned = normalized.trim_start_matches(['-', '+']);
     let normalized_value = strip_numeric_literal_suffix(unsigned);
-    if benign_numeric_value(normalized_value, language) {
-        return false;
-    }
-    true
+    !benign_numeric_value(normalized_value, language)
 }
 
 fn strip_numeric_literal_suffix(value: &str) -> &str {
@@ -1729,8 +1726,7 @@ fn jsx_url_presentation_attribute(node: Node<'_>, source: &str) -> bool {
     let attribute = node
         .child_by_field_name("name")
         .or_else(|| named_children(node).next())
-        .map(|name| text_for(source, name).trim())
-        .unwrap_or_default();
+        .map_or_default(|name| text_for(source, name).trim());
     matches!(attribute, "placeholder" | "href" | "src")
 }
 
