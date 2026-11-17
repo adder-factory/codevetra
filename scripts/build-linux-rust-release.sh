@@ -170,9 +170,9 @@ docker run --rm --init --pull never \
     python3 scripts/setup-build-tools.py --tools sccache --bin-dir "$CARGO_HOME/bin"
     export PATH="$CARGO_HOME/bin:$PATH"
     # sccache 0.19 eagerly hashes Rust inputs through an unbounded blocking
-    # pool, exhausting this container's PID budget even with Cargo jobs=2.
+    # pool, exhausting the container PID budget even with Cargo jobs=2.
     # Empty Rust wrappers override Cargo config; explicit CC/CXX wrappers
-    # still cache RocksDB/grammar objects. Cargo's target cache retains Rust.
+    # still cache RocksDB/grammar objects. The Cargo target cache retains Rust.
     echo "[rust-release] Rust: persistent Cargo artifacts; C/C++: sccache"
     python3 scripts/verify-linux-build-cache.py
     if [[ "$CODEVETRA_BENCHMARK_LINKERS" == 1 ]]; then

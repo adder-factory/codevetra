@@ -337,6 +337,21 @@ class BuildToolsTests(unittest.TestCase):
         self.assertIn('taskset --cpu-list "$CPU_SET" bash', helper)
         self.assertEqual(helper.count('docker run --rm --init --pull never'), 2)
 
+    @unittest.skipIf(os.name == 'nt', 'Unix release shell commands')
+    def test_linux_nested_build_commands_remain_single_arguments(self):
+        import shlex
+        helper = (tools.ROOT / 'scripts/build-linux-rust-release.sh').read_text()
+        argument = helper.split('timeout --signal=TERM --kill-after=30s 3300s bash -c ', 1)[1].split('\n\nCURRENT_DIGEST=', 1)[0]
+        outer = shlex.split(argument)
+        self.assertEqual(len(outer), 1)
+        commands = shlex.split(outer[0], comments=True)
+        boundary = next(index for index in range(len(commands) - 1)
+                        if commands[index:index + 2] == ['bash', '-c'])
+        self.assertEqual(len(commands[boundary + 2:]), 1)
+        for command in (outer[0], commands[boundary + 2]):
+            result = subprocess.run(['bash', '-n'], input=command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     @unittest.skipIf(os.name == 'nt', 'Unix release compiler cache policy')
     def test_linux_release_reuses_native_cache_and_rust_artifacts(self):
         import re
