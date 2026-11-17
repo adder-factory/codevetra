@@ -133,6 +133,7 @@ docker run --rm --init --pull never \
   --env CODEVETRA_BUILD_CACHE_ROOT=/cache/build-tools \
   --env SCCACHE_DIR=/cache/sccache --env SCCACHE_CACHE_SIZE=2G \
   --env CARGO_INCREMENTAL=0 --env CARGO_BUILD_JOBS=2 \
+  --env RUSTC_WRAPPER= --env RUSTC_WORKSPACE_WRAPPER= \
   --env TMPDIR=/cache/tmp \
   --env CODEVETRA_RELEASE_TARGET="$TARGET" \
   --env CODEVETRA_RELEASE_ASSET_TARGET="$ASSET_TARGET" \
@@ -168,11 +169,18 @@ docker run --rm --init --pull never \
     fi
     python3 scripts/setup-build-tools.py --tools sccache --bin-dir "$CARGO_HOME/bin"
     export PATH="$CARGO_HOME/bin:$PATH"
+    # sccache 0.19 eagerly hashes Rust inputs through an unbounded blocking
+    # pool, exhausting this container's PID budget even with Cargo jobs=2.
+    # Empty Rust wrappers override Cargo config; explicit CC/CXX wrappers
+    # still cache RocksDB/grammar objects. Cargo's target cache retains Rust.
+    echo "[rust-release] Rust: persistent Cargo artifacts; C/C++: sccache"
+    python3 scripts/verify-linux-build-cache.py
     if [[ "$CODEVETRA_BENCHMARK_LINKERS" == 1 ]]; then
       python3 scripts/setup-build-tools.py --tools mold wild --bin-dir "$CARGO_HOME/bin"
     fi
     scripts/build-rust-release.sh "$CODEVETRA_RELEASE_TARGET" "$CODEVETRA_RELEASE_ASSET_TARGET"
     sccache --show-stats
+    python3 scripts/report-build-resources.py --require-headroom
   '\'''
 
 CURRENT_DIGEST="$(python3 - "$ROOT" <<'PY'

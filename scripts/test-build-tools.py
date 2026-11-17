@@ -337,6 +337,62 @@ class BuildToolsTests(unittest.TestCase):
         self.assertIn('taskset --cpu-list "$CPU_SET" bash', helper)
         self.assertEqual(helper.count('docker run --rm --init --pull never'), 2)
 
+    @unittest.skipIf(os.name == 'nt', 'Unix release compiler cache policy')
+    def test_linux_release_reuses_native_cache_and_rust_artifacts(self):
+        import re
+        import tomllib
+        helper = (tools.ROOT / 'scripts/build-linux-rust-release.sh').read_text()
+        env = tools.environment()
+        env.update(RUSTC_WRAPPER='sccache', RUSTC_WORKSPACE_WRAPPER='sccache')
+        env.update(dict(re.findall(r'--env (RUSTC_(?:WORKSPACE_)?WRAPPER)=([^ \\\n]*)', helper)))
+        env.update(TMPDIR=str(self.root), CODEVETRA_RELEASE_TARGET='aarch64-unknown-linux-gnu',
+                   CODEVETRA_RELEASE_TOOLCHAIN=tomllib.loads((tools.ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel'])
+        result = subprocess.run([sys.executable, str(tools.ROOT / 'scripts/verify-linux-build-cache.py')],
+                                env=env, text=True, capture_output=True, timeout=150)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"rust_target_reused": true', result.stdout)
+        self.assertIn('"native_hits": 1', result.stdout)
+        self.assertIn('"changed_inputs_verified": true', result.stdout)
+
+    @unittest.skipIf(os.name == 'nt', 'Unix release probe descendants')
+    def test_linux_cache_probe_deadline_reaps_compiler_descendants(self):
+        import tomllib
+        cargo = self.root / 'cargo'
+        sleeper = ('import os,signal,time; from pathlib import Path; '
+                   'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                   'Path(os.environ["PROBE_PID"]).write_text(str(os.getpid())); time.sleep(60)')
+        cargo.write_text(f'#!{sys.executable}\nimport subprocess,sys,time\n'
+                         f'subprocess.Popen([sys.executable,"-c",{sleeper!r}])\ntime.sleep(60)\n')
+        cargo.chmod(0o755)
+        pid_file = self.root / 'compiler.pid'
+        env = tools.environment()
+        env.update(PATH=str(self.root) + os.pathsep + env['PATH'], PROBE_PID=str(pid_file),
+                   RUSTC_WRAPPER='', RUSTC_WORKSPACE_WRAPPER='',
+                   CODEVETRA_RELEASE_TARGET='aarch64-unknown-linux-gnu',
+                   CODEVETRA_RELEASE_TOOLCHAIN=tomllib.loads((tools.ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel'])
+        cleanup_needed = True
+        try:
+            result = subprocess.run([sys.executable, str(tools.ROOT / 'scripts/verify-linux-build-cache.py'), '--timeout', '3'],
+                                    env=env, text=True, capture_output=True, timeout=45)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Build deadline exceeded', result.stderr)
+            self.assertTrue(pid_file.is_file(), result.stderr)
+            pid = int(pid_file.read_text())
+            for _ in range(30):
+                state = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True, text=True).stdout.strip()
+                if not state or state.startswith('Z'):
+                    cleanup_needed = False
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail('Release compiler descendant survived its probe deadline')
+        finally:
+            if cleanup_needed and pid_file.exists():
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     @unittest.skipIf(os.name == 'nt', 'Unix compiler-server process groups')
     def test_owned_compiler_server_survives_an_idle_test_phase(self):
         runner = self.runner_module()

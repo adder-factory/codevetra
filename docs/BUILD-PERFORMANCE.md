@@ -73,6 +73,12 @@ cannot silently substitute a fixture path from another worktree. See the
 
 Linux release builds persist registry, toolchain, target and compiler caches
 under a key containing architecture, exact compiler and build-image digest.
+Inside the bounded Linux release container, Rust uses Cargo's persistent target
+cache and C/C++ uses sccache. Rust sccache is explicitly disabled there because
+version 0.19 eagerly hashes Rust inputs through a blocking pool without a
+configurable thread limit, which exhausted the 256-PID budget. Other builds
+retain Rust sccache. A real compiler probe checks this split, native cache hits
+and changed-input behavior; reaching the container's PID limit fails the build.
 They stage public source without copying private graph or Git state, check for
 source changes before publishing artifacts, and retain all archive/privacy
 and Debian runtime checks. Identical public snapshots reuse a staged timestamp
