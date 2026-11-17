@@ -538,12 +538,11 @@ fn detect_toml(
     let configured_args = fields
         .and_then(|codevetra| codevetra.get("args"))
         .and_then(toml_edit::Item::as_array)
-        .map(|args| {
+        .map_or_default(|args| {
             args.iter()
                 .map(toml_edit::Value::as_str)
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
     registration_detection(&RegistrationDetectionInput {
         target,
         location,
@@ -607,8 +606,7 @@ fn detect_json(
     let configured_args = entry
         .and_then(|entry| entry.get("args"))
         .and_then(Value::as_array)
-        .map(|args| args.iter().map(Value::as_str).collect::<Vec<_>>())
-        .unwrap_or_default();
+        .map_or_default(|args| args.iter().map(Value::as_str).collect::<Vec<_>>());
     registration_detection(&RegistrationDetectionInput {
         target,
         location,

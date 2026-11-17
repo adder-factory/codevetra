@@ -3,7 +3,7 @@
 [Documentation home](../README.md) · [Project overview](../../README.md) ·
 [Native extraction](EXTRACTION.md) · [Language matrix](../SUPPORT-MATRIX.md)
 
-Last release audit: 2026-11-13 (`v4.0.5`).
+Last release audit: 2026-11-16 (`v4.0.6`).
 
 CodeVetra v4 is a native Rust code-intelligence server for AI coding agents.
 Each project owns an embedded RocksDB 11.12.0 store. Rust implements

@@ -554,7 +554,7 @@ fn visit_let_function(
         }
     }
     // Default values run when the function is called, so they are its calls.
-    let mut body = parameters.map(default_values).unwrap_or_default();
+    let mut body = parameters.map_or_default(default_values);
     body.extend(function.child_by_field_name("body"));
     visit_in_scope(
         builder,
@@ -835,8 +835,7 @@ fn visit_module_definition(
     };
     let children: Vec<Node<'_>> = block
         .filter(|block| block.kind() == "block")
-        .map(|block| named_children(block).collect())
-        .unwrap_or_default();
+        .map_or_default(|block| named_children(block).collect());
     visit_in_scope(
         builder,
         ScopeVisit {

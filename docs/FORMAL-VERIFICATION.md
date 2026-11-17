@@ -4,6 +4,8 @@ CodeVetra uses Kani 0.68.0 and Verus 0.2026.11.02.8bf68ee for pure contracts
 at the production admission, storage, source, protocol and retrieval boundaries.
 Required builds still use the exact stable compiler in `rust-toolchain.toml`.
 Verifier compilers and solvers are development tools, never runtime dependencies.
+The pinned Verus binary requires Rust 1.99.1 compiler libraries. Sandbox setup
+installs that separate toolchain while production and Shuttle use Rust 1.100.0.
 Shuttle 0.9.10 additionally checks selected production async interleavings; its
 separate locked harness is also absent from the shipped dependency graph.
 

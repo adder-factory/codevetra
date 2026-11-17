@@ -16,9 +16,9 @@ members = [
 ]
 
 [workspace.package]
-version = "4.0.5"
+version = "4.0.6"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 authors = ["Adder Factory"]
 license = "MIT"
 repository = "https://github.com/adder-factory/codevetra"
@@ -69,7 +69,6 @@ arborium-vhdl = "=2.18.2"
 arborium-yaml = "=2.18.2"
 blake3 = "1.8.7"
 codevetra-agent = { path = "crates/codevetra-agent" }
-codevetra-cli = { path = "crates/codevetra-cli" }
 codevetra-config = { path = "crates/codevetra-config" }
 codevetra-db = { path = "crates/codevetra-db" }
 codevetra-domain = { path = "crates/codevetra-domain" }
@@ -91,9 +90,9 @@ clap = { version = "4.6.7", default-features = false, features = [
 getrandom = "0.4.3"
 ignore = "0.4.34"
 itoa = "=1.0.19"
-jiff = { version = "=0.2.43", default-features = false, features = ["std"] }
+jiff = { version = "=1.0.0", default-features = false, features = ["std"] }
 libc = "0.2.191"
-lz4_flex = { version = "=0.14.0", default-features = false, features = ["safe-encode", "safe-decode"] }
+lz4_flex = { version = "=0.14.2", default-features = false, features = ["safe-encode", "safe-decode"] }
 memchr = "=2.8.3"
 notify = "=8.2.2"
 num-traits = "=0.2.19"
@@ -146,6 +145,10 @@ tree-sitter-slang = "=0.3.1"
 tree-sitter-typescript = "=0.23.2"
 tree-sitter-wgsl-bevy = "=0.1.4"
 url = "2.5.8"
+
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+unused_workspace_dependencies = "deny"
 
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -2 }

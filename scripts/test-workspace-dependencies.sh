@@ -87,6 +87,19 @@ def metadata_member_packages(metadata: dict) -> list[dict]:
     return [packages_by_id[member_id] for member_id in member_ids]
 
 
+def canonical_member_dependency(package: dict, dependency: object, directory: str) -> bool:
+    library_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+    has_library = any(
+        library_kinds.intersection(target.get("kind", []))
+        for target in package.get("targets", [])
+    )
+    # Binary-only members cannot be consumed as Rust dependencies. Requiring
+    # a redundant entry conflicts with Cargo's unused workspace dependency gate.
+    if not has_library:
+        return dependency is None
+    return isinstance(dependency, dict) and dependency.get("path") == directory
+
+
 # Production/build dependencies form reviewed, directed capabilities. Test-only
 # support is admitted separately and must never enter a shipped dependency tree.
 ARCHITECTURE_BOUNDARIES = {
@@ -166,6 +179,21 @@ def run_architecture_regressions() -> None:
 
 
 def run_parser_regressions() -> None:
+    library = {"targets": [{"kind": ["lib"]}]}
+    binary = {"targets": [{"kind": ["bin"]}]}
+    canonical = {"path": "crates/library"}
+    if not canonical_member_dependency(library, canonical, "crates/library"):
+        fail("the canonical library dependency fixture was rejected")
+    if not canonical_member_dependency(binary, None, "crates/cli"):
+        fail("the binary-only member fixture was rejected")
+    for package, dependency, directory in [
+        (library, None, "crates/library"),
+        (library, {"path": "../outside"}, "crates/library"),
+        (binary, {"path": "crates/cli"}, "crates/cli"),
+    ]:
+        if canonical_member_dependency(package, dependency, directory):
+            fail("a missing, noncanonical, or redundant member dependency was accepted")
+
     inherited = tomllib.loads(
         """
         [dependencies] # comments and indentation must remain visible
@@ -285,11 +313,10 @@ for package in members:
         fail(f"workspace member is outside the checkout: {package_name}")
     relative_directory = relative_manifest.parent.as_posix()
     dependency = workspace_dependencies.get(package_name)
-    if not isinstance(dependency, dict):
-        fail(f"{package_name} is missing from root [workspace.dependencies]")
-    if dependency.get("path") != relative_directory:
+    if not canonical_member_dependency(package, dependency, relative_directory):
         fail(
-            f"{package_name} must use canonical workspace path {relative_directory}"
+            f"{package_name} must declare canonical workspace path {relative_directory} "
+            "for a library, or omit the dependency entry for a binary-only member"
         )
 
     member_document = load_toml(manifest_path, relative_manifest.as_posix())

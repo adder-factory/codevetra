@@ -237,8 +237,7 @@ fn visit_extension(
 ) -> Result<(), ExtractError> {
     let path = node
         .child_by_field_name("name")
-        .map(types::type_path)
-        .unwrap_or_default();
+        .map_or_default(types::type_path);
     let (Some((leaf, outer)), Some(qualified)) = (path.split_last(), joined_path(builder, &path)?)
     else {
         return builder.visit_named_children(node, depth);

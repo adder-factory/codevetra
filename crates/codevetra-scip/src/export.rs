@@ -362,8 +362,7 @@ impl<'snapshot> ScipExportAssembly<'snapshot> {
                 .owner_symbol_id
                 .as_ref()
                 .and_then(|owner| self.symbol_record_by_id.get(owner))
-                .map(|owner| symbol_range(owner, Some(source)))
-                .unwrap_or_default();
+                .map_or_default(|owner| symbol_range(owner, Some(source)));
             let Some(document) = self.documents.get_mut(&reference.file_id) else {
                 return Err(ScipError::InvalidData);
             };

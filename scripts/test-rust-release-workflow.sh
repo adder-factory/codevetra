@@ -220,6 +220,91 @@ guard = prerequisite.fetch("run")
   contract_failure("quality result guard accepted an invalid prerequisite state") unless \
     status.success? == expected
 end
+windows = document.fetch("jobs").fetch("windows-checks")
+windows_gate = document.fetch("jobs").fetch("windows-portability")
+contract_failure("Windows checks must retain independent 25-minute Windows jobs") unless \
+  windows["needs"] == "classify" &&
+  windows["if"] == "needs.classify.outputs.full == 'true'" &&
+  windows["runs-on"] == "windows-latest" && windows["timeout-minutes"] == 25 &&
+  windows["strategy"] == {"fail-fast" => false, "matrix" => {"check" => ["clippy", "migration"]}}
+contract_failure("protected Windows context must require the complete check matrix") unless \
+  windows_gate["name"] == "Windows strict compile portability" &&
+  windows_gate["needs"] == ["classify", "windows-checks"] &&
+  windows_gate["if"] == "always()" && windows_gate["runs-on"] == "ubuntu-latest" &&
+  windows_gate["timeout-minutes"] == 5
+windows_steps = windows.fetch("steps")
+windows_gate_steps = windows_gate.fetch("steps")
+contract_failure("Windows validation may not continue on error") if \
+  windows.key?("continue-on-error") || windows_gate.key?("continue-on-error") ||
+  (windows_steps + windows_gate_steps).any? { |step| step.key?("continue-on-error") }
+windows_commands = {
+  "Windows release path privacy regression" =>
+    ["migration", "scripts/test-windows-rust-release-paths.ps1"],
+  "Windows physical name migration and original-lock preservation" =>
+    ["migration", "cargo test --locked -p codevetra-config name_migration -- --nocapture"],
+  "Windows all-target, all-feature Clippy" =>
+    ["clippy", "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings"],
+  "Windows native name migration admission" =>
+    ["migration", "cargo llvm-cov test --locked -p codevetra-db --lib --lcov --output-path target/windows-native.lcov name_migration_admission -- --nocapture"],
+  "Windows state migration coverage" => ["migration", <<~'POWERSHELL'.strip]
+    rustup component add llvm-tools-preview
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    cargo install cargo-llvm-cov --version 0.9.1 --locked
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    cargo llvm-cov test --locked -p codevetra-config --lcov --output-path target/windows-config.lcov name_migration -- --nocapture
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  POWERSHELL
+}
+windows_commands.each do |name, (check, command)|
+  steps = windows_steps.select { |step| step["name"] == name }
+  contract_failure("Windows #{name} lost its complete command or matrix condition") unless \
+    steps.length == 1 && steps.first["if"] == "matrix.check == '#{check}'" &&
+    steps.first.fetch("run").strip == command
+end
+{
+  "Preserve Windows state migration coverage" => "config",
+  "Preserve Windows native migration coverage" => "native"
+}.each do |name, kind|
+  steps = windows_steps.select { |step| step["name"] == name }
+  contract_failure("Windows #{kind} coverage artifact is not required") unless \
+    steps.length == 1 && steps.first["if"] == "matrix.check == 'migration'" &&
+    steps.first.fetch("uses").start_with?("actions/upload-artifact@") &&
+    steps.first.fetch("with") == {
+      "name" => "windows-#{kind}-coverage-" + '${{ github.sha }}',
+      "path" => "target/windows-#{kind}.lcov", "if-no-files-found" => "error"
+    }
+end
+contract_failure("protected Windows gate must contain one unconditional result check") unless \
+  windows_gate_steps.length == 1 && !windows_gate_steps.first.key?("if")
+windows_prerequisite = windows_gate_steps.first
+contract_failure("protected Windows gate must bind actual prerequisite results") unless \
+  windows_prerequisite["shell"] == "bash" && windows_prerequisite["env"] == {
+    "CLASSIFY_RESULT" => '${{ needs.classify.result }}',
+    "FULL_GATE" => '${{ needs.classify.outputs.full }}',
+    "DOCS_ONLY" => '${{ needs.classify.outputs.docs_only }}',
+    "WINDOWS_RESULT" => '${{ needs.windows-checks.result }}'
+  }
+[
+  ["success", "true", "false", "success", true],
+  ["success", "false", "true", "skipped", true],
+  ["failure", "true", "false", "success", false],
+  ["cancelled", "false", "true", "skipped", false],
+  ["success", "true", "false", "failure", false],
+  ["success", "true", "false", "cancelled", false],
+  ["success", "true", "false", "skipped", false],
+  ["success", "true", "false", "", false],
+  ["success", "false", "true", "success", false],
+  ["success", "true", "true", "success", false],
+  ["success", "false", "false", "skipped", false]
+].each do |classify, full, docs, result, expected|
+  environment = {
+    "CLASSIFY_RESULT" => classify, "FULL_GATE" => full,
+    "DOCS_ONLY" => docs, "WINDOWS_RESULT" => result
+  }
+  _stdout, _stderr, status = Open3.capture3(environment, "bash", "-eu", "-c", windows_prerequisite.fetch("run"))
+  contract_failure("protected Windows gate accepted an invalid prerequisite state") unless \
+    status.success? == expected
+end
 contract_failure("attestation must require every validation job directly") unless \
   document.fetch("jobs").fetch("attest-main-gate").fetch("needs") == \
     ["classify", "quality", "unit-tests", "windows-portability", "macos-portability",
@@ -279,7 +364,7 @@ job_ids="$(awk '
     print job
   }
 ' "$VALIDATION")"
-expected_job_ids=$'classify\nunit-tests\nquality\nwindows-portability\nmacos-portability\nlinux-release-portability\nrocksdb\nattest-main-gate'
+expected_job_ids=$'classify\nunit-tests\nquality\nwindows-checks\nwindows-portability\nmacos-portability\nlinux-release-portability\nrocksdb\nattest-main-gate'
 [[ "$job_ids" == "$expected_job_ids" ]] || \
   fail 'validation jobs changed without an explicit documentation-scope contract'
 
@@ -388,12 +473,12 @@ while IFS= read -r line; do
 done <<<"$quality_block"
 validate_quality_step "$quality_step"
 
-for parallel_job in windows-portability macos-portability linux-release-portability rocksdb; do
+for parallel_job in windows-checks windows-portability macos-portability linux-release-portability rocksdb; do
   if job_block "$VALIDATION" "$parallel_job" | grep -Fq 'needs: quality'; then
     fail "independent gate $parallel_job is serialized behind quality"
   fi
 done
-for skipped_job in windows-portability macos-portability linux-release-portability; do
+for skipped_job in windows-checks macos-portability linux-release-portability; do
   skipped_block="$(job_block "$VALIDATION" "$skipped_job")"
   grep -Fq 'needs: classify' <<<"$skipped_block" || \
     fail "documentation-only scope cannot control $skipped_job"
@@ -470,6 +555,7 @@ for formal_contract in \
     fail "quality job omitted required formal verification: $formal_contract"
 done
 for formal_install_contract in \
+  'rustup toolchain install 1.99.1 --profile minimal' \
   'cargo install --locked kani-verifier --version 0.68.0' \
   'cargo kani setup --use-local-bundle' \
   'verus-0.2026.11.02.8bf68ee-' \
@@ -602,7 +688,7 @@ grep -Fq '#[cfg(not(target_pointer_width = "64"))]' "$CLI_SOURCE" || \
   fail 'the native CLI does not fail closed on 32-bit targets'
 grep -Fq 'CodeVetra v4 supports only 64-bit operating systems.' "$CLI_SOURCE" || \
   fail 'the 32-bit compile failure is not actionable'
-grep -Fq "rust:1.99.1-trixie@sha256:" "$VALIDATION" || \
+grep -Fq "rust:1.100.0-trixie@sha256:" "$VALIDATION" || \
   fail 'Linux validation does not build on current stable Debian'
 grep -Fq "rustup toolchain install \"\$CODEVETRA_RELEASE_TOOLCHAIN\" --profile minimal" "$LINUX_BUILD_HELPER" || \
   fail 'Linux builds do not install the exact reviewed compiler independently of the base image'
@@ -612,7 +698,7 @@ grep -Fq "rust-version: '$rust_toolchain'" "$VALIDATION" || \
   fail 'cargo-deny does not use the pinned stable Rust toolchain'
 grep -Fq 'debian:13-slim@sha256:' "$VALIDATION" || \
   fail 'Linux validation does not smoke on current stable Debian'
-grep -Fq "rust:1.99.1-trixie@sha256:" "$RELEASE" || \
+grep -Fq "rust:1.100.0-trixie@sha256:" "$RELEASE" || \
   fail 'Linux releases do not build on current stable Debian'
 grep -Fq 'debian:13-slim@sha256:' "$RELEASE" || \
   fail 'Linux releases do not smoke on current stable Debian'

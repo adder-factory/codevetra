@@ -2451,8 +2451,7 @@ impl ProjectRuntimeCache {
             .runtimes
             .get(root)
             .and_then(|entry| entry.auto_sync.as_ref())
-            .map(ProjectAutoSync::status)
-            .unwrap_or_default()
+            .map_or_default(ProjectAutoSync::status)
     }
 
     fn resolve_project_root(&self, input: &str) -> Result<PathBuf, ProjectRouteError> {
@@ -21269,8 +21268,7 @@ fn render_file_listing_markdown(evidence: &Value, low_tokens: bool) -> String {
     let files = evidence
         .pointer("/inventory/files")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+        .map_or_default(Vec::as_slice);
     let format = evidence
         .get("format")
         .and_then(Value::as_str)
@@ -21350,7 +21348,7 @@ fn render_grouped_files_markdown(evidence: &Value, low_tokens: bool) -> String {
     };
     let mut lines = vec!["## Indexed files by language".to_owned()];
     for (language, files) in groups {
-        let files = files.as_array().map(Vec::as_slice).unwrap_or_default();
+        let files = files.as_array().map_or_default(Vec::as_slice);
         lines.push(format!("### {language} ({})", files.len()));
         for file in files {
             let path = file.get("path").and_then(Value::as_str).unwrap_or_default();
@@ -21402,8 +21400,7 @@ fn render_cached_module_summaries(page: &Value) -> String {
     let summaries = page
         .get("summaries")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+        .map_or_default(Vec::as_slice);
     let total = page.get("total").and_then(Value::as_u64).unwrap_or(0);
     if summaries.is_empty() {
         return "No module summaries are cached yet. Run `codevetra admin summarize` after indexing to populate them."
@@ -21507,8 +21504,7 @@ fn render_file_symbols_markdown(evidence: &Value, low_tokens: bool) -> String {
     let symbols = evidence
         .get("symbols")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+        .map_or_default(Vec::as_slice);
     let mut lines = vec![format!("## Symbols in {path} ({})", symbols.len())];
     for symbol in symbols {
         let name = symbol
@@ -21543,8 +21539,7 @@ fn render_file_dependencies_markdown(evidence: &Value, low_tokens: bool) -> Stri
     let rows = evidence
         .pointer("/dependencies/rows")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+        .map_or_default(Vec::as_slice);
     let mut lines = vec![format!("## File graph for {path}")];
     for row in rows {
         let direction = row
@@ -21751,8 +21746,7 @@ fn render_ranked_biomarker_markdown(evidence: &Value, low_tokens: bool) -> Strin
     let findings = evidence
         .get("findings")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+        .map_or_default(Vec::as_slice);
     let minimum_severity = evidence
         .pointer("/filters/minSeverity")
         .and_then(Value::as_str)
@@ -21815,8 +21809,7 @@ fn render_symbol_biomarker_markdown(evidence: &Value, low_tokens: bool) -> Strin
     let results = evidence
         .get("results")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+        .map_or_default(Vec::as_slice);
     let mut lines = vec![format!("## Findings for {} symbol(s)", results.len())];
     for result in results {
         let requested = result
@@ -21841,8 +21834,7 @@ fn render_symbol_biomarker_markdown(evidence: &Value, low_tokens: bool) -> Strin
         let findings = result
             .get("findings")
             .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+            .map_or_default(Vec::as_slice);
         if low_tokens {
             lines.push(format!(
                 "{} health={}/10 findings={}",

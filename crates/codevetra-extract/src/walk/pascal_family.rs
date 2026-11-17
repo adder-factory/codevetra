@@ -569,8 +569,7 @@ fn last_qualified(builder: &ExtractionBuilder<'_, '_>) -> String {
         .facts
         .symbols
         .last()
-        .map(|symbol| symbol.qualified_name.clone())
-        .unwrap_or_default()
+        .map_or_default(|symbol| symbol.qualified_name.clone())
 }
 
 /// Charge a string the walk retains beyond the emitted facts to the
@@ -589,8 +588,7 @@ fn own_generics(
     let source = builder.context.snapshot.source();
     let parameters = declaration
         .child_by_field_name("name")
-        .map(|name| generic_parameters(source, name))
-        .unwrap_or_default();
+        .map_or_default(|name| generic_parameters(source, name));
     for parameter in &parameters {
         charge(builder, parameter)?;
         charge(builder, parameter)?;

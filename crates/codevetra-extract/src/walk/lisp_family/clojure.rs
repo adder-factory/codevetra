@@ -268,8 +268,7 @@ fn visit_local_functions(
     let bindings = forms
         .get(AFTER_HEAD)
         .filter(|bindings| bindings.kind() == "vec_lit")
-        .map(|bindings| form_children(*bindings))
-        .unwrap_or_default();
+        .map_or_default(|bindings| form_children(*bindings));
     for binding in bindings
         .iter()
         .filter(|binding| binding.kind() == "list_lit")

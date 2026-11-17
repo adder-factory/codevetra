@@ -111,8 +111,7 @@ fn visit_bash_declaration_command(
 ) -> Result<(), ExtractError> {
     let modifier = node
         .child(0)
-        .map(|child| builder.context.text(child).trim().to_ascii_lowercase())
-        .unwrap_or_default();
+        .map_or_default(|child| builder.context.text(child).trim().to_ascii_lowercase());
     let declares = modifier != "local";
     let assignment_depth = depth.saturating_add(1);
     for assignment in named_children(node).filter(|child| child.kind() == "variable_assignment") {

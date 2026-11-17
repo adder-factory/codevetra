@@ -402,8 +402,7 @@ fn cursor_offset(
             return Err(ProjectError::RequestCancelled);
         }
         if u32::try_from(index).map_err(|_| ProjectError::InvalidOptions)? == line - 1 {
-            let text = text.strip_suffix('\n').unwrap_or(text);
-            let text = text.strip_suffix('\r').unwrap_or(text);
+            let text = text.trim_suffix('\n').trim_suffix('\r');
             let column = usize::try_from(column).map_err(|_| ProjectError::InvalidOptions)?;
             if column > text.len() || !text.is_char_boundary(column) {
                 return Err(ProjectError::InvalidOptions);
@@ -426,6 +425,8 @@ mod tests {
         assert_eq!(cursor_offset(source, 1, 2, &cancellation).ok(), Some(2));
         assert_eq!(cursor_offset(source, 1, 6, &cancellation).ok(), Some(6));
         assert_eq!(cursor_offset(source, 2, 0, &cancellation).ok(), Some(8));
+        assert_eq!(cursor_offset("x\r\r\n", 1, 2, &cancellation).ok(), Some(2));
+        assert!(cursor_offset("x\r\r\n", 1, 3, &cancellation).is_err());
         for column in [1, 3, 4, 5, 7] {
             assert!(cursor_offset(source, 1, column, &cancellation).is_err());
         }

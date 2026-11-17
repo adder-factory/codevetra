@@ -24,6 +24,7 @@ provenance live on GitHub Releases.
 
 | Version | Date | Schema · Contract | Headline |
 | --- | --- | --- | --- |
+| [v4.0.6](releases/v4.0.6.md) | 2026-11-16 | Rocks v1 · V27 | Rust 1.100.0, Jiff 1.0, dependency refresh, and standard-library cancellation guards |
 | [v4.0.5](releases/v4.0.5.md) | 2026-11-13 | Rocks v1 · V27 | Implementation-query ordering, compact context metadata, symbol-impact arguments, boundary fixes, and bounded formal verification |
 | [v4.0.4](releases/v4.0.4.md) | 2026-11-01 | Rocks v1 · V27 | Complete large-graph biomarkers with bounded stages, compact inventories, and embedded-script metrics |
 | [v4.0.3](releases/v4.0.3.md) | 2026-11-01 | Rocks v1 · V27 | Biomarker cache stability during maintenance and physical canonical state migration |
@@ -103,6 +104,7 @@ Dated records of dependency selection and maintenance reviews.
 
 | Date | Shipped in | Record | Scope |
 | --- | --- | --- | --- |
+| 2026-11-16 | [v4.0.6](releases/v4.0.6.md) | [Dependency update](v2/DEPENDENCY-UPDATE-2026-11-16.md) | Rust 1.100.0, Jiff 1.0, LZ4, CI and verification tooling, and refreshed image digests |
 | 2026-10-31 | [v4.0.0](releases/v4.0.0.md) | [Dependency update](v2/DEPENDENCY-UPDATE-2026-10-31.md) | RocksDB 11.12.0, compatible Rust crates, CI actions and Linux images; wrapper maintenance review |
 | 2026-10-26 | [v3.0.6](releases/v3.0.6.md) | [Dependency update](v2/DEPENDENCY-UPDATE-2026-10-26.md) | notify and Ada grammar; 16 package upgrades; 90 direct dependencies, 289 registry names, actions, and Linux images audited |
 | 2026-10-20 | [v3.0.3](releases/v3.0.3.md) | [Dependency update](v2/DEPENDENCY-UPDATE-2026-10-20.md) | Rust 1.99.1; 90 direct dependencies and 288 registry crate names audited; rustls-webpki update |

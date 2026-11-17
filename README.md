@@ -35,12 +35,11 @@ abstention instead of presenting stale or incomplete data as certainty.
 > before indexing or reconnecting hosts. Existing RocksDB state is preserved;
 > PostgreSQL-era v2 projects also need a source rebuild. See [Upgrade](#upgrade).
 
-Version [4.0.5](docs/releases/v4.0.5.md) prioritizes production definitions for
-implementation queries, accepts explicit `includeCommands=false` in symbol
-impact requests, and reduces duplicated context metadata. Boundary fixes cover
-path validation, protobuf byte limits, token estimates, and extreme reranker
-scores. Resource-limited Kani and Verus checks verify selected pure contracts;
-Shuttle tests explore async cancellation and staging-barrier interleavings.
+Version [4.0.6](docs/releases/v4.0.6.md) updates the pinned compiler to Rust
+1.100.0 and refreshes dependencies, including Jiff 1.0 and LZ4. Standard-library
+drop guards simplify cancellation cleanup while preserving project-owned work
+and request reuse. Strict Cargo dependency checks and scheduled Shuttle updates
+keep the production and verification dependency graphs monitored.
 
 ## Start here
 
@@ -430,7 +429,7 @@ audience.
 | Area | Guides |
 | --- | --- |
 | **Set up** | [Agent-assisted installation](docs/AGENT-INSTALL.md) · [Configuration](docs/CONFIGURATION.md) · [MCP usage](docs/MCP-USAGE.md) |
-| **Upgrade** | [Cartograph to CodeVetra](docs/CODEVETRA-MIGRATION.md) · [RocksDB migration](docs/v2/ROCKSDB-MIGRATION.md) · [v4.0.5 release notes](docs/releases/v4.0.5.md) |
+| **Upgrade** | [Cartograph to CodeVetra](docs/CODEVETRA-MIGRATION.md) · [RocksDB migration](docs/v2/ROCKSDB-MIGRATION.md) · [v4.0.6 release notes](docs/releases/v4.0.6.md) |
 | **Use** | [CLI reference](docs/CLI-REFERENCE.md) · [CLI/MCP alignment](docs/cli-mcp-alignment.md) · [Language support matrix](docs/SUPPORT-MATRIX.md) · [Graph export formats](docs/GRAPH-EXPORT-FORMATS.md) |
 | **Operate** | [Storage and operations](docs/STORAGE-BACKENDS.md) · [Performance tuning](docs/PERF-TUNING.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | **Extend** | [Architecture](docs/v2/ARCHITECTURE.md) · [Native extraction](docs/v2/EXTRACTION.md) · [Extending languages and resolvers](docs/EXTENDING-EXTRACTORS-RESOLVERS.md) |
@@ -442,7 +441,7 @@ audience.
 checks on production admission, storage, source and protocol contracts,
 alongside the Rust and live gates. Unfinished proof experiments remain explicit.
 
-The repository pins Rust 1.99.1 in `rust-toolchain.toml` and uses edition 2024.
+The repository pins Rust 1.100.0 in `rust-toolchain.toml` and uses edition 2024.
 
 ```sh
 git clone https://github.com/adder-factory/codevetra.git

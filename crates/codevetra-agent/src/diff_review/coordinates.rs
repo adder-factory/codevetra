@@ -151,10 +151,7 @@ fn matches_hunk_lines(
             .checked_add(1)
             .ok_or(DiffReviewError::InvalidDiff)?;
     }
-    if hasher.finalize().as_bytes() != &hunk.old_content_digest {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(hasher.finalize().as_bytes() == &hunk.old_content_digest)
 }
 
 pub(super) async fn require_current(

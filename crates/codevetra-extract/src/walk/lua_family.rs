@@ -139,8 +139,7 @@ fn visit_local_declaration(
         .and_then(|assignment| {
             named_children(assignment).find(|child| child.kind() == "expression_list")
         })
-        .map(|list| field_children(list, "value"))
-        .unwrap_or_default();
+        .map_or_default(|list| field_children(list, "value"));
     for (index, name_node) in names.iter().enumerate() {
         let binding = LocalBinding {
             declaration: node,
@@ -242,12 +241,10 @@ fn visit_function_assignment(
     }
     let names = named_children(node)
         .find(|child| child.kind() == "variable_list")
-        .map(|list| field_children(list, "name"))
-        .unwrap_or_default();
+        .map_or_default(|list| field_children(list, "name"));
     let values = named_children(node)
         .find(|child| child.kind() == "expression_list")
-        .map(|list| field_children(list, "value"))
-        .unwrap_or_default();
+        .map_or_default(|list| field_children(list, "value"));
     let ([target], [value]) = (names.as_slice(), values.as_slice()) else {
         return Ok(false);
     };

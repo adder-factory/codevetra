@@ -18,7 +18,7 @@ BINARY = MANIFEST.parent / 'target/debug/codevetra-shuttle-checks'
 
 def build(mutation=''):
     env = dict(os.environ, CODEVETRA_SHUTTLE_MUTATION=mutation)
-    subprocess.run(['cargo', '+1.99.1', 'build', '--locked', '--offline',
+    subprocess.run(['cargo', '+1.100.0', 'build', '--locked', '--offline',
                     '--manifest-path', str(MANIFEST)], env=env, check=True)
 
 
@@ -53,9 +53,9 @@ def main(args):
         raise SystemExit('Select a known Shuttle case.')
     if len(args) == 2 and not re.fullmatch(r'[0-9a-fA-F]{1,4096}', args[1]):
         raise SystemExit('Invalid replay schedule.')
-    subprocess.run(['cargo', '+1.99.1', 'fmt', '--manifest-path', str(MANIFEST),
+    subprocess.run(['cargo', '+1.100.0', 'fmt', '--manifest-path', str(MANIFEST),
                     '--check'], check=True)
-    subprocess.run(['cargo', '+1.99.1', 'clippy', '--locked', '--offline',
+    subprocess.run(['cargo', '+1.100.0', 'clippy', '--locked', '--offline',
                     '--manifest-path', str(MANIFEST), '--', '-D', 'warnings'], check=True)
     build()
     positive = execute(args)

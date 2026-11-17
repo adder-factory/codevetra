@@ -102,11 +102,7 @@ fn ranked_file_match<'a>(
     (stem, language, components): (&str, &str, bool),
     extensions: &[&str],
 ) -> ModuleFileMatch<'a> {
-    let candidates = modules
-        .stem
-        .get(stem)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+    let candidates = modules.stem.get(stem).map_or_default(Vec::as_slice);
     let mut rank = usize::MAX;
     let mut selected = ModuleFileMatch::Missing;
     for file in candidates {
