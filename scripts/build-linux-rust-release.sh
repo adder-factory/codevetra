@@ -144,7 +144,11 @@ docker run --rm --pull never \
     set -euo pipefail
     apt-get update
     apt-get install -y --no-install-recommends clang lld libclang-dev util-linux python3
-    exec setpriv --reuid "$CODEVETRA_BUILD_UID" --regid "$CODEVETRA_BUILD_GID" --clear-groups bash -c '\''
+    # A CPU quota alone can leave a large host affinity mask visible to worker
+    # pools. Restrict affinity too, keeping the existing 256-PID limit intact.
+    CPU_SET="$(python3 -c "import os; print(*sorted(os.sched_getaffinity(0))[:2], sep=chr(44))")"
+    exec setpriv --reuid "$CODEVETRA_BUILD_UID" --regid "$CODEVETRA_BUILD_GID" --clear-groups \
+      taskset --cpu-list "$CPU_SET" bash -c '\''
     set -euo pipefail
     mkdir -p "$HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR" "$RUSTUP_HOME" "$TMPDIR"
     machine="$(uname -m)"

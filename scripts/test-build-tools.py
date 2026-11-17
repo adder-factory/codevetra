@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import build_tools as tools
@@ -196,6 +197,20 @@ class BuildToolsTests(unittest.TestCase):
         config = tomllib.loads((tools.ROOT / '.cargo/config.toml').read_text())
         self.assertNotIn('SCCACHE_BASEDIRS', config['env'])
         self.assertNotIn('CARGO_INCREMENTAL', config['env'])
+        self.assertNotIn('CC_x86_64_pc_windows_msvc', config['env'])
+        self.assertNotIn('CXX_x86_64_pc_windows_msvc', config['env'])
+
+    def test_linux_cpu_affinity_selects_at_most_two_permitted_cpus(self):
+        import re
+        helper = (tools.ROOT / 'scripts/build-linux-rust-release.sh').read_text()
+        line = next(line for line in helper.splitlines() if line.strip().startswith('CPU_SET='))
+        code = re.search(r'python3 -c "([^"]+)"', line).group(1)
+        for available, expected in [({4, 8, 12, 16}, '4,8\n'), ({7}, '7\n')]:
+            output = io.StringIO()
+            with patch.object(os, 'sched_getaffinity', return_value=available, create=True), redirect_stdout(output):
+                exec(compile(code, 'release-cpu-affinity', 'exec'), {})
+            self.assertEqual(output.getvalue(), expected)
+        self.assertIn('taskset --cpu-list "$CPU_SET" bash', helper)
 
     @unittest.skipIf(os.name == 'nt', 'Unix compiler-server process groups')
     def test_deadline_reaps_build_and_compiler_server_children(self):

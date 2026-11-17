@@ -22,8 +22,8 @@ CC_x86_64_unknown_linux_gnu = "sccache cc"
 CXX_x86_64_unknown_linux_gnu = "sccache c++"
 CC_aarch64_unknown_linux_gnu = "sccache cc"
 CXX_aarch64_unknown_linux_gnu = "sccache c++"
-CC_x86_64_pc_windows_msvc = "sccache cl.exe"
-CXX_x86_64_pc_windows_msvc = "sccache cl.exe"
+# On MSVC, cc 1.11 discovers the full compiler path and SDK environment, then
+# applies Cargo's RUSTC_WRAPPER. A bare cl.exe override bypasses that discovery.
 
 # x86_64 Linux already uses bundled LLD on the reviewed Rust toolchain. ARM
 # Linux selects the system Clang/LLD pair explicitly (installed by our helper).
