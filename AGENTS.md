@@ -51,6 +51,14 @@ bootstrap, SQLite path, or SQL query tool remains.
 
 ## Build, index, and verify
 
+Before building, install the checksum-pinned compiler cache and test runner
+with `python3 scripts/setup-build-tools.py`. For local iteration use
+`python3 scripts/rust-dev.py nextest run --locked -p <owning-crate>` and run
+doctests separately. See [build performance](docs/BUILD-PERFORMANCE.md).
+On the development Mac all Rust caches and compiler temporary files belong on
+the mounted RUST CACHE drive. Use the guarded runner and its recorded volume
+policy; never fall back to the main drive or run overlapping heavy checks.
+
 ```sh
 cargo build --locked --release -p codevetra-cli
 target/release/codevetra index /absolute/path/to/project

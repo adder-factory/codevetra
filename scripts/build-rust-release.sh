@@ -65,18 +65,52 @@ PRIVATE_BUILD_ROOTS=(
   "${HOME:-}"
   "${CARGO_HOME:-}"
   "${RUSTUP_HOME:-}"
+  "$TARGET_ROOT"
+  "${TMPDIR:-}"
   "${GITHUB_WORKSPACE:-}"
   "${RUNNER_WORKSPACE:-}"
 )
-for private_root in "${PRIVATE_BUILD_ROOTS[@]}"; do
-  [[ -n "$private_root" ]] || continue
+# GCC selects the last matching prefix. Put ancestors before descendants,
+# preserving the order of unrelated roots to avoid needless cache misses.
+PRIVATE_ROOT_INDEXES="$(python3 - "${PRIVATE_BUILD_ROOTS[@]}" <<'PY'
+import sys
+ordered = []
+for index, root in enumerate(sys.argv[1:]):
+    if not root or any(previous == root for _, previous in ordered):
+        continue
+    position = next((offset for offset, (_, previous) in enumerate(ordered)
+                     if previous.startswith(root.rstrip('/') + '/')), len(ordered))
+    ordered.insert(position, (index, root))
+print(*(index for index, _ in ordered))
+PY
+)"
+for index in $PRIVATE_ROOT_INDEXES; do
+  private_root="${PRIVATE_BUILD_ROOTS[$index]}"
   append_encoded_rust_flag "--remap-path-prefix=$private_root=."
-  CFLAGS="${CFLAGS:+$CFLAGS }-ffile-prefix-map=$private_root=."
-  CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-ffile-prefix-map=$private_root=."
+  quoted_map="$(python3 - "$private_root" <<'PY'
+import shlex, sys
+print(shlex.quote('-ffile-prefix-map=' + sys.argv[1] + '=.'))
+PY
+)"
+  CFLAGS="${CFLAGS:+$CFLAGS }$quoted_map"
+  CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }$quoted_map"
 done
 export CARGO_ENCODED_RUSTFLAGS CFLAGS CXXFLAGS
+export CC_SHELL_ESCAPED_FLAGS=1
 
-cargo build --locked --release --package codevetra-cli --target "$TARGET"
+# Encoded flags take precedence over Cargo's target-specific flags. Keep the
+# ARM Linux LLD selection when adding release privacy remaps above.
+if [[ "$TARGET" == aarch64-unknown-linux-gnu ]]; then
+  append_encoded_rust_flag '-C'
+  append_encoded_rust_flag 'link-arg=-fuse-ld=lld'
+fi
+
+if [[ "${CODEVETRA_BENCHMARK_LINKERS:-0}" == 1 ]]; then
+  cargo rustc --locked --release --package codevetra-cli --bin codevetra --target "$TARGET" -- \
+    -C "linker=$ROOT/scripts/benchmark-linker.py"
+else
+  cargo build --locked --release --package codevetra-cli --target "$TARGET"
+fi
 
 if [[ "$ASSET_TARGET" == darwin-arm64 ]]; then
   if ! command -v otool >/dev/null 2>&1; then

@@ -1,0 +1,26 @@
+nextest-version = "0.9.152"
+
+[profile.default]
+test-threads = 2
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 5, grace-period = "10s" }
+
+[profile.ci]
+test-threads = 2
+retries = 0
+fail-fast = false
+status-level = "fail"
+final-status-level = "slow"
+
+[test-groups]
+native-process = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(rocks_owner) | binary(rocks_cli) | binary(live_cli_surface) | binary(live_supervised_index) | binary(index_startup) | binary(live_supervisor)'
+test-group = 'native-process'
+
+[[profile.default.overrides]]
+filter = 'test(sustained_headless_owner_mixed_edits_and_mcp_readers)'
+# The required soak runs for 30 minutes. It still runs only when explicitly
+# selecting ignored tests; never shorten it or enable retries to clear a gate.
+slow-timeout = { period = "60s", terminate-after = 35, grace-period = "10s" }

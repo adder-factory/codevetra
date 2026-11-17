@@ -103,6 +103,7 @@ The installer verifies the archive against the release's `SHA256SUMS`. To build
 from source, use the pinned Rust toolchain, a C/C++ compiler, and libclang:
 
 ```sh
+python3 scripts/setup-build-tools.py
 cargo build --locked --release -p codevetra-cli
 ```
 
@@ -436,6 +437,12 @@ audience.
 | **Evidence** | [Changelog](docs/RELEASES.md) · [Verification and benchmarks](docs/v2/benchmarks/README.md) · [Distribution and licensing](docs/v2/LICENSING.md) |
 
 ## Development
+
+Install the pinned build tools with `python3 scripts/setup-build-tools.py`.
+Use `python3 scripts/rust-dev.py nextest run --locked -p <crate>` for focused
+work and keep workspace doctests separate. The guarded runner uses two build
+jobs and validates the configured cache drive. See
+[build performance and cache placement](docs/BUILD-PERFORMANCE.md).
 
 [Formal verification](docs/FORMAL-VERIFICATION.md) uses pinned Kani and Verus
 checks on production admission, storage, source and protocol contracts,

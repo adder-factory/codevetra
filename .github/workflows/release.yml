@@ -155,14 +155,14 @@ jobs:
             rust_target: x86_64-unknown-linux-gnu
             asset_target: linux-x64
             shell: bash
-            cache_key: unused-linux-x64
+            cache_key: release-linux-x64
             build_image: rust:1.100.0-trixie@sha256:ebc54bef33ec8f9a5cd05799366010f35efbb73b354fb4f2cb086ec6b9460ef5
             runtime_image: debian:13-slim@sha256:7378260c0a098d27ac206225db5e7d92b8c7c84ea7afccc86eeb513756bbd392
           - os: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             asset_target: linux-arm64
             shell: bash
-            cache_key: unused-linux-arm64
+            cache_key: release-linux-arm64
             build_image: rust:1.100.0-trixie@sha256:66431732f567e2fd1301ecfbdc124ac32989c8953afeac895577cb114117454c
             runtime_image: debian:13-slim@sha256:24a01011d10eba3a023bc8585b9650b8b29021240d4217c05b905e09ef4a5232
           - os: macos-26
@@ -189,7 +189,6 @@ jobs:
         run: rustup target add ${{ matrix.rust_target }}
 
       - name: Restore Rust dependency cache
-        if: ${{ !startsWith(matrix.asset_target, 'linux-') }}
         id: rust-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -198,9 +197,18 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: codevetra-rust-${{ runner.os }}-${{ matrix.cache_key }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-${{ matrix.cache_key }}-${{ matrix.build_image || 'host' }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'scripts/build-tools.json') }}
           restore-keys: |
             codevetra-rust-${{ runner.os }}-${{ matrix.cache_key }}-
+
+      - name: Install pinned build tools
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            python scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          else
+            python3 scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          fi
 
       - name: Build, audit, and smoke Unix archive
         if: matrix.shell == 'bash' && !startsWith(matrix.asset_target, 'linux-')
@@ -223,7 +231,7 @@ jobs:
         run: scripts/build-rust-release.ps1 -Target '${{ matrix.rust_target }}' -AssetTarget '${{ matrix.asset_target }}'
 
       - name: Save Rust dependency cache
-        if: ${{ !startsWith(matrix.asset_target, 'linux-') && steps.rust-cache.outputs.cache-hit != 'true' }}
+        if: steps.rust-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

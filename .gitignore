@@ -1,6 +1,7 @@
 # Rust workspace output. Cargo.lock is intentionally tracked because the
 # CLI/server are applications rather than a reusable library distribution.
 /target/
+__pycache__/
 
 # Disposable v1 build/dependency outputs may remain in a long-lived checkout
 # during the v2 cutover. They are never Rust release inputs.

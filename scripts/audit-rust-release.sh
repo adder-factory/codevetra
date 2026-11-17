@@ -32,6 +32,8 @@ for PRIVATE_FRAGMENT in \
   "${HOME:-}" \
   "${CARGO_HOME:-}" \
   "${RUSTUP_HOME:-}" \
+  "${CARGO_TARGET_DIR:-}" \
+  "${TMPDIR:-}" \
   "${GITHUB_WORKSPACE:-}" \
   "${RUNNER_WORKSPACE:-}" \
   '/Users/' \

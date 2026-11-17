@@ -1,0 +1,32 @@
+# Install the checksum-pinned tools with scripts/setup-build-tools.py first.
+[build]
+jobs = 2
+rustc-wrapper = "sccache"
+
+[alias]
+test-fast = "nextest run --locked"
+
+[env]
+# Ordinary incremental development stays enabled. sccache 0.19 passes those
+# crates through; CI explicitly disables incremental compilation for reuse.
+RUST_TEST_THREADS = "2"
+SCCACHE_CACHE_SIZE = "8G"
+# Local setup links this directory to the required cache volume; CI overrides
+# it with its separately restored compiler cache. No shared target directory.
+SCCACHE_DIR = { value = "target/sccache", relative = true }
+CC_aarch64_apple_darwin = "sccache clang"
+CXX_aarch64_apple_darwin = "sccache clang++"
+CC_x86_64_apple_darwin = "sccache clang"
+CXX_x86_64_apple_darwin = "sccache clang++"
+CC_x86_64_unknown_linux_gnu = "sccache cc"
+CXX_x86_64_unknown_linux_gnu = "sccache c++"
+CC_aarch64_unknown_linux_gnu = "sccache cc"
+CXX_aarch64_unknown_linux_gnu = "sccache c++"
+# On MSVC, cc 1.11 discovers the full compiler path and SDK environment, then
+# applies Cargo's RUSTC_WRAPPER. A bare cl.exe override bypasses that discovery.
+
+# x86_64 Linux already uses bundled LLD on the reviewed Rust toolchain. ARM
+# Linux selects the system Clang/LLD pair explicitly (installed by our helper).
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
