@@ -151,7 +151,10 @@ def validate_arguments(arguments, policy):
                 if index + 1 == len(arguments):
                     raise ValueError('Missing cache/output path argument')
                 value = arguments[index + 1]
-            resolved = cache_path(value, policy)
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                candidate = ROOT / candidate
+            resolved = cache_path(candidate, policy)
             if name == '--target-dir' and resolved != Path(policy['targetRoot']).resolve():
                 raise ValueError('Cargo target directory differs from its recorded cache policy')
 

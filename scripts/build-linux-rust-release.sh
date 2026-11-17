@@ -117,7 +117,7 @@ git -c init.templateDir= -c core.hooksPath=/dev/null init --quiet "$STAGED/sourc
 git -C "$STAGED/source" -c core.hooksPath=/dev/null add --all
 echo "[rust-release] source snapshot $SOURCE_DIGEST"
 
-docker run --rm --pull never \
+docker run --rm --init --pull never \
   --name "$CONTAINER_NAME" --cidfile "$STAGED/container.id" \
   --memory 4g --memory-swap 4g --cpus 2 --pids-limit 256 \
   --volume "$STAGED/source:/workspace" \
@@ -150,6 +150,7 @@ docker run --rm --pull never \
     exec setpriv --reuid "$CODEVETRA_BUILD_UID" --regid "$CODEVETRA_BUILD_GID" --clear-groups \
       taskset --cpu-list "$CPU_SET" bash -c '\''
     set -euo pipefail
+    trap "python3 scripts/report-build-resources.py" EXIT
     mkdir -p "$HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR" "$RUSTUP_HOME" "$TMPDIR"
     machine="$(uname -m)"
     if [[ "$machine" != "$CODEVETRA_RELEASE_MACHINE" ]]; then
@@ -197,7 +198,7 @@ if [[ -z "$VERSION" ]]; then
   exit 1
 fi
 
-docker run --rm --pull never --memory 512m --memory-swap 512m --cpus 1 --pids-limit 64 \
+docker run --rm --init --pull never --memory 512m --memory-swap 512m --cpus 1 --pids-limit 64 \
   --volume "$ROOT/release:/release:ro" \
   --env CODEVETRA_EXPECTED_MACHINE="$EXPECTED_MACHINE" \
   --env CODEVETRA_EXPECTED_VERSION="codevetra $VERSION" \

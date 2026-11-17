@@ -143,6 +143,21 @@ class BuildToolsTests(unittest.TestCase):
                 runner.validate_arguments(args, policy)
         self.assertFalse(Path(outside).exists())
 
+    def test_relative_output_paths_are_resolved_from_the_cargo_checkout(self):
+        runner = self.runner_module()
+        volume = self.root / 'volume'
+        (volume / 'target').mkdir(parents=True)
+        checkout = self.root / 'checkout'
+        checkout.mkdir()
+        policy = {'requiredVolume': str(volume), 'targetRoot': str(volume / 'target')}
+        previous = Path.cwd()
+        try:
+            os.chdir(volume)
+            with patch.object(runner, 'ROOT', checkout), self.assertRaisesRegex(ValueError, 'escapes'):
+                runner.validate_arguments(['build', '--target-dir', 'target'], policy)
+        finally:
+            os.chdir(previous)
+
     def test_bad_download_preserves_installed_tool(self):
         destination = self.root / 'bin'
         destination.mkdir()
@@ -211,6 +226,7 @@ class BuildToolsTests(unittest.TestCase):
                 exec(compile(code, 'release-cpu-affinity', 'exec'), {})
             self.assertEqual(output.getvalue(), expected)
         self.assertIn('taskset --cpu-list "$CPU_SET" bash', helper)
+        self.assertEqual(helper.count('docker run --rm --init --pull never'), 2)
 
     @unittest.skipIf(os.name == 'nt', 'Unix compiler-server process groups')
     def test_deadline_reaps_build_and_compiler_server_children(self):
