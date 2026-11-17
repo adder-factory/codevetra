@@ -70,8 +70,22 @@ PRIVATE_BUILD_ROOTS=(
   "${GITHUB_WORKSPACE:-}"
   "${RUNNER_WORKSPACE:-}"
 )
-for private_root in "${PRIVATE_BUILD_ROOTS[@]}"; do
-  [[ -n "$private_root" ]] || continue
+# GCC selects the last matching prefix. Put ancestors before descendants,
+# preserving the order of unrelated roots to avoid needless cache misses.
+PRIVATE_ROOT_INDEXES="$(python3 - "${PRIVATE_BUILD_ROOTS[@]}" <<'PY'
+import sys
+ordered = []
+for index, root in enumerate(sys.argv[1:]):
+    if not root or any(previous == root for _, previous in ordered):
+        continue
+    position = next((offset for offset, (_, previous) in enumerate(ordered)
+                     if previous.startswith(root.rstrip('/') + '/')), len(ordered))
+    ordered.insert(position, (index, root))
+print(*(index for index, _ in ordered))
+PY
+)"
+for index in $PRIVATE_ROOT_INDEXES; do
+  private_root="${PRIVATE_BUILD_ROOTS[$index]}"
   append_encoded_rust_flag "--remap-path-prefix=$private_root=."
   quoted_map="$(python3 - "$private_root" <<'PY'
 import shlex, sys

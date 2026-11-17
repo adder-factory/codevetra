@@ -568,13 +568,19 @@ with build_tools.admission() as lock:
         target = self.root / 'Rust Cache' / "developer's target"
         target.mkdir(parents=True)
         env = dict(os.environ, PATH=str(fake) + os.pathsep + os.environ['PATH'], FLAGS_CAPTURE=str(capture),
-                   CARGO_TARGET_DIR=str(target), CFLAGS='', CXXFLAGS='')
+                   CARGO_TARGET_DIR=str(target), CFLAGS='', CXXFLAGS='',
+                   GITHUB_WORKSPACE=str(target.parent), RUNNER_WORKSPACE=str(self.root))
         result = subprocess.run(['bash', 'scripts/build-rust-release.sh', 'aarch64-unknown-linux-gnu', 'linux-arm64'],
                                 cwd=tools.ROOT, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 42, result.stderr)
         flags = json.loads(capture.read_text())
+        maps = shlex.split(flags['CFLAGS'])
         expected = '-ffile-prefix-map=' + str(target) + '=.'
-        self.assertIn(expected, shlex.split(flags['CFLAGS']))
+        self.assertIn(expected, maps)
+        # GCC uses the last matching map; Clang also accepts this ordering.
+        self.assertLess(maps.index('-ffile-prefix-map=' + str(self.root) + '=.'),
+                        maps.index('-ffile-prefix-map=' + str(target.parent) + '=.'))
+        self.assertLess(maps.index('-ffile-prefix-map=' + str(target.parent) + '=.'), maps.index(expected))
         self.assertEqual(flags['CC_SHELL_ESCAPED_FLAGS'], '1')
         source = target / 'fixture.cpp'
         source.write_text('const char *path = __FILE__;\n')
