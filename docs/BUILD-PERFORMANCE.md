@@ -73,7 +73,12 @@ Linux release builds persist registry, toolchain, target and compiler caches
 under a key containing architecture, exact compiler and build-image digest.
 They stage public source without copying private graph or Git state, check for
 source changes before publishing artifacts, and retain all archive/privacy
-and Debian runtime checks. A local Docker endpoint with cgroup v2 is required;
+and Debian runtime checks. Identical public snapshots reuse a staged timestamp
+bound to their content and executable permissions; changed snapshots must be
+newer than cached artifacts. This avoids unnecessary binary rebuilds while
+preserving [Cargo's source freshness checks](https://doc.rust-lang.org/stable/nightly-rustc/cargo/compiler/fingerprint/index.html#mtime-comparison).
+Clock skew or filesystem precision that prevents proving freshness is an error.
+A local Docker endpoint with cgroup v2 is required;
 build containers have 4 GiB RAM, no swap, two CPUs, 256 PIDs and a 55-minute
 deadline. A surviving build container fences the next run until inspected.
 
@@ -93,7 +98,9 @@ separately because nextest does not execute them. `cargo test-fast -p <crate>`
 is a convenience alias; on the development Mac prefer the guarded runner.
 
 CI restores and saves the existing Rust dependency/target cache and includes
-the build-tool manifest in its cache key. Tool and workflow contract tests
+the build-tool manifest in its cache key. Hosted CI keeps temporary files in
+the runner's temporary directory outside the checkout, so Git test fixtures
+cannot accidentally discover the parent repository. Tool and workflow contract tests
 protect the unfiltered nextest suite, separate doctests, resource settings,
 asset integrity and external-volume admission.
 

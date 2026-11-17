@@ -108,6 +108,22 @@ class BuildToolsTests(unittest.TestCase):
                 tools.environment()
         self.assertFalse(output.exists())
 
+    def test_ci_temporary_fixtures_do_not_discover_the_checkout_git_repository(self):
+        checkout = self.root / 'checkout'
+        checkout.mkdir()
+        subprocess.run(['git', '-c', 'init.templateDir=', 'init', '--quiet', str(checkout)], check=True)
+        policy = {'cacheRoot': str(checkout / 'target/build-cache'), 'targetRoot': str(checkout / 'target')}
+        with patch.object(tools, 'cache_policy', return_value=policy), \
+                patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'RUNNER_TEMP': str(self.root / 'runner-temp')}):
+            env = tools.environment()
+        fixture = Path(env['TMPDIR']) / 'not-a-repository'
+        fixture.mkdir()
+        result = subprocess.run(['git', '-C', str(fixture), 'rev-parse', '--show-toplevel'],
+                                env=dict(os.environ, GIT_CEILING_DIRECTORIES=str(self.root)),
+                                capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(Path(env['SCCACHE_DIR']).is_relative_to(Path(policy['cacheRoot'])))
+
     @unittest.skipIf(os.name == 'nt', 'Unix symlink escape')
     def test_cache_children_cannot_redirect_to_main_disk(self):
         policy = tools.cache_policy()
@@ -196,6 +212,99 @@ class BuildToolsTests(unittest.TestCase):
         with patch.object(tools, 'ROOT', checkout):
             with self.assertRaisesRegex(ValueError, 'escaped'):
                 tools.snapshot(self.root / 'staged')
+
+    def test_snapshot_freshness_rebuilds_rejected_content_then_reuses_identical_binary(self):
+        import shutil
+        import tomllib
+        checkout = self.root / 'checkout'
+        (checkout / 'src').mkdir(parents=True)
+        subprocess.run(['git', '-c', 'init.templateDir=', 'init', '--quiet', str(checkout)], check=True)
+        (checkout / 'Cargo.toml').write_text('[package]\nname = "freshness_probe"\nversion = "0.0.0"\nedition = "2024"\n[workspace]\n')
+        (checkout / 'Cargo.lock').write_text('version = 4\n[[package]]\nname = "freshness_probe"\nversion = "0.0.0"\n')
+        source = checkout / 'src/main.rs'
+        source.write_text('fn main() { println!("A"); }')
+        cache = self.root / 'cache'
+        target = cache / 'target'
+        staged = self.root / 'staged'
+        env = tools.environment()
+        policy = tools.cache_policy()
+        env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(target),
+                   CARGO_BUILD_JOBS='1', CARGO_INCREMENTAL='0', RUSTC_WRAPPER='',
+                   RUSTUP_TOOLCHAIN=tomllib.loads((tools.ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel'])
+        for name in ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_TARGET', 'RUSTC_WORKSPACE_WRAPPER'):
+            env.pop(name, None)
+
+        def build():
+            result = subprocess.run(['cargo', 'build', '--offline', '--locked', '--message-format=json'],
+                                    cwd=staged, env=env, text=True, capture_output=True, timeout=30, check=True)
+            artifacts = [row for row in map(json.loads, result.stdout.splitlines())
+                         if row.get('reason') == 'compiler-artifact' and row.get('executable')]
+            self.assertEqual(len(artifacts), 1)
+            artifact = artifacts[0]
+            executable = Path(artifact['executable'])
+            output = subprocess.check_output([str(executable)], text=True, timeout=5).strip()
+            return artifact['fresh'], executable, output
+
+        # This tiny, offline compiler fixture owns an isolated target/cache;
+        # it never acquires or mutates the workspace's build artifacts.
+        with patch.object(tools, 'cache_root', return_value=cache), tools.admission(), \
+                patch.object(tools, 'ROOT', checkout), patch.object(tools, 'cache_policy', return_value=policy):
+            first = tools.snapshot(staged, build_cache=cache)
+            # B predates A's rustc invocation. A later fails the source fence,
+            # but its cached executable and dep-info are already present.
+            source.write_text('fn main() { println!("B"); }')
+            os.utime(source, ns=(1_000_000_000, 1_000_000_000))
+            fresh, _, output = build()
+            self.assertFalse(fresh)
+            self.assertEqual(output, 'A')
+            self.assertNotEqual(first, tools.snapshot())
+            anchors = list(target.rglob('dep-bin-freshness_probe'))
+            self.assertEqual(len(anchors), 1)
+            anchor = anchors[0].stat().st_mtime_ns
+            self.assertLess(source.stat().st_mtime_ns, anchor)
+            shutil.rmtree(staged)
+            second = tools.snapshot(staged, build_cache=cache)
+            self.assertGreater((staged / 'src/main.rs').stat().st_mtime_ns, anchor)
+            self.assertNotEqual(first, second)
+            fresh, executable, output = build()
+            self.assertFalse(fresh)
+            self.assertEqual(output, 'B')
+            before = (executable.stat().st_mtime_ns, tools.sha256(executable))
+            source.touch()
+            shutil.rmtree(staged)
+            self.assertEqual(second, tools.snapshot(staged, build_cache=cache))
+            fresh, executable, output = build()
+            self.assertTrue(fresh)
+            self.assertEqual(output, 'B')
+            self.assertEqual(before, (executable.stat().st_mtime_ns, tools.sha256(executable)))
+
+    def test_future_cache_timestamp_refuses_changed_source_reuse(self):
+        cache = self.root / 'cache'
+        target = cache / 'target'
+        target.mkdir(parents=True)
+        anchor = target / 'dep-info'
+        anchor.write_bytes(b'cached artifact')
+        future = time.time_ns() + 60_000_000_000
+        os.utime(anchor, ns=(future, future))
+        staged = self.root / 'source.rs'
+        staged.write_text('changed')
+        with self.assertRaisesRegex(ValueError, 'future timestamps'):
+            tools.source_freshness([staged], 'a' * 64, cache)
+        self.assertFalse((cache / 'source-freshness.json').exists())
+
+    def test_coarse_timestamps_cannot_claim_changed_source_freshness(self):
+        cache = self.root / 'cache'
+        target = cache / 'target'
+        target.mkdir(parents=True)
+        anchor = target / 'dep-info'
+        anchor.write_bytes(b'cached artifact')
+        staged = self.root / 'source.rs'
+        staged.write_text('changed')
+        os.utime(staged, ns=(1_000_000_000, 1_000_000_000))
+        with patch('os.utime'), patch('time.monotonic', side_effect=[0, 3]):
+            with self.assertRaisesRegex(ValueError, 'cannot prove source freshness'):
+                tools.source_freshness([staged], 'a' * 64, cache)
+        self.assertFalse((cache / 'source-freshness.json').exists())
 
     def test_admission_is_exclusive_and_keeps_the_lock_inode(self):
         with patch.object(tools, 'cache_root', return_value=self.root):

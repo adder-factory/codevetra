@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.request
 from contextlib import contextmanager
 
@@ -102,7 +103,7 @@ def linux_cache(path):
     policy = cache_policy()
     root = cache_path(path, policy)
     children = [root / name for name in ('cargo', 'rustup', 'target', 'sccache', 'tmp', 'home', 'build-tools')]
-    for child in children:
+    for child in [*children, root / 'source-freshness.json']:
         resolved = cache_path(child, policy)
         if not resolved.is_relative_to(root):
             raise ValueError('Linux cache child escapes its Docker bind mount')
@@ -232,6 +233,11 @@ def environment():
     policy = cache_policy()
     root = Path(policy['cacheRoot'])
     directories = {name: root / name for name in ('sccache', 'tmp')}
+    # Git fixtures must not discover the checkout above their temporary root.
+    # Hosted runners provide an isolated temp root outside the repository;
+    # a recorded local volume policy always takes precedence.
+    if os.environ.get('GITHUB_ACTIONS') == 'true' and 'requiredVolume' not in policy:
+        directories['tmp'] = Path(os.environ['RUNNER_TEMP']) / 'codevetra-build-tmp'
     for directory in directories.values():
         cache_path(directory, policy)
         directory.mkdir(parents=True, exist_ok=True)
@@ -264,10 +270,75 @@ def link_local_cache():
         link.symlink_to(destination, target_is_directory=True)
 
 
-def snapshot(destination=None):
+def source_freshness(paths, digest, build_cache):
+    """Reuse source timestamps only for the same staged bytes and permissions.
+
+    The caller holds build admission until Cargo exits. Check every cached
+    artifact's timestamp so clock skew and filesystem rounding fail closed.
+    """
+    policy = cache_policy()
+    root = cache_path(build_cache, policy)
+    receipt = cache_path(root / 'source-freshness.json', policy)
+    target = cache_path(root / 'target', policy)
+    if not receipt.is_relative_to(root) or not target.is_relative_to(root):
+        raise ValueError('Source freshness state escapes its build cache')
+    previous = None
+    if receipt.exists():
+        with receipt.open() as source:
+            data = source.read(4097)
+        if len(data) > 4096:
+            raise ValueError('Source freshness receipt exceeds its byte limit')
+        previous = json.loads(data)
+        if (not isinstance(previous, dict) or previous.get('version') != 1
+                or not isinstance(previous.get('sourceDigest'), str)
+                or len(previous['sourceDigest']) != 64
+                or any(c not in '0123456789abcdef' for c in previous['sourceDigest'])
+                or type(previous.get('mtimeNs')) is not int or not 0 < previous['mtimeNs'] < 2**63):
+            raise ValueError('Invalid source freshness receipt')
+    unchanged = previous is not None and previous['sourceDigest'] == digest
+    anchor = 0
+    if not unchanged:
+        entries = 0
+        for directory, directories, files in os.walk(target):
+            entries += len(directories) + len(files)
+            if entries > 100_000:
+                raise ValueError('Build cache exceeds the source freshness metadata bound')
+            if any((Path(directory) / name).is_symlink() for name in [*directories, *files]):
+                raise ValueError('Build cache freshness anchors must not be symlinks')
+            for name in files:
+                path = Path(directory) / name
+                anchor = max(anchor, path.stat().st_mtime_ns)
+    deadline = time.monotonic() + 2
+    while True:
+        stamp = previous['mtimeNs'] if unchanged else time.time_ns()
+        if not unchanged and anchor > stamp + 2_000_000_000:
+            raise ValueError('Build cache has future timestamps; source freshness is unproved')
+        for path in paths:
+            os.utime(path, ns=(stamp, stamp))
+        actual = {path.stat().st_mtime_ns for path in paths}
+        if len(actual) == 1 and (actual == {stamp} if unchanged else min(actual) > anchor):
+            stamp = actual.pop()
+            break
+        if unchanged or time.monotonic() >= deadline:
+            raise ValueError('Filesystem timestamps cannot prove source freshness')
+        time.sleep(0.05)
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=root, prefix='.source-freshness.', delete=False) as output:
+        pending = Path(output.name)
+        json.dump({'version': 1, 'sourceDigest': digest, 'mtimeNs': stamp}, output)
+        output.flush()
+        os.fsync(output.fileno())
+    try:
+        os.replace(pending, receipt)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def snapshot(destination=None, *, build_cache=None):
     """Stage public source without exposing credentials, graph state or caches."""
     names = subprocess.check_output(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], cwd=ROOT)
     digest = hashlib.sha256()
+    staged = []
     for name in sorted(set(filter(None, names.split(b'\0')))):
         relative = Path(os.fsdecode(name))
         source = ROOT / relative
@@ -276,11 +347,17 @@ def snapshot(destination=None):
         if not source.is_file():
             raise ValueError('Build input disappeared while staging source')
         content = source.read_bytes()
+        executable = bool(source.stat().st_mode & 0o111)
         digest.update(name + b'\0' + hashlib.sha256(content).digest())
-        digest.update(bytes([bool(source.stat().st_mode & 0o111)]))
+        digest.update(bytes([executable]))
         if destination is not None:
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
             target.write_bytes(content)
-            target.chmod(0o755 if source.stat().st_mode & 0o111 else 0o644)
+            target.chmod(0o755 if executable else 0o644)
+            staged.append(target)
+    if build_cache is not None:
+        if not staged:
+            raise ValueError('Source freshness requires a nonempty staged snapshot')
+        source_freshness(staged, digest.hexdigest(), build_cache)
     return digest.hexdigest()

@@ -103,12 +103,12 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 mkdir "$STAGED/source"
-SOURCE_DIGEST="$(python3 - "$ROOT" "$STAGED/source" <<'PY'
+SOURCE_DIGEST="$(python3 - "$ROOT" "$STAGED/source" "$CACHE" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts'))
 from build_tools import snapshot
-print(snapshot(Path(sys.argv[2])))
+print(snapshot(Path(sys.argv[2]), build_cache=Path(sys.argv[3])))
 PY
 )"
 # The archive audit queries tracked files. Create a public-only index, without
