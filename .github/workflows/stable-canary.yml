@@ -27,6 +27,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Install pinned build tools
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            python scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          else
+            python3 scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          fi
+
       - name: Install Linux native binding prerequisites
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev

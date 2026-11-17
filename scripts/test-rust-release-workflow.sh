@@ -43,6 +43,25 @@ literal_count() {
 }
 
 command -v ruby >/dev/null 2>&1 || fail 'Ruby with the standard YAML parser is required'
+ruby - "$VALIDATION" "$RELEASE" <<'RUBY'
+require 'yaml'
+validation = YAML.load_file(ARGV[0]).fetch('jobs').fetch('linux-release-portability')
+image = validation.fetch('env').fetch('CODEVETRA_LINUX_BUILD_IMAGE')
+abort 'Linux cache image must be digest pinned' unless image.match?(/@sha256:[0-9a-f]{64}$/)
+restore = validation.fetch('steps').find { |step| step['id'] == 'rust-cache' }
+abort 'Linux validation cache key must bind its build image' unless \
+  restore.fetch('with').fetch('key').include?('${{ env.CODEVETRA_LINUX_BUILD_IMAGE }}')
+build = validation.fetch('steps').find { |step| step['name'] == 'Build, audit, and smoke on glibc 2.41' }
+abort 'Linux validation must use the image bound by its cache key' unless \
+  build.fetch('run').include?('"$CODEVETRA_LINUX_BUILD_IMAGE"')
+release = YAML.load_file(ARGV[1]).fetch('jobs').fetch('build')
+restore = release.fetch('steps').find { |step| step['id'] == 'rust-cache' }
+abort 'Linux release cache key must bind its build image' unless \
+  restore.fetch('with').fetch('key').include?("${{ matrix.build_image || 'host' }}")
+build = release.fetch('steps').find { |step| step['name'] == 'Build and smoke Linux archive on current stable glibc 2.41' }
+abort 'Linux release must use the image bound by its cache key' unless \
+  build.fetch('run').include?('${{ matrix.build_image }}')
+RUBY
 python3 "$ROOT/scripts/test-unix-installer-compatibility.py"
 python3 - "$ROOT" <<'PY'
 import pathlib, re, sys, tomllib
@@ -193,7 +212,9 @@ contract_failure("unit tests may not change test concurrency or continue on erro
   end
 test_steps = unit_steps.select { |step| step["name"] == "Unit tests" }
 contract_failure("ordinary tests must run the complete unfiltered workspace suite") unless \
-  test_steps == [{"name" => "Unit tests", "run" => "cargo test --locked --workspace --all-features"}]
+  test_steps == [{"name" => "Unit tests", "run" => "cargo nextest run --locked --workspace --all-features --profile ci"}]
+contract_failure("nextest must be accompanied by complete workspace doctests") unless \
+  unit_steps.select { |step| step["name"] == "Doctests" } == [{"name" => "Doctests", "run" => "cargo test --locked --workspace --all-features --doc"}]
 contract_failure("ordinary tests need native binding prerequisites") unless unit_steps.any? do |step|
   step["run"] == "sudo apt-get update && sudo apt-get install -y clang libclang-dev"
 end
@@ -441,7 +462,7 @@ validate_quality_step() {
   local step="$1"
   [[ -n "$step" ]] || return 0
   if grep -Eq \
-      'name: (Require successful change classification|Resolve pinned Rust toolchain|Restore Rust dependency cache|Fetch locked dependencies|Release workflow contract)' \
+      'name: (Require successful change classification|Resolve pinned Rust toolchain|Restore Rust dependency cache|Fetch locked dependencies|Release workflow contract|Install pinned build tools)' \
       <<<"$step" || grep -Fq -- '- uses: actions/checkout@' <<<"$step"; then
     return 0
   fi
@@ -712,7 +733,7 @@ grep -Fq 'minos 26.0' "$UNIX_BUILD_HELPER" || \
   fail 'macOS release binaries do not verify their minimum OS contract'
 grep -Fq "TARGET_ROOT=\"\${CARGO_TARGET_DIR:-target}\"" "$UNIX_BUILD_HELPER" || \
   fail 'release builds do not honor an isolated Cargo target directory'
-grep -Fq -- '--env CARGO_TARGET_DIR=/tmp/codevetra-target' "$LINUX_BUILD_HELPER" || \
+grep -Fq -- '--env CARGO_TARGET_DIR=/cache/target' "$LINUX_BUILD_HELPER" || \
   fail 'Linux container builds can follow a host target symlink'
 grep -Fq 'requires glibc 2.41 or newer' "$UNIX_INSTALLER" || \
   fail 'the Unix installer does not reject old Linux before download'
@@ -725,16 +746,16 @@ if grep -Fq 'Swatinem/rust-cache@' "$VALIDATION" "$RELEASE"; then
 fi
 CACHE_ACTION_SHA='55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
 restore_count="$(literal_count "actions/cache/restore@$CACHE_ACTION_SHA")"
-[[ "$restore_count" == 6 ]] || fail 'every Rust cache restore must use pinned actions/cache v6.1.0'
+[[ "$restore_count" == 7 ]] || fail 'every Rust cache restore must use pinned actions/cache v6.1.0'
 save_count="$(literal_count "actions/cache/save@$CACHE_ACTION_SHA")"
-[[ "$save_count" == 4 ]] || fail 'bounded main, Windows, macOS, and release cache saves are missing'
+[[ "$save_count" == 5 ]] || fail 'bounded main, Windows, macOS, and release cache saves are missing'
 for cache_path in \
   '.cargo/registry/index/' \
   '.cargo/registry/cache/' \
   '.cargo/git/db/' \
   'target/'; do
   path_count="$(awk -v expected="$cache_path" '{ $1=$1; if ($0 == expected || $0 == "~/" expected) n++ } END { print n+0 }' "$VALIDATION" "$RELEASE")"
-  [[ "$path_count" == 10 ]] || fail "Rust cache path coverage changed for $cache_path"
+  [[ "$path_count" == 12 ]] || fail "Rust cache path coverage changed for $cache_path"
 done
 grep -Fq 'steps.rust-cache.outputs.cache-primary-key' "$VALIDATION" || \
   fail 'main cache saves are not bound to their exact restored primary key'

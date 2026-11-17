@@ -103,13 +103,25 @@ jobs:
             target/
           # Old compiler targets take minutes to restore and are invalidated
           # on a toolchain update. This bounded job restores exact matches only.
-          key: codevetra-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'scripts/build-tools.json') }}
+
+      - name: Install pinned build tools
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            python scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          else
+            python3 scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          fi
 
       - name: Install native C++ binding prerequisites
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
 
       - name: Unit tests
-        run: cargo test --locked --workspace --all-features
+        run: cargo nextest run --locked --workspace --all-features --profile ci
+
+      - name: Doctests
+        run: cargo test --locked --workspace --all-features --doc
 
   quality:
     name: format + clippy + rustdoc + unit + RocksDB-only
@@ -148,9 +160,18 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: codevetra-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'scripts/build-tools.json') }}
           restore-keys: |
             codevetra-rust-${{ runner.os }}-v2-ubuntu-
+
+      - name: Install pinned build tools
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            python scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          else
+            python3 scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          fi
 
       - name: Install native C++ binding prerequisites
         if: needs.classify.outputs.full == 'true'
@@ -158,6 +179,14 @@ jobs:
 
       - name: Fetch locked dependencies
         run: cargo fetch --locked
+
+      - name: Build tool safety contracts
+        if: needs.classify.outputs.full == 'true'
+        run: python3 scripts/test-build-tools.py
+
+      - name: Compiler cache reuse and checkout identity
+        if: needs.classify.outputs.full == 'true'
+        run: python3 scripts/verify-build-cache.py
 
       - name: Workspace dependency contract
         if: needs.classify.outputs.full == 'true'
@@ -206,6 +235,8 @@ jobs:
 
       - name: Dependency advisories, licenses, bans, and sources
         if: needs.classify.outputs.full == 'true'
+        env:
+          RUSTC_WRAPPER: ""
         uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
           rust-version: '1.100.0'
@@ -214,6 +245,8 @@ jobs:
 
       - name: Shuttle dependency advisories, licenses, bans, and sources
         if: needs.classify.outputs.full == 'true'
+        env:
+          RUSTC_WRAPPER: ""
         uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
           rust-version: '1.100.0'
@@ -366,10 +399,19 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: codevetra-rust-${{ runner.os }}-v2-windows-${{ matrix.check }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-windows-${{ matrix.check }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'scripts/build-tools.json') }}
           restore-keys: |
             codevetra-rust-${{ runner.os }}-v2-windows-${{ matrix.check }}-
             codevetra-rust-${{ runner.os }}-v2-windows-
+
+      - name: Install pinned build tools
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            python scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          else
+            python3 scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          fi
 
       - name: Resolve native binding library
         shell: pwsh
@@ -484,9 +526,18 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: codevetra-rust-${{ runner.os }}-v2-macos-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-macos-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'scripts/build-tools.json') }}
           restore-keys: |
             codevetra-rust-${{ runner.os }}-v2-macos-
+
+      - name: Install pinned build tools
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            python scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          else
+            python3 scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          fi
 
       - name: macOS all-target, all-feature Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -511,8 +562,21 @@ jobs:
     if: needs.classify.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    env:
+      CODEVETRA_LINUX_BUILD_IMAGE: rust:1.100.0-trixie@sha256:ebc54bef33ec8f9a5cd05799366010f35efbb73b354fb4f2cb086ec6b9460ef5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Restore Linux release dependency cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: codevetra-rust-${{ runner.os }}-v2-linux-release-${{ env.CODEVETRA_LINUX_BUILD_IMAGE }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'scripts/build-tools.json') }}
 
       - name: Build, audit, and smoke on glibc 2.41
         shell: bash
@@ -520,8 +584,19 @@ jobs:
           scripts/build-linux-rust-release.sh
           x86_64-unknown-linux-gnu
           linux-x64
-          rust:1.100.0-trixie@sha256:ebc54bef33ec8f9a5cd05799366010f35efbb73b354fb4f2cb086ec6b9460ef5
+          "$CODEVETRA_LINUX_BUILD_IMAGE"
           debian:13-slim@sha256:7378260c0a098d27ac206225db5e7d92b8c7c84ea7afccc86eeb513756bbd392
+
+      - name: Save Linux release dependency cache
+        if: github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
   rocksdb:
     name: RocksDB native (${{ matrix.shard }})
@@ -565,9 +640,19 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: codevetra-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: codevetra-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'scripts/build-tools.json') }}
           restore-keys: |
             codevetra-rust-${{ runner.os }}-v2-ubuntu-
+
+      - name: Install pinned build tools
+        if: needs.classify.outputs.full == 'true'
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            python scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          else
+            python3 scripts/setup-build-tools.py --bin-dir "$RUNNER_TEMP/codevetra-tools" --github-env
+          fi
 
       - name: Native database transactions, snapshots, retention, and fault paths
         if: needs.classify.outputs.full == 'true' && matrix.shard == 'database'
