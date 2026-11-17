@@ -338,6 +338,16 @@ class BuildToolsTests(unittest.TestCase):
         self.assertEqual(helper.count('docker run --rm --init --pull never'), 2)
 
     @unittest.skipIf(os.name == 'nt', 'Unix compiler-server process groups')
+    def test_owned_compiler_server_survives_an_idle_test_phase(self):
+        runner = self.runner_module()
+        env = tools.environment()
+        env.update(SCCACHE_IDLE_TIMEOUT='1', SCCACHE_DIR=str(self.root / 'sccache-cache'))
+        with patch.object(runner, 'cache_root', return_value=self.root):
+            result = runner.run([sys.executable, '-c', 'import time; time.sleep(2)'], env, 10)
+        self.assertEqual(result, 0)
+        self.assertFalse(list(self.root.glob('run-*.sock')))
+
+    @unittest.skipIf(os.name == 'nt', 'Unix compiler-server process groups')
     def test_deadline_reaps_build_and_compiler_server_children(self):
         runner = self.runner_module()
         # Both parents have a descendant that ignores SIGTERM. Killing only the
@@ -393,11 +403,97 @@ time.sleep(60)
         self.assertEqual(child.returncode, 0)
 
     @unittest.skipIf(os.name == 'nt', 'Unix supervisor death and inherited flock')
+    def test_supervisor_death_recovers_admission_after_server_idle_exit(self):
+        build = self.root / 'short-build.py'
+        build.write_text('import os,time\nfrom pathlib import Path\n'
+                         'Path(os.environ["PROBE_ROOT"], "build.pid").write_text(str(os.getpid()))\n'
+                         'time.sleep(0.5)\n')
+        script = '''import importlib.util, os, sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+import build_tools
+root = Path(os.environ['PROBE_ROOT'])
+build_tools.cache_root = lambda: root
+spec = importlib.util.spec_from_file_location('runner', 'scripts/rust-dev.py')
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+spawn = runner.subprocess.Popen
+def record(*args, **kwargs):
+    child = spawn(*args, **kwargs)
+    if kwargs.get('env', {}).get('SCCACHE_START_SERVER') == '1':
+        (root / 'server.pid').write_text(str(child.pid))
+    return child
+runner.subprocess.Popen = record
+with build_tools.admission() as lock:
+    runner.run([sys.executable, str(root / 'short-build.py')], os.environ, 1, lock)
+'''
+        env = tools.environment()
+        env.update(PROBE_ROOT=str(self.root), SCCACHE_DIR=str(self.root / 'sccache-cache'))
+        supervisor = subprocess.Popen([sys.executable, '-c', script], env=env, cwd=tools.ROOT,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+        recovered = False
+        succeeded = False
+        try:
+            for _ in range(100):
+                if (self.root / 'build.pid').exists():
+                    break
+                if supervisor.poll() is not None:
+                    self.fail(supervisor.stderr.read().decode())
+                time.sleep(0.02)
+            else:
+                self.fail('Owned fixture did not start')
+            server = int((self.root / 'server.pid').read_text())
+            rows = subprocess.check_output(['ps', '-axo', 'pid=,ppid='], text=True)
+            children = [int(pid) for pid, parent in (row.split() for row in rows.splitlines())
+                        if int(parent) == server]
+            self.assertEqual(len(children), 1)
+            (self.root / 'compiler.pid').write_text(str(children[0]))
+            supervisor.kill()
+            supervisor.wait(timeout=5)
+            with patch.object(tools, 'cache_root', return_value=self.root):
+                with self.assertRaises(BlockingIOError):
+                    with tools.admission():
+                        self.fail('Surviving server must retain admission')
+                deadline = time.monotonic() + 36
+                while time.monotonic() < deadline:
+                    try:
+                        with tools.admission():
+                            recovered = True
+                            break
+                    except BlockingIOError:
+                        time.sleep(0.1)
+            self.assertTrue(recovered, 'Idle server did not release admission after supervisor death')
+            for name in ('build', 'server', 'compiler'):
+                pid = int((self.root / (name + '.pid')).read_text())
+                for _ in range(100):
+                    state = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True, text=True).stdout.strip()
+                    if not state or state.startswith('Z'):
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail(name + ' survived automatic recovery')
+            succeeded = True
+        finally:
+            if supervisor.poll() is None:
+                supervisor.kill()
+                supervisor.wait(timeout=5)
+            supervisor.stderr.close()
+            # Failure cleanup only. Successful recovery above sends no signal
+            # to the workload or server after killing the supervisor.
+            if not succeeded:
+                marker = self.root / 'server.pid'
+                if marker.exists():
+                    try:
+                        os.killpg(int(marker.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    @unittest.skipIf(os.name == 'nt', 'Unix supervisor death and inherited flock')
     def test_supervisor_sigkill_keeps_admission_until_owned_work_exits(self):
         body = '''import os, socket, time
 from pathlib import Path
 name = 'server' if os.environ.get('SCCACHE_START_SERVER') else 'build'
-Path(os.environ['PROBE_ROOT'], name + '.pid').write_text(str(os.getpid()))
+Path(os.environ['PROBE_ROOT'], name + '.pid').write_text(str(os.getpgrp()))
 if name == 'server':
     sock = socket.socket(socket.AF_UNIX)
     sock.bind(os.environ['SCCACHE_SERVER_UDS'])

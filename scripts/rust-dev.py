@@ -8,6 +8,7 @@ import platform
 import signal
 import socket
 import subprocess
+import sys
 import time
 
 from build_tools import ROOT, admission, cache_path, cache_policy, cache_root, environment
@@ -93,8 +94,20 @@ def run(command, env, timeout, lock=None):
     previous = signal.signal(signal.SIGTERM, interrupted)
     inherited = {'pass_fds': (lock.fileno(),)} if lock is not None and os.name != 'nt' else {}
     try:
-        server_env = dict(env, SCCACHE_START_SERVER='1', SCCACHE_NO_DAEMON='1')
-        server = subprocess.Popen(['sccache'], env=server_env, start_new_session=os.name != 'nt', **inherited)
+        # Long test/soak phases legitimately make no compiler requests. Keep
+        # the server beyond our deadline/cleanup, but retain a finite idle
+        # exit if the supervisor is killed and cannot clean up its server.
+        server_env = dict(env, SCCACHE_START_SERVER='1', SCCACHE_NO_DAEMON='1',
+                          SCCACHE_IDLE_TIMEOUT=str(timeout + 30))
+        # sccache closes inherited descriptors. A waiting wrapper retains our
+        # admission FD for its entire lifetime, including after parent SIGKILL.
+        # Catch (rather than ignore) SIGTERM so the exec'd server gets the
+        # default disposition and the wrapper waits for group cleanup.
+        server_command = [sys.executable, '-c',
+                          'import signal,subprocess,sys; '
+                          'signal.signal(signal.SIGTERM, lambda *_: None); '
+                          'sys.exit(subprocess.call(["sccache"]))']
+        server = subprocess.Popen(server_command, env=server_env, start_new_session=os.name != 'nt', **inherited)
         for _ in range(100):
             if exit_status(server) is not None:
                 raise RuntimeError('Owned compiler server exited during startup')

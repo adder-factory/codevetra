@@ -50,9 +50,11 @@ stop above 8 GiB. This sampled guard is not a kernel memory limit; formal
 verification must continue through the separate cgroup-limited
 `scripts/verify-formal.sh` supervisor. Never run Kani or Verus directly on the
 Mac. Hosted CI uses each runner's explicitly restored ephemeral cache.
-On Unix, the server and Cargo inherit the admission lock: killing the
+On Unix, a compiler-server wrapper and Cargo retain the admission lock: killing the
 supervisor cannot admit another build while those processes are still alive.
 Inspect surviving owned work before retrying; never delete the lock file.
+The owned server's idle timeout exceeds the admitted command deadline by
+30 seconds, allowing long tests while keeping orphaned idle servers finite.
 
 ## Compiler caching
 
