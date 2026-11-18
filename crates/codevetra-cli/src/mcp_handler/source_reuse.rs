@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_HANDLES: usize = 64;
-const MAX_HANDLE_BYTES: usize = 8192;
+pub(super) const MAX_HANDLE_BYTES: usize = 8192;
 const LIFETIME_SECONDS: u64 = 1800;
 const MAX_RESULT_BYTES: usize = 1536 * 1024;
 
@@ -185,96 +185,111 @@ struct Counts {
     reused_bytes: usize,
 }
 
-fn project_sources(
-    value: &mut Value,
-    project: &str,
-    reuse: &Reuse,
-    counts: &mut Counts,
-    depth: usize,
-    cancellation: &ProjectCancellation,
-) -> Result<(), ToolError> {
-    if cancellation.is_cancelled() {
-        return Err(safe_error(
-            ToolErrorCode::Unavailable,
-            "source projection cancelled",
-        ));
-    }
-    if depth > 64 {
-        return Err(ToolError::internal());
-    }
-    if let Some(source) = identity(value, project) {
-        return project_source(value, source, reuse, counts);
-    }
-    match value {
-        Value::Object(map) => {
-            for child in map.values_mut() {
-                project_sources(child, project, reuse, counts, depth + 1, cancellation)?;
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                project_sources(child, project, reuse, counts, depth + 1, cancellation)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+/// One response projection owns its acknowledgement policy, counters and cancellation scope.
+pub(super) struct Projection<'a> {
+    project: &'a str,
+    reuse: Reuse,
+    cancellation: &'a ProjectCancellation,
+    counts: Counts,
 }
 
-fn project_source(
-    value: &mut Value,
-    source: SourceIdentity,
-    reuse: &Reuse,
-    counts: &mut Counts,
-) -> Result<(), ToolError> {
-    let bytes =
-        usize::try_from(source.end_byte - source.start_byte).map_err(|_| ToolError::internal())?;
-    let known = reuse
-        .acknowledged
-        .iter()
-        .find(|(_, handle)| handle.source == source);
-    let handle = if let Some((text, _)) = known {
-        text.clone()
-    } else {
-        encode(&Handle {
-            version: 1,
-            source,
-            issued_at: reuse.now,
-        })?
-    };
-    if counts.offered >= MAX_HANDLES {
-        counts.source_bytes += bytes;
-        return Ok(());
+impl<'a> Projection<'a> {
+    pub(super) fn new(
+        project: &'a str,
+        reuse: Reuse,
+        cancellation: &'a ProjectCancellation,
+    ) -> Self {
+        Self {
+            project,
+            reuse,
+            cancellation,
+            counts: Counts::default(),
+        }
     }
-    counts.offered += 1;
-    value["sourceHandle"] = Value::String(handle.clone());
-    if known.is_some() {
-        let before = serde_json::to_vec(value)
-            .map_err(|_| ToolError::internal())?
-            .len();
-        let old_excerpt = value["excerpt"].clone();
-        value["excerpt"]
-            .as_object_mut()
-            .ok_or_else(ToolError::internal)?
-            .remove("text");
-        value["sourceReference"] = json!({"handle":handle,"state":"acknowledged_exact_source","expand":"files --format read --source-handle <handle>; sourceReuse=full/reset always emits source"});
-        if serde_json::to_vec(value)
-            .map_err(|_| ToolError::internal())?
-            .len()
-            < before
-        {
-            counts.referenced += 1;
-            counts.reused_bytes += bytes;
+    fn sources(&mut self, value: &mut Value, depth: usize) -> Result<(), ToolError> {
+        if self.cancellation.is_cancelled() {
+            return Err(safe_error(
+                ToolErrorCode::Unavailable,
+                "source projection cancelled",
+            ));
+        }
+        if depth > 64 {
+            return Err(ToolError::internal());
+        }
+        if let Some(source) = identity(value, self.project) {
+            return self.source(value, source);
+        }
+        match value {
+            Value::Object(map) => {
+                for child in map.values_mut() {
+                    self.sources(child, depth + 1)?;
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    self.sources(child, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl Projection<'_> {
+    fn source(&mut self, value: &mut Value, source: SourceIdentity) -> Result<(), ToolError> {
+        let reuse = &self.reuse;
+        let counts = &mut self.counts;
+
+        let bytes = usize::try_from(source.end_byte - source.start_byte)
+            .map_err(|_| ToolError::internal())?;
+        let known = reuse
+            .acknowledged
+            .iter()
+            .find(|(_, handle)| handle.source == source);
+        let handle = if let Some((text, _)) = known {
+            text.clone()
+        } else {
+            encode(&Handle {
+                version: 1,
+                source,
+                issued_at: reuse.now,
+            })?
+        };
+        if counts.offered >= MAX_HANDLES {
+            counts.source_bytes += bytes;
             return Ok(());
         }
-        value["excerpt"] = old_excerpt;
-        value
-            .as_object_mut()
-            .ok_or_else(ToolError::internal)?
-            .remove("sourceReference");
+        counts.offered += 1;
+        value["sourceHandle"] = Value::String(handle.clone());
+        if known.is_some() {
+            let before = serde_json::to_vec(value)
+                .map_err(|_| ToolError::internal())?
+                .len();
+            let old_excerpt = value["excerpt"].clone();
+            value["excerpt"]
+                .as_object_mut()
+                .ok_or_else(ToolError::internal)?
+                .remove("text");
+            value["sourceReference"] = json!({"handle":handle,"state":"acknowledged_exact_source","expand":"files --format read --source-handle <handle>; sourceReuse=full/reset always emits source"});
+            if serde_json::to_vec(value)
+                .map_err(|_| ToolError::internal())?
+                .len()
+                < before
+            {
+                counts.referenced += 1;
+                counts.reused_bytes += bytes;
+                return Ok(());
+            }
+            value["excerpt"] = old_excerpt;
+            value
+                .as_object_mut()
+                .ok_or_else(ToolError::internal)?
+                .remove("sourceReference");
+        }
+        counts.source_bytes += bytes;
+        Ok(())
     }
-    counts.source_bytes += bytes;
-    Ok(())
 }
 
 fn result(value: &Value) -> Result<ToolResult, ToolError> {
@@ -283,9 +298,7 @@ fn result(value: &Value) -> Result<ToolResult, ToolError> {
 
 pub(super) fn apply(
     original: ToolResult,
-    project: &str,
-    reuse: Reuse,
-    cancellation: &ProjectCancellation,
+    mut projection: Projection<'_>,
 ) -> Result<ToolResult, ToolError> {
     let Some(structured) = original.structured_content() else {
         return Ok(original);
@@ -294,8 +307,8 @@ pub(super) fn apply(
         .map_err(|_| ToolError::internal())?
         .len();
     let mut payload = Value::Object(structured.clone());
-    let mut counts = Counts::default();
-    project_sources(&mut payload, project, &reuse, &mut counts, 0, cancellation)?;
+    projection.sources(&mut payload, 0)?;
+    let Projection { counts, reuse, .. } = projection;
     payload["sourceReuse"] = json!({"mode":Value::String(reuse.mode),"handlesOffered":counts.offered,"references":counts.referenced,"newSourceBytes":counts.source_bytes,"reusedSourceBytes":counts.reused_bytes,"ignoredExpiredOrUnknownHandles":reuse.ignored,"retainedServerHistory":0,"handleLifetimeSeconds":LIFETIME_SECONDS,"baselineResultBytes":baseline,"emittedResultBytes":0,"totalResponseBytesSaved":0,"totalResponseBytesAdded":0,"accounting":"JSON serialized MCP ToolResult including text and structured content; excludes transport envelope. References assert client possession, never inspection or safety."});
     for _ in 0..8 {
         let output = result(&payload)?;
@@ -374,14 +387,16 @@ pub(super) async fn recover(
     payload["recovery"] = json!({"state":"revalidated_full_source","previousHandleExpired":now()?.saturating_sub(handle.issued_at) > LIFETIME_SECONDS});
     apply(
         result(&payload)?,
-        handler.runtime.root_identity(),
-        Reuse {
-            acknowledged: Vec::new(),
-            mode: "full".to_owned(),
-            now: now()?,
-            ignored: 0,
-        },
-        &cancellation,
+        Projection::new(
+            handler.runtime.root_identity(),
+            Reuse {
+                acknowledged: Vec::new(),
+                mode: "full".to_owned(),
+                now: now()?,
+                ignored: 0,
+            },
+            &cancellation,
+        ),
     )
 }
 
@@ -414,9 +429,11 @@ mod tests {
         let original = result(&json!({"source":source(&text,"g1",0)}))?;
         let offered = apply(
             original.clone(),
-            "project",
-            options("offer", vec![])?,
-            &ProjectCancellation::new(),
+            Projection::new(
+                "project",
+                options("offer", vec![])?,
+                &ProjectCancellation::new(),
+            ),
         )?;
         let handle = offered.structured_content().ok_or("payload")?["source"]["sourceHandle"]
             .as_str()
@@ -424,9 +441,11 @@ mod tests {
             .to_owned();
         let reused = apply(
             original.clone(),
-            "project",
-            options("reuse", vec![handle.clone()])?,
-            &ProjectCancellation::new(),
+            Projection::new(
+                "project",
+                options("reuse", vec![handle.clone()])?,
+                &ProjectCancellation::new(),
+            ),
         )?;
         let payload = reused.structured_content().ok_or("payload")?;
         assert!(payload["source"]["excerpt"].get("text").is_none());
@@ -449,9 +468,11 @@ mod tests {
         ] {
             let full = apply(
                 original.clone(),
-                project,
-                options(mode, handles)?,
-                &ProjectCancellation::new(),
+                Projection::new(
+                    project,
+                    options(mode, handles)?,
+                    &ProjectCancellation::new(),
+                ),
             )?;
             assert_eq!(
                 full.structured_content().ok_or("payload")?["source"]["excerpt"]["text"],
@@ -465,9 +486,11 @@ mod tests {
         ] {
             let full = apply(
                 result(&json!({"source":changed}))?,
-                "project",
-                options("reuse", vec![handle.clone()])?,
-                &ProjectCancellation::new(),
+                Projection::new(
+                    "project",
+                    options("reuse", vec![handle.clone()])?,
+                    &ProjectCancellation::new(),
+                ),
             )?;
             assert_eq!(
                 full.structured_content().ok_or("payload")?["sourceReuse"]["references"],
@@ -491,9 +514,7 @@ mod tests {
         assert!(
             apply(
                 result(&source("body", "g", 0))?,
-                "p",
-                options("offer", vec![])?,
-                &token
+                Projection::new("p", options("offer", vec![])?, &token)
             )
             .is_err()
         );
@@ -501,18 +522,14 @@ mod tests {
         assert!(
             apply(
                 result(&payload)?,
-                "p",
-                options("offer", vec![])?,
-                &ProjectCancellation::new()
+                Projection::new("p", options("offer", vec![])?, &ProjectCancellation::new())
             )
             .is_err()
         );
         // Rejected response state cannot poison the next call: there is no retained history.
         let next = apply(
             result(&source("body", "g", 0))?,
-            "p",
-            options("reuse", vec![])?,
-            &ProjectCancellation::new(),
+            Projection::new("p", options("reuse", vec![])?, &ProjectCancellation::new()),
         )?;
         assert_eq!(
             next.structured_content().ok_or("payload")?["excerpt"]["text"],

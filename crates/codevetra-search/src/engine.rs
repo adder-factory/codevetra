@@ -5,10 +5,11 @@ use std::{
 
 use codevetra_db::{
     CodeVetraDatabase, CurrentEntryPointsLookup, CurrentFileLookup, CurrentFileSymbolsLookup,
-    CurrentFilesLookup, CurrentGenerationLookup, CurrentGraphLookup, CurrentReferenceRecord,
-    CurrentSourceRangeLookup, CurrentSymbolRecord, CurrentSymbolSetLookup, EntryPointBucket,
-    ExactTextLookup, GraphDirection, SearchComponent, SearchHit, SearchQuery, SemanticStorageError,
-    SimilarSymbolsInput, SimilarSymbolsRequest, SimilarSymbolsResult, SourceLineRange,
+    CurrentFilesLookup, CurrentGenerationLookup, CurrentGraphEdge, CurrentGraphLookup,
+    CurrentReferenceRecord, CurrentSourceRangeLookup, CurrentSymbolRecord, CurrentSymbolSetLookup,
+    EntryPointBucket, ExactTextLookup, GraphDirection, SearchComponent, SearchHit, SearchQuery,
+    SemanticStorageError, SimilarSymbolsInput, SimilarSymbolsRequest, SimilarSymbolsResult,
+    SourceLineRange,
 };
 use codevetra_domain::{
     DocumentKind, EdgeKind, FileId, GenerationId, NormalizedPath, ProjectId, SourceLanguage,
@@ -52,7 +53,7 @@ enum TraversalKind {
     Impact,
 }
 
-/// Deterministic retrieval facade over one PostgreSQL-backed CodeVetra schema.
+/// Deterministic retrieval facade over one project's native graph.
 #[derive(Clone)]
 pub struct DeterministicRetriever {
     database: CodeVetraDatabase,
@@ -1175,17 +1176,8 @@ async fn run_graph_path(
     let mut parents = BTreeMap::<SymbolId, GraphArc>::new();
     let mut truncated = false;
     for depth in 1..=budget.max_depth() {
-        let edges = database
-            .current_graph_edges(
-                CurrentGraphLookup::new(
-                    CurrentGenerationLookup::new(request.project_id(), expected_generation_id),
-                    &frontier,
-                    GraphDirection::Outgoing,
-                )
-                .with_limit(GRAPH_EDGE_READ_LIMIT)
-                .with_edge_kinds(request.edge_kind().as_slice())
-                .with_minimum_confidence(request.minimum_confidence()),
-            )
+        let edges = request
+            .read_outgoing_edges(database, expected_generation_id, &frontier)
             .await?;
         truncated |= edges.len() == usize::from(GRAPH_EDGE_READ_LIMIT);
         let arcs = edges
@@ -1239,6 +1231,28 @@ async fn run_graph_path(
         path: None,
         truncated,
     }))
+}
+
+impl GraphPathRequest {
+    async fn read_outgoing_edges(
+        &self,
+        database: &CodeVetraDatabase,
+        generation: &GenerationId,
+        frontier: &[SymbolId],
+    ) -> Result<Vec<CurrentGraphEdge>, RetrievalError> {
+        Ok(database
+            .current_graph_edges(
+                CurrentGraphLookup::new(
+                    CurrentGenerationLookup::new(self.project_id(), generation),
+                    frontier,
+                    GraphDirection::Outgoing,
+                )
+                .with_limit(GRAPH_EDGE_READ_LIMIT)
+                .with_edge_kinds(self.edge_kind().as_slice())
+                .with_minimum_confidence(self.minimum_confidence()),
+            )
+            .await?)
+    }
 }
 
 async fn require_graph_path_endpoints(

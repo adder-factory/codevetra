@@ -38,20 +38,19 @@ fn input(number: u8, base: GraphBase) -> Result<GraphPublicationInput> {
         || false,
     )
     .map_err(|_| super::super::super::operation("fixture-validation"))?;
-    GraphPublicationInput::prepare(
+    crate::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(number),
             source_revision: identity(number),
             base,
         },
-        facts,
         GraphPolicy {
             maximum_input_bytes: 64 * 1_024,
             ..GraphPolicy::default()
         },
-        256 * 1_048_576,
         &request()?,
     )
+    .prepare(facts, 256 * 1_048_576)
 }
 
 fn read_budget() -> Result<ReadBudget> {
@@ -71,8 +70,10 @@ async fn destroyed_packed_tables_admit_old_graph_reads_before_publication_finish
             ..WorkerPolicy::default()
         })?;
         let store = open(&runtime, root.path()).await?;
+        let initial_input = input(1, GraphBase::Empty)?;
         store
-            .publish_graph(input(1, GraphBase::Empty)?, &request()?)
+            .with_request(&request()?)
+            .publish_graph(initial_input)
             .await?;
         let (entered, before_credit) = tokio::sync::oneshot::channel();
         let (reclaim, reclaim_now) = mpsc::channel();
@@ -90,14 +91,17 @@ async fn destroyed_packed_tables_admit_old_graph_reads_before_publication_finish
         let control = request()?;
         let writer_control = control.clone();
         let writer_store = store.clone();
-        let mut writer =
-            tokio::spawn(async move { writer_store.publish_graph(next, &writer_control).await });
+        let mut writer = tokio::spawn(async move {
+            writer_store
+                .with_request(&writer_control)
+                .publish_graph(next)
+                .await
+        });
         tokio::time::timeout(Duration::from_secs(2), before_credit).await??;
         let reader_control = request()?;
-        let mut reader = Box::pin(store.read(
+        let mut reader = Box::pin(store.with_request(&reader_control).read(
             Some(generation(1)),
             read_budget()?,
-            &reader_control,
             |snapshot, budget| {
                 let graph = snapshot.graph(budget)?;
                 let (documents, cursor) = graph.documents(None, 8, budget)?;
@@ -129,25 +133,23 @@ async fn destroyed_packed_tables_admit_old_graph_reads_before_publication_finish
         } else {
             generation(2)
         };
+        let expected = Some(expected);
+        let verification_budget = read_budget()?;
         store
-            .read(
-                Some(expected),
-                read_budget()?,
-                &request()?,
-                move |snapshot, budget| {
-                    let graph = snapshot.graph(budget)?;
-                    assert_eq!(graph.info().files, 1);
-                    assert_eq!(graph.info().documents, 1);
-                    let (documents, _) = graph.documents(None, 8, budget)?;
-                    assert!(documents[0].code().starts_with(if cancelled {
-                        "fn fixture_1()"
-                    } else {
-                        "fn fixture_2()"
-                    }));
-                    assert_eq!(graph.info().content_digest == old_digest, cancelled);
-                    Ok(())
-                },
-            )
+            .with_request(&request()?)
+            .read(expected, verification_budget, move |snapshot, budget| {
+                let graph = snapshot.graph(budget)?;
+                assert_eq!(graph.info().files, 1);
+                assert_eq!(graph.info().documents, 1);
+                let (documents, _) = graph.documents(None, 8, budget)?;
+                assert!(documents[0].code().starts_with(if cancelled {
+                    "fn fixture_1()"
+                } else {
+                    "fn fixture_2()"
+                }));
+                assert_eq!(graph.info().content_digest == old_digest, cancelled);
+                Ok(())
+            })
             .await?;
         drop(store);
         runtime.shutdown(&request()?).await?;

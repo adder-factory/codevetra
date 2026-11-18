@@ -7,7 +7,7 @@ use crate::{
     NativeDatabase, NativeParseCacheBudgetPressure, NativeParseCacheError,
     NativeParseCacheRetentionPolicy, NativeParseCacheRetentionReport, NativeParseCacheStats,
     native_database::{now, timestamp_order, visit_state},
-    retrieval::native::{retain, visit_files},
+    retrieval::native::{RankedRows, visit_files},
     rocks::{ReadBudget, RocksError, StateTransaction},
 };
 use codevetra_domain::{ContentDigest, ProjectId};
@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 struct Inventory {
     stats: NativeParseCacheStats,
     contracts: BTreeMap<ContentDigest, (u64, String)>,
-    candidates: Vec<Header>,
+    candidates: RetentionCandidates,
     live: BTreeSet<(String, String, ContentDigest)>,
     workspace: usize,
     candidate_total: u64,
@@ -36,7 +36,7 @@ impl NativeDatabase {
         let request = crate::native_database::request_for(std::time::Duration::from_secs(30))
             .map_err(crate::native_database::storage_error)
             .map_err(NativeParseCacheError::from)?;
-        self.prune_native_parse_cache_with_request(project, protected, policy, &request)
+        self.prune_native_parse_cache_with_request(project, policy.protecting(protected), &request)
             .await
     }
 
@@ -46,27 +46,29 @@ impl NativeDatabase {
     pub async fn prune_native_parse_cache_with_request(
         &self,
         project: &ProjectId,
-        protected: &ContentDigest,
-        policy: NativeParseCacheRetentionPolicy,
+        selection: crate::NativeParseCacheRetention<'_>,
         request: &crate::rocks::StorageRequest,
     ) -> Result<NativeParseCacheRetentionReport, NativeParseCacheError> {
         self.require_project(project)
             .map_err(NativeParseCacheError::from)?;
-        let protected = protected.clone();
+        let protected = selection.protected.clone();
+        let policy = selection.policy;
         self.state_with_request(
-            None,
-            16 * 1_048_576,
-            100_000,
+            crate::rocks::StateAccess::write(None, PRUNE_WRITE_BYTES, PRUNE_WRITE_ROWS),
             request,
             move |transaction, budget| {
-                let mut inventory = inventory(transaction, budget, &protected, policy)?;
+                let mut inventory = inventory(transaction, budget, policy.protecting(&protected))?;
                 let before = inventory.stats;
                 let CacheRemoval {
                     headers: removal,
                     rows: row_cost,
                     incomplete,
                 } = plan_removal(&mut inventory, &protected, policy)?;
-                let orphans = orphaned(transaction, budget, 100_000_u32.saturating_sub(row_cost))?;
+                let orphans = orphaned(
+                    transaction,
+                    budget,
+                    PRUNE_WRITE_ROWS.saturating_sub(row_cost),
+                )?;
                 for header in &removal {
                     remove(transaction, header, true)?;
                 }
@@ -87,7 +89,7 @@ impl NativeDatabase {
                     rows_removed: removal.len() as u64,
                     payload_bytes_removed: before.payload_bytes - inventory.stats.payload_bytes,
                     deletion_limit_reached: incomplete
-                        || (inventory.candidates.len() as u64) < inventory.candidate_total,
+                        || (inventory.candidates.headers.len() as u64) < inventory.candidate_total,
                     pressure: NativeParseCacheBudgetPressure {
                         over_row_budget: inventory.stats.rows > policy.maximum_rows(),
                         over_payload_byte_budget: inventory.stats.payload_bytes
@@ -120,7 +122,7 @@ fn plan_removal(
         rows: 0,
         incomplete: false,
     };
-    for header in &inventory.candidates {
+    for header in &inventory.candidates.headers {
         let obsolete = !allowed.contains(&header.key.extractor_contract_digest)
             || (header.key.extractor_contract_digest == *protected && !is_live(inventory, header));
         if !obsolete && !over_capacity(inventory, policy) {
@@ -188,13 +190,13 @@ impl Inventory {
 fn inventory(
     transaction: &StateTransaction<'_>,
     budget: &mut ReadBudget,
-    protected: &ContentDigest,
-    policy: NativeParseCacheRetentionPolicy,
+    selection: crate::NativeParseCacheRetention<'_>,
 ) -> Result<Inventory, RocksError> {
+    let crate::NativeParseCacheRetention { protected, policy } = selection;
     let mut inventory = Inventory {
         stats: NativeParseCacheStats::default(),
         contracts: BTreeMap::new(),
-        candidates: Vec::new(),
+        candidates: RetentionCandidates::new(0),
         live: BTreeSet::new(),
         workspace: 0,
         candidate_total: 0,
@@ -215,58 +217,77 @@ fn inventory(
             Ok(())
         })?;
     }
-    visit_state::<Header>(transaction, NAMESPACE, b"h/", budget, |_, header, _| {
-        inventory.record_header(&header)
-    })?;
+    visit_state::<Header>(
+        &transaction.scan(NAMESPACE, b"h/"),
+        budget,
+        |_, header, _| inventory.record_header(&header),
+    )?;
     inventory.stats.contracts = inventory.contracts.len() as u64;
     let allowed = retained_contracts(&inventory, protected, policy);
     let capacity = over_capacity(&inventory, policy);
-    let maximum = usize::try_from(policy.maximum_deletions())
-        .map_err(|_| corrupt())?
-        .min(33_000);
-    let mut candidate_bytes = 0_usize;
-    visit_state::<Header>(transaction, NAMESPACE, b"h/", budget, |_, header, _| {
-        let protected_live =
-            header.key.extractor_contract_digest == *protected && is_live(&inventory, &header);
-        let obsolete = !allowed.contains(&header.key.extractor_contract_digest)
-            || (header.key.extractor_contract_digest == *protected && !protected_live);
-        if !protected_live && (obsolete || capacity) {
-            inventory.candidate_total += 1;
-            retain_candidate(
-                &mut inventory.candidates,
-                header,
-                maximum,
-                &mut candidate_bytes,
-            )?;
-        }
-        Ok(())
-    })?;
+    inventory.candidates = RetentionCandidates::new(
+        usize::try_from(policy.maximum_deletions())
+            .map_err(|_| corrupt())?
+            .min(MAXIMUM_CANDIDATES),
+    );
+    visit_state::<Header>(
+        &transaction.scan(NAMESPACE, b"h/"),
+        budget,
+        |_, header, _| {
+            let protected_live =
+                header.key.extractor_contract_digest == *protected && is_live(&inventory, &header);
+            let obsolete = !allowed.contains(&header.key.extractor_contract_digest)
+                || (header.key.extractor_contract_digest == *protected && !protected_live);
+            if !protected_live && (obsolete || capacity) {
+                inventory.candidate_total += 1;
+                inventory.candidates.retain(header)?;
+            }
+            Ok(())
+        },
+    )?;
     Ok(inventory)
 }
 
-fn retain_candidate(
-    candidates: &mut Vec<Header>,
-    header: Header,
-    maximum: usize,
-    bytes: &mut usize,
-) -> Result<(), RocksError> {
-    let order = |a: &Header, b: &Header| {
-        timestamp_order(&a.last_used, &b.last_used).then(a.key.path.cmp(&b.key.path))
-    };
-    let position = candidates.partition_point(|existing| !order(existing, &header).is_gt());
-    if position >= maximum {
-        return Ok(());
+const MAXIMUM_CANDIDATES: usize = 33_000;
+const CANDIDATE_ENTRY_OVERHEAD: usize = 512;
+const CANDIDATE_WORKSPACE_BYTES: usize = 32 * 1_048_576;
+const PRUNE_WRITE_BYTES: u32 = 16 * 1_048_576;
+const PRUNE_WRITE_ROWS: u32 = 100_000;
+
+struct RetentionCandidates {
+    headers: RankedRows<Header, fn(&Header, &Header) -> std::cmp::Ordering>,
+    bytes: usize,
+}
+
+impl RetentionCandidates {
+    fn new(maximum: usize) -> Self {
+        Self {
+            headers: RankedRows::new(maximum, |a, b| {
+                timestamp_order(&a.last_used, &b.last_used).then(a.key.path.cmp(&b.key.path))
+            }),
+            bytes: 0,
+        }
     }
-    if candidates.len() == maximum {
-        let last = candidates.last().ok_or(corrupt())?;
-        *bytes = bytes.saturating_sub(last.key.path.as_str().len() + 512);
+
+    fn retain(&mut self, header: Header) -> Result<(), RocksError> {
+        if !self.headers.would_retain(&header) {
+            return Ok(());
+        }
+        if self.headers.is_full() {
+            let last = self.headers.last().ok_or(corrupt())?;
+            self.bytes = self
+                .bytes
+                .saturating_sub(last.key.path.as_str().len() + CANDIDATE_ENTRY_OVERHEAD);
+        }
+        self.bytes = self
+            .bytes
+            .saturating_add(header.key.path.as_str().len() + CANDIDATE_ENTRY_OVERHEAD);
+        if self.bytes > CANDIDATE_WORKSPACE_BYTES {
+            return Err(workspace());
+        }
+        self.headers.insert(header);
+        Ok(())
     }
-    *bytes = bytes.saturating_add(header.key.path.as_str().len() + 512);
-    if *bytes > 32 * 1_048_576 {
-        return Err(workspace());
-    }
-    retain(candidates, header, maximum, order);
-    Ok(())
 }
 
 fn retained_contracts(
@@ -312,9 +333,7 @@ fn orphaned(
     let mut output = Vec::new();
     let mut rows = 0_u32;
     visit_state::<Prepared>(
-        transaction,
-        NAMESPACE,
-        b"s/",
+        &transaction.scan(NAMESPACE, b"s/"),
         budget,
         |key, prepared, budget| {
             let created = prepared

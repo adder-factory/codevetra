@@ -283,7 +283,7 @@ pub struct ExtractedSymbol {
     /// Whether implementation search text stopped at its per-symbol byte ceiling.
     pub body_search_truncated: bool,
     /// Privacy-safe structural and agent-prone detector counters computed from the body AST/text.
-    pub health: SymbolHealthMetrics,
+    pub health: crate::SymbolHealth,
     /// Implementation and test-ownership state.
     #[serde(flatten)]
     pub implementation: SymbolImplementationFlags,
@@ -382,6 +382,7 @@ impl CloneTokenProfile {
 }
 
 /// Bounded per-symbol metrics retained without source literals.
+/// Raw counters cover the full admitted AST and use a common 32-bit representation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolHealthMetrics {
     /// The actual native metrics producer; absent means unsupported or not evaluated.
@@ -393,75 +394,79 @@ pub struct SymbolHealthMetrics {
     /// Distinct source rows containing owned syntax, with comments and opaque literals collapsed.
     pub code_lines: u32,
     /// Number of parameter entries.
-    pub parameter_count: u16,
+    pub parameter_count: u32,
     /// Cyclomatic-complexity score for the symbol.
-    pub cyclomatic: u16,
+    pub cyclomatic: u32,
+    /// Whole-body, unguarded Rust value mapping, optionally passed to one uniform call.
+    /// Raw complexity is retained; the classification does not establish callee purity.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flat_value_mapping: bool,
     /// Maximum control-flow nesting depth.
-    pub max_nesting: u16,
+    pub max_nesting: u32,
     /// Maximum operands observed in one conditional expression.
-    pub max_conditional_operands: u16,
+    pub max_conditional_operands: u32,
     /// Bytes covered by outermost string and numeric literals inside the symbol body.
     pub literal_bytes: u32,
     /// Suspicious numeric literals not covered by a named-constant exemption.
-    pub magic_numbers: u16,
+    pub magic_numbers: u32,
     /// Hardcoded URL literals found in executable code.
-    pub hardcoded_urls: u16,
+    pub hardcoded_urls: u32,
     /// Actionable hardcoded URL literals passed to request/client operations.
-    pub hardcoded_url_requests: u16,
+    pub hardcoded_url_requests: u32,
     /// Actionable hardcoded URL literals assigned to endpoint-like configuration.
-    pub hardcoded_url_configuration: u16,
+    pub hardcoded_url_configuration: u32,
     /// Presentation, navigation, and vendor-asset URL literals intentionally abstained.
-    pub hardcoded_url_presentation_abstentions: u16,
+    pub hardcoded_url_presentation_abstentions: u32,
     /// Credential/PII handling confidence on a bounded integer 0-100 scale.
-    pub secrets_score: u16,
+    pub secrets_score: u32,
     /// Bit-set of the privacy-safe secret-signal categories contributing to the score.
     pub secrets_signal_mask: u16,
     /// Whether literal, environment, or exposure evidence makes secret handling actionable.
     pub secrets_actionable: bool,
     /// Count of documented numeric claims disjoint from a constant's current value.
-    pub stale_doc_numbers: u16,
+    pub stale_doc_numbers: u32,
     /// Nested-iteration patterns with a likely accidental quadratic cost.
-    pub accidental_quadratic: u16,
+    pub accidental_quadratic: u32,
     /// Catch or rescue clauses with an empty body.
-    pub empty_catches: u16,
+    pub empty_catches: u32,
     /// Synchronous I/O calls made from an asynchronous declaration.
-    pub sync_io_in_async: u16,
+    pub sync_io_in_async: u32,
     /// Loops that await each iteration sequentially.
-    pub sequential_await_loops: u16,
+    pub sequential_await_loops: u32,
     /// Awaited loops abstained because an awaited result feeds the next iteration.
-    pub serial_await_dependency_loops: u16,
+    pub serial_await_dependency_loops: u32,
     /// Awaited loops abstained because post-await break or return preserves ordering.
-    pub serial_await_control_flow_loops: u16,
+    pub serial_await_control_flow_loops: u32,
     /// Awaited loops abstained through an explicit `codevetra: serial-await` marker.
-    pub serial_await_intent_loops: u16,
+    pub serial_await_intent_loops: u32,
     /// Nested delegate methods assembled into a returned facade object.
-    pub facade_factory_delegates: u16,
+    pub facade_factory_delegates: u32,
     /// True when a function is a cohesive returned-object facade factory.
     pub facade_factory: bool,
     /// TypeScript casts that explicitly erase a value to `any`.
-    pub ts_any_casts: u16,
+    pub ts_any_casts: u32,
     /// TypeScript diagnostic-suppression directives.
-    pub ts_suppressions: u16,
+    pub ts_suppressions: u32,
     /// Debug logging calls retained in the declaration.
-    pub debug_logs: u16,
+    pub debug_logs: u32,
     /// TODO-like incomplete-implementation markers.
-    pub incomplete_markers: u16,
+    pub incomplete_markers: u32,
     /// Dynamic code-evaluation calls.
-    pub dynamic_eval: u16,
+    pub dynamic_eval: u32,
     /// Uses of cryptographic hashes that are unsuitable for security decisions.
-    pub insecure_hash: u16,
+    pub insecure_hash: u32,
     /// Uses of non-cryptographic randomness in security-sensitive shapes.
-    pub insecure_random: u16,
+    pub insecure_random: u32,
     /// HTTP client operations with no detected timeout.
-    pub http_without_timeout: u16,
+    pub http_without_timeout: u32,
     /// SQL statements assembled through string concatenation or interpolation.
-    pub sql_string_concatenation: u16,
+    pub sql_string_concatenation: u32,
     /// JSON parses whose result crosses a boundary without validation.
-    pub unsafe_json_parse: u16,
+    pub unsafe_json_parse: u32,
     /// Environment values consumed without detected validation.
-    pub unvalidated_env: u16,
+    pub unvalidated_env: u32,
     /// Declarations with an unexpectedly empty implementation body.
-    pub empty_body: u16,
+    pub empty_body: u32,
 }
 
 pub use codevetra_domain::biomarkers::HealthOperationSite;
@@ -471,33 +476,33 @@ impl SymbolHealthMetrics {
     #[must_use]
     pub fn source_metric(&self, metric: codevetra_domain::biomarkers::SourceHealthMetric) -> f64 {
         use codevetra_domain::biomarkers::SourceHealthMetric as M;
-        match metric {
-            M::CodeLines => f64::from(self.code_lines),
-            M::Cyclomatic => f64::from(self.cyclomatic),
-            M::MaxNesting => f64::from(self.max_nesting),
-            M::MaxConditionalOperands => f64::from(self.max_conditional_operands),
-            M::ParameterCount => f64::from(self.parameter_count),
-            M::EmptyBody => f64::from(self.empty_body),
-            M::MagicNumbers => f64::from(self.magic_numbers),
-            M::HardcodedUrls => f64::from(self.hardcoded_urls),
-            M::AccidentalQuadratic => f64::from(self.accidental_quadratic),
-            M::EmptyCatches => f64::from(self.empty_catches),
-            M::SyncIoInAsync => f64::from(self.sync_io_in_async),
-            M::SequentialAwaitLoops => f64::from(self.sequential_await_loops),
-            M::TsAnyCasts => f64::from(self.ts_any_casts),
-            M::TsSuppressions => f64::from(self.ts_suppressions),
-            M::DebugLogs => f64::from(self.debug_logs),
-            M::IncompleteMarkers => f64::from(self.incomplete_markers),
-            M::DynamicEval => f64::from(self.dynamic_eval),
-            M::InsecureHash => f64::from(self.insecure_hash),
-            M::InsecureRandom => f64::from(self.insecure_random),
-            M::HttpWithoutTimeout => f64::from(self.http_without_timeout),
-            M::SqlStringConcatenation => f64::from(self.sql_string_concatenation),
-            M::UnsafeJsonParse => f64::from(self.unsafe_json_parse),
-            M::UnvalidatedEnv => f64::from(self.unvalidated_env),
-            M::SecretsScore => f64::from(self.secrets_score),
-            M::BrainRisk => 0.0, // Calculated only by the shared evaluator.
-        }
+        f64::from(match metric {
+            M::CodeLines => self.code_lines,
+            M::Cyclomatic => self.cyclomatic,
+            M::MaxNesting => self.max_nesting,
+            M::MaxConditionalOperands => self.max_conditional_operands,
+            M::ParameterCount => self.parameter_count,
+            M::EmptyBody => self.empty_body,
+            M::MagicNumbers => self.magic_numbers,
+            M::HardcodedUrls => self.hardcoded_urls,
+            M::AccidentalQuadratic => self.accidental_quadratic,
+            M::EmptyCatches => self.empty_catches,
+            M::SyncIoInAsync => self.sync_io_in_async,
+            M::SequentialAwaitLoops => self.sequential_await_loops,
+            M::TsAnyCasts => self.ts_any_casts,
+            M::TsSuppressions => self.ts_suppressions,
+            M::DebugLogs => self.debug_logs,
+            M::IncompleteMarkers => self.incomplete_markers,
+            M::DynamicEval => self.dynamic_eval,
+            M::InsecureHash => self.insecure_hash,
+            M::InsecureRandom => self.insecure_random,
+            M::HttpWithoutTimeout => self.http_without_timeout,
+            M::SqlStringConcatenation => self.sql_string_concatenation,
+            M::UnsafeJsonParse => self.unsafe_json_parse,
+            M::UnvalidatedEnv => self.unvalidated_env,
+            M::SecretsScore => self.secrets_score,
+            M::BrainRisk => 0, // Calculated only by the shared evaluator.
+        })
     }
 }
 
@@ -569,6 +574,8 @@ pub enum ImportBindingKind {
     Named,
     /// `import * as Local from './module'`.
     Namespace,
+    /// Rust external module with an exact, source-relative `#[path = "..."]` file.
+    RustFileModule,
     /// `export * from './module'`, expanded after project-wide module resolution.
     ReExportAll,
     /// Syntax-recovered wildcard exports remain explicitly unresolved.

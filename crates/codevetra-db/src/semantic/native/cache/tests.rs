@@ -5,8 +5,8 @@ use crate::{
     GenerationFacts, GenerationValidationLimits, NativeDatabase, PendingEmbeddingPageInput,
     PendingEmbeddingPageRequest, SearchDocumentInput, SemanticReadinessRequest, SymbolInput,
     rocks::{
-        AsyncProjectStore, GraphBase, GraphPolicy, GraphPublicationInput, GraphRevision,
-        StorageRequest, StorageRuntime, StorePolicy, WorkerPolicy,
+        AsyncProjectStore, GraphBase, GraphPolicy, GraphRevision, StorageRequest, StorageRuntime,
+        StorePolicy, WorkerPolicy,
     },
     validate_generation_facts,
 };
@@ -55,37 +55,38 @@ async fn pending_embeddings_continue_after_an_empty_already_embedded_page() -> T
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn embedding_cursor_seeks_past_consumed_document_bodies() -> TestResult {
     let fixture = Fixture::new(false).await?;
-    let ids = fixture
-        .store
-        .state(
-            Some(generation()),
-            ReadBudget::new(100, 1_048_576, TIMEOUT)?,
-            0,
-            0,
-            &request()?,
-            |transaction, budget| {
-                let snapshot = transaction.graph_snapshot()?;
-                let graph = snapshot.graph(budget)?;
-                let cursor = crate::EmbeddingPageCursor {
-                    generation_id: generation(),
-                    after_row_id: 127,
-                    after_document: document(127),
-                };
-                let mut small = ReadBudget::new(4, 4096, TIMEOUT)?;
-                let mut ids = Vec::new();
-                let result = vectors::documents_scan_after(
-                    &graph,
-                    &mut small,
-                    Some(&cursor),
-                    |ordinal, row, _| {
+    let ids = {
+        let request_bound_access = crate::rocks::StateAccess::read_only(Some(generation()));
+        let request_bound_budget = ReadBudget::new(100, 1_048_576, TIMEOUT)?;
+        fixture
+            .store
+            .with_request(&request()?)
+            .state(
+                request_bound_access,
+                request_bound_budget,
+                |transaction, budget| {
+                    let snapshot = transaction.graph_snapshot()?;
+                    let graph = snapshot.graph(budget)?;
+                    let cursor = crate::EmbeddingPageCursor {
+                        generation_id: generation(),
+                        after_row_id: 127,
+                        after_document: document(127),
+                    };
+                    let mut small = ReadBudget::new(4, 4096, TIMEOUT)?;
+                    let mut ids = Vec::new();
+                    let result = vectors::DocumentScan {
+                        graph: &graph,
+                        start: Some(&cursor),
+                    }
+                    .visit(&mut small, |ordinal, row, _| {
                         ids.push((ordinal, row.document_id));
                         Ok(std::ops::ControlFlow::Continue(()))
-                    },
-                );
-                Ok(result.map(|()| ids))
-            },
-        )
-        .await??;
+                    });
+                    Ok(result.map(|()| ids))
+                },
+            )
+            .await
+    }??;
     assert_eq!(ids, vec![(128, document(128))]);
     fixture.runtime.shutdown(&request()?).await?;
     Ok(())
@@ -94,34 +95,30 @@ async fn embedding_cursor_seeks_past_consumed_document_bodies() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_summary_scopes_render_exact_source_without_loading_symbols() -> TestResult {
     let fixture = Fixture::new(false).await?;
-    let text = fixture
-        .store
-        .state(
-            Some(generation()),
-            ReadBudget::new(100, 1_048_576, TIMEOUT)?,
-            0,
-            0,
-            &request()?,
-            |transaction, budget| {
-                let snapshot = transaction.graph_snapshot()?;
-                let graph = snapshot.graph(budget)?;
-                let source = graph.document(&document(1), budget)?.ok_or(
-                    crate::rocks::RocksError::Corrupt {
-                        field: "test_document",
-                    },
-                )?;
-                let mut small = ReadBudget::new(8, 256, TIMEOUT)?;
-                Ok(vectors::source(
-                    transaction,
-                    &graph,
-                    &generation(),
-                    source,
-                    &mut small,
-                ))
-            },
-        )
-        .await??
-        .0;
+    let text = {
+        let request_bound_access = crate::rocks::StateAccess::read_only(Some(generation()));
+        let request_bound_budget = ReadBudget::new(100, 1_048_576, TIMEOUT)?;
+        fixture
+            .store
+            .with_request(&request()?)
+            .state(
+                request_bound_access,
+                request_bound_budget,
+                |transaction, budget| {
+                    let snapshot = transaction.graph_snapshot()?;
+                    let graph = snapshot.graph(budget)?;
+                    let source = graph.document(&document(1), budget)?.ok_or(
+                        crate::rocks::RocksError::Corrupt {
+                            field: "test_document",
+                        },
+                    )?;
+                    let mut small = ReadBudget::new(8, 256, TIMEOUT)?;
+                    Ok(vectors::SourceReader::new(transaction, &graph).render(source, &mut small))
+                },
+            )
+            .await
+    }??
+    .0;
     assert_eq!(
         text,
         "path:\nsrc/lib.rs\n\nlanguage:\nrust\n\nkind:\nsymbol\n\nname:\nfunction_1\n\ncode:\nfn function() {}"
@@ -136,7 +133,11 @@ async fn rerank_sources_preserve_order_and_reject_foreign_generations_and_missin
     let fixture = Fixture::new(false).await?;
     let project = fixture.database.project_id().clone();
     let query = |generation, documents| {
-        crate::RerankDocumentsRequest::new(project.clone(), generation, documents, TIMEOUT)
+        crate::RerankDocumentsRequest::new(
+            crate::CurrentGenerationLookup::new(&project, &generation),
+            documents,
+            TIMEOUT,
+        )
     };
     let inputs = fixture
         .database
@@ -287,9 +288,11 @@ impl Fixture {
         let runtime = StorageRuntime::new(WorkerPolicy::default())?;
         let store = AsyncProjectStore::open(
             &runtime,
-            root.path().to_owned(),
-            digest(1),
-            StorePolicy::default(),
+            crate::rocks::ProjectOpening::new(
+                root.path().to_owned(),
+                digest(1),
+                StorePolicy::default(),
+            ),
             &request()?,
         )
         .await?;
@@ -298,21 +301,22 @@ impl Fixture {
             GenerationValidationLimits::new(16 * 1_048_576, 64 * 1_048_576)?,
             || false,
         )?;
-        store
-            .publish_graph(
-                GraphPublicationInput::new(
-                    GraphRevision {
-                        generation_id: generation(),
-                        source_revision: digest(9),
-                        base: GraphBase::Empty,
-                    },
-                    facts,
-                    GraphPolicy::default(),
-                    &request()?,
-                )?,
+        {
+            let request_bound_input = crate::rocks::GraphPreparation::new(
+                GraphRevision {
+                    generation_id: generation(),
+                    source_revision: digest(9),
+                    base: GraphBase::Empty,
+                },
+                GraphPolicy::default(),
                 &request()?,
             )
-            .await?;
+            .resident(facts)?;
+            store
+                .with_request(&request()?)
+                .publish_graph(request_bound_input)
+                .await
+        }?;
         let database = NativeDatabase::new(store.clone(), &digest(1));
         let model = database
             .register_embedding_model(
@@ -397,32 +401,31 @@ impl Fixture {
     async fn bounded_query(&self) -> TestResult {
         let cache = self.database.semantic_cache.clone();
         let model = self.model.clone();
-        let hits = self
-            .store
-            .state(
-                Some(generation()),
-                ReadBudget::new(32, 16_384, TIMEOUT)?,
-                0,
-                0,
-                &request()?,
-                move |transaction, budget| {
-                    let snapshot = transaction.graph_snapshot()?;
-                    let graph = snapshot.graph(budget)?;
-                    Ok(top_k(
-                        &cache,
-                        VectorQuery {
-                            transaction,
-                            graph: &graph,
-                            generation: &generation(),
-                            model: &model,
-                            vector: &[1.0, 0.0],
-                            limit: 2,
-                        },
-                        budget,
-                    ))
-                },
-            )
-            .await??;
+        let hits = {
+            let request_bound_access = crate::rocks::StateAccess::read_only(Some(generation()));
+            let request_bound_budget = ReadBudget::new(32, 16_384, TIMEOUT)?;
+            self.store
+                .with_request(&request()?)
+                .state(
+                    request_bound_access,
+                    request_bound_budget,
+                    move |transaction, budget| {
+                        let snapshot = transaction.graph_snapshot()?;
+                        let graph = snapshot.graph(budget)?;
+                        Ok(cache.top_k(
+                            VectorQuery {
+                                transaction,
+                                graph: &graph,
+                                model: &model,
+                                vector: &[1.0, 0.0],
+                                limit: 2,
+                            },
+                            budget,
+                        ))
+                    },
+                )
+                .await
+        }??;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].document_id(), &document(1));
         assert!(hits[0].distance().abs() < 1e-12);
@@ -474,17 +477,19 @@ async fn exhausted_readiness_discards_partial_corpus_and_releases_builder() -> T
     let fixture = Fixture::new(true).await?;
     let cache = fixture.database.semantic_cache.clone();
     let model = fixture.model.clone();
-    let result = fixture
-        .store
-        .state(
-            Some(generation()),
-            ReadBudget::new(400, 1_048_576, TIMEOUT)?,
-            0,
-            0,
-            &request()?,
-            move |transaction, budget| Ok(readiness(&cache, transaction, &model, budget)),
-        )
-        .await?;
+    let result = {
+        let request_bound_access = crate::rocks::StateAccess::read_only(Some(generation()));
+        let request_bound_budget = ReadBudget::new(400, 1_048_576, TIMEOUT)?;
+        fixture
+            .store
+            .with_request(&request()?)
+            .state(
+                request_bound_access,
+                request_bound_budget,
+                move |transaction, budget| Ok(cache.readiness(transaction, &model, budget)),
+            )
+            .await
+    }?;
     assert!(result.is_err());
     {
         let cached = fixture
@@ -510,9 +515,10 @@ async fn corrupt_readiness_cannot_publish_a_partial_corpus() -> TestResult {
     let broken = key.clone();
     fixture
         .database
-        .state(None, 1024, 1, move |tx, _| {
-            tx.put(StateNamespace::Embeddings, &broken, vec![0])
-        })
+        .state(
+            crate::rocks::StateAccess::write(None, 1024, 1),
+            move |tx, _| tx.put(StateNamespace::Embeddings, &broken, vec![0]),
+        )
         .await?;
     assert!(fixture.readiness().await.is_err());
     {
@@ -528,9 +534,10 @@ async fn corrupt_readiness_cannot_publish_a_partial_corpus() -> TestResult {
     }
     fixture
         .database
-        .state(None, 1024, 1, move |tx, _| {
-            tx.delete(StateNamespace::Embeddings, &key)
-        })
+        .state(
+            crate::rocks::StateAccess::write(None, 1024, 1),
+            move |tx, _| tx.delete(StateNamespace::Embeddings, &key),
+        )
         .await?;
     fixture.fill(true).await?;
     assert!(fixture.readiness().await?.ready());

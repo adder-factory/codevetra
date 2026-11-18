@@ -3,8 +3,8 @@ use crate::{
     AgentArtifactQuery, GenerationFacts, GenerationValidationLimits, SummarySaveInput,
     SymbolSummarySaveInput,
     rocks::{
-        AsyncProjectStore, GraphBase, GraphPolicy, GraphPublicationInput, GraphRevision,
-        StorageRequest, StorageRuntime, StorePolicy, WorkerPolicy,
+        AsyncProjectStore, GraphBase, GraphPolicy, GraphRevision, StorageRequest, StorageRuntime,
+        StorePolicy, WorkerPolicy,
     },
     validate_generation_facts,
 };
@@ -37,9 +37,11 @@ impl Fixture {
         let runtime = StorageRuntime::new(WorkerPolicy::default())?;
         let store = AsyncProjectStore::open(
             &runtime,
-            root.path().to_owned(),
-            digest(1),
-            StorePolicy::default(),
+            crate::rocks::ProjectOpening::new(
+                root.path().to_owned(),
+                digest(1),
+                StorePolicy::default(),
+            ),
             &request()?,
         )
         .await?;
@@ -88,21 +90,22 @@ impl Fixture {
             GenerationValidationLimits::new(64 * 1_048_576, 128 * 1_048_576)?,
             || false,
         )?;
-        store
-            .publish_graph(
-                GraphPublicationInput::new(
-                    GraphRevision {
-                        generation_id: GenerationId::from_uuid_v8([1; 16]),
-                        source_revision: digest(9),
-                        base: GraphBase::Empty,
-                    },
-                    facts,
-                    GraphPolicy::default(),
-                    &request()?,
-                )?,
+        {
+            let request_bound_input = crate::rocks::GraphPreparation::new(
+                GraphRevision {
+                    generation_id: GenerationId::from_uuid_v8([1; 16]),
+                    source_revision: digest(9),
+                    base: GraphBase::Empty,
+                },
+                GraphPolicy::default(),
                 &request()?,
             )
-            .await?;
+            .resident(facts)?;
+            store
+                .with_request(&request()?)
+                .publish_graph(request_bound_input)
+                .await
+        }?;
         let database = NativeDatabase::new(store, &digest(1));
         for id in 1..=4 {
             database
@@ -171,23 +174,7 @@ async fn bounded_batch_scans_unrelated_symbols_once_and_preserves_order_and_qual
     for item in &mut owned {
         item.mode = "structural_rule";
     }
-    let singles = owned.clone();
-    let repeated = db
-        .store
-        .state(
-            None,
-            ReadBudget::new(6_000, 16 * 1_048_576, Duration::from_secs(30))?,
-            WRITE_BYTES,
-            4 * WRITE_ROWS,
-            &request()?,
-            move |transaction, budget| {
-                for item in singles {
-                    save_batch(transaction, budget, vec![item], false)?;
-                }
-                Ok(())
-            },
-        )
-        .await;
+    let repeated = repeated_file_scans(db, owned.clone()).await;
     assert!(matches!(
         repeated,
         Err(RocksError::Limit {
@@ -195,17 +182,25 @@ async fn bounded_batch_scans_unrelated_symbols_once_and_preserves_order_and_qual
         })
     ));
     // One streaming graph scan fits; repeating it for each scope exceeds these bounds.
-    let records = db
-        .store
-        .state(
-            None,
-            ReadBudget::new(6_000, 16 * 1_048_576, Duration::from_secs(30))?,
-            WRITE_BYTES,
-            4 * WRITE_ROWS,
-            &request()?,
-            move |transaction, budget| save_batch(transaction, budget, owned, false),
-        )
-        .await?;
+    let records = {
+        let request_bound_access =
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, 4 * WRITE_ROWS);
+        let request_bound_budget = ReadBudget::new(6_000, 16 * 1_048_576, Duration::from_secs(30))?;
+        db.store
+            .with_request(&request()?)
+            .state(
+                request_bound_access,
+                request_bound_budget,
+                move |transaction, budget| {
+                    SaveBatch {
+                        requests: owned,
+                        modules: false,
+                    }
+                    .save(transaction, budget)
+                },
+            )
+            .await
+    }?;
     let scopes = records
         .iter()
         .map(|record| record.as_ref().map(Record::scope_key))
@@ -323,22 +318,24 @@ async fn durable_trace_waits_for_a_real_mutation_transaction() -> TestResult {
     let (release, wait) = std::sync::mpsc::channel();
     let store = db.store.clone();
     let writing = tokio::spawn(async move {
-        store
-            .state(
-                None,
-                ReadBudget::new(100, 1_048_576, Duration::from_secs(10))?,
-                4096,
-                1,
-                &StorageRequest::new(Duration::from_secs(10))?,
-                move |transaction, _| {
-                    transaction.put(StateNamespace::Metadata, b"writer-test", vec![1])?;
-                    entered.send(()).map_err(|()| RocksError::Cancelled)?;
-                    wait.recv_timeout(Duration::from_secs(5))
-                        .map_err(|_| RocksError::Cancelled)?;
-                    Ok(())
-                },
-            )
-            .await
+        {
+            let request_bound_access = crate::rocks::StateAccess::write(None, 4096, 1);
+            let request_bound_budget = ReadBudget::new(100, 1_048_576, Duration::from_secs(10))?;
+            store
+                .with_request(&StorageRequest::new(Duration::from_secs(10))?)
+                .state(
+                    request_bound_access,
+                    request_bound_budget,
+                    move |transaction, _| {
+                        transaction.put(StateNamespace::Metadata, b"writer-test", vec![1])?;
+                        entered.send(()).map_err(|()| RocksError::Cancelled)?;
+                        wait.recv_timeout(Duration::from_secs(5))
+                            .map_err(|_| RocksError::Cancelled)?;
+                        Ok(())
+                    },
+                )
+                .await
+        }
     });
     tokio::time::timeout(Duration::from_secs(3), started).await??;
     let database = db.clone();
@@ -367,4 +364,32 @@ async fn durable_trace_waits_for_a_real_mutation_transaction() -> TestResult {
     assert!(blocked, "trace mutation bypassed the held transaction");
     fixture.runtime.shutdown(&request()?).await?;
     Ok(())
+}
+
+async fn repeated_file_scans(
+    db: &NativeDatabase,
+    singles: Vec<OwnedSave>,
+) -> Result<(), RocksError> {
+    {
+        let request_bound_access =
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, 4 * WRITE_ROWS);
+        let request_bound_budget = ReadBudget::new(6_000, 16 * 1_048_576, Duration::from_secs(30))?;
+        db.store
+            .with_request(&StorageRequest::new(Duration::from_secs(30))?)
+            .state(
+                request_bound_access,
+                request_bound_budget,
+                move |transaction, budget| {
+                    for item in singles {
+                        SaveBatch {
+                            requests: vec![item],
+                            modules: false,
+                        }
+                        .save(transaction, budget)?;
+                    }
+                    Ok(())
+                },
+            )
+            .await
+    }
 }

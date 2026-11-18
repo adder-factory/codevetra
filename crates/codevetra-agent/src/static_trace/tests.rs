@@ -8,7 +8,7 @@ async fn cancellation_retains_a_bounded_prefix_without_claiming_final_freshness(
     let root = tempfile::tempdir()?;
     std::fs::write(
         root.path().join("trace.ts"),
-        "export function entry() { return target(); }\nexport function target() { return 7; }\n",
+        "export function entry() { target(); return target(); }\nexport function target() { return entry(); }\n",
     )?;
     let runtime = ProjectRuntime::open(root.path()).await?;
     let indexed = runtime
@@ -56,6 +56,23 @@ async fn cancellation_retains_a_bounded_prefix_without_claiming_final_freshness(
         .await?;
     assert!(complete.fresh);
     assert_eq!(complete.functions.len(), 2);
+    assert_eq!(complete.functions[0].calls.len(), 2);
+    assert_eq!(complete.functions[0].calls[0].state, "resolved_static_call");
+    assert_eq!(
+        complete.functions[0].calls[1].state,
+        "definition_reuse_or_recursion_boundary"
+    );
+    assert_eq!(
+        complete.functions[1].calls[0].state,
+        "definition_reuse_or_recursion_boundary"
+    );
+    assert!(
+        complete
+            .functions
+            .iter()
+            .flat_map(|function| &function.calls)
+            .all(|call| call.expanded)
+    );
     let cancelled = ProjectCancellation::new();
     cancelled.cancel();
     assert!(matches!(

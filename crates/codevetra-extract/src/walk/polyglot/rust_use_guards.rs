@@ -30,6 +30,7 @@ const EXPRESSION_MACROS: [&str; 23] = [
     "dbg",
     "compile_error",
 ];
+const MAXIMUM_FLAT_ARGUMENT_NODES: usize = 4_096;
 
 pub(super) fn unrepresented_bindings(
     builder: &mut ExtractionBuilder<'_, '_>,
@@ -113,7 +114,7 @@ fn opaque_macro(
     let standard = if item {
         builtin_compile_error(builder, node)?
     } else {
-        None
+        qualified_expression_macro(builder, (node, tokens))?
     };
     builder.emit_import_binding(ExtractedImportBinding {
         kind: ImportBindingKind::Namespace,
@@ -128,6 +129,67 @@ fn opaque_macro(
         span: crate::walk::syntax::span_for(tokens)?,
     })?;
     block_macro(builder, node)
+}
+
+fn qualified_expression_macro(
+    builder: &mut ExtractionBuilder<'_, '_>,
+    (node, tokens): (Node<'_>, Node<'_>),
+) -> Result<Option<String>, ExtractError> {
+    let Some(name) = node.child_by_field_name("macro") else {
+        return Ok(None);
+    };
+    let path = super::qualified_path::lookup_name(builder, name)?;
+    if path.as_deref().and_then(|path| path.rsplit("::").next()) == Some("compile_error")
+        || !flat_expression_arguments(builder, tokens)?
+    {
+        return Ok(None);
+    }
+    standard_expression_macro(builder, node)
+}
+
+/// Without blocks, declarations, or nested invocations, standard expression
+/// arguments cannot introduce a different type/module binding for a qualified
+/// path. Value bindings remain opaque to unqualified-name resolution.
+fn flat_expression_arguments(
+    builder: &mut ExtractionBuilder<'_, '_>,
+    tokens: Node<'_>,
+) -> Result<bool, ExtractError> {
+    if tokens.has_error() || tokens.descendant_count() > MAXIMUM_FLAT_ARGUMENT_NODES {
+        return Ok(false);
+    }
+    for token in super::super::syntax::descendants_including_root(tokens) {
+        builder.context.ensure_active()?;
+        if token.kind() == "token_tree" && builder.context.text(token).starts_with('{') {
+            return Ok(false);
+        }
+        let spelling = if token.kind() == "identifier" {
+            builder.context.text(token)
+        } else {
+            token.kind()
+        };
+        if matches!(
+            spelling,
+            "!" | "#"
+                | ";"
+                | "let"
+                | "fn"
+                | "struct"
+                | "enum"
+                | "union"
+                | "type"
+                | "trait"
+                | "mod"
+                | "use"
+                | "impl"
+                | "const"
+                | "static"
+                | "extern"
+                | "macro_rules"
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn builtin_compile_error(
@@ -214,14 +276,19 @@ fn macro_import(
     if !super::super::rust_macro::has_macro_use(builder, node) {
         return Ok(());
     }
-    let Some(scope) = node
-        .parent()
-        .filter(|scope| node.end_byte() < scope.end_byte())
-    else {
+    let Some(scope) = node.parent().filter(|scope| {
+        node.kind() == "extern_crate_declaration" || node.end_byte() < scope.end_byte()
+    }) else {
         return Ok(());
     };
-    let span = SourceSpan::new(end_position(node)?, end_position(scope)?)
-        .map_err(|_| ExtractError::InvalidSpan)?;
+    let span = if node.kind() == "extern_crate_declaration" {
+        // The macro-use prelude applies before the extern-crate declaration;
+        // module macro imports instead retain their textual after-only scope.
+        crate::walk::syntax::span_for(scope)?
+    } else {
+        SourceSpan::new(end_position(node)?, end_position(scope)?)
+            .map_err(|_| ExtractError::InvalidSpan)?
+    };
     builder.emit_import_binding(ExtractedImportBinding {
         kind: ImportBindingKind::Namespace,
         module_specifier: "<rust-opaque-macro-import>".to_owned(),

@@ -1,7 +1,8 @@
 //! Read canonical fixed-point centrality without recomputation or SQL.
 
 use crate::{
-    NativeDatabase, StorageError, SymbolBetweennessScore, SymbolPageRankScore, rocks::RocksError,
+    NativeDatabase, StorageError, SymbolBetweennessScore, SymbolInput, SymbolPageRankScore,
+    rocks::RocksError,
 };
 use codevetra_domain::{GenerationId, ProjectId, SymbolId};
 use std::{collections::BTreeSet, time::Duration};
@@ -16,17 +17,7 @@ impl NativeDatabase {
         expected: &GenerationId,
         symbols: &[SymbolId],
     ) -> Result<Vec<SymbolBetweennessScore>, StorageError> {
-        self.native_centrality(
-            project,
-            expected,
-            symbols,
-            |symbol, value| SymbolBetweennessScore {
-                symbol_id: symbol,
-                score: value,
-            },
-            false,
-        )
-        .await
+        self.native_centrality(project, expected, symbols).await
     }
 
     /// Read directed `PageRank` evidence from the expected complete generation.
@@ -38,26 +29,14 @@ impl NativeDatabase {
         expected: &GenerationId,
         symbols: &[SymbolId],
     ) -> Result<Vec<SymbolPageRankScore>, StorageError> {
-        self.native_centrality(
-            project,
-            expected,
-            symbols,
-            |symbol, value| SymbolPageRankScore {
-                symbol_id: symbol,
-                score: value,
-            },
-            true,
-        )
-        .await
+        self.native_centrality(project, expected, symbols).await
     }
 
-    async fn native_centrality<T: Send + 'static>(
+    async fn native_centrality<T: CentralityScore>(
         &self,
         project: &ProjectId,
         expected: &GenerationId,
         symbols: &[SymbolId],
-        record: fn(SymbolId, Option<f64>) -> T,
-        pagerank: bool,
     ) -> Result<Vec<T>, StorageError> {
         self.require_project(project)?;
         if symbols.len() > 500 {
@@ -73,18 +52,38 @@ impl NativeDatabase {
                     let symbol = graph
                         .symbol(&id, budget)?
                         .ok_or(RocksError::GenerationChanged)?;
-                    let score = if pagerank {
-                        symbol.pagerank_ppb
-                    } else {
-                        symbol.betweenness_ppb
-                    };
-                    Ok(record(
-                        id,
-                        score.map(|value| f64::from(value) / 1_000_000_000.0),
-                    ))
+                    Ok(T::from_symbol(id, &symbol))
                 })
                 .collect()
         })
         .await
     }
+}
+
+// The result type selects its own stored score, so the two centrality measures
+// cannot be paired with the wrong record constructor by a boolean argument.
+trait CentralityScore: Send + 'static {
+    fn from_symbol(id: SymbolId, symbol: &SymbolInput) -> Self;
+}
+
+impl CentralityScore for SymbolBetweennessScore {
+    fn from_symbol(symbol_id: SymbolId, symbol: &SymbolInput) -> Self {
+        Self {
+            symbol_id,
+            score: normalized_score(symbol.betweenness_ppb),
+        }
+    }
+}
+
+impl CentralityScore for SymbolPageRankScore {
+    fn from_symbol(symbol_id: SymbolId, symbol: &SymbolInput) -> Self {
+        Self {
+            symbol_id,
+            score: normalized_score(symbol.pagerank_ppb),
+        }
+    }
+}
+
+fn normalized_score(parts_per_billion: Option<u32>) -> Option<f64> {
+    parts_per_billion.map(|value| f64::from(value) / super::SCORE_PARTS_PER_BILLION)
 }

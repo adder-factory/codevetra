@@ -33,14 +33,9 @@ where
         return Err(StageItemFailure);
     }
     if request.kind == ReferenceKind::Imports {
-        return Ok(Some(resolve_import(
-            index,
-            request,
-            request.name,
-            PROVENANCE,
-            UNRESOLVED,
-            cancelled,
-        )?));
+        return Ok(Some(
+            IncludeTarget::Kamailio(request.name).resolve(index, request, cancelled)?,
+        ));
     }
     resolve_route(index, request, cancelled).map(Some)
 }
@@ -59,14 +54,7 @@ where
     if request.kind == ReferenceKind::Imports
         && let Some(specifier) = request.name.strip_prefix("freeswitch::include::")
     {
-        return resolve_import(
-            index,
-            request,
-            specifier,
-            "native-freeswitch-static-config",
-            "native-freeswitch-unresolved",
-            cancelled,
-        );
+        return IncludeTarget::FreeSwitch(specifier).resolve(index, request, cancelled);
     }
     Ok(ReferenceResolution::unresolved(
         "native-freeswitch-external",
@@ -96,7 +84,7 @@ where
         if candidate.kind != SymbolKind::Function || candidate.qualified_name != request.name {
             continue;
         }
-        if !route_visible(index, request, &candidate.file_id, cancelled)? {
+        if !request.telephony_route_visible(index, &candidate.file_id, cancelled)? {
             continue;
         }
         if retained.is_some() {
@@ -115,60 +103,76 @@ where
     ))
 }
 
-fn route_visible<Cancel>(
-    index: &ResolutionIndex,
-    request: &ResolutionRequest<'_>,
-    file: &FileId,
-    cancelled: &mut Cancel,
-) -> Result<bool, StageItemFailure>
-where
-    Cancel: FnMut() -> bool,
-{
-    let mut visible = file == request.file_id;
-    for binding in request.import_bindings.bindings {
-        if cancelled() {
-            return Err(StageItemFailure);
+impl ResolutionRequest<'_> {
+    fn telephony_route_visible<Cancel>(
+        &self,
+        index: &ResolutionIndex,
+        file: &FileId,
+        cancelled: &mut Cancel,
+    ) -> Result<bool, StageItemFailure>
+    where
+        Cancel: FnMut() -> bool,
+    {
+        let mut visible = file == self.file_id;
+        for binding in self.import_bindings.bindings {
+            if cancelled() {
+                return Err(StageItemFailure);
+            }
+            visible |= include_file(index, self, binding) == Some(file);
         }
-        visible |= include_file(index, request, binding) == Some(file);
+        Ok(visible)
     }
-    Ok(visible)
 }
 
-fn resolve_import<Cancel>(
-    index: &ResolutionIndex,
-    request: &ResolutionRequest<'_>,
-    specifier: &str,
-    provenance: &'static str,
-    unresolved: &'static str,
-    cancelled: &mut Cancel,
-) -> Result<ReferenceResolution, StageItemFailure>
-where
-    Cancel: FnMut() -> bool,
-{
-    let mut file = None;
-    // Prefixed XML lookup names differ from the source-visible import name,
-    // so select the exact span/specifier from the file's retained bindings.
-    for binding in request.import_bindings.bindings {
-        if cancelled() {
-            return Err(StageItemFailure);
+// Each dialect keeps its literal include and resolution provenance together.
+enum IncludeTarget<'a> {
+    Kamailio(&'a str),
+    FreeSwitch(&'a str),
+}
+
+impl IncludeTarget<'_> {
+    fn resolve<Cancel>(
+        self,
+        index: &ResolutionIndex,
+        request: &ResolutionRequest<'_>,
+        cancelled: &mut Cancel,
+    ) -> Result<ReferenceResolution, StageItemFailure>
+    where
+        Cancel: FnMut() -> bool,
+    {
+        let (specifier, provenance, unresolved) = match self {
+            Self::Kamailio(specifier) => (specifier, PROVENANCE, UNRESOLVED),
+            Self::FreeSwitch(specifier) => (
+                specifier,
+                "native-freeswitch-static-config",
+                "native-freeswitch-unresolved",
+            ),
+        };
+        let mut file = None;
+        // Prefixed XML lookup names differ from the source-visible import name,
+        // so select the exact span/specifier from the file's retained bindings.
+        for binding in request.import_bindings.bindings {
+            if cancelled() {
+                return Err(StageItemFailure);
+            }
+            if binding.span == request.span && binding.module_specifier == specifier {
+                file = include_file(index, request, binding);
+                break;
+            }
         }
-        if binding.span == request.span && binding.module_specifier == specifier {
-            file = include_file(index, request, binding);
-            break;
-        }
+        let target = file
+            .and_then(|id| index.file_symbols.get(id))
+            .map(|id| ResolvedTarget {
+                symbol_id: id.clone(),
+                kind: SymbolKind::File,
+                confidence: 1.0,
+                provenance,
+            });
+        Ok(target.map_or_else(
+            || ReferenceResolution::unresolved(unresolved),
+            ReferenceResolution::resolved,
+        ))
     }
-    let target = file
-        .and_then(|id| index.file_symbols.get(id))
-        .map(|id| ResolvedTarget {
-            symbol_id: id.clone(),
-            kind: SymbolKind::File,
-            confidence: 1.0,
-            provenance,
-        });
-    Ok(target.map_or_else(
-        || ReferenceResolution::unresolved(unresolved),
-        ReferenceResolution::resolved,
-    ))
 }
 
 /// `FreeSWITCH` includes use the including XML directory. Kamailio first tries

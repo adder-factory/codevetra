@@ -1,5 +1,7 @@
 //! Canonicalization used by the validated source-path type.
 
+const MAXIMUM_PATH_BYTES: usize = 4096;
+
 pub(super) fn drive_prefix(first: u8, second: u8) -> bool {
     first.is_ascii_alphabetic() && second == b':'
 }
@@ -10,10 +12,9 @@ pub(super) fn normalize_path(raw: &str) -> Option<String> {
 
 pub(super) fn normalize_bytes(raw: &[u8]) -> Option<Vec<u8>> {
     if raw.is_empty()
-        || raw.len() > 4096
-        || raw[0] == b'/'
-        || raw[0] == b'\\'
-        || (raw.len() >= 2 && drive_prefix(raw[0], raw[1]))
+        || raw.len() > MAXIMUM_PATH_BYTES
+        || matches!(raw[0], b'/' | b'\\')
+        || has_drive_prefix(raw)
     {
         return None;
     }
@@ -29,14 +30,17 @@ pub(super) fn normalize_bytes(raw: &[u8]) -> Option<Vec<u8>> {
             start = end + 1;
         }
     }
-    if canonical.is_empty()
-        || canonical.len() > 4096
-        || (canonical.len() >= 2 && drive_prefix(canonical[0], canonical[1]))
+    if canonical.is_empty() || canonical.len() > MAXIMUM_PATH_BYTES || has_drive_prefix(&canonical)
     {
         None
     } else {
         Some(canonical)
     }
+}
+
+fn has_drive_prefix(path: &[u8]) -> bool {
+    path.get(..2)
+        .is_some_and(|prefix| drive_prefix(prefix[0], prefix[1]))
 }
 
 fn append_component(canonical: &mut Vec<u8>, component: &[u8]) -> Option<()> {

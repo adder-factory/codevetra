@@ -76,8 +76,23 @@ regressions, and complete the original general proofs under the same bounds.
 
 Kani compiles production modules by path. Verus receives unchanged executable
 function bodies extracted by `scripts/prepare-formal.py`, plus independently
-specified integer postconditions. A changed signature or ambiguous function
-fails extraction. The generated code has no `external_body`, unchecked proof,
+specified integer postconditions. Modules can explicitly list scalar constants
+in `verification/contracts.json`; the bridge copies each current production
+initializer and checks its declared type. Expected formulas retain independent
+numeric values, so changing a production constant cannot silently change its
+proof obligation. Missing or ambiguous declarations, changed signatures, and
+nested or attributed constants, module attributes, and block constant initializers
+fail extraction. Constant binding currently supports unconditional declarations
+at the source file's own module scope. The same bridge binds explicitly listed
+struct fields for both verifiers. It copies the production declaration after
+checking its complete field signature, module scope, and exact reviewed outer
+attributes; missing, duplicate, nested, conditional, or changed declarations fail.
+For the coordinate, policy, writer-identity, and retention-state types,
+serialization/derive attributes are checked but omitted
+from the proof declaration: the proofs cover raw coordinate ordering, storage-policy bounds, writer identity, and retention decisions, including
+invalid inputs, rather than serialization or constructors. Kani's
+generated include is created inside the disposable sandbox before every run;
+there is no handwritten substitute for the production fields. The generated code has no `external_body`, unchecked proof,
 or handwritten implementation copy; Verus runs with `--no-cheating`. The
 compiler, solvers, verifier specifications and extraction bridge remain trusted
 components. This follows the complete success/failure specification approach

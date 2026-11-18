@@ -54,6 +54,7 @@ mod resource_resolution;
 mod route_bridges;
 mod rust_dependency_paths;
 mod rust_facade_resolution;
+mod rust_file_modules;
 mod rust_inline_modules;
 mod rust_local_types;
 mod rust_path_guards;
@@ -2718,7 +2719,7 @@ struct NativeSymbolFacts {
     docstring: Option<String>,
     body_search_text: String,
     body_search_truncated: bool,
-    health: codevetra_extract::SymbolHealthMetrics,
+    health: codevetra_extract::SymbolHealth,
     implementation: SymbolImplementationFlags,
     export: SymbolExportFlags,
     execution: SymbolExecutionFlags,
@@ -2757,7 +2758,7 @@ impl NativeSymbolFacts {
     fn modeled_retained_bytes(&self) -> u64 {
         usize_to_u64(size_of::<Self>())
             .saturating_add(modeled_symbol_input_bytes(&self.input))
-            .saturating_add(usize_to_u64(self.health.operation_sites.retained_bytes()))
+            .saturating_add(usize_to_u64(self.health.retained_bytes()))
             .saturating_add(usize_to_u64(self.name.capacity()))
             .saturating_add(usize_to_u64(self.body_search_text.capacity()))
             .saturating_add(usize_to_u64(self.clone_shape_digest.as_str().len()))
@@ -8125,7 +8126,8 @@ fn index_project_reexports(
             | ImportBindingKind::ReExportNamed
             | ImportBindingKind::ReExportUncertain
             | ImportBindingKind::IncludeQuoted
-            | ImportBindingKind::IncludeSystem => continue,
+            | ImportBindingKind::IncludeSystem
+            | ImportBindingKind::RustFileModule => continue,
         };
         let source_symbol_id = if namespace {
             let mut owners = file.symbols.iter().filter(|symbol| {
@@ -8518,6 +8520,34 @@ struct ReferenceLookup<'reference> {
 }
 
 impl<'reference> ReferenceLookup<'reference> {
+    fn apply_dispatch(
+        &self,
+        language: &str,
+        mut resolution: ReferenceResolution,
+    ) -> ReferenceResolution {
+        // A Rust receiver invocation cannot call a free function. The general
+        // project-name fallback is useful across languages, but its function
+        // candidates are not valid method evidence even when uniquely named.
+        if language == "rust"
+            && self.dynamic_dispatch_name.is_some()
+            && resolution
+                .target
+                .as_ref()
+                .is_some_and(|target| target.kind != SymbolKind::Method)
+        {
+            resolution = ReferenceResolution::unresolved(DYNAMIC_DISPATCH_UNRESOLVED_PROVENANCE);
+        }
+        if self.dynamic_dispatch_name.is_some()
+            && let Some(target) = resolution.target.as_mut()
+            && target.provenance != generic_resolution::CURRENT_CLASS_PROVENANCE
+            && target.provenance != native_bridge_details::ALIAS_PROVENANCE
+        {
+            target.confidence = DYNAMIC_DISPATCH_CONFIDENCE;
+            target.provenance = DYNAMIC_DISPATCH_PROVENANCE;
+        }
+        resolution
+    }
+
     fn classify(reference: &'reference ExtractedReference) -> Self {
         let resolution_name = reference.resolution_name.as_deref();
         let fenced_name = resolution_name
@@ -8631,7 +8661,7 @@ where
         );
     }
     let lookup = ReferenceLookup::classify(reference);
-    let mut resolution = resolve_lookup_reference(
+    let resolution = resolve_lookup_reference(
         index,
         (
             ExtractedReferenceQuery {
@@ -8643,26 +8673,7 @@ where
         ),
         cancelled,
     )?;
-    // A Rust receiver invocation cannot call a free function. The general
-    // project-name fallback is useful across languages, but its function
-    // candidates are not valid method evidence even when uniquely named.
-    if context.identity.language == "rust"
-        && lookup.dynamic_dispatch_name.is_some()
-        && resolution
-            .target
-            .as_ref()
-            .is_some_and(|target| target.kind != SymbolKind::Method)
-    {
-        resolution = ReferenceResolution::unresolved(DYNAMIC_DISPATCH_UNRESOLVED_PROVENANCE);
-    }
-    if lookup.dynamic_dispatch_name.is_some()
-        && let Some(target) = resolution.target.as_mut()
-        && target.provenance != generic_resolution::CURRENT_CLASS_PROVENANCE
-        && target.provenance != native_bridge_details::ALIAS_PROVENANCE
-    {
-        target.confidence = DYNAMIC_DISPATCH_CONFIDENCE;
-        target.provenance = DYNAMIC_DISPATCH_PROVENANCE;
-    }
+    let resolution = lookup.apply_dispatch(&context.identity.language, resolution);
     let resolution = go_module_paths::prefer(
         index,
         (
@@ -10244,6 +10255,9 @@ where
         source_name,
     } = query;
     let resolution = resolve_reference(index, request, cancelled)?;
+    if resolution.target.is_some() {
+        return Ok(resolution);
+    }
     let package_qualified = request
         .name
         .strip_suffix(source_name)
@@ -10251,8 +10265,7 @@ where
     // Any declaration carrying the exact package-qualified name (even an
     // ambiguous set) is authoritative; the compatibility lookup only runs when
     // no packaged declaration exists at all.
-    if resolution.target.is_some()
-        || request.language != SourceLanguage::Xml.as_str()
+    if request.language != SourceLanguage::Xml.as_str()
         || route_bridges::authoritative_lookup(request.name)
         || telephony_resolution::authoritative_lookup(request.name)
         || !package_qualified
@@ -11326,7 +11339,8 @@ where
             | ImportBindingKind::ReExportAll
             | ImportBindingKind::ReExportUncertain
             | ImportBindingKind::ReExportNamespace
-            | ImportBindingKind::ReExportNamed => {}
+            | ImportBindingKind::ReExportNamed
+            | ImportBindingKind::RustFileModule => {}
         }
     }
     match matched {
@@ -12191,7 +12205,10 @@ where
             return Err(StageItemFailure);
         }
         if reference.language == "rust"
-            && binding.kind == ImportBindingKind::Namespace
+            && matches!(
+                binding.kind,
+                ImportBindingKind::Namespace | ImportBindingKind::RustFileModule
+            )
             && index.is_some_and(|index| {
                 !rust_local_types::root_declaration(index, (reference.file_id, binding.span))
             })
@@ -12282,7 +12299,7 @@ fn runtime_binding_target_name<'a>(
                 .filter(|suffix| suffix.starts_with('.') || suffix.starts_with("::"))
                 .map(|_| binding.imported_name.as_str())
         }
-        ImportBindingKind::Namespace => {
+        ImportBindingKind::Namespace | ImportBindingKind::RustFileModule => {
             if matches!(language, "ada" | "vhdl" | "rust") && binding.local_name == "*" {
                 return Some(reference_name);
             }
@@ -14697,6 +14714,7 @@ mod tests {
     mod qualified_types;
     mod receiver_types;
     mod repr;
+    mod rust_file_attributes;
     mod rust_module_paths;
     mod rust_receivers;
     mod rust_review_regressions;
@@ -14785,14 +14803,15 @@ mod tests {
 
     const FULL_TEST_EVIDENCE: NativeEvidencePolicy = NativeEvidencePolicy::FULL;
     const STRUCTURAL_TEST_EVIDENCE: NativeEvidencePolicy = NativeEvidencePolicy::STRUCTURAL;
-    // V27 changes the domain and adds health analyzer metadata; graph facts are unchanged.
+    // V34 changes only the domain for these frozen fixtures.
+    // Independent encoding reproduces each V33 digest before deriving its V34 pin.
     const PARSER_ONLY_FILE_COUNT: usize = 6;
     const EXPECTED_PARSER_ONLY_DIGEST: &str =
-        "ab18b8c7d8df02c4111ebefe6f0a69f76dcc4f36f38f08815aebaa1567870351";
+        "4a42f886ea1910c017352ea84137920cf3993e2e593700482f85b73af64bfb16";
     const EXPECTED_PARSER_ONLY_PROJECTION: (usize, usize, usize, usize, usize) = (6, 6, 0, 0, 6);
     const ADMITTED_FAMILY_FILE_COUNT: usize = 14;
     const EXPECTED_ADMITTED_FAMILY_DIGEST: &str =
-        "efc0d7d69cf52ddc1fa0c2f4c93e5fa5935fce6b9e6123023dc7ad53e9490c02";
+        "62b01cc63726634a7dd649ff95c400d25737ef201d24d28cf6108fe41f01a422";
     const EXPECTED_ADMITTED_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
         (14, 33, 19, 6, 33);
     const GENERIC_FAMILY_FILE_COUNT: usize = 28;
@@ -14819,7 +14838,7 @@ mod tests {
     // references and centrality; bridge_digest_proof then removes six alias
     // links to recover 04a9f9b9... exactly under the V23 domain.
     const EXPECTED_GENERIC_FAMILY_DIGEST: &str =
-        "d075bf6ee24d300b0415e48d3d22b4ee49251117ca91723267849fcc9469d813";
+        "b608ff030c2adb11bb2eefd8d3e8923b820945bd25842c8e3e73d23b2a9c4cb8";
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
         (28, 260, 292, 135, 260);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
@@ -14830,7 +14849,7 @@ mod tests {
     // frameworks::routes::mybatis_local_sql_roles_preserve_the_frozen_custom_digest
     // regression removes the hint and compares every fact table and digest.
     const EXPECTED_CUSTOM_FAMILY_DIGEST: &str =
-        "3f374b14f941196a22ac11e38a7d36bc0f7043e223ec29ed31a869143f8415fc";
+        "138f3cb8980341578a87023b577ef3fce16b1d2e0628d0b60c5aa324ab9b3727";
     // A Liquid `{% render %}` partner is a Component as well as an Import
     // (+1 symbol and its containment).
     const EXPECTED_CUSTOM_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =

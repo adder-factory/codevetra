@@ -6,8 +6,8 @@ use codevetra_db::{
     CurrentGenerationLookup, CurrentGraphLookup, EdgeInput, FileInput, GenerationFacts,
     GenerationValidationLimits, GraphDirection, NativeDatabase, SymbolInput,
     rocks::{
-        AsyncProjectStore, GraphBase, GraphPolicy, GraphPublicationInput, GraphRevision,
-        StorageRequest, StorageRuntime, StorePolicy, WorkerPolicy,
+        AsyncProjectStore, GraphBase, GraphPolicy, GraphRevision, StorageRequest, StorageRuntime,
+        StorePolicy, WorkerPolicy,
     },
     validate_generation_facts,
 };
@@ -103,9 +103,11 @@ async fn native_filters_precede_candidate_cap_for_traversal_and_paths() -> TestR
     let identity = ContentDigest::from_bytes([9; 32]);
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        identity.clone(),
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            identity.clone(),
+            StorePolicy::default(),
+        ),
         &request,
     )
     .await?;
@@ -117,18 +119,18 @@ async fn native_filters_precede_candidate_cap_for_traversal_and_paths() -> TestR
     )?
     .0;
     store
+        .with_request(&request)
         .publish_graph(
-            GraphPublicationInput::new(
+            codevetra_db::rocks::GraphPreparation::new(
                 GraphRevision {
                     generation_id: generation.clone(),
                     source_revision: identity.clone(),
                     base: GraphBase::Empty,
                 },
-                facts,
                 GraphPolicy::default(),
                 &request,
-            )?,
-            &request,
+            )
+            .resident(facts)?,
         )
         .await?;
     let database = NativeDatabase::new(store, &identity);

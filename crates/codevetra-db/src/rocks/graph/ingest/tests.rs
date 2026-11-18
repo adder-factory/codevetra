@@ -46,7 +46,15 @@ fn previous_rows_follow_empty_pages_to_remaining_facts() -> TestResult {
     }
     let snapshot = store.current_snapshot(None)?;
     let request = StorageRequest::new(std::time::Duration::from_secs(30))?;
-    let mut rows = PreviousRows::new(Some(&snapshot), Collection::Graph, b"test/", &request);
+    let mut rows = PreviousRows {
+        snapshot: Some(&snapshot),
+        collection: Collection::Graph,
+        prefix: b"test/",
+        rows: VecDeque::new(),
+        after: None,
+        done: false,
+        request: &request,
+    };
     let (key, value) = rows.pop()?.ok_or("lost fact after empty continuation")?;
     assert_eq!(key.as_bytes(), b"test/z");
     assert_eq!(value, b"remaining");
@@ -90,7 +98,7 @@ fn grouped_discovery_polls_cancellation_before_a_large_group_finishes() -> TestR
         || false,
     )?;
     let mut polls = 0;
-    let mut groups = table_groups(&facts, REFERENCE, facts.references().len(), || {
+    let mut groups = CanonicalTable::new(&facts, REFERENCE)?.groups(|| {
         polls += 1;
         if polls == 17 {
             Err(RocksError::Cancelled)
@@ -132,5 +140,27 @@ fn failed_cleanup_preserves_cancellation_and_cannot_terminalize_a_newer_writer()
     store.seal(&replacement, digest, GenerationDigestVersion::V23)?;
     store.publish(&replacement)?;
     assert_eq!(store.current_snapshot(None)?.revision().sequence, 2);
+    Ok(())
+}
+
+#[test]
+fn canonical_tables_reject_unknown_prefixes_and_out_of_range_rows() -> TestResult {
+    let (facts, _) = crate::validate_generation_facts(
+        crate::GenerationFacts::default(),
+        crate::GenerationValidationLimits::new(8 * 1_048_576, 32 * 1_048_576)?,
+        || false,
+    )?;
+    assert!(matches!(
+        CanonicalTable::new(&facts, b"unknown/"),
+        Err(RocksError::Corrupt { .. })
+    ));
+    for prefix in [FILE, SYMBOL, EDGE, REFERENCE, NUMERICAL, DOCUMENT] {
+        let table = CanonicalTable::new(&facts, prefix)?;
+        assert!(matches!(table.row(0), Err(RocksError::Corrupt { .. })));
+        assert!(matches!(
+            table.row(usize::MAX),
+            Err(RocksError::Corrupt { .. })
+        ));
+    }
     Ok(())
 }

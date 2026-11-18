@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     EdgeInput, FileInput, GraphDirection, NativeDatabase,
-    retrieval::native::{in_directory, retain, visit_files, visit_symbols},
+    retrieval::native::{RankedRows, in_directory, visit_files, visit_symbols},
     rocks::{GraphLink, GraphSnapshot, ReadBudget, RocksError},
 };
 use codevetra_domain::{FileId, GenerationId, SymbolId};
@@ -36,8 +36,8 @@ impl NativeDatabase {
                 total_symbols: 0,
                 truncated: false,
             };
-            let mut languages = BTreeMap::new();
-            let mut workspace = 0;
+            let mut selected = RankedRows::new(1, |a: &FileSurfaceRow, b| a.path.cmp(&b.path));
+            let mut aggregates = FileAggregates::default();
             for (_, (file, symbols)) in file_rows(graph, budget)? {
                 output.total_files += 1;
                 output.total_bytes = output
@@ -48,28 +48,19 @@ impl NativeDatabase {
                     .total_symbols
                     .checked_add(symbols)
                     .ok_or(RocksError::Format)?;
-                add_aggregate(
-                    &mut languages,
-                    &file.language,
-                    symbols,
-                    file.byte_size,
-                    &mut workspace,
-                )?;
-                retain(
-                    &mut output.files,
-                    FileSurfaceRow {
-                        path: file.normalized_path,
-                        language: file.language,
-                        byte_size: file.byte_size,
-                        parse_status: file.parse_status.as_str().to_owned(),
-                        symbol_count: symbols,
-                    },
-                    1,
-                    |a, b| a.path.cmp(&b.path),
-                );
+                aggregates.add(AggregateKey::Language(&file.language), &file, symbols)?;
+                selected.insert(FileSurfaceRow {
+                    path: file.normalized_path,
+                    language: file.language,
+                    byte_size: file.byte_size,
+                    parse_status: file.parse_status.as_str().to_owned(),
+                    symbol_count: symbols,
+                });
             }
+            output.files = selected.into_vec();
             output.truncated = output.total_files > output.files.len() as u64;
-            let mut languages = languages
+            let mut languages = aggregates
+                .languages
                 .into_iter()
                 .map(
                     |(language, (files, symbols, bytes))| FileLanguageAggregate {
@@ -118,6 +109,10 @@ impl NativeDatabase {
                     total_symbols: 0,
                     truncated: false,
                 };
+                let mut selected =
+                    RankedRows::new(usize::from(request.limit), |a: &FileSurfaceRow, b| {
+                        a.path.cmp(&b.path)
+                    });
                 for (_, (file, symbols)) in file_rows(graph, budget)? {
                     if !matches_file(&file, &request, regex.as_ref()) {
                         continue;
@@ -131,19 +126,15 @@ impl NativeDatabase {
                         .total_symbols
                         .checked_add(symbols)
                         .ok_or(RocksError::Format)?;
-                    retain(
-                        &mut output.files,
-                        FileSurfaceRow {
-                            path: file.normalized_path,
-                            language: file.language,
-                            byte_size: file.byte_size,
-                            parse_status: file.parse_status.as_str().to_owned(),
-                            symbol_count: symbols,
-                        },
-                        usize::from(request.limit),
-                        |a, b| a.path.cmp(&b.path),
-                    );
+                    selected.insert(FileSurfaceRow {
+                        path: file.normalized_path,
+                        language: file.language,
+                        byte_size: file.byte_size,
+                        parse_status: file.parse_status.as_str().to_owned(),
+                        symbol_count: symbols,
+                    });
                 }
+                output.files = selected.into_vec();
                 output.truncated = output.total_files > output.files.len() as u64;
                 Ok(output)
             },
@@ -176,41 +167,26 @@ impl NativeDatabase {
             generation.generation_id(),
             FILE_QUERY_TIMEOUT,
             move |graph, budget| {
-                let mut languages = BTreeMap::<String, (u64, u64, u64)>::new();
-                let mut directories = BTreeMap::<String, (u64, u64, u64)>::new();
-                let mut workspace = 0_usize;
+                let mut aggregates = FileAggregates::default();
                 for (_, (file, symbols)) in file_rows(graph, budget)? {
                     if !matches_file(&file, &request, regex.as_ref()) {
                         continue;
                     }
-                    add_aggregate(
-                        &mut languages,
-                        &file.language,
-                        symbols,
-                        file.byte_size,
-                        &mut workspace,
-                    )?;
+                    aggregates.add(AggregateKey::Language(&file.language), &file, symbols)?;
                     if !file.normalized_path.contains('/') {
-                        add_aggregate(
-                            &mut directories,
-                            ".",
-                            symbols,
-                            file.byte_size,
-                            &mut workspace,
-                        )?;
+                        aggregates.add(AggregateKey::Directory("."), &file, symbols)?;
                     }
                     let mut prefix = file.normalized_path.as_str();
                     while let Some((parent, _)) = prefix.rsplit_once('/') {
-                        add_aggregate(
-                            &mut directories,
-                            parent,
-                            symbols,
-                            file.byte_size,
-                            &mut workspace,
-                        )?;
+                        aggregates.add(AggregateKey::Directory(parent), &file, symbols)?;
                         prefix = parent;
                     }
                 }
+                let FileAggregates {
+                    languages,
+                    directories,
+                    ..
+                } = aggregates;
                 let mut languages = languages
                     .into_iter()
                     .map(
@@ -268,7 +244,13 @@ impl NativeDatabase {
                     return Ok(dependency_result(Vec::new(), request.per_direction_limit));
                 };
                 let symbols = file_symbols(graph, budget, &anchor)?;
-                let mut grouped = BTreeMap::<(bool, String), FileDependencyRow>::new();
+                let mut dependencies = DependencyCollector {
+                    graph,
+                    budget,
+                    anchor,
+                    files,
+                    grouped: BTreeMap::new(),
+                };
                 for incoming in [false, true] {
                     if (incoming && request.direction == FileDependencyDirection::Dependencies)
                         || (!incoming && request.direction == FileDependencyDirection::Dependents)
@@ -276,19 +258,11 @@ impl NativeDatabase {
                         continue;
                     }
                     for symbol in &symbols {
-                        adjacent_files(
-                            graph,
-                            budget,
-                            symbol,
-                            incoming,
-                            &anchor,
-                            &files,
-                            &mut grouped,
-                        )?;
+                        dependencies.adjacent_files(symbol, incoming)?;
                     }
                 }
                 Ok(dependency_result(
-                    grouped.into_values().collect(),
+                    dependencies.grouped.into_values().collect(),
                     request.per_direction_limit,
                 ))
             },
@@ -401,112 +375,143 @@ fn matches_file(
         && regex.is_none_or(|regex| regex.is_match(&file.normalized_path))
 }
 
-fn add_aggregate(
-    map: &mut BTreeMap<String, (u64, u64, u64)>,
-    key: &str,
-    symbols: u64,
-    bytes: u64,
-    workspace: &mut usize,
-) -> Result<(), RocksError> {
-    if !map.contains_key(key) {
-        *workspace = workspace.saturating_add(key.len() + 128);
-    }
-    if *workspace > 32 * 1_048_576 {
-        return Err(RocksError::Limit {
-            resource: "file_workspace_bytes",
-        });
-    }
-    let value = map.entry(key.to_owned()).or_default();
-    value.0 = value.0.checked_add(1).ok_or(RocksError::Format)?;
-    value.1 = value.1.checked_add(symbols).ok_or(RocksError::Format)?;
-    value.2 = value.2.checked_add(bytes).ok_or(RocksError::Format)?;
-    Ok(())
+const AGGREGATE_ENTRY_OVERHEAD: usize = 128;
+const AGGREGATE_WORKSPACE_BYTES: usize = 32 * 1_048_576;
+
+#[derive(Clone, Copy)]
+enum AggregateKey<'a> {
+    Language(&'a str),
+    Directory(&'a str),
 }
 
-fn adjacent_files(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    symbol: &SymbolId,
-    incoming: bool,
-    anchor: &FileId,
-    files: &BTreeMap<FileId, FileInput>,
-    grouped: &mut BTreeMap<(bool, String), FileDependencyRow>,
-) -> Result<(), RocksError> {
-    let direction = if incoming {
-        GraphDirection::Incoming
-    } else {
-        GraphDirection::Outgoing
-    };
-    let mut cursor = None;
-    loop {
-        let page = graph.neighbors(symbol, direction, cursor.as_ref(), 256, budget)?;
-        for link in page.links {
-            record_adjacent_dependency(graph, budget, &link, incoming, anchor, files, grouped)?;
+/// Both dimensions charge the same bounded workspace before inserting a key.
+#[derive(Default)]
+struct FileAggregates {
+    languages: BTreeMap<String, (u64, u64, u64)>,
+    directories: BTreeMap<String, (u64, u64, u64)>,
+    workspace: usize,
+}
+
+impl FileAggregates {
+    fn add(
+        &mut self,
+        key: AggregateKey<'_>,
+        file: &FileInput,
+        symbols: u64,
+    ) -> Result<(), RocksError> {
+        let (map, key) = match key {
+            AggregateKey::Language(key) => (&mut self.languages, key),
+            AggregateKey::Directory(key) => (&mut self.directories, key),
+        };
+        if !map.contains_key(key) {
+            self.workspace = self
+                .workspace
+                .saturating_add(key.len() + AGGREGATE_ENTRY_OVERHEAD);
         }
-        cursor = page.next;
-        if cursor.is_none() {
+        if self.workspace > AGGREGATE_WORKSPACE_BYTES {
+            return Err(RocksError::Limit {
+                resource: "file_workspace_bytes",
+            });
+        }
+        let value = map.entry(key.to_owned()).or_default();
+        value.0 = value.0.checked_add(1).ok_or(RocksError::Format)?;
+        value.1 = value.1.checked_add(symbols).ok_or(RocksError::Format)?;
+        value.2 = value
+            .2
+            .checked_add(file.byte_size)
+            .ok_or(RocksError::Format)?;
+        Ok(())
+    }
+}
+
+/// One anchor and generation own the dependency walk and its complete directional totals.
+struct DependencyCollector<'request, 'view, 'store> {
+    graph: &'request GraphSnapshot<'view, 'store>,
+    budget: &'request mut ReadBudget,
+    anchor: FileId,
+    files: BTreeMap<FileId, FileInput>,
+    grouped: BTreeMap<(bool, String), FileDependencyRow>,
+}
+
+impl DependencyCollector<'_, '_, '_> {
+    fn adjacent_files(&mut self, symbol: &SymbolId, incoming: bool) -> Result<(), RocksError> {
+        let direction = if incoming {
+            GraphDirection::Incoming
+        } else {
+            GraphDirection::Outgoing
+        };
+        let mut cursor = None;
+        loop {
+            let page =
+                self.graph
+                    .adjacency(symbol, direction)
+                    .page(cursor.as_ref(), 256, self.budget)?;
+            for link in page.links {
+                self.record_adjacent_dependency(&link, incoming)?;
+            }
+            cursor = page.next;
+            if cursor.is_none() {
+                return Ok(());
+            }
+        }
+    }
+    fn record_adjacent_dependency(
+        &mut self,
+        link: &GraphLink,
+        incoming: bool,
+    ) -> Result<(), RocksError> {
+        if link.kind() == codevetra_domain::EdgeKind::Contains {
             return Ok(());
         }
+        let adjacent = if incoming {
+            link.source_symbol_id()
+        } else {
+            link.target_symbol_id()
+        };
+        let symbol = self
+            .graph
+            .symbol(adjacent, self.budget)?
+            .ok_or(RocksError::Format)?;
+        if symbol.file_id == self.anchor {
+            return Ok(());
+        }
+        let edge = self.graph.edge(link, self.budget)?;
+        self.record_dependency(incoming, &symbol.file_id, &edge)
     }
-}
-
-fn record_adjacent_dependency(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    link: &GraphLink,
-    incoming: bool,
-    anchor: &FileId,
-    files: &BTreeMap<FileId, FileInput>,
-    grouped: &mut BTreeMap<(bool, String), FileDependencyRow>,
-) -> Result<(), RocksError> {
-    if link.kind() == codevetra_domain::EdgeKind::Contains {
-        return Ok(());
+    fn record_dependency(
+        &mut self,
+        incoming: bool,
+        file_id: &FileId,
+        edge: &EdgeInput,
+    ) -> Result<(), RocksError> {
+        let file = self.files.get(file_id).ok_or(RocksError::Format)?;
+        let row = self
+            .grouped
+            .entry((incoming, file.normalized_path.clone()))
+            .or_insert_with(|| FileDependencyRow {
+                direction: if incoming {
+                    "dependents"
+                } else {
+                    "dependencies"
+                }
+                .to_owned(),
+                path: file.normalized_path.clone(),
+                language: file.language.clone(),
+                edge_count: 0,
+                site_count: 0,
+                edge_kinds: Vec::new(),
+            });
+        row.edge_count = row.edge_count.checked_add(1).ok_or(RocksError::Format)?;
+        row.site_count = row
+            .site_count
+            .checked_add(u64::from(edge.site_count))
+            .ok_or(RocksError::Format)?;
+        if !row.edge_kinds.iter().any(|kind| kind == edge.kind.as_str()) {
+            row.edge_kinds.push(edge.kind.as_str().to_owned());
+            row.edge_kinds.sort();
+        }
+        Ok(())
     }
-    let adjacent = if incoming {
-        link.source_symbol_id()
-    } else {
-        link.target_symbol_id()
-    };
-    let symbol = graph.symbol(adjacent, budget)?.ok_or(RocksError::Format)?;
-    if &symbol.file_id == anchor {
-        return Ok(());
-    }
-    let file = files.get(&symbol.file_id).ok_or(RocksError::Format)?;
-    let edge = graph.edge(link, budget)?;
-    record_dependency(grouped, incoming, file, &edge)
-}
-
-fn record_dependency(
-    grouped: &mut BTreeMap<(bool, String), FileDependencyRow>,
-    incoming: bool,
-    file: &FileInput,
-    edge: &EdgeInput,
-) -> Result<(), RocksError> {
-    let row = grouped
-        .entry((incoming, file.normalized_path.clone()))
-        .or_insert_with(|| FileDependencyRow {
-            direction: if incoming {
-                "dependents"
-            } else {
-                "dependencies"
-            }
-            .to_owned(),
-            path: file.normalized_path.clone(),
-            language: file.language.clone(),
-            edge_count: 0,
-            site_count: 0,
-            edge_kinds: Vec::new(),
-        });
-    row.edge_count = row.edge_count.checked_add(1).ok_or(RocksError::Format)?;
-    row.site_count = row
-        .site_count
-        .checked_add(u64::from(edge.site_count))
-        .ok_or(RocksError::Format)?;
-    if !row.edge_kinds.iter().any(|kind| kind == edge.kind.as_str()) {
-        row.edge_kinds.push(edge.kind.as_str().to_owned());
-        row.edge_kinds.sort();
-    }
-    Ok(())
 }
 
 fn dependency_result(rows: Vec<FileDependencyRow>, limit: u16) -> FileDependencyResult {

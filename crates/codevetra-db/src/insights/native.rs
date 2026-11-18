@@ -1,15 +1,14 @@
 //! Relationship-aware feature queries over the complete native graph snapshot.
 
 mod findings;
+mod impact;
 mod references;
 mod risk;
-mod tests;
 
 use crate::{
-    GraphDirection, ReferenceInput,
-    rocks::{GraphLink, GraphSnapshot, ReadBudget, RocksError},
+    ReferenceInput,
+    rocks::{GraphSnapshot, ReadBudget, RocksError},
 };
-use codevetra_domain::SymbolId;
 
 fn visit_references(
     graph: &GraphSnapshot<'_, '_>,
@@ -24,26 +23,6 @@ fn visit_references(
             visit(reference, budget)?;
         }
         cursor = next;
-        if cursor.is_none() {
-            return Ok(());
-        }
-    }
-}
-fn neighbors(
-    graph: &GraphSnapshot<'_, '_>,
-    id: &SymbolId,
-    direction: GraphDirection,
-    budget: &mut ReadBudget,
-    mut visit: impl FnMut(GraphLink, &mut ReadBudget) -> Result<(), RocksError>,
-) -> Result<(), RocksError> {
-    let mut cursor = None;
-    loop {
-        let page = graph.neighbors(id, direction, cursor.as_ref(), 256, budget)?;
-        for link in page.links {
-            budget.checkpoint()?;
-            visit(link, budget)?;
-        }
-        cursor = page.next;
         if cursor.is_none() {
             return Ok(());
         }

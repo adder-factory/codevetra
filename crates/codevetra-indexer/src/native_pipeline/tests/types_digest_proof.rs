@@ -8,10 +8,11 @@ use super::{
     capability_symbol, generation_validation_limits, validate_generation_facts,
 };
 
-// V27 adds health analyzer metadata and its domain; restored graph facts are unchanged.
+// V34 changes only the domain for this unchanged frozen corpus.
+// Independent encoding reproduces the V33 pin before deriving the V34 pin.
 const PREVIOUS_RECEIVER_DIGEST: &str =
-    "a15f474bfb5284b6c658c8e425c0a2c9462c3679bd05421e7ae8420de0e30fcf";
-const BRIDGE_ONLY_DIGEST: &str = "26326a913da3b98186d5fe18afa3a903c69ae20bbe119bad9df76768ccc68a3a";
+    "38992f20e183c2a650613d2db11e04a4aaee0873b081b788941eb822862a0b41";
+const BRIDGE_ONLY_DIGEST: &str = "647b3fd0daefb162912310852418b6162347f0db9a8e5399f2e7bd7b54291364";
 const EXPECTED_RECEIVER_CONFIDENCE: f32 = 0.95;
 const RECEIVER_DELTA: &[(&str, u64, u64, &str)] = &[
     ("generic/fixture.rb", 293, 296, "native-unresolved"),

@@ -2,7 +2,7 @@ use codevetra_domain::{FileParseStatus, ReferenceKind, SymbolKind};
 
 use super::super::{CustomImportInput, CustomReferenceInput, poll_cancellation};
 use super::tokens::{self, Kind, Token};
-use super::{CustomBuilder, ExtractError, safe_name, symbol};
+use super::{CustomBuilder, CustomSymbolInput, ExtractError, safe_name};
 use crate::ImportBindingKind;
 
 const ROUTES: &[&str] = &[
@@ -149,11 +149,10 @@ fn declare_route(
     } else {
         route_name(kind, label)
     };
-    symbol(
-        builder,
-        (SymbolKind::Function, label, qualified),
-        (token.start, tokens[opening + index].end),
-        None,
+    builder.add_symbol(
+        CustomSymbolInput::new(SymbolKind::Function, label, qualified)
+            .at(token.start, tokens[opening + index].end)
+            .with_parent(None),
     )?;
     Ok(Some((opening + index, position)))
 }
@@ -202,16 +201,33 @@ fn route_header<'source>(source: &'source str, tokens: &[Token]) -> Option<(&'so
     if first.kind != Kind::Word || !ROUTES.contains(&first.text(source)) {
         return None;
     }
-    match tokens.get(1)?.kind {
-        Kind::Punctuation(b'{') => Some((first.text(source), 1)),
-        Kind::Punctuation(b'[')
-            if tokens.get(3)?.kind == Kind::Punctuation(b']')
-                && tokens.get(4)?.kind == Kind::Punctuation(b'{') =>
-        {
-            let name = tokens
-                .get(2)?
-                .value(source)
-                .filter(|name| safe_name(name))?;
+    match tokens {
+        [
+            _,
+            Token {
+                kind: Kind::Punctuation(b'{'),
+                ..
+            },
+            ..,
+        ] => Some((first.text(source), 1)),
+        [
+            _,
+            Token {
+                kind: Kind::Punctuation(b'['),
+                ..
+            },
+            label,
+            Token {
+                kind: Kind::Punctuation(b']'),
+                ..
+            },
+            Token {
+                kind: Kind::Punctuation(b'{'),
+                ..
+            },
+            ..,
+        ] => {
+            let name = label.value(source).filter(|name| safe_name(name))?;
             Some((name, 4))
         }
         _ => None,
@@ -251,15 +267,14 @@ fn top_level(builder: &mut CustomBuilder<'_, '_>, tokens: &[Token]) -> Result<()
             .filter(|token| token.kind == Kind::Word && safe_name(token.text(source)))
     {
         let name_text = name.text(source);
-        symbol(
-            builder,
-            (
+        builder.add_symbol(
+            CustomSymbolInput::new(
                 SymbolKind::Constant,
                 name_text,
                 format!("kamailio::define::{name_text}"),
-            ),
-            (name.start, name.end),
-            None,
+            )
+            .at(name.start, name.end)
+            .with_parent(None),
         )?;
     }
     if text == "loadmodule"
@@ -288,15 +303,14 @@ fn top_level(builder: &mut CustomBuilder<'_, '_>, tokens: &[Token]) -> Result<()
         && let Some(parameter) = tokens.get(4).copied()
         && let Some(name) = parameter.value(source).filter(|name| safe_name(name))
     {
-        symbol(
-            builder,
-            (
+        builder.add_symbol(
+            CustomSymbolInput::new(
                 SymbolKind::Property,
                 name,
                 format!("kamailio::module::{module}::{name}"),
-            ),
-            (parameter.start, parameter.end),
-            None,
+            )
+            .at(parameter.start, parameter.end)
+            .with_parent(None),
         )?;
     }
     if first.kind == Kind::Word
@@ -305,15 +319,14 @@ fn top_level(builder: &mut CustomBuilder<'_, '_>, tokens: &[Token]) -> Result<()
             .get(1)
             .is_some_and(|token| token.kind == Kind::Punctuation(b'='))
     {
-        symbol(
-            builder,
-            (
+        builder.add_symbol(
+            CustomSymbolInput::new(
                 SymbolKind::Property,
                 text,
                 format!("kamailio::core::{text}"),
-            ),
-            (first.start, first.end),
-            None,
+            )
+            .at(first.start, first.end)
+            .with_parent(None),
         )?;
     }
     Ok(())

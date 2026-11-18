@@ -115,12 +115,10 @@ fn source_admission_stays_durable_without_leaking_private_patterns() -> TestResu
         identity(1),
         Duration::from_secs(30),
     )?;
-    store.seal_with_admission(
-        &writer,
-        identity(2),
-        GenerationDigestVersion::V23,
-        vec![PRIVATE.to_owned()],
-        Some(1024),
+    writer.seal(
+        &store,
+        RevisionSeal::new(identity(2), GenerationDigestVersion::V23)
+            .with_source_admission(vec![PRIVATE.to_owned()], Some(1024)),
     )?;
     let revision = store.publish(&writer)?;
     assert!(!format!("{revision:?}").contains(PRIVATE));
@@ -199,15 +197,9 @@ fn reused_lookup_keeps_exact_keys_and_versions_across_reverse_and_missing_seeks(
         (0, b"a", None),
     ] {
         assert_eq!(
-            read_record_from(
-                &snapshot,
-                &mut iterator,
-                &meta,
-                sequence,
-                &RecordKey::new(key.to_vec())?,
-                &mut budget
-            )?
-            .as_deref(),
+            PublishedRead::new(&snapshot, &meta, sequence)
+                .read_from(&mut iterator, &RecordKey::new(key.to_vec())?, &mut budget)?
+                .as_deref(),
             expected,
         );
     }

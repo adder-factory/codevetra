@@ -9,8 +9,8 @@ use codevetra_db::{
     CurrentGenerationLookup, EdgeInput, FileInput, GenerationFacts, GenerationValidationLimits,
     NativeDatabase, ReferenceInput, SearchDocumentInput, SearchQuery, SymbolInput,
     rocks::{
-        AsyncProjectStore, GraphBase, GraphPolicy, GraphPublicationInput, GraphRevision,
-        StorageRequest, StorageRuntime, StorePolicy, WorkerPolicy,
+        AsyncProjectStore, GraphBase, GraphPolicy, GraphRevision, StorageRequest, StorageRuntime,
+        StorePolicy, WorkerPolicy,
     },
     validate_generation_facts,
 };
@@ -20,8 +20,8 @@ use codevetra_domain::{
 };
 use codevetra_indexer::StageItemFailure;
 use fixture::{
-    BENCHMARK_CONFIG, FixtureInput, FrozenFixture, SamplePlan, ValidationBudget, WorkloadSize,
-    qualified_name,
+    BENCHMARK_CONFIG, FixtureInput, FrozenFixture, RowCounts, SamplePlan, ValidationBudget,
+    WorkloadSize, qualified_name,
 };
 use std::{
     error::Error,
@@ -29,10 +29,20 @@ use std::{
 };
 
 type BenchResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
-// V26 identity for the frozen fixture; its inputs and fingerprint stay fixed.
-// An independent wire encoder reproduced V25 and changed only the domain.
+// V34 identity for the frozen fixture; its inputs and fingerprint stay fixed.
+// An independent wire encoder reproduced V25, V27, V30, V31, V32 and V33 before deriving V34.
 const EXPECTED_LOGICAL_DIGEST: &str =
-    "9bf0024aae9a07fa9053bd8b0b54e1b80410e830364e9ceac5c4d0774689594d";
+    "bef936da1afdb1cd442bea9c83b988612aacc2102224f0016263555b8cbc54ee";
+const NATIVE_WORKER_POLICY: WorkerPolicy = WorkerPolicy {
+    threads: 2,
+    pending_jobs: 32,
+    pending_bytes: 256 * 1_048_576,
+};
+const PROJECT_IDENTITY: [u8; 32] = [7; 32];
+const GENERATION_IDENTITY: [u8; 16] = [1; 16];
+const SEARCH_RESULT_LIMIT: u16 = 10;
+const MILLISECONDS_PER_SECOND: f64 = 1000.0;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> BenchResult {
@@ -71,16 +81,17 @@ async fn sample_run(
     drop(plan);
     let root = tempfile::tempdir()?;
     let runtime = StorageRuntime::new(WorkerPolicy {
-        threads: u8::try_from(workers.max(2))?,
-        pending_jobs: 32,
-        pending_bytes: 256 * 1_048_576,
+        threads: u8::try_from(workers.max(u16::from(NATIVE_WORKER_POLICY.threads)))?,
+        ..NATIVE_WORKER_POLICY
     })?;
-    let identity = ContentDigest::from_bytes([7; 32]);
+    let identity = ContentDigest::from_bytes(PROJECT_IDENTITY);
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        identity.clone(),
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            identity.clone(),
+            StorePolicy::default(),
+        ),
         &request,
     )
     .await?;
@@ -94,24 +105,29 @@ async fn sample_run(
                 fixture.config.validation_bytes[ValidationBudget::Output as usize],
                 fixture.config.validation_bytes[ValidationBudget::Working as usize])?, || request.check().is_err())?;
             if facts.digest().as_str() != EXPECTED_LOGICAL_DIGEST { return Err(format!("frozen logical digest changed: {}", facts.digest()).into()); }
-            let counts = (&fixture.expected_rows, facts.files().len(), facts.symbols().len(), facts.edges().len(), facts.references().len(), facts.numerical_sites().len(), facts.documents().len());
-            if counts.0.files != i64::try_from(counts.1)? || counts.0.symbols != i64::try_from(counts.2)?
-                || counts.0.edges != i64::try_from(counts.3)? || counts.0.references != i64::try_from(counts.4)?
-                || counts.0.numerical_sites != i64::try_from(counts.5)? || counts.0.documents != i64::try_from(counts.6)? { return Err("frozen native row counts changed".into()); }
-            Ok(GraphPublicationInput::new(GraphRevision {generation_id:GenerationId::from_uuid_v8([1;16]),
-                source_revision:ContentDigest::parse(&fixture.source_digest)?, base:GraphBase::Empty}, facts, GraphPolicy::default(), &request)?)
+            let counts = RowCounts {
+                files: i64::try_from(facts.files().len())?,
+                symbols: i64::try_from(facts.symbols().len())?,
+                edges: i64::try_from(facts.edges().len())?,
+                references: i64::try_from(facts.references().len())?,
+                numerical_sites: i64::try_from(facts.numerical_sites().len())?,
+                documents: i64::try_from(facts.documents().len())?,
+            };
+            if counts != fixture.expected_rows { return Err("frozen native row counts changed".into()); }
+            Ok(codevetra_db::rocks::GraphPreparation::new(GraphRevision {generation_id:GenerationId::from_uuid_v8(GENERATION_IDENTITY),
+                source_revision:ContentDigest::parse(&fixture.source_digest)?, base:GraphBase::Empty}, GraphPolicy::default(), &request).resident(facts)?)
         })?;
-        let published = store.publish_graph(input, &request).await?;
+        let published = store.with_request(&request).publish_graph(input).await?;
         let elapsed = started.elapsed();
-        let hits = database.search_current_code(SearchQuery::new(CurrentGenerationLookup::new(database.project_id(), &published.revision.generation_id), fixture.config.bm25_query, 10)).await?;
+        let hits = database.search_current_code(SearchQuery::new(CurrentGenerationLookup::new(database.project_id(), &published.revision.generation_id), fixture.config.bm25_query, SEARCH_RESULT_LIMIT)).await?;
         if hits.first().map(codevetra_db::SearchHit::document_id) != Some(&fixture.needle_document_id) { return Err("frozen native BM25 needle ranking changed".into()); }
-        let usage = store.storage_usage(&request).await?;
+        let usage = store.with_request(&request).storage_usage().await?;
         Ok(serde_json::json!({"workers":workers,"sample":sample,"plan":plan_report,
-            "extractionMillis":extraction.as_secs_f64()*1000.0,"publicationMillis":elapsed.as_secs_f64()*1000.0,
+            "extractionMillis":extraction.as_secs_f64()*MILLISECONDS_PER_SECOND,"publicationMillis":elapsed.as_secs_f64()*MILLISECONDS_PER_SECOND,
             "rows":fixture.expected_rows,"usage":usage,"write":published.report}))
     }.await;
     let cleanup = runtime
-        .shutdown(&StorageRequest::new(Duration::from_secs(30))?)
+        .shutdown(&StorageRequest::new(SHUTDOWN_TIMEOUT)?)
         .await;
     match (outcome, cleanup) {
         (Ok(report), Ok(())) => Ok(report),

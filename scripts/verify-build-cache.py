@@ -69,7 +69,7 @@ def main():
         script = Path(__file__).resolve()
         # run() normally binds Cargo to the checkout. This probe owns its fixture.
         runner.ROOT = root
-        result = runner.run([sys.executable, str(script), '--probe'], env, 180, lock)
+        result = runner.BuildRun([sys.executable, str(script), '--probe'], env, 180).run(lock)
         if result:
             raise SystemExit(result)
 

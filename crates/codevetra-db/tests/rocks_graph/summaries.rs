@@ -23,9 +23,11 @@ impl Fixture {
         let runtime = StorageRuntime::new(WorkerPolicy::default())?;
         let store = AsyncProjectStore::open(
             &runtime,
-            root.path().to_owned(),
-            digest(1),
-            StorePolicy::default(),
+            codevetra_db::rocks::ProjectOpening::new(
+                root.path().to_owned(),
+                digest(1),
+                StorePolicy::default(),
+            ),
             &request()?,
         )
         .await?;
@@ -44,9 +46,13 @@ impl Fixture {
                 metadata: serde_json::json!({"name":format!("function_{id}")}),
             })
             .collect();
-        store
-            .publish_graph(input(1, canonical(facts)?)?, &request()?)
-            .await?;
+        {
+            let request_bound_input = input(1, canonical(facts)?)?;
+            store
+                .with_request(&request()?)
+                .publish_graph(request_bound_input)
+                .await
+        }?;
         let database = NativeDatabase::new(store.clone(), &digest(1));
         Ok(Self {
             _root: root,
@@ -83,7 +89,9 @@ async fn structural_role_cursor_advances_past_cached_pages_and_fences_changed_so
     )
     .await?;
     let first = db
-        .pending_structural_roles(project, "structural:v2", None, 1)
+        .pending_structural_roles(
+            codevetra_db::PendingStructuralRoleQuery::new(project, "structural:v2").page(None, 1),
+        )
         .await?;
     assert!(
         first.symbols.is_empty(),
@@ -94,8 +102,11 @@ async fn structural_role_cursor_advances_past_cached_pages_and_fences_changed_so
         .as_ref()
         .ok_or("cached first page lost its continuation")?;
     assert!(matches!(
-        db.pending_structural_roles(project, "different-model", Some(cursor), 1)
-            .await,
+        db.pending_structural_roles(
+            codevetra_db::PendingStructuralRoleQuery::new(project, "different-model")
+                .page(Some(cursor), 1)
+        )
+        .await,
         Err(StorageError::InvalidInput {
             field: "role_cursor"
         })
@@ -104,7 +115,10 @@ async fn structural_role_cursor_advances_past_cached_pages_and_fences_changed_so
     let mut ids = Vec::new();
     while let Some(after) = next {
         let page = db
-            .pending_structural_roles(project, "structural:v2", Some(&after), 1)
+            .pending_structural_roles(
+                codevetra_db::PendingStructuralRoleQuery::new(project, "structural:v2")
+                    .page(Some(&after), 1),
+            )
             .await?;
         assert_eq!(page.generation_id, first.generation_id);
         for candidate in page.symbols {
@@ -135,13 +149,20 @@ async fn structural_role_cursor_advances_past_cached_pages_and_fences_changed_so
         assert_eq!(saved.body(), "worker");
         assert_eq!(saved.metadata()["via"], via);
     }
-    fixture
-        .store
-        .publish_graph(input(2, canonical(raw_facts(3, Vec::new()))?)?, &request()?)
-        .await?;
+    {
+        let request_bound_input = input(2, canonical(raw_facts(3, Vec::new()))?)?;
+        fixture
+            .store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
     assert!(matches!(
-        db.pending_structural_roles(project, "structural:v2", Some(cursor), 1)
-            .await,
+        db.pending_structural_roles(
+            codevetra_db::PendingStructuralRoleQuery::new(project, "structural:v2")
+                .page(Some(cursor), 1)
+        )
+        .await,
         Err(StorageError::CurrentGenerationChanged)
     ));
     assert_eq!(
@@ -249,7 +270,9 @@ async fn role_batches_are_atomic_bounded_ordered_and_preserve_judged_results() -
     let db = &fixture.database;
     let project = db.project_id();
     let generation = db
-        .pending_structural_roles(project, "structural:v2", None, 1)
+        .pending_structural_roles(
+            codevetra_db::PendingStructuralRoleQuery::new(project, "structural:v2").page(None, 1),
+        )
         .await?
         .generation_id;
     let metadata = || serde_json::json!({"model":"structural:v2", "via":"structural_fallback"});
@@ -313,7 +336,9 @@ async fn role_batch_rejects_empty_duplicates_and_oversized_inputs() -> TestResul
     let db = &fixture.database;
     let project = db.project_id();
     let generation = db
-        .pending_structural_roles(project, "structural:v2", None, 1)
+        .pending_structural_roles(
+            codevetra_db::PendingStructuralRoleQuery::new(project, "structural:v2").page(None, 1),
+        )
         .await?
         .generation_id;
     let metadata = || serde_json::json!({"model":"structural:v2", "via":"structural_fallback"});

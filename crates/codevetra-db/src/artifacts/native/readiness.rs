@@ -14,6 +14,9 @@ use codevetra_domain::{ContentDigest, GenerationId, ProjectId, SymbolId};
 use std::collections::BTreeMap;
 
 const PAGE: usize = 16;
+const COUNT_ENTRY_OVERHEAD: usize = 128;
+const MAXIMUM_COUNT_KEYS: usize = 8192;
+const MAXIMUM_COUNT_BYTES: usize = 32 * 1_048_576;
 
 struct Candidate {
     id: SymbolId,
@@ -45,134 +48,150 @@ impl NativeDatabase {
     ) -> Result<(SummaryCoverageStats, Vec<AgentRoleCount>), StorageError> {
         self.require_project(project)?;
         let policy = policy.clone();
-        self.state(Some(generation.clone()), 0, 0, move |tx, budget| {
-            let snapshot = tx.graph_snapshot()?;
-            let graph = snapshot.graph(budget)?;
-            counts(tx, &graph, &policy, budget)
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(Some(generation.clone())),
+            move |tx, budget| {
+                let snapshot = tx.graph_snapshot()?;
+                let graph = snapshot.graph(budget)?;
+                ReadinessReader { tx, graph: &graph }.counts(&policy, budget)
+            },
+        )
         .await
     }
 }
 
-fn counts(
-    tx: &StateTransaction<'_>,
-    graph: &GraphSnapshot<'_, '_>,
-    policy: &SummaryCandidatePolicy,
-    budget: &mut ReadBudget,
-) -> Result<(SummaryCoverageStats, Vec<AgentRoleCount>), RocksError> {
-    let lengths = summaries::documentation_lengths(graph, budget)?;
-    let mut output = Counts {
-        summaries: SummaryCoverageStats {
-            eligible_symbols: 0,
-            summarized_symbols: 0,
-            pending_symbols: 0,
-            by_model: BTreeMap::new(),
-        },
-        roles: BTreeMap::new(),
-        retained: 0,
-    };
-    let mut page = Vec::with_capacity(PAGE);
-    visit_symbols(graph, budget, |symbol, budget| {
-        let summary = summaries::eligible(&symbol, policy, &lengths);
-        output.summaries.eligible_symbols += u64::from(summary);
-        page.push(Candidate {
-            id: symbol.symbol_id,
-            digest: symbol.structural_digest,
-            summary,
-        });
-        if page.len() == PAGE {
-            read_page(tx, &page, &mut output, budget)?;
-            page.clear();
+struct ReadinessReader<'a, 'view, 'store> {
+    tx: &'a StateTransaction<'store>,
+    graph: &'a GraphSnapshot<'view, 'store>,
+}
+impl ReadinessReader<'_, '_, '_> {
+    fn counts(
+        &self,
+        policy: &SummaryCandidatePolicy,
+        budget: &mut ReadBudget,
+    ) -> Result<(SummaryCoverageStats, Vec<AgentRoleCount>), RocksError> {
+        let Self { tx, graph } = *self;
+
+        let lengths = summaries::documentation_lengths(graph, budget)?;
+        let mut output = Counts {
+            summaries: SummaryCoverageStats {
+                eligible_symbols: 0,
+                summarized_symbols: 0,
+                pending_symbols: 0,
+                by_model: BTreeMap::new(),
+            },
+            roles: BTreeMap::new(),
+            retained: 0,
+        };
+        let mut page = Vec::with_capacity(PAGE);
+        visit_symbols(graph, budget, |symbol, budget| {
+            let summary = summaries::eligible(&symbol, policy, &lengths);
+            output.summaries.eligible_symbols += u64::from(summary);
+            page.push(Candidate {
+                id: symbol.symbol_id,
+                digest: symbol.structural_digest,
+                summary,
+            });
+            if page.len() == PAGE {
+                output.read_page(tx, &page, budget)?;
+                page.clear();
+            }
+            Ok(())
+        })?;
+        if !page.is_empty() {
+            output.read_page(tx, &page, budget)?;
         }
-        Ok(())
-    })?;
-    if !page.is_empty() {
-        read_page(tx, &page, &mut output, budget)?;
+        output.summaries.pending_symbols =
+            output.summaries.eligible_symbols - output.summaries.summarized_symbols;
+        let mut roles = output
+            .roles
+            .into_iter()
+            .map(|(role, symbols)| AgentRoleCount { role, symbols })
+            .collect::<Vec<_>>();
+        roles.sort_by(|a, b| b.symbols.cmp(&a.symbols).then(a.role.cmp(&b.role)));
+        Ok((output.summaries, roles))
     }
-    output.summaries.pending_symbols =
-        output.summaries.eligible_symbols - output.summaries.summarized_symbols;
-    let mut roles = output
-        .roles
-        .into_iter()
-        .map(|(role, symbols)| AgentRoleCount { role, symbols })
-        .collect::<Vec<_>>();
-    roles.sort_by(|a, b| b.symbols.cmp(&a.symbols).then(a.role.cmp(&b.role)));
-    Ok((output.summaries, roles))
 }
 
-fn read_page(
-    tx: &StateTransaction<'_>,
-    page: &[Candidate],
-    output: &mut Counts,
-    budget: &mut ReadBudget,
-) -> Result<(), RocksError> {
-    let mut targets = Vec::with_capacity(PAGE * 2);
-    for candidate in page {
-        targets.push(Target {
-            candidate,
-            kind: Kind::Role,
-        });
-        if candidate.summary {
+impl Counts {
+    fn read_page(
+        &mut self,
+        tx: &StateTransaction<'_>,
+        page: &[Candidate],
+        budget: &mut ReadBudget,
+    ) -> Result<(), RocksError> {
+        let mut targets = Vec::with_capacity(PAGE * 2);
+        for candidate in page {
             targets.push(Target {
                 candidate,
-                kind: Kind::Summary,
+                kind: Kind::Role,
             });
+            if candidate.summary {
+                targets.push(Target {
+                    candidate,
+                    kind: Kind::Summary,
+                });
+            }
         }
-    }
-    let keys = targets
-        .iter()
-        .map(|target| {
-            scope_key(target.kind, Scope::Symbol, target.candidate.id.as_str()).into_bytes()
-        })
-        .collect::<Vec<_>>();
-    let pointers = tx.get_many(NAMESPACE, &keys, budget)?;
-    let mut selected = Vec::new();
-    for (target, pointer) in targets.into_iter().zip(pointers) {
-        if let Some(pointer) = pointer {
-            selected.push((target, counter(&pointer)?));
+        let keys = targets
+            .iter()
+            .map(|target| {
+                scope_key(target.kind, Scope::Symbol, target.candidate.id.as_str()).into_bytes()
+            })
+            .collect::<Vec<_>>();
+        let pointers = tx.get_many(NAMESPACE, &keys, budget)?;
+        let mut selected = Vec::new();
+        for (target, pointer) in targets.into_iter().zip(pointers) {
+            if let Some(pointer) = pointer {
+                selected.push((target, counter(&pointer)?));
+            }
         }
-    }
-    if selected.is_empty() {
-        return Ok(());
-    }
-    let keys = selected
-        .iter()
-        .map(|(_, id)| primary(*id).into_bytes())
-        .collect::<Vec<_>>();
-    let rows = tx.get_many(NAMESPACE, &keys, budget)?;
-    for ((target, id), bytes) in selected.into_iter().zip(rows) {
-        let record: Record = decode(&bytes.ok_or_else(corrupt)?)?;
-        validate_record(&record)?;
-        if record.id != id
-            || record.kind != target.kind
-            || record.scope != Scope::Symbol
-            || record.scope_key != target.candidate.id.as_str()
-            || !indexed(record.kind, record.state)
-        {
-            return Err(corrupt());
+        if selected.is_empty() {
+            return Ok(());
         }
-        if record.source_digest.as_deref() == Some(target.candidate.digest.as_str()) {
-            count_record(output, record)?;
+        let keys = selected
+            .iter()
+            .map(|(_, id)| primary(*id).into_bytes())
+            .collect::<Vec<_>>();
+        let rows = tx.get_many(NAMESPACE, &keys, budget)?;
+        for ((target, id), bytes) in selected.into_iter().zip(rows) {
+            let record: Record = decode(&bytes.ok_or_else(corrupt)?)?;
+            validate_record(&record)?;
+            if record.id != id
+                || record.kind != target.kind
+                || record.scope != Scope::Symbol
+                || record.scope_key != target.candidate.id.as_str()
+                || !indexed(record.kind, record.state)
+            {
+                return Err(corrupt());
+            }
+            if record.source_digest.as_deref() == Some(target.candidate.digest.as_str()) {
+                self.record(record)?;
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
-fn count_record(output: &mut Counts, record: Record) -> Result<(), RocksError> {
-    if record.kind == Kind::Role && matches!(record.state, State::Active | State::Complete) {
-        count(&mut output.roles, record.body, &mut output.retained)?;
-    } else if record.kind == Kind::Summary && record.state == State::Complete {
-        let model = record
-            .metadata
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("unknown")
-            .to_owned();
-        count(&mut output.summaries.by_model, model, &mut output.retained)?;
-        output.summaries.summarized_symbols += 1;
+impl Counts {
+    fn record(&mut self, record: Record) -> Result<(), RocksError> {
+        let output = self;
+
+        if record.kind == Kind::Role && matches!(record.state, State::Active | State::Complete) {
+            count(&mut output.roles, record.body, &mut output.retained)?;
+        } else if record.kind == Kind::Summary && record.state == State::Complete {
+            let model = record
+                .metadata
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown")
+                .to_owned();
+            count(&mut output.summaries.by_model, model, &mut output.retained)?;
+            output.summaries.summarized_symbols += 1;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn count(
@@ -181,8 +200,8 @@ fn count(
     retained: &mut usize,
 ) -> Result<(), RocksError> {
     if !map.contains_key(&key) {
-        *retained = retained.saturating_add(key.len() + 128);
-        if map.len() >= 8192 || *retained > 32 * 1_048_576 {
+        *retained = retained.saturating_add(key.len() + COUNT_ENTRY_OVERHEAD);
+        if map.len() >= MAXIMUM_COUNT_KEYS || *retained > MAXIMUM_COUNT_BYTES {
             return Err(workspace());
         }
     }

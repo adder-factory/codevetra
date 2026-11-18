@@ -67,8 +67,11 @@ fn scan_pages_continue_across_tombstones_and_unpublished_only_keys() -> TestResu
     let snapshot = store.current_snapshot(None)?;
     let mut cursor = None;
     for expected in [b"a", b"b"] {
-        let page =
-            snapshot.scan_prefix(Collection::Graph, b"", cursor.as_ref(), 1, &mut budget()?)?;
+        let page = snapshot.scan_prefix(Collection::Graph, b"").page(
+            cursor.as_ref(),
+            1,
+            &mut budget()?,
+        )?;
         assert_eq!(page.rows.len(), 0);
         assert_eq!(
             page.next_after.as_ref().map(RecordKey::as_bytes),
@@ -76,13 +79,14 @@ fn scan_pages_continue_across_tombstones_and_unpublished_only_keys() -> TestResu
         );
         cursor = page.next_after;
     }
-    let page = snapshot.scan_prefix(Collection::Graph, b"", cursor.as_ref(), 1, &mut budget()?)?;
+    let page =
+        snapshot
+            .scan_prefix(Collection::Graph, b"")
+            .page(cursor.as_ref(), 1, &mut budget()?)?;
     assert_eq!(page.rows.len(), 1);
     assert_eq!(page.rows[0].0.as_bytes(), b"c");
     assert_eq!(page.rows[0].1, b"visible");
-    let final_page = snapshot.scan_prefix(
-        Collection::Graph,
-        b"",
+    let final_page = snapshot.scan_prefix(Collection::Graph, b"").page(
         page.next_after.as_ref(),
         1,
         &mut budget()?,

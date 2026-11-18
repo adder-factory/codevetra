@@ -5,9 +5,11 @@ async fn reclaimed_bytes_preserve_floor_reply_and_fifo_reader_admission() -> Tes
     let pool = pool()?;
     let request = request()?;
     assert!(
-        pool.run_reclaiming(&request, 10, true, 11, |_, _| Ok(()))
-            .await
-            .is_err()
+        pool.run_reclaiming(&request, JobCapacity::write(10).reclaiming(11), |_, _| Ok(
+            ()
+        ))
+        .await
+        .is_err()
     );
     assert_eq!(pool.bytes.available_permits(), 1_048_576);
     let mut payload = Vec::new();
@@ -24,9 +26,7 @@ async fn reclaimed_bytes_preserve_floor_reply_and_fifo_reader_admission() -> Tes
     let (finished, finished_now) = oneshot::channel();
     let mut writer = Box::pin(pool.run_reclaiming(
         &request,
-        reservation,
-        true,
-        credit_limit,
+        JobCapacity::write(reservation).reclaiming(credit_limit),
         move |_, credit| {
             assert!(credit.release(capacity + 1).is_err());
             let _entered = entered.send(());
@@ -50,9 +50,9 @@ async fn reclaimed_bytes_preserve_floor_reply_and_fifo_reader_admission() -> Tes
         pool.bytes.available_permits(),
         1_048_576 - usize::try_from(reservation)?
     );
-    let mut large = Box::pin(pool.run(&request, 300_000, false, |_| Ok(7)));
+    let mut large = Box::pin(pool.run(&request, JobCapacity::read(300_000), |_| Ok(7)));
     assert!(futures_util::poll!(large.as_mut()).is_pending());
-    let mut small = Box::pin(pool.run(&request, 64_000, false, |_| Ok(8)));
+    let mut small = Box::pin(pool.run(&request, JobCapacity::read(64_000), |_| Ok(8)));
     // FIFO keeps the small request behind the earlier large waiter.
     assert!(futures_util::poll!(small.as_mut()).is_pending());
     destroy.send(())?;

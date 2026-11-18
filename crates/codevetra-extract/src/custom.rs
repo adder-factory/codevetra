@@ -151,6 +151,11 @@ impl<'name> CustomSymbolInput<'name> {
         self
     }
 
+    fn with_parent(mut self, parent: Option<SymbolId>) -> Self {
+        self.options.parent = parent;
+        self
+    }
+
     fn with_options(mut self, options: SymbolOptions) -> Self {
         self.options = options;
         self
@@ -575,7 +580,7 @@ fn custom_symbol(parts: CustomSymbolParts<'_>) -> Result<ExtractedSymbol, Extrac
         docstring: None,
         body_search_text: options.body_search_text,
         body_search_truncated: false,
-        health: crate::SymbolHealthMetrics::default(),
+        health: crate::SymbolHealth::default(),
         implementation: SymbolImplementationFlags {
             declaration_only: options.declaration_only,
             test_symbol: false,

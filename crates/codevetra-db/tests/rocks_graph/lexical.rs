@@ -44,17 +44,16 @@ fn persisted_postings_bound_rare_queries_and_follow_sparse_updates_and_deletions
     assert_eq!(old.search_code("ÄPFEL", 1, &mut budget()?)?.0.len(), 1);
     raw.files[0].content_hash = digest(4);
     raw.documents[0].code = "freshreplacement".into();
-    let sparse = GraphPublicationInput::replace_files(
+    let sparse = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(2),
             source_revision: digest(8),
             base: GraphBase::Current(generation(1)),
         },
-        base,
-        raw.clone(),
         GraphPolicy::default(),
         &request()?,
-    )?;
+    )
+    .replace_files(base, raw.clone())?;
     store.publish_graph(sparse, &request()?)?;
     let current = store.current_snapshot(None)?;
     let current = current.graph(&mut budget()?)?;
@@ -118,19 +117,19 @@ fn optional_posting_workspace_never_rejects_a_complete_graph() -> TestResult {
         natural_text: String::new(),
         metadata: serde_json::json!({}),
     });
-    let publication = GraphPublicationInput::new(
+    let publication = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(1),
             source_revision: digest(8),
             base: GraphBase::Empty,
         },
-        canonical(raw.clone())?,
         GraphPolicy {
             maximum_working_bytes: 1_048_576,
             ..GraphPolicy::default()
         },
         &request()?,
-    )?;
+    )
+    .resident(canonical(raw.clone())?)?;
     store.publish_graph(publication, &request()?)?;
     let pinned = store.current_snapshot(None)?;
     let graph = pinned.graph(&mut budget()?)?;
@@ -197,19 +196,19 @@ fn uuid_table_streaming_leaves_workspace_for_lexical_postings() -> TestResult {
         raw.documents
             .push(document(&raw, id, "raretabletoken".into())?);
     }
-    let publication = GraphPublicationInput::new(
+    let publication = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(1),
             source_revision: digest(8),
             base: GraphBase::Empty,
         },
-        canonical(raw)?,
         GraphPolicy {
             maximum_working_bytes: 1_048_576,
             ..GraphPolicy::default()
         },
         &request()?,
-    )?;
+    )
+    .resident(canonical(raw)?)?;
     store.publish_graph(publication, &request()?)?;
     let snapshot = store.current_snapshot(None)?;
     let graph = snapshot.graph(&mut budget()?)?;
@@ -246,20 +245,19 @@ fn sparse_payload_and_vocabulary_share_the_working_budget() -> TestResult {
         }
         document.metadata = serde_json::json!({"payload":"x".repeat(58_000)});
     }
-    let publication = GraphPublicationInput::replace_files(
+    let publication = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(2),
             source_revision: digest(8),
             base: GraphBase::Current(generation(1)),
         },
-        base,
-        raw,
         GraphPolicy {
             maximum_working_bytes: 1_048_576,
             ..GraphPolicy::default()
         },
         &request()?,
-    )?;
+    )
+    .replace_files(base, raw)?;
     store.publish_graph(publication, &request()?)?;
     let snapshot = store.current_snapshot(None)?;
     let graph = snapshot.graph(&mut budget()?)?;
@@ -314,19 +312,19 @@ fn prior_large_vocabulary_streams_across_batch_boundaries_and_lower_policy() -> 
     );
     assert_eq!(graph.search_code("original9999", 1, &mut budget()?)?.0, []);
     raw.documents[0].code = "sharedtoken afterlower".into();
-    let lower = GraphPublicationInput::new(
+    let lower = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(3),
             source_revision: digest(8),
             base: GraphBase::Current(generation(2)),
         },
-        canonical(raw)?,
         GraphPolicy {
             maximum_working_bytes: 1_048_576,
             ..GraphPolicy::default()
         },
         &request()?,
-    )?;
+    )
+    .resident(canonical(raw)?)?;
     store.publish_graph(lower, &request()?)?;
     let current = store.current_snapshot(None)?;
     let graph = current.graph(&mut budget()?)?;

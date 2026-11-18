@@ -18,7 +18,7 @@ const DEFAULT_MAXIMUM_ROWS: u64 = 5_000_000;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) const DEFAULT_NODE_LIMIT: u16 = 1_000;
-const MAXIMUM_NODE_LIMIT: u16 = 50_000;
+pub(super) const MAXIMUM_NODE_LIMIT: u16 = 50_000;
 
 /// Stable spellings `--kind` accepts: every symbol kind the domain defines.
 fn node_kind_names() -> Vec<&'static str> {

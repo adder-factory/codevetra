@@ -1,11 +1,15 @@
 //! Logical-key encoding independent of the `RocksDB` execution boundary.
 
+pub(super) const MAXIMUM_KEY_BYTES: usize = 4_096;
+const ESCAPED_ZERO: u8 = 255;
+const SEQUENCE_BYTES: usize = std::mem::size_of::<u64>();
+
 pub(super) fn escape(bytes: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(bytes.len().saturating_add(2));
     for &byte in bytes {
         encoded.push(byte);
         if byte == 0 {
-            encoded.push(255);
+            encoded.push(ESCAPED_ZERO);
         }
     }
     encoded
@@ -20,11 +24,11 @@ pub(super) fn decode(encoded: &[u8]) -> Option<(Vec<u8>, u64)> {
             decoded.push(byte);
         } else {
             match encoded.get(index) {
-                Some(255) => decoded.push(0),
+                Some(&ESCAPED_ZERO) => decoded.push(0),
                 Some(0) => {
                     index += 1;
-                    let sequence: [u8; 8] = encoded.get(index..)?.try_into().ok()?;
-                    if decoded.is_empty() || decoded.len() > 4096 {
+                    let sequence: [u8; SEQUENCE_BYTES] = encoded.get(index..)?.try_into().ok()?;
+                    if decoded.is_empty() || decoded.len() > MAXIMUM_KEY_BYTES {
                         return None;
                     }
                     return Some((decoded, !u64::from_be_bytes(sequence)));
@@ -33,7 +37,7 @@ pub(super) fn decode(encoded: &[u8]) -> Option<(Vec<u8>, u64)> {
             }
             index += 1;
         }
-        if decoded.len() > 4096 {
+        if decoded.len() > MAXIMUM_KEY_BYTES {
             break;
         }
     }

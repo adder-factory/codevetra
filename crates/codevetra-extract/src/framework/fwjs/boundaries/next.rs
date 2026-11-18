@@ -1,7 +1,7 @@
 //! Initial same-origin Next App Router slice. Unknown base/configuration stays explicit.
 use super::{
-    ExtractError, FrameworkBuilder, Node, ReceiverKind, Site, State, SymbolKind, add, argument,
-    imported, lexical, literal, member, scope_key, text,
+    ExtractError, FrameworkBuilder, Node, ReceiverKind, Site, State, SymbolKind, argument, literal,
+    member, scope_key, text,
 };
 
 pub(super) fn scope_for_path(path: &str) -> Option<String> {
@@ -20,8 +20,7 @@ pub(super) fn scope_for_path(path: &str) -> Option<String> {
 
 pub(super) fn registrations(
     builder: &mut FrameworkBuilder<'_, '_>,
-    state: &mut State,
-    lexical: &lexical::Index,
+    state: &mut State<'_>,
 ) -> Result<(), ExtractError> {
     let Some(scope) = state.next_scope.clone() else {
         return Ok(());
@@ -63,14 +62,12 @@ pub(super) fn registrations(
         ) {
             continue;
         }
-        let eligible = registration_export(http, export.exported, export.default_export, &name);
+        let eligible = registration_export(http, export, &name);
         if !eligible {
             continue;
         }
-        add(
+        state.add(
             builder,
-            state,
-            lexical,
             Site {
                 channel,
                 role,
@@ -86,15 +83,19 @@ pub(super) fn registrations(
     }
     Ok(())
 }
-fn registration_export(http: bool, exported: bool, default_export: bool, name: &str) -> bool {
+fn registration_export(
+    http: bool,
+    export: codevetra_domain::SymbolExportFlags,
+    name: &str,
+) -> bool {
     if http {
-        exported
+        export.exported
             && matches!(
                 name,
                 "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
             )
     } else {
-        default_export
+        export.default_export
     }
 }
 
@@ -125,16 +126,14 @@ fn route_path(directory: &str) -> Option<String> {
 pub(super) fn receiver(
     builder: &FrameworkBuilder<'_, '_>,
     value: Node<'_>,
-    state: &State,
+    state: &State<'_>,
 ) -> Option<ReceiverKind> {
     if value.kind() != "call_expression" {
         return None;
     }
     let function = value.child_by_field_name("function")?;
     if function.kind() == "identifier"
-        && imported(
-            builder,
-            state,
+        && state.imported(
             text(builder, function),
             &["next/navigation", "next/router"],
             &["useRouter"],
@@ -143,7 +142,7 @@ pub(super) fn receiver(
         return Some(ReceiverKind::Router);
     }
     let (owner, method) = member(builder, value)?;
-    if method != "create" || !imported(builder, state, owner, &["axios"], &["default"]) {
+    if method != "create" || !state.imported(owner, &["axios"], &["default"]) {
         return None;
     }
     let options = argument(value, 0)?;
@@ -159,8 +158,7 @@ pub(super) fn receiver(
 pub(super) fn call(
     builder: &mut FrameworkBuilder<'_, '_>,
     call: Node<'_>,
-    state: &mut State,
-    lexical: &lexical::Index,
+    state: &mut State<'_>,
 ) -> Result<(), ExtractError> {
     let Some(function) = call.child_by_field_name("function") else {
         return Ok(());
@@ -170,9 +168,7 @@ pub(super) fn call(
         && !state.names.contains_key("fetch")
         && !state.imports.contains_key("fetch");
     let redirect = function.kind() == "identifier"
-        && imported(
-            builder,
-            state,
+        && state.imported(
             direct,
             &["next/navigation"],
             &["redirect", "permanentRedirect"],
@@ -228,7 +224,6 @@ pub(super) fn call(
     source_site(
         builder,
         state,
-        lexical,
         SourceSite {
             channel,
             operation: operation.as_deref().unwrap_or("UNKNOWN"),
@@ -249,8 +244,7 @@ struct SourceSite<'a, 'tree> {
 }
 fn source_site(
     builder: &mut FrameworkBuilder<'_, '_>,
-    state: &mut State,
-    lexical: &lexical::Index,
+    state: &mut State<'_>,
     input: SourceSite<'_, '_>,
 ) -> Result<(), ExtractError> {
     let scope = state
@@ -266,10 +260,8 @@ fn source_site(
         }
         _ => ("<dynamic-or-unproven-base>", "unknown"),
     };
-    add(
+    state.add(
         builder,
-        state,
-        lexical,
         Site {
             channel: input.channel,
             role,
@@ -343,14 +335,13 @@ fn client_module(builder: &FrameworkBuilder<'_, '_>) -> bool {
 pub(super) fn markup(
     builder: &mut FrameworkBuilder<'_, '_>,
     node: Node<'_>,
-    state: &mut State,
-    lexical: &lexical::Index,
+    state: &mut State<'_>,
 ) -> Result<(), ExtractError> {
     let Some(name) = node.child_by_field_name("name") else {
         return Ok(());
     };
     let tag = text(builder, name);
-    if tag != "a" && !imported(builder, state, tag, &["next/link"], &["default"]) {
+    if tag != "a" && !state.imported(tag, &["next/link"], &["default"]) {
         return Ok(());
     }
     let mut destination = None;
@@ -383,7 +374,6 @@ pub(super) fn markup(
     source_site(
         builder,
         state,
-        lexical,
         SourceSite {
             channel: "navigation",
             operation: "link",

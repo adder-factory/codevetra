@@ -1,6 +1,6 @@
 //! Native file pressure and orphan analysis preserve source and ranking fences.
 
-use super::{corrupt, neighbors, visit_references, workspace};
+use super::{corrupt, visit_references, workspace};
 use crate::{
     FileHistoryMetrics, FileInput, GraphDirection, NativeDatabase, StorageError, SymbolInput,
     artifacts::native::summaries::visit_documents,
@@ -9,7 +9,7 @@ use crate::{
         StructuralHotspotCategory as Category, StructuralHotspotQuery,
         StructuralHotspotSort as Sort, validate_limit,
     },
-    retrieval::native::{retain, simple_name, visit_files, visit_symbols},
+    retrieval::native::{simple_name, visit_files, visit_symbols},
     rocks::{GraphSnapshot, ReadBudget, RocksError},
 };
 use codevetra_domain::{DocumentKind, EdgeKind, FileId, ProjectId, Visibility};
@@ -51,37 +51,44 @@ impl NativeDatabase {
     ) -> Result<Vec<StructuralHotspot>, StorageError> {
         self.require_project(project)?;
         validate_limit(request.limit)?;
-        self.state(None, 0, 0, move |transaction, budget| {
-            if transaction.current()?.is_none() {
-                return Ok(Vec::new());
-            }
-            let snapshot = transaction.graph_snapshot()?;
-            let graph = snapshot.graph(budget)?;
-            let mut files = risk_inventory(&graph, budget)?;
-            let paths = files
-                .iter()
-                .map(|(id, row)| (row.file.normalized_path.clone(), id.clone()))
-                .collect::<BTreeMap<_, _>>();
-            crate::history::native::visit_metrics(transaction, budget, |path, metrics| {
-                if let Some(row) = paths.get(path).and_then(|id| files.get_mut(id)) {
-                    row.history = Some(metrics);
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                if transaction.current()?.is_none() {
+                    return Ok(Vec::new());
                 }
-                Ok(())
-            })?;
-            let now = jiff::Timestamp::now().as_second();
-            let mut rows = Vec::new();
-            let (mut maximum_pressure, mut maximum_churn) = (0_u64, 0_u64);
-            for (_, row) in files {
-                let row = hotspot(row)?;
-                if !matches_hotspot(&row, &request, now) {
-                    continue;
+                let snapshot = transaction.graph_snapshot()?;
+                let graph = snapshot.graph(budget)?;
+                let mut files = risk_inventory(&graph, budget)?;
+                let paths = files
+                    .iter()
+                    .map(|(id, row)| (row.file.normalized_path.clone(), id.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                crate::history::native::visit_metrics(transaction, budget, |path, metrics| {
+                    if let Some(row) = paths.get(path).and_then(|id| files.get_mut(id)) {
+                        row.history = Some(metrics);
+                    }
+                    Ok(())
+                })?;
+                let now = jiff::Timestamp::now().as_second();
+                let mut rows = Vec::new();
+                let (mut maximum_pressure, mut maximum_churn) = (0_u64, 0_u64);
+                for (_, row) in files {
+                    let row = hotspot(row)?;
+                    if !matches_hotspot(&row, &request, now) {
+                        continue;
+                    }
+                    maximum_pressure = maximum_pressure.max(row.structural_risk);
+                    maximum_churn = maximum_churn.max(churn(&row)?);
+                    rows.push(row);
                 }
-                maximum_pressure = maximum_pressure.max(row.structural_risk);
-                maximum_churn = maximum_churn.max(churn(&row)?);
-                rows.push(row);
-            }
-            rank_hotspots(rows, maximum_pressure, maximum_churn, request)
-        })
+                RiskScale {
+                    maximum_pressure,
+                    maximum_churn,
+                }
+                .rank(rows, request)
+            },
+        )
         .await
     }
 
@@ -111,7 +118,16 @@ impl NativeDatabase {
     ) -> Result<Vec<DeadCodeCandidate>, StorageError> {
         validate_limit(request.limit)?;
         self.current_graph(project, DEFAULT_INSIGHT_TIMEOUT, move |graph, budget| {
-            let mut selected = Vec::new();
+            let mut selected = crate::retrieval::native::RankedRows::new(
+                usize::from(request.limit),
+                |a: &(SymbolInput, FileInput), b| {
+                    b.0.pagerank_ppb
+                        .cmp(&a.0.pagerank_ppb)
+                        .then(a.1.normalized_path.cmp(&b.1.normalized_path))
+                        .then(a.0.start_line.cmp(&b.0.start_line))
+                        .then(a.0.symbol_id.cmp(&b.0.symbol_id))
+                },
+            );
             visit_symbols(graph, budget, |symbol, budget| {
                 if symbol.export.exported
                     || !matches!(
@@ -125,21 +141,10 @@ impl NativeDatabase {
                 if excluded(&symbol, &file, request) || claimed(graph, &symbol, budget)? {
                     return Ok(());
                 }
-                retain(
-                    &mut selected,
-                    (symbol, file),
-                    usize::from(request.limit),
-                    |a, b| {
-                        b.0.pagerank_ppb
-                            .cmp(&a.0.pagerank_ppb)
-                            .then(a.1.normalized_path.cmp(&b.1.normalized_path))
-                            .then(a.0.start_line.cmp(&b.0.start_line))
-                            .then(a.0.symbol_id.cmp(&b.0.symbol_id))
-                    },
-                );
+                selected.insert((symbol, file));
                 Ok(())
             })?;
-            hydrate_orphans(graph, budget, selected)
+            hydrate_orphans(graph, budget, selected.into_vec())
         })
         .await
         .map(Option::unwrap_or_default)
@@ -156,28 +161,35 @@ fn matches_hotspot(row: &StructuralHotspot, request: &StructuralHotspotQuery, no
         })
 }
 
-fn rank_hotspots(
-    rows: Vec<StructuralHotspot>,
+struct RiskScale {
     maximum_pressure: u64,
     maximum_churn: u64,
-    request: StructuralHotspotQuery,
-) -> Result<Vec<StructuralHotspot>, RocksError> {
-    let mut selected = Vec::new();
-    for mut row in rows {
-        row.structural_pressure = ratio(row.structural_risk, maximum_pressure)?;
-        row.churn_score = ratio(churn(&row)?, maximum_churn)?;
-        let base = row.centrality * 0.7 + row.structural_pressure * 0.3;
-        row.risk_score = base * row.churn_score;
-        row.maintenance_score = row.churn_score * (1.0 - row.centrality);
-        row.brittle_score = base / (1.0 + row.churn_score);
-        if request.category == Category::Brittle && row.external_dependents == 0 {
-            continue;
+}
+
+impl RiskScale {
+    fn rank(
+        &self,
+        rows: Vec<StructuralHotspot>,
+        request: StructuralHotspotQuery,
+    ) -> Result<Vec<StructuralHotspot>, RocksError> {
+        let mut selected =
+            crate::retrieval::native::RankedRows::new(usize::from(request.limit), |a, b| {
+                hotspot_order(a, b, request)
+            });
+        for mut row in rows {
+            row.structural_pressure = ratio(row.structural_risk, self.maximum_pressure)?;
+            row.churn_score = ratio(churn(&row)?, self.maximum_churn)?;
+            let base = row.centrality * 0.7 + row.structural_pressure * 0.3;
+            row.risk_score = base * row.churn_score;
+            row.maintenance_score = row.churn_score * (1.0 - row.centrality);
+            row.brittle_score = base / (1.0 + row.churn_score);
+            if request.category == Category::Brittle && row.external_dependents == 0 {
+                continue;
+            }
+            selected.insert(row);
         }
-        retain(&mut selected, row, usize::from(request.limit), |a, b| {
-            hotspot_order(a, b, request)
-        });
+        Ok(selected.into_vec())
     }
-    Ok(selected)
 }
 
 fn risk_inventory(
@@ -212,12 +224,9 @@ fn risk_inventory(
         row.symbols += u64::from(symbol.symbol_kind != "file");
         row.routes += u64::from(symbol.symbol_kind == "route");
         row.centrality = row.centrality.max(symbol.pagerank_ppb.unwrap_or(0));
-        neighbors(
-            graph,
-            &symbol.symbol_id,
-            GraphDirection::Outgoing,
-            budget,
-            |link, budget| {
+        graph
+            .adjacency(&symbol.symbol_id, GraphDirection::Outgoing)
+            .visit(budget, |link, budget| {
                 if link.kind() == EdgeKind::Contains {
                     return Ok(());
                 }
@@ -238,8 +247,7 @@ fn risk_inventory(
                     return Err(workspace());
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         Ok(())
     })?;
     visit_references(graph, budget, |reference, _| {
@@ -254,6 +262,12 @@ fn risk_inventory(
     })?;
     Ok(files)
 }
+
+const STRUCTURAL_COMPOSITE_WEIGHT: u64 = 100;
+const COMMIT_COMPOSITE_CAP: u64 = 1000;
+const COMMIT_COMPOSITE_WEIGHT: u64 = 10;
+const CHANGED_LINE_COMPOSITE_SCALE: u64 = 10;
+const CHANGED_LINE_COMPOSITE_CAP: u64 = 1000;
 
 fn hotspot(row: Risk) -> Result<StructuralHotspot, RocksError> {
     let available = row.history.is_some();
@@ -280,13 +294,21 @@ fn hotspot(row: Risk) -> Result<StructuralHotspot, RocksError> {
         })
         .ok_or(corrupt())?;
     let composite = structural
-        .checked_mul(100)
-        .and_then(|value| value.checked_add(history.commit_count.min(1000) * 10))
+        .checked_mul(STRUCTURAL_COMPOSITE_WEIGHT)
+        .and_then(|value| {
+            value.checked_add(
+                history.commit_count.min(COMMIT_COMPOSITE_CAP) * COMMIT_COMPOSITE_WEIGHT,
+            )
+        })
         .and_then(|value| {
             history
                 .insertions
                 .checked_add(history.deletions)
-                .and_then(|lines| value.checked_add((lines / 10).min(1000)))
+                .and_then(|lines| {
+                    value.checked_add(
+                        (lines / CHANGED_LINE_COMPOSITE_SCALE).min(CHANGED_LINE_COMPOSITE_CAP),
+                    )
+                })
         })
         .ok_or(corrupt())?;
     let touched = history
@@ -426,12 +448,9 @@ fn claimed(
     budget: &mut ReadBudget,
 ) -> Result<bool, RocksError> {
     let mut claimed = false;
-    neighbors(
-        graph,
-        &symbol.symbol_id,
-        GraphDirection::Incoming,
-        budget,
-        |link, budget| {
+    graph
+        .adjacency(&symbol.symbol_id, GraphDirection::Incoming)
+        .visit(budget, |link, budget| {
             if link.source_symbol_id() != &symbol.symbol_id
                 && matches!(
                     link.kind().as_str(),
@@ -471,8 +490,7 @@ fn claimed(
                 }
             }
             Ok(())
-        },
-    )?;
+        })?;
     Ok(claimed)
 }
 
@@ -505,37 +523,25 @@ fn hydrate_orphans(
     for (symbol, file) in selected {
         let mut outgoing = 0_u64;
         let mut dispatch = false;
-        neighbors(
-            graph,
-            &symbol.symbol_id,
-            GraphDirection::Outgoing,
-            budget,
-            |link, _| {
+        graph
+            .adjacency(&symbol.symbol_id, GraphDirection::Outgoing)
+            .visit(budget, |link, _| {
                 outgoing += u64::from(!matches!(link.kind().as_str(), "contains" | "def_use"));
                 Ok(())
-            },
-        )?;
-        neighbors(
-            graph,
-            &symbol.symbol_id,
-            GraphDirection::Incoming,
-            budget,
-            |link, budget| {
+            })?;
+        graph
+            .adjacency(&symbol.symbol_id, GraphDirection::Incoming)
+            .visit(budget, |link, budget| {
                 if link.kind() == EdgeKind::Contains {
-                    neighbors(
-                        graph,
-                        link.source_symbol_id(),
-                        GraphDirection::Outgoing,
-                        budget,
-                        |parent, _| {
+                    graph
+                        .adjacency(link.source_symbol_id(), GraphDirection::Outgoing)
+                        .visit(budget, |parent, _| {
                             dispatch |= matches!(parent.kind().as_str(), "implements" | "extends");
                             Ok(())
-                        },
-                    )?;
+                        })?;
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         let safe_code = code.remove(&symbol.symbol_id).unwrap_or_default();
         output.push((
             DeadCodeCandidate {

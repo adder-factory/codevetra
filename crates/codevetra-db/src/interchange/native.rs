@@ -49,9 +49,7 @@ impl NativeDatabase {
         }
         let maximum = request.maximum_rows;
         self.transaction(
-            None,
-            0,
-            0,
+            crate::rocks::StateAccess::read_only(None),
             request.statement_timeout,
             move |transaction, budget| {
                 let generation = transaction
@@ -80,9 +78,9 @@ impl NativeDatabase {
                     },
                     bytes: 0,
                 };
-                export_files(&graph, budget, &mut output)?;
-                export_symbols(&graph, budget, &mut output)?;
-                export_references(&graph, budget, &mut output)?;
+                output.files(&graph, budget)?;
+                output.symbols(&graph, budget)?;
+                output.references(&graph, budget)?;
                 sort(&mut output.snapshot);
                 Ok(output.snapshot)
             },
@@ -91,133 +89,136 @@ impl NativeDatabase {
     }
 }
 
-fn export_files(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    output: &mut Export,
-) -> Result<(), Error> {
-    visit_files(graph, budget, |file, _| {
-        output
-            .charge(file.normalized_path.len() + file.language.len() + 256)
-            .map_err(bound)?;
-        output.snapshot.files.push(InterchangeFile {
-            file_id: file.file_id,
-            path: file.normalized_path,
-            language: file.language,
-            content_hash: file.content_hash.to_string(),
-            byte_size: file.byte_size,
-        });
-        Ok(())
-    })
-    .map_err(Error::from)
-}
-fn export_symbols(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    output: &mut Export,
-) -> Result<(), Error> {
-    let mut ids = BTreeMap::<SymbolId, usize>::new();
-    visit_symbols(graph, budget, |symbol, budget| {
-        output
-            .charge(
+impl Export {
+    fn files(
+        &mut self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+    ) -> Result<(), Error> {
+        visit_files(graph, budget, |file, _| {
+            self.charge(file.normalized_path.len() + file.language.len() + 256)
+                .map_err(bound)?;
+            self.snapshot.files.push(InterchangeFile {
+                file_id: file.file_id,
+                path: file.normalized_path,
+                language: file.language,
+                content_hash: file.content_hash.to_string(),
+                byte_size: file.byte_size,
+            });
+            Ok(())
+        })
+        .map_err(Error::from)
+    }
+    fn symbols(
+        &mut self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+    ) -> Result<(), Error> {
+        let mut ids = BTreeMap::<SymbolId, usize>::new();
+        visit_symbols(graph, budget, |symbol, budget| {
+            self.charge(
                 symbol.qualified_name.len()
                     + symbol.signature.len()
                     + symbol.symbol_kind.len()
                     + 768,
             )
             .map_err(bound)?;
-        ids.insert(symbol.symbol_id.clone(), output.snapshot.symbols.len());
-        export_edges(graph, budget, &symbol.symbol_id, output)?;
-        output.snapshot.symbols.push(InterchangeSymbol {
-            symbol_id: symbol.symbol_id,
-            file_id: symbol.file_id,
-            symbol_kind: symbol.symbol_kind,
-            qualified_name: symbol.qualified_name,
-            signature: symbol.signature,
-            code: String::new(),
-            natural_text: String::new(),
-            start_byte: symbol.start_byte,
-            end_byte: symbol.end_byte,
-            start_line: symbol.start_line,
-            end_line: symbol.end_line,
-        });
-        Ok(())
-    })?;
-    visit_documents(graph, budget, |document, _| {
-        if document.kind == DocumentKind::Symbol
-            && let Some(index) = document
-                .symbol_id
-                .as_ref()
-                .and_then(|id| ids.get(id))
-                .copied()
-        {
-            output
-                .charge(document.code.len() + document.natural_text.len())
-                .map_err(bound)?;
-            let row = &mut output.snapshot.symbols[index];
-            row.code = document.code;
-            row.natural_text = document.natural_text;
-        }
-        Ok(())
-    })
-    .map_err(Error::from)
-}
-fn export_edges(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    id: &SymbolId,
-    output: &mut Export,
-) -> Result<(), RocksError> {
-    let mut cursor = None;
-    loop {
-        let page = graph.neighbors(id, GraphDirection::Outgoing, cursor.as_ref(), 256, budget)?;
-        for link in page.links {
-            budget.checkpoint()?;
-            let edge = graph.edge(&link, budget)?;
-            output.charge(edge.provenance.len() + 256).map_err(bound)?;
-            output.snapshot.edges.push(InterchangeEdge {
-                source_symbol_id: edge.source_symbol_id,
-                target_symbol_id: edge.target_symbol_id,
-                edge_kind: edge.kind.as_str().to_owned(),
-                confidence: edge.confidence,
-                provenance: edge.provenance,
-                site_count: edge.site_count,
+            ids.insert(symbol.symbol_id.clone(), self.snapshot.symbols.len());
+            self.edges(graph, budget, &symbol.symbol_id)?;
+            self.snapshot.symbols.push(InterchangeSymbol {
+                symbol_id: symbol.symbol_id,
+                file_id: symbol.file_id,
+                symbol_kind: symbol.symbol_kind,
+                qualified_name: symbol.qualified_name,
+                signature: symbol.signature,
+                code: String::new(),
+                natural_text: String::new(),
+                start_byte: symbol.start_byte,
+                end_byte: symbol.end_byte,
+                start_line: symbol.start_line,
+                end_line: symbol.end_line,
             });
+            Ok(())
+        })?;
+        visit_documents(graph, budget, |document, _| {
+            if document.kind == DocumentKind::Symbol
+                && let Some(index) = document
+                    .symbol_id
+                    .as_ref()
+                    .and_then(|id| ids.get(id))
+                    .copied()
+            {
+                self.charge(document.code.len() + document.natural_text.len())
+                    .map_err(bound)?;
+                let row = &mut self.snapshot.symbols[index];
+                row.code = document.code;
+                row.natural_text = document.natural_text;
+            }
+            Ok(())
+        })
+        .map_err(Error::from)
+    }
+    fn edges(
+        &mut self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+        id: &SymbolId,
+    ) -> Result<(), RocksError> {
+        let mut cursor = None;
+        loop {
+            let page =
+                graph
+                    .adjacency(id, GraphDirection::Outgoing)
+                    .page(cursor.as_ref(), 256, budget)?;
+            for link in page.links {
+                budget.checkpoint()?;
+                let edge = graph.edge(&link, budget)?;
+                self.charge(edge.provenance.len() + 256).map_err(bound)?;
+                self.snapshot.edges.push(InterchangeEdge {
+                    source_symbol_id: edge.source_symbol_id,
+                    target_symbol_id: edge.target_symbol_id,
+                    edge_kind: edge.kind.as_str().to_owned(),
+                    confidence: edge.confidence,
+                    provenance: edge.provenance,
+                    site_count: edge.site_count,
+                });
+            }
+            cursor = page.next;
+            if cursor.is_none() {
+                return Ok(());
+            }
         }
-        cursor = page.next;
-        if cursor.is_none() {
-            return Ok(());
+    }
+    fn references(
+        &mut self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+    ) -> Result<(), Error> {
+        let mut cursor = None;
+        loop {
+            let (references, next) = graph.reference_records(cursor.as_ref(), 256, budget)?;
+            for reference in references {
+                budget.checkpoint()?;
+                self.charge(reference.reference_name.len() + reference.reference_kind.len() + 320)?;
+                self.snapshot.references.push(InterchangeReference {
+                    file_id: reference.file_id,
+                    owner_symbol_id: reference.owner_symbol_id,
+                    target_symbol_id: reference.target_symbol_id,
+                    reference_name: reference.reference_name,
+                    reference_kind: reference.reference_kind,
+                    start_byte: reference.start_byte,
+                    end_byte: reference.end_byte,
+                    site_count: reference.site_count,
+                });
+            }
+            cursor = next;
+            if cursor.is_none() {
+                return Ok(());
+            }
         }
     }
 }
-fn export_references(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    output: &mut Export,
-) -> Result<(), Error> {
-    let mut cursor = None;
-    loop {
-        let (references, next) = graph.reference_records(cursor.as_ref(), 256, budget)?;
-        for reference in references {
-            budget.checkpoint()?;
-            output.charge(reference.reference_name.len() + reference.reference_kind.len() + 320)?;
-            output.snapshot.references.push(InterchangeReference {
-                file_id: reference.file_id,
-                owner_symbol_id: reference.owner_symbol_id,
-                target_symbol_id: reference.target_symbol_id,
-                reference_name: reference.reference_name,
-                reference_kind: reference.reference_kind,
-                start_byte: reference.start_byte,
-                end_byte: reference.end_byte,
-                site_count: reference.site_count,
-            });
-        }
-        cursor = next;
-        if cursor.is_none() {
-            return Ok(());
-        }
-    }
-}
+
 fn sort(snapshot: &mut InterchangeSnapshot) {
     snapshot
         .files

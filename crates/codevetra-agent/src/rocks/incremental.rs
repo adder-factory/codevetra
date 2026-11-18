@@ -31,8 +31,7 @@ impl RocksProjectRuntime {
             request,
             publication_policy,
             progress: _,
-            excludes,
-            ceiling,
+            admission,
         } = build;
         request.check()?;
         let Some(cached) = warm.as_ref().filter(|cached| {
@@ -100,13 +99,8 @@ impl RocksProjectRuntime {
             base: base.clone(),
         };
         let candidate = tokio::task::block_in_place(|| {
-            GraphPublicationInput::replace_files(
-                identity,
-                facts,
-                replacements,
-                *publication_policy,
-                request,
-            )
+            codevetra_db::rocks::GraphPreparation::new(identity, *publication_policy, request)
+                .replace_files(facts, replacements)
         });
         request.check()?;
         // An exhausted optional fast path does not reduce the complete build's
@@ -114,9 +108,7 @@ impl RocksProjectRuntime {
         let Ok(input) = candidate else {
             return Ok(None);
         };
-        let admitted = tokio::task::block_in_place(|| {
-            input.with_source_admission(excludes.to_vec(), *ceiling)
-        });
+        let admitted = tokio::task::block_in_place(|| admission.attach(input));
         request.check()?;
         let files = u16::try_from(paths.len()).map_err(|_| RocksProjectError::InvalidQuery)?;
         match admitted {
@@ -168,7 +160,7 @@ mod tests {
     use super::*;
     use crate::rocks::{
         Duration, GraphPolicy, NativeBuildProgress, ReadBudget, RocksError, RocksIndexOptions,
-        StorageRequest,
+        SourceAdmission, StorageRequest,
     };
     use codevetra_domain::ReferenceKind;
 
@@ -211,7 +203,14 @@ mod tests {
         let progress = NativeBuildProgress::default();
         std::fs::write(&file, "pub fn value() -> u32 { 2 }\n")?;
         let (source, policy) = runtime
-            .scan_with_admission(&request, false, excludes.clone(), None)
+            .scan_with_admission(
+                &request,
+                false,
+                SourceAdmission {
+                    excludes: excludes.clone(),
+                    ceiling: None,
+                },
+            )
             .await?;
         let mut warm = runtime.indexing.lock().await;
         let (sparse, _) = runtime
@@ -224,8 +223,7 @@ mod tests {
                     base: GraphBase::Current(first.revision.generation_id.clone()),
                     request: &request,
                     progress: &progress,
-                    excludes: &[],
-                    ceiling: None,
+                    admission: &SourceAdmission::default(),
                     publication_policy,
                 },
             )
@@ -253,7 +251,14 @@ mod tests {
             .await?;
         std::fs::write(&file, "pub fn value() -> u32 { 3 }\n")?;
         let (source, policy) = runtime
-            .scan_with_admission(&request, false, excludes.clone(), None)
+            .scan_with_admission(
+                &request,
+                false,
+                SourceAdmission {
+                    excludes: excludes.clone(),
+                    ceiling: None,
+                },
+            )
             .await?;
         let mut warm = runtime.indexing.lock().await;
         let prepared = runtime
@@ -266,8 +271,10 @@ mod tests {
                     base: GraphBase::Current(before.revision.generation_id.clone()),
                     request: &request,
                     progress: &NativeBuildProgress::default(),
-                    excludes: &excludes,
-                    ceiling: None,
+                    admission: &SourceAdmission {
+                        excludes: excludes.clone(),
+                        ceiling: None,
+                    },
                     publication_policy,
                 },
             )
@@ -281,7 +288,8 @@ mod tests {
         drop(warm);
         let published = runtime
             .store
-            .publish_graph(prepared.input, &request)
+            .with_request(&request)
+            .publish_graph(prepared.input)
             .await?;
         let status = runtime.status(&request).await?;
         assert!(status.fresh);
@@ -401,8 +409,7 @@ mod tests {
                     base: GraphBase::Current(original_generation.clone()),
                     request: &cancelled,
                     progress: &NativeBuildProgress::default(),
-                    excludes: &[],
-                    ceiling: None,
+                    admission: &SourceAdmission::default(),
                     publication_policy: GraphPolicy::default(),
                 },
             )
@@ -553,15 +560,15 @@ mod tests {
         assert_eq!(added.incremental_files, 0);
         runtime
             .store
+            .with_request(&request)
             .read(
                 Some(added.revision.generation_id),
                 ReadBudget::new(100, 1_048_576, Duration::from_secs(10))?,
-                &request,
                 |snapshot, budget| {
                     let graph = snapshot.graph(budget)?;
                     let (files, _) = graph.files(None, 10, budget)?;
                     let file = files.first().ok_or(RocksError::Format)?;
-                    let (rows, _) = graph.references(&file.file_id, None, 100, budget)?;
+                    let (rows, _) = graph.references(&file.file_id).page(None, 100, budget)?;
                     assert!(rows.iter().any(|row| row.reference_name == "later"
                         && row.reference_kind == ReferenceKind::Calls.as_str()
                         && row.target_symbol_id.is_some()));
@@ -576,15 +583,15 @@ mod tests {
         assert_eq!(deleted.incremental_files, 0);
         runtime
             .store
+            .with_request(&request)
             .read(
                 Some(deleted.revision.generation_id),
                 ReadBudget::new(100, 1_048_576, Duration::from_secs(10))?,
-                &request,
                 |snapshot, budget| {
                     let graph = snapshot.graph(budget)?;
                     let (files, _) = graph.files(None, 10, budget)?;
                     let file = files.first().ok_or(RocksError::Format)?;
-                    let (rows, _) = graph.references(&file.file_id, None, 100, budget)?;
+                    let (rows, _) = graph.references(&file.file_id).page(None, 100, budget)?;
                     assert!(
                         rows.iter()
                             .any(|row| row.reference_name == "later"

@@ -24,6 +24,14 @@ const REQUEST_BYTES: usize = 64 * 1024;
 const RESPONSE_BYTES: usize = 2 * 1024 * 1024 + 4096;
 const CONNECTIONS: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const PROTOCOL_VERSION: u8 = 4;
+const MAXIMUM_REQUEST_MILLIS: u32 = 300_000;
+const OWNER_INSTANCE_BYTES: usize = 16;
+const HEX_DIGITS_PER_BYTE: usize = 2;
+const LOCAL_SOCKET_PATH_BYTES: usize = 100;
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+const PRIVATE_SOCKET_MODE: u32 = 0o600;
+const GROUP_AND_OTHER_PERMISSIONS: u32 = 0o077;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,15 +101,19 @@ impl OwnerClient {
         let remaining = context
             .deadline()
             .saturating_duration_since(tokio::time::Instant::now());
-        let timeout_millis = u32::try_from(remaining.min(Duration::from_secs(300)).as_millis())
-            .map_err(|_| super::transport_error(unavailable()))?;
+        let timeout_millis = u32::try_from(
+            remaining
+                .min(Duration::from_millis(u64::from(MAXIMUM_REQUEST_MILLIS)))
+                .as_millis(),
+        )
+        .map_err(|_| super::transport_error(unavailable()))?;
         if timeout_millis == 0 {
             return Err(super::transport_error(
                 "native owner request deadline expired",
             ));
         }
         let request = Request {
-            version: 4,
+            version: PROTOCOL_VERSION,
             project: self.project,
             expected_owner,
             tool: call.name,
@@ -172,9 +184,9 @@ impl OwnerListener {
     /// Called only after this process has acquired the project's native primary.
     pub(crate) fn bind(root: &Path) -> Result<Self, String> {
         let (path, project, uid) = endpoint(root)?;
-        let mut instance = [0_u8; 16];
+        let mut instance = [0_u8; OWNER_INSTANCE_BYTES];
         getrandom::fill(&mut instance).map_err(|_| unavailable())?;
-        let mut instance_hex = String::with_capacity(32);
+        let mut instance_hex = String::with_capacity(OWNER_INSTANCE_BYTES * HEX_DIGITS_PER_BYTE);
         for byte in instance {
             write!(&mut instance_hex, "{byte:02x}").map_err(|_| unavailable())?;
         }
@@ -203,7 +215,7 @@ impl OwnerListener {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
-        fs::set_permissions(&guard.path, fs::Permissions::from_mode(0o600))
+        fs::set_permissions(&guard.path, fs::Permissions::from_mode(PRIVATE_SOCKET_MODE))
             .map_err(|_| unavailable())?;
         Ok(Self {
             listener,
@@ -231,7 +243,7 @@ impl OwnerListener {
                 accepted = self.listener.accept(), if self.connections.len() < CONNECTIONS => {
                     let Ok((stream, _)) = accepted else { break Err(unavailable()) };
                     if stream.peer_cred().is_ok_and(|credentials| credentials.uid() == self.uid) {
-                        self.connections.push(Box::pin(connection(stream, handler.clone(), self.project.clone(), self.instance.clone(), closing.subscribe())));
+                        self.connections.push(Box::pin(OwnerConnection { handler: handler.clone(), project: self.project.clone(), owner_instance: self.instance.clone() }.serve(stream, closing.subscribe())));
                     }
                 }
             }
@@ -282,11 +294,14 @@ fn endpoint_for_user(root: &Path, uid: u32) -> Result<(PathBuf, String, u32), St
     let project = hash.finalize().to_hex().to_string();
     let path = state.join("owner.sock");
     // macOS sockaddr_un has a 104-byte pathname; leave room for its NUL.
-    let path = if path.as_os_str().as_encoded_bytes().len() < 100 {
+    let path = if path.as_os_str().as_encoded_bytes().len() < LOCAL_SOCKET_PATH_BYTES {
         path
     } else {
         let directory = PathBuf::from(format!("/tmp/codevetra-owner-{uid}"));
-        match fs::DirBuilder::new().mode(0o700).create(&directory) {
+        match fs::DirBuilder::new()
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(&directory)
+        {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(unavailable()),
@@ -295,7 +310,7 @@ fn endpoint_for_user(root: &Path, uid: u32) -> Result<(PathBuf, String, u32), St
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
             || metadata.uid() != uid
-            || metadata.mode() & 0o077 != 0
+            || metadata.mode() & GROUP_AND_OTHER_PERMISSIONS != 0
         {
             return Err("native project owner directory is unsafe".to_owned());
         }
@@ -304,89 +319,103 @@ fn endpoint_for_user(root: &Path, uid: u32) -> Result<(PathBuf, String, u32), St
     Ok((path, project, uid))
 }
 
-async fn connection(
-    mut stream: UnixStream,
+struct OwnerConnection {
     handler: Arc<dyn ToolHandler>,
     project: String,
     owner_instance: String,
-    mut closing: watch::Receiver<bool>,
-) {
-    let request: Request =
-        match tokio::time::timeout(IO_TIMEOUT, read_frame(&mut stream, REQUEST_BYTES)).await {
-            Ok(Ok(request)) => request,
-            _ => return,
-        };
-    if request.version != 4
-        || request.project != project
-        || !(1..=300_000).contains(&request.timeout_millis)
-    {
-        return;
-    }
-    if request
-        .expected_owner
-        .as_ref()
-        .is_some_and(|expected| expected != &owner_instance)
-    {
-        let reply = Reply::Error {
-            code: "conflict".to_owned(),
-            message: "native project owner changed; prior job outcome is unverified".to_owned(),
-        };
-        let _ = tokio::time::timeout(IO_TIMEOUT, write_frame(&mut stream, &reply, RESPONSE_BYTES))
-            .await;
-        return;
-    }
-    if !handler
-        .tools()
-        .iter()
-        .any(|tool| tool.name() == request.tool)
-    {
-        return;
-    }
-    let context = ToolCallContext::local(Duration::from_millis(u64::from(request.timeout_millis)));
-    let context = if let Some(ceiling) = request.tool_ceiling {
-        match context.with_tool_ceiling(ceiling.iter().map(String::as_str)) {
-            Ok(context) => context,
-            Err(_) => return,
-        }
-    } else {
-        context
-    };
-    if !context.allows_tool(&request.tool) {
-        return;
-    }
-    let operation = handler.call(
-        ToolCall {
-            name: request.tool,
-            arguments: request.arguments,
-        },
-        context.clone(),
-    );
-    tokio::pin!(operation);
-    let mut unexpected = [0_u8; 1];
-    let result = tokio::select! {
-        result = &mut operation => result,
-        _ = stream.read(&mut unexpected) => { context.cancellation().cancel(); operation.await },
-        _ = closing.changed() => { context.cancellation().cancel(); operation.await },
-        () = tokio::time::sleep_until(context.deadline()) => { context.cancellation().cancel(); operation.await },
-    };
-    let mut reply = match result {
-        Ok(result) => Reply::Ok {
+}
+
+impl OwnerConnection {
+    async fn serve(self, mut stream: UnixStream, mut closing: watch::Receiver<bool>) {
+        let Self {
+            handler,
+            project,
             owner_instance,
-            result,
-        },
-        Err(error) => Reply::Error {
-            code: error.code().as_str().to_owned(),
-            message: error.wire_message().to_owned(),
-        },
-    };
-    if serde_json::to_vec(&reply).is_ok_and(|bytes| bytes.len() > RESPONSE_BYTES) {
-        reply = Reply::Error {
+        } = self;
+        let request: Request =
+            match tokio::time::timeout(IO_TIMEOUT, read_frame(&mut stream, REQUEST_BYTES)).await {
+                Ok(Ok(request)) => request,
+                _ => return,
+            };
+        if !request.compatible(&project) {
+            return;
+        }
+        if request
+            .expected_owner
+            .as_ref()
+            .is_some_and(|expected| expected != &owner_instance)
+        {
+            let reply = Reply::Error {
+                code: "conflict".to_owned(),
+                message: "native project owner changed; prior job outcome is unverified".to_owned(),
+            };
+            let _ =
+                tokio::time::timeout(IO_TIMEOUT, write_frame(&mut stream, &reply, RESPONSE_BYTES))
+                    .await;
+            return;
+        }
+        let Some((call, context)) = request.admit(handler.as_ref()) else {
+            return;
+        };
+        let operation = handler.call(call, context.clone());
+        tokio::pin!(operation);
+        let mut unexpected = [0_u8; 1];
+        let result = tokio::select! {
+            result = &mut operation => result,
+            _ = stream.read(&mut unexpected) => { context.cancellation().cancel(); operation.await },
+            _ = closing.changed() => { context.cancellation().cancel(); operation.await },
+            () = tokio::time::sleep_until(context.deadline()) => { context.cancellation().cancel(); operation.await },
+        };
+        let mut reply = match result {
+            Ok(result) => Reply::Ok {
+                owner_instance,
+                result,
+            },
+            Err(error) => Reply::Error {
+                code: error.code().as_str().to_owned(),
+                message: error.wire_message().to_owned(),
+            },
+        };
+        if serde_json::to_vec(&reply).is_ok_and(|bytes| bytes.len() > RESPONSE_BYTES) {
+            reply = Reply::Error {
             code: "unavailable".to_owned(),
             message: "native_owner_output_too_large: response exceeds the owner transport bound; narrow pathFilter or maxChangedFiles, or request lowTokens for a summary".to_owned(),
         };
+        }
+        let _ = tokio::time::timeout(IO_TIMEOUT, write_frame(&mut stream, &reply, RESPONSE_BYTES))
+            .await;
     }
-    let _ =
-        tokio::time::timeout(IO_TIMEOUT, write_frame(&mut stream, &reply, RESPONSE_BYTES)).await;
+}
+
+impl Request {
+    fn compatible(&self, project: &str) -> bool {
+        self.version == PROTOCOL_VERSION
+            && self.project == project
+            && (1..=MAXIMUM_REQUEST_MILLIS).contains(&self.timeout_millis)
+    }
+    fn admit(self, handler: &dyn ToolHandler) -> Option<(ToolCall, ToolCallContext)> {
+        if !handler.tools().iter().any(|tool| tool.name() == self.tool) {
+            return None;
+        }
+        let context = ToolCallContext::local(Duration::from_millis(u64::from(self.timeout_millis)));
+        let context = if let Some(ceiling) = self.tool_ceiling {
+            context
+                .with_tool_ceiling(ceiling.iter().map(String::as_str))
+                .ok()?
+        } else {
+            context
+        };
+        if !context.allows_tool(&self.tool) {
+            return None;
+        }
+        Some((
+            ToolCall {
+                name: self.tool,
+                arguments: self.arguments,
+            },
+            context,
+        ))
+    }
 }
 
 async fn read_frame<T: serde::de::DeserializeOwned>(
@@ -424,6 +453,30 @@ async fn write_frame<T: Serialize>(
 
 fn unavailable() -> String {
     "native project owner transport is unavailable".to_owned()
+}
+
+/// Run the headless Unix owner until its listener finishes or shutdown is requested.
+pub(super) async fn watch(
+    root: &Path,
+    handler: Arc<crate::mcp_handler::RocksHandler>,
+    mut shutdown: super::Shutdown,
+) -> Result<(), String> {
+    let mut listener = OwnerListener::bind(root)?;
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let owner = listener.run(handler, stopped);
+    std::io::Write::write_all(
+        &mut std::io::stdout().lock(),
+        b"{\"owner\":\"ready\",\"autoSync\":true}\n",
+    )
+    .map_err(|_| "headless owner readiness output failed".to_owned())?;
+    tokio::pin!(owner);
+    tokio::select! {
+        result = &mut owner => result,
+        () = shutdown.requested() => {
+            let _ = stop.send(true);
+            owner.await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -479,7 +532,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         fs::DirBuilder::new()
-            .mode(0o700)
+            .mode(PRIVATE_DIRECTORY_MODE)
             .create(root.path().join(".codevetra"))?;
         let handler = Arc::new(RetainedJobHandler {
             definition: RocksHandler::definitions(false)?
@@ -510,7 +563,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         fs::DirBuilder::new()
-            .mode(0o700)
+            .mode(PRIVATE_DIRECTORY_MODE)
             .create(root.path().join(".codevetra"))?;
         let handler = Arc::new(RetainedJobHandler {
             definition: RocksHandler::definitions(false)?
@@ -527,8 +580,7 @@ mod tests {
         let observer = context.clone();
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            crate::rocks_cli::remote_job::run(
-                root.path(),
+            crate::rocks_cli::remote_job::RemoteJobs::new(root.path()).run(
                 ToolCall {
                     name: "codevetra_admin".to_owned(),
                     arguments: serde_json::from_value(json!({"action":"status", "jobId":7}))?,
@@ -606,16 +658,18 @@ mod tests {
                 let budget =
                     codevetra_db::rocks::ReadBudget::new(100, 1_048_576, Duration::from_secs(30))
                         .map_err(|_| ToolError::internal())?;
-                let operation = self
-                    .store
-                    .state(None, budget, 0, 0, &request, move |_, budget| {
+                let operation = self.store.with_request(&request).state(
+                    codevetra_db::rocks::StateAccess::read_only(None),
+                    budget,
+                    move |_, budget| {
                         let _entered = entered.send(());
                         release
                             .recv_timeout(Duration::from_secs(10))
                             .map_err(|_| codevetra_db::rocks::RocksError::Cancelled)?;
                         budget.checkpoint()?;
                         Ok(())
-                    });
+                    },
+                );
                 tokio::pin!(operation);
                 let result = tokio::select! {
                     result = &mut operation => result,
@@ -641,9 +695,11 @@ mod tests {
         let runtime = StorageRuntime::new(WorkerPolicy::default())?;
         let store = AsyncProjectStore::open(
             &runtime,
-            directory,
-            codevetra_domain::ContentDigest::from_bytes([42; 32]),
-            StorePolicy::default(),
+            codevetra_db::rocks::ProjectOpening::new(
+                directory,
+                codevetra_domain::ContentDigest::from_bytes([42; 32]),
+                StorePolicy::default(),
+            ),
             &StorageRequest::new(Duration::from_secs(30))?,
         )
         .await?;

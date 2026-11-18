@@ -227,7 +227,7 @@ fn rust_file_module_visibility_preserves_existing_filesystem_cancellation_polls(
     }
 }
 
-fn visibility_request<'a>(
+pub(super) fn visibility_request<'a>(
     index: &'a super::ResolutionIndex,
     (file_path, span, name): (&'a str, super::SourceSpan, &'a str),
 ) -> super::ResolutionRequest<'a> {
@@ -251,7 +251,7 @@ fn visibility_request<'a>(
     }
 }
 
-fn visibility_resolution_index(
+pub(super) fn visibility_resolution_index(
     files: &[(&str, &str)],
     (reference_path, reference_name): (&str, &str),
 ) -> (super::ResolutionIndex, super::SourceSpan) {
@@ -469,4 +469,234 @@ fn rust_module_paths_do_not_cross_private_inline_children_from_the_file_root() {
     assert_eq!(call.target_symbol_id.as_ref(), Some(&target.symbol_id));
     assert_eq!(call.resolution_provenance, "native-rust-qualified-path");
     assert_eq!(call.confidence, 1.0);
+}
+
+#[test]
+fn rust_sibling_module_imports_resolve_internal_associated_constructors() {
+    for visibility in ["pub(super)", "pub(crate)", ""] {
+        let implementation = format!(
+            "pub(super) struct Classes; impl Classes {{ {visibility} fn new() -> Self {{ Self }} }}"
+        );
+        let facts = generation(&[
+            ("Cargo.toml", CARGO),
+            ("src/lib.rs", "mod findings;"),
+            ("src/findings.rs", "mod inventory; mod clones;"),
+            (
+                "src/findings/inventory.rs",
+                "use super::{clones}; pub fn run() { clones::Classes::new(); }",
+            ),
+            ("src/findings/clones.rs", &implementation),
+        ]);
+        let owner = capability_symbol(&facts, "src/findings/inventory.rs", "run");
+        let target = capability_symbol(&facts, "src/findings/clones.rs", "Classes::new");
+        let call = CapabilityReferenceQuery::new(&facts, owner)
+            .named("clones::Classes::new", ReferenceKind::Calls);
+        assert_eq!(
+            call.target_symbol_id.as_ref(),
+            (!visibility.is_empty()).then_some(&target.symbol_id),
+            "{visibility}: {call:?}"
+        );
+    }
+}
+
+#[test]
+fn rust_associated_method_name_does_not_shadow_sibling_module_import() {
+    let facts = generation(&[
+        ("Cargo.toml", CARGO),
+        ("src/lib.rs", "mod findings;"),
+        ("src/findings.rs", "mod inventory; mod clones;"),
+        (
+            "src/findings/inventory.rs",
+            "use super::{clones}; struct Referenced; impl Referenced { pub fn clones(self) { clones::Classes::new(); } }",
+        ),
+        (
+            "src/findings/clones.rs",
+            "pub(super) struct Classes; impl Classes { pub(super) fn new() -> Self { Self } }",
+        ),
+    ]);
+    let owner = capability_symbol(&facts, "src/findings/inventory.rs", "Referenced::clones");
+    let target = capability_symbol(&facts, "src/findings/clones.rs", "Classes::new");
+    let call = CapabilityReferenceQuery::new(&facts, owner)
+        .named("clones::Classes::new", ReferenceKind::Calls);
+    assert_eq!(
+        call.target_symbol_id.as_ref(),
+        Some(&target.symbol_id),
+        "{call:?}"
+    );
+}
+
+#[test]
+fn rust_associated_method_module_import_fix_preserves_nearer_type_shadowing() {
+    for source in [
+        "use super::{clones}; struct Referenced; impl Referenced { pub fn clones<clones>(self) { clones::Classes::new(); } }",
+        "use super::{clones}; struct Referenced; impl Referenced { pub fn clones(self) { mod clones { pub struct Classes; impl Classes { pub fn new() -> Self { Self } } } clones::Classes::new(); } }",
+    ] {
+        let facts = generation(&[
+            ("Cargo.toml", CARGO),
+            ("src/lib.rs", "mod findings;"),
+            ("src/findings.rs", "mod inventory; mod clones;"),
+            ("src/findings/inventory.rs", source),
+            (
+                "src/findings/clones.rs",
+                "pub(super) struct Classes; impl Classes { pub(super) fn new() -> Self { Self } }",
+            ),
+        ]);
+        let owner = capability_symbol(&facts, "src/findings/inventory.rs", "Referenced::clones");
+        let imported = capability_symbol(&facts, "src/findings/clones.rs", "Classes::new");
+        let call = CapabilityReferenceQuery::new(&facts, owner)
+            .named("clones::Classes::new", ReferenceKind::Calls);
+        assert_ne!(
+            call.target_symbol_id.as_ref(),
+            Some(&imported.symbol_id),
+            "{source}: {call:?}"
+        );
+    }
+}
+
+#[test]
+fn conditional_file_modules_retain_unique_conventional_targets() {
+    for attributes in [
+        "#[cfg(unix)]",
+        "#[cfg(not(unix))]",
+        "#[cfg(unix)] /* comment */ #[cfg(feature = \"owner\")]",
+    ] {
+        let source = format!(
+            "{attributes} mod transport; pub fn run() {{ transport::Owner::connect(); transport::watch(); }}"
+        );
+        let facts = generation(&[
+            ("Cargo.toml", CARGO),
+            ("src/lib.rs", &source),
+            (
+                "src/transport.rs",
+                "pub(crate) struct Owner; impl Owner { pub(crate) fn connect() {} } pub(crate) fn watch() {}",
+            ),
+        ]);
+        let owner = capability_symbol(&facts, "src/lib.rs", "run");
+        for (name, qualified) in [
+            ("transport::Owner::connect", "Owner::connect"),
+            ("transport::watch", "watch"),
+        ] {
+            let target = capability_symbol(&facts, "src/transport.rs", qualified);
+            let call =
+                CapabilityReferenceQuery::new(&facts, owner).named(name, ReferenceKind::Calls);
+            assert_eq!(
+                call.target_symbol_id.as_ref(),
+                Some(&target.symbol_id),
+                "{attributes}: {call:?}"
+            );
+            assert_eq!(call.confidence, 1.0);
+            assert_eq!(call.resolution_provenance, "native-import-binding");
+        }
+    }
+}
+
+#[test]
+fn conditional_file_modules_reject_uncertain_attributes_and_duplicate_declarations() {
+    let too_many = "#[cfg(unix)]\n".repeat(129);
+    let too_deep = format!("#[cfg({}unix{})]", "not(".repeat(18), ")".repeat(18));
+    for attributes in [
+        "#[cfg_attr(unix, path = \"other.rs\")] /* trivia */ #[cfg(unix)]",
+        "#[path = \"other.rs\"] /* trivia */ #[unknown]",
+        "#[unknown] // trivia\n#[cfg(unix)]",
+        "#[cfg]",
+        "#[cfg()]",
+        "#[cfg(not(unix, windows))]",
+        "#[cfg(broken(unix))]",
+        too_many.as_str(),
+        too_deep.as_str(),
+    ] {
+        let source = format!("{attributes} mod transport; pub fn run() {{ transport::watch(); }}");
+        let facts = generation(&[
+            ("Cargo.toml", CARGO),
+            ("src/lib.rs", &source),
+            ("src/transport.rs", "pub(crate) fn watch() {}"),
+            ("src/other.rs", "pub(crate) fn watch() {}"),
+        ]);
+        let owner = capability_symbol(&facts, "src/lib.rs", "run");
+        let call = CapabilityReferenceQuery::new(&facts, owner)
+            .named("transport::watch", ReferenceKind::Calls);
+        assert!(call.target_symbol_id.is_none(), "{attributes}: {call:?}");
+    }
+    let facts = generation(&[
+        ("Cargo.toml", CARGO),
+        (
+            "src/lib.rs",
+            "#[cfg(unix)] mod transport; #[cfg(not(unix))] mod transport; pub fn run() { transport::watch(); }",
+        ),
+        ("src/transport.rs", "pub(crate) fn watch() {}"),
+    ]);
+    let owner = capability_symbol(&facts, "src/lib.rs", "run");
+    let call = CapabilityReferenceQuery::new(&facts, owner)
+        .named("transport::watch", ReferenceKind::Calls);
+    assert!(call.target_symbol_id.is_none(), "{call:?}");
+}
+
+#[test]
+fn conditional_module_bindings_do_not_hide_rejected_or_inline_alternatives() {
+    let conventional = "#[cfg(unix)] pub mod transport;";
+    for alternative in [
+        "#[cfg(not(unix))] #[path = \"portable.rs\"] mod transport;",
+        "#[cfg_attr(not(unix), path = \"portable.rs\")] mod transport;",
+        "#[unknown] mod transport;",
+        "#[cfg(not(unix))] mod transport { pub fn watch() {} }",
+    ] {
+        for declarations in [
+            format!("{conventional} {alternative}"),
+            format!("{alternative} {conventional}"),
+        ] {
+            let source = format!("{declarations} pub fn run() {{ transport::watch(); }}");
+            let facts = generation(&[
+                ("Cargo.toml", CARGO),
+                ("src/lib.rs", &source),
+                ("src/transport.rs", "pub fn watch() {}"),
+                ("src/portable.rs", "pub fn watch() {}"),
+            ]);
+            let owner = capability_symbol(&facts, "src/lib.rs", "run");
+            let call = CapabilityReferenceQuery::new(&facts, owner)
+                .named("transport::watch", ReferenceKind::Calls);
+            assert!(call.target_symbol_id.is_none(), "{declarations}: {call:?}");
+        }
+    }
+}
+
+#[test]
+fn conditional_module_targets_preserve_privacy_and_ambiguous_root_ownership() {
+    let facts = generation(&[
+        ("Cargo.toml", CARGO),
+        (
+            "src/lib.rs",
+            "pub mod outer; pub fn outside() { outer::transport::watch(); }",
+        ),
+        (
+            "src/outer.rs",
+            "#[cfg(unix)] mod transport; pub fn inside() { transport::watch(); }",
+        ),
+        ("src/outer/transport.rs", "pub(crate) fn watch() {}"),
+    ]);
+    let target = capability_symbol(&facts, "src/outer/transport.rs", "watch");
+    let inside = capability_symbol(&facts, "src/outer.rs", "inside");
+    let call = CapabilityReferenceQuery::new(&facts, inside)
+        .named("transport::watch", ReferenceKind::Calls);
+    assert_eq!(call.target_symbol_id.as_ref(), Some(&target.symbol_id));
+    let outside = capability_symbol(&facts, "src/lib.rs", "outside");
+    let call = CapabilityReferenceQuery::new(&facts, outside)
+        .named("outer::transport::watch", ReferenceKind::Calls);
+    assert!(call.target_symbol_id.is_none(), "{call:?}");
+
+    let facts = generation(&[
+        ("Cargo.toml", CARGO),
+        (
+            "src/lib.rs",
+            "#[cfg(unix)] mod transport; pub fn helper() {}",
+        ),
+        (
+            "src/main.rs",
+            "#[cfg(unix)] mod transport; pub fn helper() {}",
+        ),
+        ("src/transport.rs", "pub fn run() { super::helper(); }"),
+    ]);
+    let owner = capability_symbol(&facts, "src/transport.rs", "run");
+    let call =
+        CapabilityReferenceQuery::new(&facts, owner).named("super::helper", ReferenceKind::Calls);
+    assert!(call.target_symbol_id.is_none(), "{call:?}");
 }

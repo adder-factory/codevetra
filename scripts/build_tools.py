@@ -7,6 +7,7 @@ from pathlib import Path
 import platform
 import plistlib
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -17,7 +18,83 @@ from contextlib import contextmanager
 ROOT = Path(__file__).resolve().parent.parent
 PINS = ROOT / 'scripts/build-tools.json'
 POLICY = ROOT / '.codevetra/build-tools-local.json'
+IO_CHUNK_BYTES = 1024 * 1024
+DOWNLOAD_TIMEOUT_SECONDS = 60
+MAX_ARCHIVE_MEMBERS = 512
+PUBLIC_EXECUTABLE_MODE = 0o755
+PUBLIC_FILE_MODE = 0o644
+EXECUTABLE_BITS = 0o111
 MAX_DOWNLOAD = 256 * 1024 * 1024
+SOURCE_RECEIPT_BYTES = 4096
+SOURCE_DIGEST_HEX_LENGTH = 64
+MAXIMUM_MTIME_NS = 2**63
+MAX_BUILD_CACHE_ENTRIES = 100_000
+SOURCE_TIMESTAMP_WAIT_SECONDS = 2
+SOURCE_TIMESTAMP_RETRY_SECONDS = 0.05
+NANOSECONDS_PER_SECOND = 1_000_000_000
+CACHE_TAG_SIGNATURE = b'Signature: 8a477f597d28d172789f06886806bc55'
+
+
+def verify_target_identity(target, opened):
+    current = target.lstat()
+    if (not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+            or opened.st_uid != os.getuid()):
+        raise ValueError('Coverage target ownership or directory identity changed')
+
+
+def validate_cache_tag(directory):
+    descriptor = os.open('CACHEDIR.TAG', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory)
+    try:
+        if (not stat.S_ISREG(os.fstat(descriptor).st_mode)
+                or os.read(descriptor, len(CACHE_TAG_SIGNATURE)) != CACHE_TAG_SIGNATURE):
+            raise ValueError('Existing cache tag is invalid; refusing to replace it')
+    finally:
+        os.close(descriptor)
+
+
+def install_cache_tag(directory):
+    temporary = '.codevetra-cache-tag-' + os.urandom(8).hex()
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         PUBLIC_FILE_MODE, dir_fd=directory)
+    try:
+        with os.fdopen(descriptor, 'wb') as output:
+            output.write(CACHE_TAG_SIGNATURE + b'\n# Cargo artifacts in the verified CodeVetra target.\n')
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            # Publish a complete marker exclusively, without following or replacing
+            # an existing file. Both names are anchored to the verified directory.
+            os.link(temporary, 'CACHEDIR.TAG', src_dir_fd=directory, dst_dir_fd=directory,
+                    follow_symlinks=False)
+        except FileExistsError:
+            validate_cache_tag(directory)
+    finally:
+        os.unlink(temporary, dir_fd=directory)
+
+
+def prepare_coverage_target():
+    """Mark only the explicitly configured, owned Cargo cache for scoped cleanup."""
+    if os.name != 'posix':
+        raise ValueError('The Bash coverage workflow requires POSIX cache ownership checks')
+    with admission():
+        policy = cache_policy()
+        target = cache_path(policy['targetRoot'], policy)
+        if target != Path(policy['targetRoot']).absolute():
+            raise ValueError('Coverage target path traverses a symlink')
+        descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            opened = os.fstat(descriptor)
+            verify_target_identity(target, opened)
+            try:
+                validate_cache_tag(descriptor)
+            except FileNotFoundError:
+                install_cache_tag(descriptor)
+            verify_target_identity(target, opened)
+        finally:
+            os.close(descriptor)
+    return target
 
 
 def cache_path(path, policy):
@@ -142,7 +219,7 @@ def admission():
 def sha256(path):
     digest = hashlib.sha256()
     with path.open('rb') as source:
-        for block in iter(lambda: source.read(1024 * 1024), b''):
+        for block in iter(lambda: source.read(IO_CHUNK_BYTES), b''):
             digest.update(block)
     return digest.hexdigest()
 
@@ -151,8 +228,8 @@ def download(url, destination, expected):
     if not url.startswith('https://github.com/') or '/releases/download/' not in url:
         raise ValueError('Build tools require an exact HTTPS GitHub release asset')
     total = 0
-    with urllib.request.urlopen(url, timeout=60) as response, destination.open('wb') as target:
-        while block := response.read(1024 * 1024):
+    with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response, destination.open('wb') as target:
+        while block := response.read(IO_CHUNK_BYTES):
             total += len(block)
             if total > MAX_DOWNLOAD:
                 raise ValueError('Build tool download exceeded the byte limit')
@@ -166,7 +243,7 @@ def extract_binary(archive, name, destination):
     with tarfile.open(archive, 'r:gz') as source:
         members = []
         for member in source:
-            if len(members) >= 512:
+            if len(members) >= MAX_ARCHIVE_MEMBERS:
                 raise ValueError('Build tool archive has too many members')
             members.append(member)
         # mold also ships a lib/mold directory; only non-directory entries can
@@ -175,8 +252,8 @@ def extract_binary(archive, name, destination):
         if len(matches) != 1 or not matches[0].isfile() or matches[0].size > MAX_DOWNLOAD:
             raise ValueError('Build tool archive must contain one bounded regular executable')
         with source.extractfile(matches[0]) as executable, destination.open('wb') as target:
-            shutil.copyfileobj(executable, target, 1024 * 1024)
-    destination.chmod(0o755)
+            shutil.copyfileobj(executable, target, IO_CHUNK_BYTES)
+    destination.chmod(PUBLIC_EXECUTABLE_MODE)
 
 
 def install(names, bin_dir):
@@ -215,7 +292,7 @@ def install(names, bin_dir):
                 with candidate.open('rb') as source:
                     shutil.copyfileobj(source, staged)
             try:
-                pending.chmod(0o755)
+                pending.chmod(PUBLIC_EXECUTABLE_MODE)
                 os.replace(pending, destination)
             finally:
                 pending.unlink(missing_ok=True)
@@ -270,6 +347,71 @@ def link_local_cache():
         link.symlink_to(destination, target_is_directory=True)
 
 
+def read_source_receipt(receipt):
+    if not receipt.exists():
+        return None
+    with receipt.open() as source:
+        data = source.read(SOURCE_RECEIPT_BYTES + 1)
+    if len(data) > SOURCE_RECEIPT_BYTES:
+        raise ValueError('Source freshness receipt exceeds its byte limit')
+    previous = json.loads(data)
+    if not isinstance(previous, dict) or previous.get('version') != 1:
+        raise ValueError('Invalid source freshness receipt')
+    digest = previous.get('sourceDigest')
+    if (not isinstance(digest, str) or len(digest) != SOURCE_DIGEST_HEX_LENGTH
+            or any(c not in '0123456789abcdef' for c in digest)):
+        raise ValueError('Invalid source freshness receipt')
+    stamp = previous.get('mtimeNs')
+    if type(stamp) is not int or not 0 < stamp < MAXIMUM_MTIME_NS:
+        raise ValueError('Invalid source freshness receipt')
+    return previous
+
+
+def latest_artifact_timestamp(target):
+    anchor = 0
+    entries = 0
+    for directory, directories, files in os.walk(target):
+        entries += len(directories) + len(files)
+        if entries > MAX_BUILD_CACHE_ENTRIES:
+            raise ValueError('Build cache exceeds the source freshness metadata bound')
+        if any((Path(directory) / name).is_symlink() for name in [*directories, *files]):
+            raise ValueError('Build cache freshness anchors must not be symlinks')
+        for name in files:
+            anchor = max(anchor, (Path(directory) / name).stat().st_mtime_ns)
+    return anchor
+
+
+def stamp_sources(paths, previous, anchor):
+    """Reuse an exact proven timestamp, or wait for one newer than every artifact."""
+    unchanged = previous is not None
+    deadline = time.monotonic() + SOURCE_TIMESTAMP_WAIT_SECONDS
+    while True:
+        stamp = previous['mtimeNs'] if unchanged else time.time_ns()
+        if not unchanged and anchor > stamp + SOURCE_TIMESTAMP_WAIT_SECONDS * NANOSECONDS_PER_SECOND:
+            raise ValueError('Build cache has future timestamps; source freshness is unproved')
+        for path in paths:
+            os.utime(path, ns=(stamp, stamp))
+        actual = {path.stat().st_mtime_ns for path in paths}
+        if len(actual) == 1 and (actual == {stamp} if unchanged else min(actual) > anchor):
+            return actual.pop()
+        if unchanged or time.monotonic() >= deadline:
+            raise ValueError('Filesystem timestamps cannot prove source freshness')
+        time.sleep(SOURCE_TIMESTAMP_RETRY_SECONDS)
+
+
+def write_source_receipt(receipt, digest, stamp):
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=receipt.parent, prefix='.source-freshness.', delete=False) as output:
+        pending = Path(output.name)
+        json.dump({'version': 1, 'sourceDigest': digest, 'mtimeNs': stamp}, output)
+        output.flush()
+        os.fsync(output.fileno())
+    try:
+        os.replace(pending, receipt)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
 def source_freshness(paths, digest, build_cache):
     """Reuse source timestamps only for the same staged bytes and permissions.
 
@@ -282,56 +424,11 @@ def source_freshness(paths, digest, build_cache):
     target = cache_path(root / 'target', policy)
     if not receipt.is_relative_to(root) or not target.is_relative_to(root):
         raise ValueError('Source freshness state escapes its build cache')
-    previous = None
-    if receipt.exists():
-        with receipt.open() as source:
-            data = source.read(4097)
-        if len(data) > 4096:
-            raise ValueError('Source freshness receipt exceeds its byte limit')
-        previous = json.loads(data)
-        if (not isinstance(previous, dict) or previous.get('version') != 1
-                or not isinstance(previous.get('sourceDigest'), str)
-                or len(previous['sourceDigest']) != 64
-                or any(c not in '0123456789abcdef' for c in previous['sourceDigest'])
-                or type(previous.get('mtimeNs')) is not int or not 0 < previous['mtimeNs'] < 2**63):
-            raise ValueError('Invalid source freshness receipt')
+    previous = read_source_receipt(receipt)
     unchanged = previous is not None and previous['sourceDigest'] == digest
-    anchor = 0
-    if not unchanged:
-        entries = 0
-        for directory, directories, files in os.walk(target):
-            entries += len(directories) + len(files)
-            if entries > 100_000:
-                raise ValueError('Build cache exceeds the source freshness metadata bound')
-            if any((Path(directory) / name).is_symlink() for name in [*directories, *files]):
-                raise ValueError('Build cache freshness anchors must not be symlinks')
-            for name in files:
-                path = Path(directory) / name
-                anchor = max(anchor, path.stat().st_mtime_ns)
-    deadline = time.monotonic() + 2
-    while True:
-        stamp = previous['mtimeNs'] if unchanged else time.time_ns()
-        if not unchanged and anchor > stamp + 2_000_000_000:
-            raise ValueError('Build cache has future timestamps; source freshness is unproved')
-        for path in paths:
-            os.utime(path, ns=(stamp, stamp))
-        actual = {path.stat().st_mtime_ns for path in paths}
-        if len(actual) == 1 and (actual == {stamp} if unchanged else min(actual) > anchor):
-            stamp = actual.pop()
-            break
-        if unchanged or time.monotonic() >= deadline:
-            raise ValueError('Filesystem timestamps cannot prove source freshness')
-        time.sleep(0.05)
-    root.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode='w', dir=root, prefix='.source-freshness.', delete=False) as output:
-        pending = Path(output.name)
-        json.dump({'version': 1, 'sourceDigest': digest, 'mtimeNs': stamp}, output)
-        output.flush()
-        os.fsync(output.fileno())
-    try:
-        os.replace(pending, receipt)
-    finally:
-        pending.unlink(missing_ok=True)
+    anchor = 0 if unchanged else latest_artifact_timestamp(target)
+    stamp = stamp_sources(paths, previous if unchanged else None, anchor)
+    write_source_receipt(receipt, digest, stamp)
 
 
 def snapshot(destination=None, *, build_cache=None):
@@ -347,14 +444,14 @@ def snapshot(destination=None, *, build_cache=None):
         if not source.is_file():
             raise ValueError('Build input disappeared while staging source')
         content = source.read_bytes()
-        executable = bool(source.stat().st_mode & 0o111)
+        executable = bool(source.stat().st_mode & EXECUTABLE_BITS)
         digest.update(name + b'\0' + hashlib.sha256(content).digest())
         digest.update(bytes([executable]))
         if destination is not None:
             target = destination / relative
-            target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            target.parent.mkdir(parents=True, exist_ok=True, mode=PUBLIC_EXECUTABLE_MODE)
             target.write_bytes(content)
-            target.chmod(0o755 if executable else 0o644)
+            target.chmod(PUBLIC_EXECUTABLE_MODE if executable else PUBLIC_FILE_MODE)
             staged.append(target)
     if build_cache is not None:
         if not staged:

@@ -3,8 +3,8 @@
 use codevetra_db::{
     CurrentGenerationLookup, NativeDatabase, SearchQuery,
     rocks::{
-        AsyncProjectStore, Collection, GraphBase, GraphPolicy, GraphRevision, ReadBudget,
-        StorageRequest, StorageRuntime, StorePolicy, WorkerPolicy,
+        AsyncProjectStore, Collection, GraphBase, GraphPolicy, GraphPreparation, GraphRevision,
+        ReadBudget, StorageRequest, StorageRuntime, StorePolicy, WorkerPolicy,
     },
 };
 use codevetra_domain::{ContentDigest, GenerationDigestVersion, GenerationId};
@@ -55,7 +55,7 @@ async fn run_sample(root: &std::path::Path, workers: u16) -> CorpusResult<serde_
                 SourceRoot::open(root).map_err(|_| error("source"))?,
                 pipeline_config(workers),
             ),
-            GraphRevision {
+            GraphPreparation::new(GraphRevision {
                 generation_id: GenerationId::from_uuid_v8([1; 16]),
                 source_revision: ContentDigest::from_bytes(
                     *blake3::hash(SOURCE_REVISION.as_bytes()).as_bytes(),
@@ -63,24 +63,19 @@ async fn run_sample(root: &std::path::Path, workers: u16) -> CorpusResult<serde_
                 base: GraphBase::Empty,
             },
             GraphPolicy::default(),
-            &request,
+            &request),
         )
         .await
         .map_err(|failure| format!("native pipeline: {failure}"))?;
         let extraction = started.elapsed();
         let published = store
-            .publish_graph(input, &request)
+            .with_request(&request).publish_graph(input)
             .await
             .map_err(|failure| format!("publish: {failure}"))?;
         let generation = published.revision.generation_id.clone();
         let (rows, kinds) = store
-            .read(
-                Some(generation.clone()),
-                ReadBudget::new(200_000, 128 * 1_048_576, Duration::from_secs(30))
-                    .map_err(|_| error("budget"))?,
-                &request,
-                inspect_graph,
-            )
+            .with_request(&request).read(Some(generation.clone()), ReadBudget::new(200_000, 128 * 1_048_576, Duration::from_secs(30))
+                    .map_err(|_| error("budget"))?, inspect_graph)
             .await
             .map_err(|failure| format!("native inspection: {failure}"))?;
         let mut results = Vec::new();
@@ -122,7 +117,7 @@ async fn run_sample(root: &std::path::Path, workers: u16) -> CorpusResult<serde_
         Ok(
             serde_json::json!({"workers":workers,"extractionMillis":extraction.as_secs_f64()*1000.0,
             "elapsedMillis":started.elapsed().as_secs_f64()*1000.0,"invariant":invariant,
-            "usage":store.storage_usage(&request).await.map_err(|_|error("usage"))?}),
+            "usage":store.with_request(&request).storage_usage().await.map_err(|_|error("usage"))?}),
         )
     }
     .await;
@@ -151,9 +146,11 @@ async fn open_store(
     let identity = ContentDigest::from_bytes([9; 32]);
     let store = AsyncProjectStore::open(
         &runtime,
-        directory.to_owned(),
-        identity.clone(),
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            directory.to_owned(),
+            identity.clone(),
+            StorePolicy::default(),
+        ),
         request,
     )
     .await
@@ -184,7 +181,9 @@ fn inspect_graph(
     let mut cursor = None;
     loop {
         let page =
-            snapshot.scan_prefix(Collection::Graph, b"cg1/", cursor.as_ref(), 128, budget)?;
+            snapshot
+                .scan_prefix(Collection::Graph, b"cg1/")
+                .page(cursor.as_ref(), 128, budget)?;
         for (key, bytes) in page.rows {
             if bytes
                 .windows(LIVE_SECRET_SENTINEL.len())
@@ -220,6 +219,8 @@ const CORPUS_FINGERPRINT_DOMAIN: &[u8] = b"cartograph-v2-native-real-corpus-v1";
 const EXPECTED_CORPUS_FINGERPRINT: &str =
     "ab91088c482ed36d31759382283342654ce6958be4e601429b8181da531c5fc1";
 
+// V34 changes only the hash domain for this non-Rust corpus; independent wire
+// encoding reproduces V33 before deriving V34. Corpus bytes and facts are unchanged.
 // V27 adds health-analyzer language and exact operation evidence, corrects nine
 // substring-eval false positives and three caught initializer parses, and detects
 // thirteen previously missed environment-access owners. Independently reconstructed
@@ -229,7 +230,7 @@ const EXPECTED_CORPUS_FINGERPRINT: &str =
 // targets, declarations, documents, source bytes and BM25 identities stay fixed.
 // Independent wire encoding reproduces the old V25 digest before deriving V26.
 const EXPECTED_LOGICAL_DIGEST: &str =
-    "a6c00f3223cdbd76928245ee1dfd5143566654d3975a3603e00054483cef16ad";
+    "89946b718bbb22c79f849c43025fc747274bb55f88bac1c2dadc5bdbdf35bde9";
 
 // Native scoring uses k1=1.2, b=.75 and name/code/natural weights 4/1/2.
 // Independently checked corpus statistics: N=6362, weighted tokens=348835,
@@ -292,8 +293,12 @@ const EXPECTED_UNRESOLVED_REFERENCES: u64 = 13_414;
 // grown canonical metadata buffers. Corpus bytes and logical facts are fixed.
 const EXPECTED_MODELED_GENERATION_BYTES: u64 = 25_638_779;
 
-// +101,408 bytes for the normalized symbol layout and +5,520 sparse site heap.
-const EXPECTED_RESOLVE_HIGH_WATER_BYTES: u64 = 127_512_219;
+// The unchanged corpus has 6,328 populated records and 6,348 vector slots.
+// Relative to the pre-widening inline layout, sparse health reduces each native
+// record from 512 to 432 bytes and owns 152 metric bytes per populated record.
+// Preserving both existing conservative header charges gives the exact delta:
+// -(6,328 + 6,348) * 80 + 6,328 * 152 = -52,224 bytes.
+const EXPECTED_RESOLVE_HIGH_WATER_BYTES: u64 = 127_459_995;
 
 // +1,512,078 bytes independently derived from JSON map/string/site allocations.
 const EXPECTED_VALIDATION_HIGH_WATER_BYTES: u64 = 154_904_433;

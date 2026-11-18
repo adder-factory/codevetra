@@ -1,6 +1,8 @@
 //! Specifications are deliberately independent of the checked implementation formulas.
 #![allow(dead_code)]
 
+include!("production_types.inc");
+
 #[path = "../../crates/codevetra-config/src/numeric/predicate.rs"]
 mod config;
 #[path = "../../crates/codevetra-domain/src/source/coordinates.rs"]
@@ -31,7 +33,9 @@ fn source_coordinates() {
     let (a, b): (u64, u64) = kani::any();
     let (al, bl, ac, bc): (u32, u32, u32, u32) = kani::any();
     assert_eq!(coordinates::valid_position(al), al > 0);
-    let valid = coordinates::valid_span(a, b, al, bl, ac, bc);
+    let start = SourcePosition { byte: a, line: al, column: ac };
+    let end = SourcePosition { byte: b, line: bl, column: bc };
+    let valid = coordinates::valid_span(&start, &end);
     assert_eq!(
         valid,
         al > 0 && a < b && (al < bl || (al == bl && ac <= bc))
@@ -88,17 +92,17 @@ fn storage_reservations() {
 fn retention_budget() {
     let (batch, counters, key, maximum): (usize, usize, usize, usize) = kani::any();
     let total = batch as u128 + counters as u128 * 96 + 131_072 + key as u128 * 2 + 256;
-    assert_eq!(
-        storage::retention_batch_fits(batch, counters, key, maximum),
-        total <= maximum as u128
-    );
+    let workspace = storage::retention_workspace(batch, counters, key);
+    assert_eq!(workspace.map(|bytes| bytes as u128),
+        (total <= usize::MAX as u128).then_some(total));
+    assert_eq!(workspace.is_some_and(|bytes| bytes <= maximum), total <= maximum as u128);
 }
 
 #[kani::proof]
 fn storage_policy() {
     let (cache, memtable, batch, rows): (usize, usize, usize, usize) = kani::any();
     assert_eq!(
-        storage::valid_store_policy(cache, memtable, batch, rows),
+        storage::valid_store_policy(&StorePolicy { cache_bytes: cache, memtable_bytes: memtable, maximum_batch_bytes: batch, maximum_batch_rows: rows }),
         cache >= 8_388_608
             && cache <= 4_294_967_296
             && memtable >= 4_194_304
@@ -117,7 +121,9 @@ fn writer_fences() {
     let a: [u8; 32] = kani::any();
     let b: [u8; 32] = kani::any();
     let unexpired: bool = kani::any();
-    let owned = lifecycle::owns_writer(active, &a, requested, &b);
+    let active_identity = WriterIdentity { sequence: active, fence: a };
+    let requested_identity = WriterIdentity { sequence: requested, fence: b };
+    let owned = lifecycle::owns_writer(&active_identity, &requested_identity);
     let mut bytes_match = true;
     for i in 0..32 {
         bytes_match &= a[i] == b[i];
@@ -151,10 +157,10 @@ fn retention_decisions() {
     let (retained, keep): (u8, u8) = kani::any();
     let (published, anchor): (bool, bool) = kani::any();
     assert_eq!(
-        lifecycle::keep_superseded(sequence, floor, retained, keep),
+        lifecycle::keep_superseded(sequence, &RetentionSelection { previous_floor: floor, retained, keep }),
         !(sequence < floor || retained >= keep)
     );
-    let remove = lifecycle::remove_version(published, sequence, floor, anchor);
+    let remove = lifecycle::remove_version(published, sequence, &VersionAnchor { floor, kept_anchor: anchor });
     assert_eq!(!remove, published && (sequence >= floor || !anchor));
     assert!(!published || sequence < floor || !remove);
 }
@@ -213,8 +219,14 @@ fn token_rounding() {
 fn protobuf_admission() {
     let (current, tag, length, payload, maximum): (usize, usize, usize, usize, usize) = kani::any();
     let total = current as u128 + tag as u128 + length as u128 + payload as u128;
+    let size = wire::delimited_size(tag, length, payload);
+    let mathematical_size = tag as u128 + length as u128 + payload as u128;
     assert_eq!(
-        wire::delimited_end(current, tag, length, payload, maximum).map(|n| n as u128),
+        size.map(|n| n as u128),
+        (mathematical_size <= usize::MAX as u128).then_some(mathematical_size)
+    );
+    assert_eq!(
+        size.and_then(|size| wire::cursor_end(current, size, maximum)).map(|n| n as u128),
         (total <= maximum as u128).then_some(total)
     );
     let end = current as u128 + payload as u128;

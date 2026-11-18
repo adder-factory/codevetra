@@ -1,13 +1,37 @@
 use super::{
-    ExtractError, FrameworkBuilder, Node, ReceiverKind, Site, State, add, argument, lexical,
-    literal, member, text,
+    ExtractError, FrameworkBuilder, Node, ReceiverKind, Site, State, argument, literal, member,
+    text,
 };
+
+struct ChannelOperation {
+    channel: &'static str,
+    adapter: &'static str,
+    registration: bool,
+}
+
+impl ReceiverKind {
+    fn channel_operation(self, operation: &str) -> Option<ChannelOperation> {
+        let (channel, adapter, registration) = match (self, operation) {
+            (Self::Event, "emit") => ("event", "node-events-v1", false),
+            (Self::Event, "on" | "once" | "addListener") => ("event", "node-events-v1", true),
+            (Self::Queue, "add") => ("queue", "bull-instance-v1", false),
+            (Self::Queue, "process") => ("queue", "bull-instance-v1", true),
+            (Self::Observer, "add") => ("observer", "set-observer-v1", true),
+            (Self::Observer, "forEach") => ("observer", "set-observer-v1", false),
+            _ => return None,
+        };
+        Some(ChannelOperation {
+            channel,
+            adapter,
+            registration,
+        })
+    }
+}
 
 pub(super) fn call(
     builder: &mut FrameworkBuilder<'_, '_>,
     call: Node<'_>,
-    state: &mut State,
-    lexical: &lexical::Index,
+    state: &mut State<'_>,
 ) -> Result<(), ExtractError> {
     let Some((receiver, operation)) = member(builder, call) else {
         return Ok(());
@@ -20,19 +44,18 @@ pub(super) fn call(
         })
         .cloned()
     else {
-        return unknown_receiver(builder, call, state, lexical);
+        return unknown_receiver(builder, call, state);
     };
     if binding.kind == ReceiverKind::Observer && !binding.observer_dispatch_proven {
         return Ok(());
     }
-    let (channel, adapter, registration) = match (binding.kind, operation) {
-        (ReceiverKind::Event, "emit") => ("event", "node-events-v1", false),
-        (ReceiverKind::Event, "on" | "once" | "addListener") => ("event", "node-events-v1", true),
-        (ReceiverKind::Queue, "add") => ("queue", "bull-instance-v1", false),
-        (ReceiverKind::Queue, "process") => ("queue", "bull-instance-v1", true),
-        (ReceiverKind::Observer, "add") => ("observer", "set-observer-v1", true),
-        (ReceiverKind::Observer, "forEach") => ("observer", "set-observer-v1", false),
-        _ => return Ok(()),
+    let Some(ChannelOperation {
+        channel,
+        adapter,
+        registration,
+    }) = binding.kind.channel_operation(operation)
+    else {
+        return Ok(());
     };
     let operation = operation.to_owned();
     let target = if registration {
@@ -68,10 +91,8 @@ pub(super) fn call(
                 && matches!(node.kind(), "arrow_function" | "function_expression")
         })
         .unwrap_or(call);
-    add(
+    state.add(
         builder,
-        state,
-        lexical,
         Site {
             channel,
             role,
@@ -89,7 +110,7 @@ pub(super) fn call(
 pub(super) fn prove_observer(
     builder: &FrameworkBuilder<'_, '_>,
     call: Node<'_>,
-    state: &mut State,
+    state: &mut State<'_>,
 ) {
     if call.kind() != "call_expression" || !observer_dispatch(builder, call) {
         return;
@@ -152,8 +173,7 @@ fn observer_dispatch(builder: &FrameworkBuilder<'_, '_>, call: Node<'_>) -> bool
 fn unknown_receiver(
     builder: &mut FrameworkBuilder<'_, '_>,
     call: Node<'_>,
-    state: &mut State,
-    lexical: &lexical::Index,
+    state: &mut State<'_>,
 ) -> Result<(), ExtractError> {
     let Some((receiver, operation)) = member(builder, call) else {
         return Ok(());
@@ -175,10 +195,8 @@ fn unknown_receiver(
         .and_then(|node| literal(builder, node))
         .unwrap_or("<dynamic>")
         .to_owned();
-    add(
+    state.add(
         builder,
-        state,
-        lexical,
         Site {
             channel,
             role: "unknown",

@@ -4,6 +4,7 @@ use super::{
     Collection, Duration, RecordChange, RocksError, TestResult, budget, generation, identity, key,
     publish, store,
 };
+use codevetra_db::rocks::RetentionPolicy;
 
 #[test]
 fn completed_retention_skips_unchanged_versions_across_reopen() -> TestResult {
@@ -18,11 +19,11 @@ fn completed_retention_skips_unchanged_versions_across_reopen() -> TestResult {
             b"value".to_vec(),
         )],
     )?;
-    let first = native.prune(2, 4, 100, &mut budget()?)?;
+    let first = native.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     assert!(first.complete);
     assert_eq!(first.versions_visited, 1);
     for owner in [&native, &native.clone()] {
-        let repeated = owner.prune(2, 1, 1, &mut budget()?)?;
+        let repeated = owner.prune(RetentionPolicy::new(2, 1, 1), &mut budget()?)?;
         assert!(repeated.complete);
         assert_eq!(repeated.versions_visited, 0);
         assert_eq!(repeated.versions_removed, 0);
@@ -32,7 +33,9 @@ fn completed_retention_skips_unchanged_versions_across_reopen() -> TestResult {
     drop(native);
     let reopened = store(root.path())?;
     assert_eq!(
-        reopened.prune(2, 4, 100, &mut budget()?)?.versions_visited,
+        reopened
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .versions_visited,
         0
     );
     assert_eq!(
@@ -61,7 +64,11 @@ fn completed_retention_rejects_live_writers_and_drains_failed_and_published_chan
         )],
     )?;
     let pinned = native.current_snapshot(None)?;
-    assert!(native.prune(2, 4, 100, &mut budget()?)?.complete);
+    assert!(
+        native
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .complete
+    );
     let failed = native.begin_revision(generation(2), identity(1), Duration::from_secs(30))?;
     native.stage(
         &failed,
@@ -71,14 +78,14 @@ fn completed_retention_rejects_live_writers_and_drains_failed_and_published_chan
         ],
     )?;
     assert!(matches!(
-        native.prune(2, 4, 100, &mut budget()?),
+        native.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?),
         Err(RocksError::WriterBusy)
     ));
     native.fail(&failed)?;
     let mut removed = 0;
     let mut complete = false;
     for _ in 0..10 {
-        let progress = native.prune(2, 4, 1, &mut budget()?)?;
+        let progress = native.prune(RetentionPolicy::new(2, 4, 1), &mut budget()?)?;
         removed += progress.versions_removed;
         if progress.complete {
             complete = true;
@@ -87,13 +94,18 @@ fn completed_retention_rejects_live_writers_and_drains_failed_and_published_chan
     }
     assert!(complete);
     assert_eq!(removed, 2);
-    assert_eq!(native.prune(2, 4, 100, &mut budget()?)?.versions_visited, 0);
+    assert_eq!(
+        native
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .versions_visited,
+        0
+    );
     publish(
         &native,
         3,
         &[RecordChange::delete(Collection::Graph, key(b"stable")?)],
     )?;
-    let changed = native.prune(2, 4, 100, &mut budget()?)?;
+    let changed = native.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     assert!(changed.complete);
     assert!(changed.versions_visited > 0);
     let current = native.current_snapshot(None)?;
@@ -126,13 +138,22 @@ fn a_policy_change_invalidates_completion_even_when_cleanup_is_partial() -> Test
         )?;
     }
     let pinned = native.retained_snapshot(&generation(1))?;
-    assert!(native.prune(2, 4, 100, &mut budget()?)?.complete);
-    let partial = native.prune(0, 1, 1, &mut budget()?)?;
+    assert!(
+        native
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .complete
+    );
+    let partial = native.prune(RetentionPolicy::new(0, 1, 1), &mut budget()?)?;
     assert!(!partial.complete);
-    let resumed = native.prune(2, 4, 100, &mut budget()?)?;
+    let resumed = native.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     assert!(resumed.complete);
     assert!(resumed.versions_visited > 0);
-    assert_eq!(native.prune(2, 4, 100, &mut budget()?)?.versions_visited, 0);
+    assert_eq!(
+        native
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .versions_visited,
+        0
+    );
     assert_eq!(
         pinned.get(Collection::Graph, &key(b"moving")?, &mut budget()?)?,
         Some(1_u64.to_be_bytes().to_vec())
@@ -158,7 +179,7 @@ fn a_new_reservation_restarts_partial_cleanup_before_certifying_completion() -> 
             RecordChange::put(Collection::Graph, key(b"z")?, b"stable".to_vec()),
         ],
     )?;
-    let partial = native.prune(2, 4, 1, &mut budget()?)?;
+    let partial = native.prune(RetentionPolicy::new(2, 4, 1), &mut budget()?)?;
     assert!(!partial.complete);
     assert_eq!(partial.versions_visited, 1);
     assert_eq!(partial.oldest_retained_sequence, 1);
@@ -174,16 +195,21 @@ fn a_new_reservation_restarts_partial_cleanup_before_certifying_completion() -> 
     native.fail(&failed)?;
     // The newer version of a sorts before the old cursor. Finish the old pass
     // without certifying completion, then wrap to collect that failed version.
-    let resumed = native.prune(2, 4, 100, &mut budget()?)?;
+    let resumed = native.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     assert!(!resumed.complete);
     assert_eq!(resumed.versions_visited, 1);
     assert_eq!(resumed.versions_removed, 0);
-    let resumed = native.prune(2, 4, 100, &mut budget()?)?;
+    let resumed = native.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     assert!(resumed.complete);
     assert_eq!(resumed.oldest_retained_sequence, 1);
     assert_eq!(resumed.versions_removed, 1);
     assert_eq!(resumed.versions_visited, 3);
-    assert_eq!(native.prune(2, 4, 100, &mut budget()?)?.versions_visited, 0);
+    assert_eq!(
+        native
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .versions_visited,
+        0
+    );
     assert_eq!(
         native
             .current_snapshot(None)?
@@ -216,7 +242,7 @@ fn new_reservations_do_not_starve_cleanup_after_a_retained_prefix() -> TestResul
         )],
     )?;
     native.fail(&failed)?;
-    let partial = native.prune(2, 4, 1, &mut budget()?)?;
+    let partial = native.prune(RetentionPolicy::new(2, 4, 1), &mut budget()?)?;
     assert!(!partial.complete);
     assert_eq!(partial.versions_visited, 1);
     let mut removed = 0;
@@ -224,7 +250,7 @@ fn new_reservations_do_not_starve_cleanup_after_a_retained_prefix() -> TestResul
         let empty =
             native.begin_revision(generation(sequence), identity(1), Duration::from_secs(30))?;
         native.fail(&empty)?;
-        let progress = native.prune(2, 4, 1, &mut budget()?)?;
+        let progress = native.prune(RetentionPolicy::new(2, 4, 1), &mut budget()?)?;
         assert!(!progress.complete);
         removed += progress.versions_removed;
     }
@@ -235,7 +261,16 @@ fn new_reservations_do_not_starve_cleanup_after_a_retained_prefix() -> TestResul
             .get(Collection::Graph, &key(b"a")?, &mut budget()?)?,
         Some(b"retained".to_vec())
     );
-    assert!(native.prune(2, 4, 100, &mut budget()?)?.complete);
-    assert_eq!(native.prune(2, 4, 100, &mut budget()?)?.versions_visited, 0);
+    assert!(
+        native
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .complete
+    );
+    assert_eq!(
+        native
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .versions_visited,
+        0
+    );
     Ok(())
 }

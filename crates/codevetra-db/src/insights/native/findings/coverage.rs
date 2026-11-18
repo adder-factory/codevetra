@@ -29,13 +29,8 @@ impl CoverageAccumulator {
         }
     }
 
-    pub(super) fn observe(
-        &mut self,
-        file: &FileInput,
-        symbol: &SymbolInput,
-        document: &Document,
-        base: Option<&Base<'_>>,
-    ) {
+    pub(super) fn observe(&mut self, subject: Subject<'_>) {
+        let file = subject.file;
         let rows = self
             .languages
             .entry(file.language.clone())
@@ -51,7 +46,7 @@ impl CoverageAccumulator {
             });
         for (rule, row) in self.registry.iter().zip(rows) {
             row.considered_symbols += 1;
-            match disposition(rule, file, symbol, document, base) {
+            match subject.disposition(rule) {
                 Disposition::Evaluated => {
                     row.eligible_symbols += 1;
                     row.evaluated_symbols += 1;
@@ -88,47 +83,93 @@ impl CoverageAccumulator {
     }
 }
 
-fn disposition(
-    rule: &DetectorCapability,
-    file: &FileInput,
-    symbol: &SymbolInput,
-    document: &Document,
-    base: Option<&Base<'_>>,
-) -> Disposition {
-    if document.test || symbol.declaration_only {
-        return Disposition::Excluded;
+/// One symbol and its matching evidence; scored observations derive every
+/// identity from the same Base rather than accepting independently paired inputs.
+#[derive(Clone, Copy)]
+pub(super) struct Subject<'a> {
+    file: &'a FileInput,
+    symbol: &'a SymbolInput,
+    document: &'a Document,
+    base: Option<&'a Base<'a>>,
+}
+
+impl<'a> Subject<'a> {
+    pub(super) fn unscored(
+        file: &'a FileInput,
+        symbol: &'a SymbolInput,
+        document: &'a Document,
+    ) -> Self {
+        Self {
+            file,
+            symbol,
+            document,
+            base: None,
+        }
     }
-    let language = if rule.input == DetectorInput::SourceMetrics {
-        document
-            .analyzed_language
-            .map_or(file.language.as_str(), |language| language.as_str())
-    } else {
-        file.language.as_str()
-    };
-    if !rule.languages.admits(language) || !rule.scope.admits(&symbol.symbol_kind) {
-        return Disposition::Unsupported;
+
+    pub(super) fn scored(base: &'a Base<'a>) -> Self {
+        Self {
+            file: base.file,
+            symbol: base.symbol,
+            document: base.document,
+            base: Some(base),
+        }
     }
-    if rule.input == DetectorInput::SourceMetrics && document.analyzed_language.is_none() {
-        return Disposition::Unsupported;
+
+    fn language(&self, input: DetectorInput) -> &str {
+        if input == DetectorInput::SourceMetrics {
+            self.document
+                .analyzed_language
+                .map_or(self.file.language.as_str(), |language| language.as_str())
+        } else {
+            self.file.language.as_str()
+        }
     }
-    if let Some(source) = SOURCE_RULES.iter().find(|source| source.name == rule.name)
-        && (document.health("code_lines") < f64::from(source.minimum_code_lines)
-            || (rule.name == "long_parameter_list"
-                && base.is_some_and(|base| base.topology.framework)))
-    {
-        return Disposition::Excluded;
+
+    fn source_rule_excluded(&self, rule: &DetectorCapability) -> bool {
+        SOURCE_RULES
+            .iter()
+            .find(|source| source.name == rule.name)
+            .is_some_and(|source| {
+                self.document.health("code_lines") < f64::from(source.minimum_code_lines)
+                    || source.excludes_value_mapping(
+                        self.document.analyzed_language,
+                        self.document.syntax.flat_value_mapping,
+                    )
+                    || (rule.name == "long_parameter_list"
+                        && self.base.is_some_and(|base| base.topology.framework))
+            })
     }
-    match rule.input {
-        DetectorInput::PreviousGeneration
-            if base.is_none_or(|base| base.prior.is_none() || !base.recent_prior) =>
+
+    fn disposition(&self, rule: &DetectorCapability) -> Disposition {
+        if self.document.test || self.symbol.declaration_only {
+            return Disposition::Excluded;
+        }
+        if !rule.languages.admits(self.language(rule.input))
+            || !rule.scope.admits(&self.symbol.symbol_kind)
         {
-            Disposition::Unavailable
+            return Disposition::Unsupported;
         }
-        DetectorInput::Coverage if base.is_none_or(|base| base.coverage.is_none()) => {
-            Disposition::Unavailable
+        if rule.input == DetectorInput::SourceMetrics && self.document.analyzed_language.is_none() {
+            return Disposition::Unsupported;
         }
-        // Layer policy is evaluated by the project service, independently of native findings.
-        DetectorInput::LayerPolicy => Disposition::Unavailable,
-        _ => Disposition::Evaluated,
+        if self.source_rule_excluded(rule) {
+            return Disposition::Excluded;
+        }
+        match rule.input {
+            DetectorInput::PreviousGeneration
+                if self
+                    .base
+                    .is_none_or(|base| base.prior.is_none() || !base.recent_prior) =>
+            {
+                Disposition::Unavailable
+            }
+            DetectorInput::Coverage if self.base.is_none_or(|base| base.coverage.is_none()) => {
+                Disposition::Unavailable
+            }
+            // Layer policy is evaluated by the project service, independently of native findings.
+            DetectorInput::LayerPolicy => Disposition::Unavailable,
+            _ => Disposition::Evaluated,
+        }
     }
 }

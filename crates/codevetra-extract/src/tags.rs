@@ -665,7 +665,7 @@ fn build_tag_definition(
         docstring: input.definition.docstring,
         body_search_text: String::new(),
         body_search_truncated: false,
-        health,
+        health: health.into(),
         implementation: SymbolImplementationFlags::default(),
         export: SymbolExportFlags::default(),
         execution: SymbolExecutionFlags::default(),

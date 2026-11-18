@@ -1,4 +1,5 @@
 use super::*;
+use crate::rocks::RetentionPolicy;
 
 fn budget() -> TestResult<ReadBudget> {
     Ok(ReadBudget::new(1_000, 1_048_576, Duration::from_secs(10))?)
@@ -28,16 +29,24 @@ fn unchanged_retention_does_not_write_the_wal_even_after_mutable_state_changes()
     let root = tempfile::tempdir()?;
     let store = ProjectStore::open(root.path(), &identity(7), StorePolicy::default())?;
     published(&store, 1)?;
-    assert!(store.prune(2, 4, 100, &mut budget()?)?.complete);
-    store.state(None, 4_096, 1, &mut budget()?, |transaction, _| {
-        transaction.put(
-            state::StateNamespace::Sessions,
-            b"session",
-            b"active".to_vec(),
-        )
-    })?;
+    assert!(
+        store
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .complete
+    );
+    store.state(
+        &crate::rocks::StateAccess::write(None, 4_096, 1),
+        &mut budget()?,
+        |transaction, _| {
+            transaction.put(
+                state::StateNamespace::Sessions,
+                b"session",
+                b"active".to_vec(),
+            )
+        },
+    )?;
     let before = store.inner.database.latest_sequence_number();
-    let report = store.prune(2, 4, 100, &mut budget()?)?;
+    let report = store.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     assert!(report.complete);
     assert_eq!(report.versions_visited, 0);
     assert_eq!(store.inner.database.latest_sequence_number(), before);
@@ -49,7 +58,7 @@ fn completed_retention_still_checks_cancellation_after_waiting_for_its_lock() ->
     let root = tempfile::tempdir()?;
     let store = ProjectStore::open(root.path(), &identity(7), StorePolicy::default())?;
     published(&store, 1)?;
-    store.prune(2, 4, 100, &mut budget()?)?;
+    store.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     let before = store.inner.database.latest_sequence_number();
     let request = StorageRequest::new(Duration::from_secs(10))?;
     let controlled = store.with_control(request.clone());
@@ -59,7 +68,7 @@ fn completed_retention_still_checks_cancellation_after_waiting_for_its_lock() ->
         let task = scope.spawn(move || {
             entered.send(()).map_err(|_| operation("test_gate"))?;
             let mut allowance = ReadBudget::new(100, 1_048_576, Duration::from_secs(10))?;
-            controlled.prune(2, 4, 100, &mut allowance)
+            controlled.prune(RetentionPolicy::new(2, 4, 100), &mut allowance)
         });
         started.recv_timeout(Duration::from_secs(2))?;
         request.cancel();
@@ -70,7 +79,7 @@ fn completed_retention_still_checks_cancellation_after_waiting_for_its_lock() ->
     assert_eq!(store.inner.database.latest_sequence_number(), before);
     let mut cancelled_budget = budget()?.with_control(request);
     assert_eq!(
-        store.prune(2, 4, 100, &mut cancelled_budget),
+        store.prune(RetentionPolicy::new(2, 4, 100), &mut cancelled_budget),
         Err(RocksError::Cancelled)
     );
     Ok(())
@@ -81,7 +90,7 @@ fn completed_retention_terminalizes_an_expired_writer_and_collects_its_rows() ->
     let root = tempfile::tempdir()?;
     let store = ProjectStore::open(root.path(), &identity(7), StorePolicy::default())?;
     published(&store, 1)?;
-    store.prune(2, 4, 100, &mut budget()?)?;
+    store.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     let abandoned = store.begin_revision(
         GenerationId::from_uuid_v8([2; 16]),
         identity(1),
@@ -100,13 +109,18 @@ fn completed_retention_terminalizes_an_expired_writer_and_collects_its_rows() ->
         .as_mut()
         .ok_or("writer missing")?
         .expires_at = Instant::now();
-    let report = store.prune(2, 4, 100, &mut budget()?)?;
+    let report = store.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     assert!(report.complete);
     assert_eq!(report.versions_removed, 1);
     assert!(store.lock_writer()?.is_none());
     assert!(store.stage(&abandoned, &[]).is_err());
     assert_eq!(store.current_snapshot(None)?.revision().sequence, 1);
-    assert_eq!(store.prune(2, 4, 100, &mut budget()?)?.versions_visited, 0);
+    assert_eq!(
+        store
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .versions_visited,
+        0
+    );
     Ok(())
 }
 
@@ -118,7 +132,7 @@ fn older_executable_retention_progress_invalidates_a_saved_completion_marker() -
         let store = ProjectStore::open(root.path(), &identity(7), StorePolicy::default())?;
         published(&store, 1)?;
         published(&store, 2)?;
-        store.prune(1, 4, 100, &mut budget()?)?;
+        store.prune(RetentionPolicy::new(1, 4, 100), &mut budget()?)?;
         let saved = store.get_meta(COMPLETED)?.ok_or("completion missing")?;
         let meta = store.meta()?;
         let mut batch = WriteBatch::default();
@@ -126,15 +140,23 @@ fn older_executable_retention_progress_invalidates_a_saved_completion_marker() -
         store.write(&batch)?;
         // An older executable changes the floor or leaves a cursor without
         // updating the completion marker introduced by this executable.
-        store.prune(u8::from(!changed_floor), 4, 1, &mut budget()?)?;
+        store.prune(
+            RetentionPolicy::new(u8::from(!changed_floor), 4, 1),
+            &mut budget()?,
+        )?;
         let mut batch = WriteBatch::default();
         batch.put_cf(&meta, COMPLETED, saved);
         store.write(&batch)?;
-        let report = store.prune(1, 4, 100, &mut budget()?)?;
+        let report = store.prune(RetentionPolicy::new(1, 4, 100), &mut budget()?)?;
         assert!(report.complete);
         assert!(report.versions_visited > 0);
         assert!(store.get_meta(b"retention/cursor")?.is_none());
-        assert_eq!(store.prune(1, 4, 100, &mut budget()?)?.versions_visited, 0);
+        assert_eq!(
+            store
+                .prune(RetentionPolicy::new(1, 4, 100), &mut budget()?)?
+                .versions_visited,
+            0
+        );
     }
     Ok(())
 }
@@ -147,7 +169,7 @@ fn malformed_completion_marker_fails_closed() -> TestResult {
     batch.put_cf(&store.meta()?, b"retention/completed-v1", b"{}");
     store.write(&batch)?;
     assert_eq!(
-        store.prune(2, 4, 100, &mut budget()?),
+        store.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?),
         Err(RocksError::Corrupt {
             field: "retention_completed"
         })
@@ -160,7 +182,11 @@ fn legacy_cursor_without_a_reservation_watermark_wraps_before_completion() -> Te
     let root = tempfile::tempdir()?;
     let store = ProjectStore::open(root.path(), &identity(7), StorePolicy::default())?;
     published(&store, 1)?;
-    assert!(!store.prune(2, 4, 1, &mut budget()?)?.complete);
+    assert!(
+        !store
+            .prune(RetentionPolicy::new(2, 4, 1), &mut budget()?)?
+            .complete
+    );
     let bytes = store
         .get_meta(b"retention/cursor")?
         .ok_or("cursor missing")?;
@@ -176,13 +202,18 @@ fn legacy_cursor_without_a_reservation_watermark_wraps_before_completion() -> Te
         serde_json::to_vec(&legacy)?,
     );
     store.write(&batch)?;
-    let report = store.prune(2, 4, 100, &mut budget()?)?;
+    let report = store.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     assert!(!report.complete);
     assert_eq!(report.versions_visited, 0);
-    let report = store.prune(2, 4, 100, &mut budget()?)?;
+    let report = store.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?;
     assert!(report.complete);
     assert_eq!(report.versions_visited, 1);
-    assert_eq!(store.prune(2, 4, 100, &mut budget()?)?.versions_visited, 0);
+    assert_eq!(
+        store
+            .prune(RetentionPolicy::new(2, 4, 100), &mut budget()?)?
+            .versions_visited,
+        0
+    );
     Ok(())
 }
 
@@ -191,7 +222,11 @@ fn cursor_from_a_future_reservation_fails_closed() -> TestResult {
     let root = tempfile::tempdir()?;
     let store = ProjectStore::open(root.path(), &identity(7), StorePolicy::default())?;
     published(&store, 1)?;
-    assert!(!store.prune(2, 4, 1, &mut budget()?)?.complete);
+    assert!(
+        !store
+            .prune(RetentionPolicy::new(2, 4, 1), &mut budget()?)?
+            .complete
+    );
     let bytes = store
         .get_meta(b"retention/cursor")?
         .ok_or("cursor missing")?;
@@ -205,7 +240,7 @@ fn cursor_from_a_future_reservation_fails_closed() -> TestResult {
     );
     store.write(&batch)?;
     assert_eq!(
-        store.prune(2, 4, 100, &mut budget()?),
+        store.prune(RetentionPolicy::new(2, 4, 100), &mut budget()?),
         Err(RocksError::Corrupt {
             field: "retention_cursor"
         })

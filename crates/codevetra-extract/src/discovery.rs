@@ -967,6 +967,24 @@ mod tests {
     }
 
     #[test]
+    fn configured_source_namespace_rescues_artifact_modules_without_generated_output() {
+        let directory = tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let root = directory.path();
+        for path in ["src/artifacts/native/neighbor.rs", "artifacts/generated.rs"] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap_or(root))
+                .unwrap_or_else(|error| panic!("fixture directory failed: {error}"));
+            fs::write(path, "pub fn retained() {}\n")
+                .unwrap_or_else(|error| panic!("fixture source failed: {error}"));
+        }
+        assert_eq!(discover_with_excludes(root, &[]), [] as [String; 0]);
+        assert_eq!(
+            discover_with_excludes(root, &["!src/artifacts/**".to_owned()]),
+            ["src/artifacts/native/neighbor.rs"]
+        );
+    }
+
+    #[test]
     fn pattern_ignore_files_exclude_while_an_empty_marker_still_drops_the_tree() {
         let directory = match tempdir() {
             Ok(directory) => directory,

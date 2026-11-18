@@ -668,7 +668,7 @@ impl<'source, 'cancel> FrameworkBuilder<'source, 'cancel> {
             docstring: None,
             body_search_text,
             body_search_truncated: false,
-            health: crate::SymbolHealthMetrics::default(),
+            health: crate::SymbolHealth::default(),
             implementation: SymbolImplementationFlags::default(),
             export: SymbolExportFlags::named(true),
             execution: SymbolExecutionFlags::default(),

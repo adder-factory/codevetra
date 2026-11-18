@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 
 mod wire;
+use wire::{
+    PROTOBUF_TAG_SHIFT, PROTOBUF_WIRE_TYPE_MASK, VARINT_CONTINUATION_BIT, VARINT_PAYLOAD_BITS,
+    VARINT_PAYLOAD_MASK, WIRE_I32, WIRE_I64, WIRE_LEN, WIRE_VARINT,
+};
 
 use crate::model::{
     CODEVETRA_EDGES_FIELD, CodeVetraScipEdge, MAXIMUM_DOCUMENTS, MAXIMUM_OCCURRENCES,
@@ -9,17 +13,8 @@ use crate::model::{
     ScipRelationshipRoles, ScipSymbolInformation, TEXT_ENCODING_UTF8,
 };
 
-const WIRE_VARINT: u8 = 0;
-const WIRE_I64: u8 = 1;
-const WIRE_LEN: u8 = 2;
-const WIRE_I32: u8 = 5;
-const PROTOBUF_TAG_SHIFT: u32 = 3;
-const PROTOBUF_WIRE_TYPE_MASK: u64 = 7;
 const FIXED_64_BYTES: usize = 8;
 const FIXED_32_BYTES: usize = 4;
-const VARINT_PAYLOAD_BITS: usize = 7;
-const VARINT_PAYLOAD_MASK: u8 = 0x7f;
-const VARINT_CONTINUATION_BIT: u8 = 0x80;
 
 const INDEX_METADATA: u32 = 1;
 const INDEX_DOCUMENTS: u32 = 2;
@@ -117,15 +112,15 @@ impl Writer {
     fn bytes(&mut self, field: u32, value: &[u8]) -> Result<(), ScipError> {
         let tag = wire::field_tag(field, WIRE_LEN).ok_or(ScipError::InvalidData)?;
         let length = u64::try_from(value.len()).map_err(|_| ScipError::LimitExceeded)?;
-        wire::delimited_end(
-            self.bytes.len(),
+        let encoded_size = wire::delimited_size(
             wire::varint_length(tag),
             wire::varint_length(length),
             value.len(),
-            MAXIMUM_SCIP_BYTES,
         )
         .ok_or(ScipError::LimitExceeded)?;
-        self.tag(field, WIRE_LEN)?;
+        wire::cursor_end(self.bytes.len(), encoded_size, MAXIMUM_SCIP_BYTES)
+            .ok_or(ScipError::LimitExceeded)?;
+        self.varint(tag)?;
         self.varint(length)?;
         self.bytes.extend_from_slice(value);
         Ok(())
@@ -278,33 +273,12 @@ pub fn decode_scip_index(bytes: &[u8]) -> Result<ScipIndex, ScipError> {
         return Err(ScipError::LimitExceeded);
     }
     let mut documents = Vec::with_capacity(document_values.len());
-    let mut symbols = 0_usize;
-    let mut occurrences = 0_usize;
-    let mut relationships = 0_usize;
+    let mut counts = IndexCounts::default();
     for value in document_values {
         let decoded = decode_message(value)?;
         let document = decode_document(&decoded)?;
-        symbols = symbols
-            .checked_add(document.symbols.len())
-            .ok_or(ScipError::LimitExceeded)?;
-        occurrences = occurrences
-            .checked_add(document.occurrences.len())
-            .ok_or(ScipError::LimitExceeded)?;
-        relationships = document
-            .symbols
-            .iter()
-            .try_fold(relationships, |total, symbol| {
-                total
-                    .checked_add(symbol.relationships.len())
-                    .and_then(|value| value.checked_add(symbol.codevetra_edges.len()))
-                    .ok_or(ScipError::LimitExceeded)
-            })?;
-        if symbols > MAXIMUM_SYMBOLS
-            || occurrences > MAXIMUM_OCCURRENCES
-            || relationships > MAXIMUM_RELATIONSHIPS
-        {
-            return Err(ScipError::LimitExceeded);
-        }
+        counts.add(&document)?;
+        counts.validate()?;
         documents.push(document);
     }
     Ok(ScipIndex {
@@ -400,33 +374,52 @@ fn validate_cardinality(index: &ScipIndex) -> Result<(), ScipError> {
     if index.documents.len() > MAXIMUM_DOCUMENTS {
         return Err(ScipError::LimitExceeded);
     }
-    let mut symbols = 0_usize;
-    let mut occurrences = 0_usize;
-    let mut relationships = 0_usize;
+    let mut counts = IndexCounts::default();
     for document in &index.documents {
-        symbols = symbols
+        counts.add(document)?;
+    }
+    counts.validate()
+}
+
+#[derive(Default)]
+struct IndexCounts {
+    symbols: usize,
+    occurrences: usize,
+    relationships: usize,
+}
+
+impl IndexCounts {
+    fn add(&mut self, document: &ScipDocument) -> Result<(), ScipError> {
+        self.symbols = self
+            .symbols
             .checked_add(document.symbols.len())
             .ok_or(ScipError::LimitExceeded)?;
-        occurrences = occurrences
+        self.occurrences = self
+            .occurrences
             .checked_add(document.occurrences.len())
             .ok_or(ScipError::LimitExceeded)?;
-        relationships = document
-            .symbols
-            .iter()
-            .try_fold(relationships, |total, symbol| {
-                total
-                    .checked_add(symbol.relationships.len())
-                    .and_then(|value| value.checked_add(symbol.codevetra_edges.len()))
-                    .ok_or(ScipError::LimitExceeded)
-            })?;
-    }
-    if symbols > MAXIMUM_SYMBOLS
-        || occurrences > MAXIMUM_OCCURRENCES
-        || relationships > MAXIMUM_RELATIONSHIPS
-    {
-        Err(ScipError::LimitExceeded)
-    } else {
+        self.relationships =
+            document
+                .symbols
+                .iter()
+                .try_fold(self.relationships, |total, symbol| {
+                    total
+                        .checked_add(symbol.relationships.len())
+                        .and_then(|value| value.checked_add(symbol.codevetra_edges.len()))
+                        .ok_or(ScipError::LimitExceeded)
+                })?;
         Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ScipError> {
+        if self.symbols > MAXIMUM_SYMBOLS
+            || self.occurrences > MAXIMUM_OCCURRENCES
+            || self.relationships > MAXIMUM_RELATIONSHIPS
+        {
+            Err(ScipError::LimitExceeded)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -573,13 +566,50 @@ fn packed_u32(message: &Message<'_>, field: u32) -> Result<Vec<u32>, ScipError> 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn length_delimited_header_is_inside_the_output_budget() {
+    fn varint_length_and_codec_agree_at_every_payload_boundary() -> Result<(), ScipError> {
+        assert_eq!(wire::varint_length(0), 1);
+        assert_eq!(wire::varint_length(u64::MAX), 10);
+        for (shift, shorter) in [
+            (7, 1),
+            (14, 2),
+            (21, 3),
+            (28, 4),
+            (35, 5),
+            (42, 6),
+            (49, 7),
+            (56, 8),
+            (63, 9),
+        ] {
+            let boundary = 1_u64 << shift;
+            for (value, length) in [(boundary - 1, shorter), (boundary, shorter + 1)] {
+                assert_eq!(wire::varint_length(value), length);
+                let mut writer = Writer::new();
+                writer.varint(value)?;
+                assert_eq!(writer.bytes.len(), length);
+                assert_eq!(wire::read_varint(&writer.bytes, 0), Some((value, length)));
+            }
+        }
+        assert_eq!(wire::read_varint(&[0xff; 10], 0), None);
+        assert_eq!(wire::read_varint(&[0x80], 0), None);
+        Ok(())
+    }
+
+    #[test]
+    fn length_delimited_header_is_inside_the_output_budget() -> Result<(), ScipError> {
         let mut writer = super::Writer {
             bytes: vec![0; super::MAXIMUM_SCIP_BYTES - 3],
         };
         // Field 16 needs two tag bytes, plus one length byte and one payload byte.
         assert!(writer.bytes(16, &[1]).is_err());
-        assert!(writer.bytes.len() <= super::MAXIMUM_SCIP_BYTES);
+        assert_eq!(writer.bytes.len(), super::MAXIMUM_SCIP_BYTES - 3);
+        writer.bytes.truncate(super::MAXIMUM_SCIP_BYTES - 4);
+        writer.bytes(16, &[1])?;
+        assert_eq!(writer.bytes.len(), super::MAXIMUM_SCIP_BYTES);
+        assert_eq!(
+            &writer.bytes[super::MAXIMUM_SCIP_BYTES - 4..],
+            &[0x82, 1, 1, 1]
+        );
+        Ok(())
     }
 
     use super::*;

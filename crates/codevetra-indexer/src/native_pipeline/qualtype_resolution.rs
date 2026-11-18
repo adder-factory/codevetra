@@ -25,7 +25,7 @@ pub(super) struct Owner {
     pub(super) name: String,
     pub(super) kind: SymbolKind,
     pub(super) static_member: bool,
-    pub(super) parameter_count: u16,
+    pub(super) parameter_count: u32,
     pub(super) source_scope: Option<(FileId, u64, u64)>,
 }
 

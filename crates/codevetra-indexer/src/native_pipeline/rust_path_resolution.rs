@@ -6,10 +6,10 @@ use super::{
     ImportResolution, ModulePathIndex, NativeFileFacts, RESOLUTION_MAP_NODE_ALLOWANCE,
     RUST_QUALIFIED_PATH_PROVENANCE, RUST_WORKSPACE_CRATE_PROVENANCE, ReferenceDispatch,
     ReferenceResolution, ResolutionIndex, ResolutionIndexTarget, ResolutionRequest, ResolvedTarget,
-    StageItemFailure, SymbolKind, Visibility, normalize_relative_module_path,
-    qualtype_resolution::Selection, reference_kind_candidate, resolution_candidates_for_file,
-    resolve_normalized_module_file, rust_inline_modules::ModuleScope, rust_parent_module_contains,
-    rust_uniform_paths::Anchor, select_candidate, size_of, try_clone_text, usize_to_u64,
+    StageItemFailure, SymbolKind, Visibility, qualtype_resolution::Selection,
+    reference_kind_candidate, resolution_candidates_for_file, rust_inline_modules::ModuleScope,
+    rust_parent_module_contains, rust_uniform_paths::Anchor, select_candidate, size_of,
+    try_clone_text, usize_to_u64,
 };
 
 const MAXIMUM_PATH_BYTES: usize = 1_024;
@@ -36,12 +36,20 @@ pub(super) struct PathIndex {
     pub(super) use_scopes: super::rust_use_bindings::ImplScopes,
     pub(super) scoped_imports: super::rust_scoped_modules::ScopedImports,
     pub(super) declarations: super::rust_path_guards::Declarations,
+    pub(super) explicit_files: std::collections::HashSet<FileId>,
 }
 
 pub(super) struct ModuleEdge {
     pub(super) file: Option<FileId>,
     pub(super) visibility: ModuleVisibility,
     pub(super) parent_module: Option<super::SymbolId>,
+    pub(super) source: ModuleSource,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModuleSource {
+    Conventional,
+    ExplicitFile,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -85,8 +93,10 @@ where
         if cancelled() {
             return Err(StageItemFailure);
         }
-        if binding.kind != ImportBindingKind::Namespace
-            || !binding.module_specifier.starts_with("./")
+        let explicit = binding.kind == ImportBindingKind::RustFileModule;
+        if !(explicit
+            || binding.kind == ImportBindingKind::Namespace
+                && binding.module_specifier.starts_with("./"))
             || !super::rust_local_types::root_declaration(
                 target.index,
                 (&file.file.file_id, binding.span),
@@ -98,11 +108,7 @@ where
             *existing = None;
             continue;
         }
-        let path =
-            normalize_relative_module_path(&file.file.normalized_path, &binding.module_specifier);
-        let module = path
-            .as_deref()
-            .and_then(|path| resolve_normalized_module_file(&target.index.modules, path, "rust"));
+        let module = super::rust_file_modules::binding_file(target.index, file, binding);
         target.budget.charge(
             RESOLUTION_MAP_NODE_ALLOWANCE
                 .saturating_add(usize_to_u64(size_of::<(String, Option<ModuleEdge>)>()))
@@ -115,10 +121,15 @@ where
             Some(ModuleEdge {
                 file: module.cloned(),
                 visibility: visibility
-                    .get(binding.module_specifier.as_str())
+                    .get(binding.local_name.as_str())
                     .copied()
                     .unwrap_or_default(),
                 parent_module: None,
+                source: if explicit {
+                    ModuleSource::ExplicitFile
+                } else {
+                    ModuleSource::Conventional
+                },
             }),
         );
     }
@@ -162,13 +173,17 @@ where
         if cancelled() {
             return Err(StageItemFailure);
         }
-        if symbol.kind == SymbolKind::Import && symbol.name.starts_with("./") {
+        if symbol.kind == SymbolKind::Import
+            && symbol.name.starts_with("./")
+            && !target.index.parents.contains_key(&symbol.input.symbol_id)
+        {
             target.budget.charge(
                 RESOLUTION_MAP_NODE_ALLOWANCE
                     .saturating_add(usize_to_u64(size_of::<(&str, ModuleVisibility)>())),
             )?;
             visibility.try_reserve(1).map_err(|_| StageItemFailure)?;
-            visibility.insert(symbol.name.as_str(), ModuleVisibility::from_symbol(symbol));
+            let name = symbol.name.rsplit('/').next().unwrap_or(&symbol.name);
+            visibility.insert(name, ModuleVisibility::from_symbol(symbol));
         }
     }
     Ok(visibility)
@@ -241,9 +256,12 @@ where
         if cancelled() {
             return Err(StageItemFailure);
         }
-        if binding.kind == ImportBindingKind::Namespace
-            && binding.local_name == name
-            && binding.module_specifier.starts_with("./")
+        if matches!(
+            binding.kind,
+            ImportBindingKind::Namespace | ImportBindingKind::RustFileModule
+        ) && binding.local_name == name
+            && (binding.kind == ImportBindingKind::RustFileModule
+                || binding.module_specifier.starts_with("./"))
             && super::rust_local_types::root_declaration(index, (request.file_id, binding.span))
         {
             return Ok(true);
@@ -264,6 +282,17 @@ where
     let (request, _) = query;
     if request.language != "rust" {
         return Ok(None);
+    }
+    if query.1.kind == ImportBindingKind::RustFileModule
+        || query.1.kind == ImportBindingKind::Namespace
+            && query.1.module_specifier.starts_with("./")
+            && index
+                .languages
+                .rust_paths
+                .explicit_files
+                .contains(request.file_id)
+    {
+        return resolve_file_binding(index, request, cancelled).map(Some);
     }
     if query.1.local_name == "*" && query.1.module_specifier == "super::*" {
         return super::rust_scoped_modules::resolve_glob(index, request, cancelled).map(|target| {
@@ -298,6 +327,72 @@ where
         }
         _ => Some(resolution),
     })
+}
+
+fn resolve_file_binding<Cancel>(
+    index: &ResolutionIndex,
+    request: &ResolutionRequest<'_>,
+    cancelled: &mut Cancel,
+) -> Result<ImportResolution, StageItemFailure>
+where
+    Cancel: FnMut() -> bool,
+{
+    if !supported_request(request)
+        || !super::rust_local_types::use_scope_proven(index, request, cancelled)?
+        || !super::rust_use_bindings::unshadowed(index, (request, None), cancelled)?
+    {
+        return Ok(ImportResolution::Unresolved);
+    }
+    let Some((module, name)) = request.name.rsplit_once("::") else {
+        return Ok(ImportResolution::Unresolved);
+    };
+    let current = ModuleScope {
+        file: request.file_id,
+        inline: "",
+        module: None,
+    };
+    let mut resolution = file_member(index, (request, current, module, name), cancelled)?;
+    if let ImportResolution::Resolved(target) = &mut resolution {
+        target.provenance = IMPORT_BINDING_PROVENANCE;
+    }
+    Ok(match resolution {
+        ImportResolution::NotBound => ImportResolution::Unresolved,
+        other => other,
+    })
+}
+
+fn file_member<Cancel>(
+    index: &ResolutionIndex,
+    (request, current, module, name): (&ResolutionRequest<'_>, ModuleScope<'_>, &str, &str),
+    cancelled: &mut Cancel,
+) -> Result<ImportResolution, StageItemFailure>
+where
+    Cancel: FnMut() -> bool,
+{
+    match declared_module(index, (current, module, request, false), cancelled)? {
+        ModuleLookup::Known(scope) => {
+            member_in_scope(index, (request, scope, name, true), cancelled)
+        }
+        ModuleLookup::Unproven => {
+            let Some((parent, _)) = module.rsplit_once("::") else {
+                return Ok(ImportResolution::Unresolved);
+            };
+            let Some(associated) = request
+                .name
+                .strip_prefix(parent)
+                .and_then(|suffix| suffix.strip_prefix("::"))
+            else {
+                return Ok(ImportResolution::Unresolved);
+            };
+            let ModuleLookup::Known(scope) =
+                declared_module(index, (current, parent, request, false), cancelled)?
+            else {
+                return Ok(ImportResolution::Unresolved);
+            };
+            member_in_scope(index, (request, scope, associated, true), cancelled)
+        }
+        ModuleLookup::Inaccessible | ModuleLookup::Ambiguous => Ok(ImportResolution::Unresolved),
+    }
 }
 
 fn absolute_target<Cancel>(

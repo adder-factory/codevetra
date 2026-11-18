@@ -7,49 +7,45 @@ use super::{
     RocksError, Snapshot, WriteBatch, decode_sequence, operation,
 };
 
+const MAXIMUM_BATCH_READ_KEYS: usize = 128;
+const MAXIMUM_BATCH_READ_BYTES: usize = 8 * 1_048_576;
+const MAXIMUM_SCAN_ROWS: u16 = 2000;
+const SCAN_PAGE_BYTES: usize = 4 * 1_048_576;
+
 const PREFIX: &[u8] = b"state1/";
 const KEY_BYTES: usize = 4096;
 const VALUE_BYTES: usize = 16 * 1_048_576;
 
 /// Typed namespaces for mutable, project-local evidence and agent state.
+/// Discriminants are persisted in state keys and must never be reordered or reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum StateNamespace {
     /// Content-fenced summaries, notes, decisions, and roles.
-    Artifacts,
+    Artifacts = 1,
     /// MCP session metadata.
-    Sessions,
+    Sessions = 2,
     /// Bounded tool-call traces.
-    Trace,
+    Trace = 3,
     /// Saved tool macros.
-    Macros,
+    Macros = 4,
     /// Source-fenced Git history and issue attribution.
-    History,
+    History = 5,
     /// Model- and content-fenced embedding records.
-    Embeddings,
+    Embeddings = 6,
     /// Source-fenced coverage records.
-    Coverage,
+    Coverage = 7,
     /// Content-addressed extraction cache.
-    ParseCache,
+    ParseCache = 8,
     /// Generation-fenced structural and centrality results.
-    Derived,
+    Derived = 9,
     /// Durable maintenance and readiness metadata.
-    Metadata,
+    Metadata = 10,
 }
 
 impl StateNamespace {
     const fn byte(self) -> u8 {
-        match self {
-            Self::Artifacts => 1,
-            Self::Sessions => 2,
-            Self::Trace => 3,
-            Self::Macros => 4,
-            Self::History => 5,
-            Self::Embeddings => 6,
-            Self::Coverage => 7,
-            Self::ParseCache => 8,
-            Self::Derived => 9,
-            Self::Metadata => 10,
-        }
+        self as u8
     }
 }
 
@@ -68,12 +64,12 @@ pub struct StateTransaction<'store> {
 impl ProjectStore {
     pub(in crate::rocks) fn state<T>(
         &self,
-        expected: Option<&GenerationId>,
-        maximum_write_bytes: usize,
-        maximum_write_rows: usize,
+        access: &crate::rocks::StateAccess,
         budget: &mut ReadBudget,
         operation: impl FnOnce(&mut StateTransaction<'_>, &mut ReadBudget) -> Result<T>,
     ) -> Result<T> {
+        let maximum_write_bytes = access.maximum_write_bytes as usize;
+        let maximum_write_rows = access.maximum_write_rows as usize;
         if maximum_write_bytes > self.inner.policy.maximum_batch_bytes
             || maximum_write_rows > self.inner.policy.maximum_batch_rows
         {
@@ -96,7 +92,7 @@ impl ProjectStore {
             maximum_rows: maximum_write_rows,
             aborted: false,
         };
-        if let Some(expected) = expected {
+        if let Some(expected) = &access.expected {
             let current = transaction
                 .current()?
                 .ok_or(RocksError::GenerationUnavailable)?;
@@ -273,7 +269,7 @@ impl<'store> StateTransaction<'store> {
         keys: &[Vec<u8>],
         budget: &mut ReadBudget,
     ) -> Result<Vec<Option<Vec<u8>>>> {
-        if keys.is_empty() || keys.len() > 128 {
+        if keys.is_empty() || keys.len() > MAXIMUM_BATCH_READ_KEYS {
             return Err(RocksError::Limit {
                 resource: "state_batch_read_keys",
             });
@@ -288,7 +284,7 @@ impl<'store> StateTransaction<'store> {
             .collect::<Result<Vec<_>>>()?;
         let mut options = rocksdb::ReadOptions::default();
         options.set_snapshot(&self.snapshot);
-        options.set_value_size_soft_limit(8 * 1_048_576);
+        options.set_value_size_soft_limit(MAXIMUM_BATCH_READ_BYTES as u64);
         let meta = self.store.meta()?;
         let rows = self
             .store
@@ -311,7 +307,7 @@ impl<'store> StateTransaction<'store> {
             retained = retained.checked_add(bytes).ok_or(RocksError::Limit {
                 resource: "state_batch_read_bytes",
             })?;
-            if retained > 8 * 1_048_576 {
+            if retained > MAXIMUM_BATCH_READ_BYTES {
                 return Err(RocksError::Limit {
                     resource: "state_batch_read_bytes",
                 });
@@ -327,72 +323,18 @@ impl<'store> StateTransaction<'store> {
         Ok(output)
     }
 
-    /// Scan one namespace in key order, respecting the same physical read budget.
-    /// The cursor is exclusive and belongs to this namespace.
-    /// # Errors
-    /// Returns key, row, byte, deadline, or storage errors.
-    pub fn scan(
-        &self,
+    /// Bind a read cursor to this transaction, namespace and logical-key prefix.
+    #[must_use]
+    pub fn scan<'query>(
+        &'query self,
         namespace: StateNamespace,
-        prefix: &[u8],
-        after: Option<&[u8]>,
-        limit: u16,
-        budget: &mut ReadBudget,
-    ) -> Result<super::RecordPage> {
-        if limit == 0 || limit > 2000 {
-            return Err(RocksError::Limit {
-                resource: "state_page_rows",
-            });
+        prefix: &'query [u8],
+    ) -> StateScan<'query, 'store> {
+        StateScan {
+            transaction: self,
+            namespace,
+            prefix,
         }
-        // Reads and writes use separate phases. This avoids an unbounded merge
-        // buffer and makes every page correspond to this transaction snapshot.
-        if !self.changes.is_empty() {
-            return Err(RocksError::Transition);
-        }
-        let prefix = key_bytes(namespace, prefix)?;
-        let start = match after {
-            Some(after) => key_bytes(namespace, after)?,
-            None => prefix.clone(),
-        };
-        if !start.starts_with(&prefix) {
-            return Err(RocksError::Transition);
-        }
-        let meta = self.store.meta()?;
-        let mut options = super::ReadOptions::default();
-        options.set_iterate_lower_bound(start.clone());
-        if let Some(end) = super::key::successor(prefix.clone()) {
-            options.set_iterate_upper_bound(end);
-        }
-        let iterator = self.snapshot.iterator_cf_opt(
-            &meta,
-            options,
-            IteratorMode::From(&start, Direction::Forward),
-        );
-        let mut rows = Vec::new();
-        let mut next_after = None;
-        let mut page_bytes = 0_usize;
-        for row in iterator {
-            let (key, value) = row.map_err(|_| operation("state_scan"))?;
-            budget.charge(key.len().saturating_add(value.len()))?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if after.is_some() && key.as_ref() == start {
-                continue;
-            }
-            if rows.len() == usize::from(limit) || page_bytes >= 4 * 1_048_576 {
-                next_after = rows
-                    .last()
-                    .map(|(key, _): &(super::RecordKey, Vec<u8>)| key.clone());
-                break;
-            }
-            let logical = key.get(PREFIX.len() + 1..).ok_or(RocksError::Format)?;
-            page_bytes = page_bytes
-                .saturating_add(key.len())
-                .saturating_add(value.len());
-            rows.push((super::RecordKey::new(logical.to_vec())?, value.to_vec()));
-        }
-        Ok(super::RecordPage { rows, next_after })
     }
 
     /// Replace a bounded value in this transaction's atomic write batch.
@@ -468,4 +410,112 @@ fn key_bytes(namespace: StateNamespace, key: &[u8]) -> Result<Vec<u8>> {
     encoded.push(namespace.byte());
     encoded.extend_from_slice(key);
     Ok(encoded)
+}
+
+/// Borrowed state range pinned to one transaction snapshot and namespace.
+pub struct StateScan<'query, 'store> {
+    transaction: &'query StateTransaction<'store>,
+    namespace: StateNamespace,
+    prefix: &'query [u8],
+}
+
+impl StateScan<'_, '_> {
+    /// Scan one namespace in key order, respecting the same physical read budget.
+    /// The cursor is exclusive and belongs to this namespace.
+    /// # Errors
+    /// Returns key, row, byte, deadline, or storage errors.
+    pub fn page(
+        &self,
+        after: Option<&[u8]>,
+        limit: u16,
+        budget: &mut ReadBudget,
+    ) -> Result<super::RecordPage> {
+        let Self {
+            transaction,
+            namespace,
+            prefix,
+        } = *self;
+
+        if limit == 0 || limit > MAXIMUM_SCAN_ROWS {
+            return Err(RocksError::Limit {
+                resource: "state_page_rows",
+            });
+        }
+        // Reads and writes use separate phases. This avoids an unbounded merge
+        // buffer and makes every page correspond to this transaction snapshot.
+        if !transaction.changes.is_empty() {
+            return Err(RocksError::Transition);
+        }
+        let prefix = key_bytes(namespace, prefix)?;
+        let start = match after {
+            Some(after) => key_bytes(namespace, after)?,
+            None => prefix.clone(),
+        };
+        if !start.starts_with(&prefix) {
+            return Err(RocksError::Transition);
+        }
+        let meta = transaction.store.meta()?;
+        let mut options = super::ReadOptions::default();
+        options.set_iterate_lower_bound(start.clone());
+        if let Some(end) = super::key::successor(prefix.clone()) {
+            options.set_iterate_upper_bound(end);
+        }
+        let iterator = transaction.snapshot.iterator_cf_opt(
+            &meta,
+            options,
+            IteratorMode::From(&start, Direction::Forward),
+        );
+        let mut rows = Vec::new();
+        let mut next_after = None;
+        let mut page_bytes = 0_usize;
+        for row in iterator {
+            let (key, value) = row.map_err(|_| operation("state_scan"))?;
+            budget.charge(key.len().saturating_add(value.len()))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if after.is_some() && key.as_ref() == start {
+                continue;
+            }
+            if rows.len() == usize::from(limit) || page_bytes >= SCAN_PAGE_BYTES {
+                next_after = rows
+                    .last()
+                    .map(|(key, _): &(super::RecordKey, Vec<u8>)| key.clone());
+                break;
+            }
+            let logical = key.get(PREFIX.len() + 1..).ok_or(RocksError::Format)?;
+            page_bytes = page_bytes
+                .saturating_add(key.len())
+                .saturating_add(value.len());
+            rows.push((super::RecordKey::new(logical.to_vec())?, value.to_vec()));
+        }
+        Ok(super::RecordPage { rows, next_after })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_namespace_key_tags_remain_compatible_with_persisted_records() -> Result<()> {
+        for (namespace, tag) in [
+            (StateNamespace::Artifacts, 1),
+            (StateNamespace::Sessions, 2),
+            (StateNamespace::Trace, 3),
+            (StateNamespace::Macros, 4),
+            (StateNamespace::History, 5),
+            (StateNamespace::Embeddings, 6),
+            (StateNamespace::Coverage, 7),
+            (StateNamespace::ParseCache, 8),
+            (StateNamespace::Derived, 9),
+            (StateNamespace::Metadata, 10),
+        ] {
+            let mut expected = b"state1/".to_vec();
+            expected.push(tag);
+            expected.extend_from_slice(b"fixture");
+            assert_eq!(key_bytes(namespace, b"fixture")?, expected);
+        }
+        Ok(())
+    }
 }

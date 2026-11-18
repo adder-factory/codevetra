@@ -18,6 +18,13 @@ use std::{
 #[cfg(test)]
 mod tests;
 
+const MAXIMUM_TRACE_STEPS: usize = 512;
+const MAXIMUM_CALL_DEPTH: usize = 4;
+const MINIMUM_REPORT_BYTES: usize = 16 * 1024;
+const MAXIMUM_REPORT_BYTES: usize = 512 * 1024;
+const MAXIMUM_SOURCE_WINDOW_BYTES: usize = 256 * 1024;
+const TRACE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Finite trace request. Expansion is a definition table, not a flattened execution list.
 pub struct StaticTraceRequest {
     /// Exact entry declaration.
@@ -157,13 +164,13 @@ impl ProjectRuntime {
         cancellation: ProjectCancellation,
     ) -> Result<StaticTraceReport, ProjectError> {
         if request.maximum_steps == 0
-            || request.maximum_steps > 512
-            || request.maximum_depth > 4
-            || !(16 * 1024..=512 * 1024).contains(&request.maximum_bytes)
+            || request.maximum_steps > MAXIMUM_TRACE_STEPS
+            || request.maximum_depth > MAXIMUM_CALL_DEPTH
+            || !(MINIMUM_REPORT_BYTES..=MAXIMUM_REPORT_BYTES).contains(&request.maximum_bytes)
         {
             return Err(ProjectError::InvalidOptions);
         }
-        let control = codevetra_db::CodeVetraDatabase::request_control(Duration::from_secs(30))
+        let control = codevetra_db::CodeVetraDatabase::request_control(TRACE_TIMEOUT)
             .map_err(|_| ProjectError::SourceContextUnavailable)?;
         let mut progress = None;
         let (outcome, cancelled) = {
@@ -209,10 +216,9 @@ impl ProjectRuntime {
         let report = progress
             .as_mut()
             .ok_or(ProjectError::SourceContextUnavailable)?;
-        let mut pending = VecDeque::from([(request.symbol_id.clone(), 0_usize)]);
-        let mut seen = BTreeSet::from([request.symbol_id.clone()]);
+        let mut frontier = CallFrontier::new(request.symbol_id.clone());
         let mut steps = 0;
-        while let Some((id, depth)) = pending.pop_front() {
+        while let Some((id, depth)) = frontier.pending.pop_front() {
             if cancellation.is_cancelled() {
                 return Err(ProjectError::RequestCancelled);
             }
@@ -224,7 +230,7 @@ impl ProjectRuntime {
                     &report.generation,
                     vec![SourceContextRequest::new(
                         id,
-                        SourceContextOptions::new(0, 256 * 1024)?,
+                        SourceContextOptions::new(0, MAXIMUM_SOURCE_WINDOW_BYTES)?,
                     )],
                     cancellation.clone(),
                 )
@@ -265,8 +271,7 @@ impl ProjectRuntime {
                         depth,
                         maximum_depth: request.maximum_depth,
                     },
-                    &mut seen,
-                    &mut pending,
+                    &mut frontier,
                 )
                 .await?;
             report.record_unknowns(unknowns);
@@ -365,8 +370,7 @@ impl ProjectRuntime {
     async fn trace_calls(
         &self,
         input: CallInput<'_>,
-        seen: &mut BTreeSet<SymbolId>,
-        pending: &mut VecDeque<(SymbolId, usize)>,
+        frontier: &mut CallFrontier,
     ) -> Result<(Vec<StaticTraceCall>, Vec<&'static str>), ProjectError> {
         let mut calls = Vec::new();
         let mut unknowns = Vec::new();
@@ -415,7 +419,7 @@ impl ProjectRuntime {
             let target = (exact && targets.len() == 1)
                 .then(|| targets.into_iter().next())
                 .flatten();
-            let state = admit_call_target(&input, target.as_ref(), seen, pending, &mut unknowns);
+            let state = frontier.admit(&input, target.as_ref(), &mut unknowns);
             calls.push(StaticTraceCall {
                 step: step.id,
                 focused: target.is_some() && target.as_ref() == input.focus,
@@ -429,31 +433,45 @@ impl ProjectRuntime {
     }
 }
 
-fn admit_call_target(
-    input: &CallInput<'_>,
-    target: Option<&SymbolId>,
-    seen: &mut BTreeSet<SymbolId>,
-    pending: &mut VecDeque<(SymbolId, usize)>,
-    unknowns: &mut Vec<&'static str>,
-) -> &'static str {
-    let Some(target) = target else {
-        unknowns.push("unresolved_calls");
-        return "unresolved_ambiguous_or_coarse_call";
-    };
-    if seen.contains(target) {
-        return "definition_reuse_or_recursion_boundary";
+/// The queue and its admission set belong to one breadth-first expansion.
+struct CallFrontier {
+    seen: BTreeSet<SymbolId>,
+    pending: VecDeque<(SymbolId, usize)>,
+}
+
+impl CallFrontier {
+    fn new(entry: SymbolId) -> Self {
+        Self {
+            seen: BTreeSet::from([entry.clone()]),
+            pending: VecDeque::from([(entry, 0)]),
+        }
     }
-    if input.depth >= input.maximum_depth {
-        unknowns.push("call_depth_limit");
-        return "call_depth_limit";
+
+    fn admit(
+        &mut self,
+        input: &CallInput<'_>,
+        target: Option<&SymbolId>,
+        unknowns: &mut Vec<&'static str>,
+    ) -> &'static str {
+        let Some(target) = target else {
+            unknowns.push("unresolved_calls");
+            return "unresolved_ambiguous_or_coarse_call";
+        };
+        if self.seen.contains(target) {
+            return "definition_reuse_or_recursion_boundary";
+        }
+        if input.depth >= input.maximum_depth {
+            unknowns.push("call_depth_limit");
+            return "call_depth_limit";
+        }
+        if self.seen.len() >= 16 {
+            unknowns.push("function_limit");
+            return "function_limit";
+        }
+        self.seen.insert(target.clone());
+        self.pending.push_back((target.clone(), input.depth + 1));
+        "resolved_static_call"
     }
-    if seen.len() >= 16 {
-        unknowns.push("function_limit");
-        return "function_limit";
-    }
-    seen.insert(target.clone());
-    pending.push_back((target.clone(), input.depth + 1));
-    "resolved_static_call"
 }
 
 fn reconcile_expanded_calls(report: &mut StaticTraceReport) {

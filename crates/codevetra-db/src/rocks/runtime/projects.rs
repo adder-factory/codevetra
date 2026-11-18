@@ -6,7 +6,8 @@ use std::{
 
 use codevetra_domain::ContentDigest;
 
-use super::{ProjectStore, Result, RocksError, StorageRequest, StorePolicy};
+use super::{ProjectOpening, ProjectStore, Result, RocksError, StorageRequest};
+use crate::rocks::StorePolicy;
 
 #[cfg(test)]
 mod tests;
@@ -38,39 +39,32 @@ pub(super) struct ProjectAccess {
 impl Projects {
     pub(super) fn open(
         self: &Arc<Self>,
-        root: &Path,
-        identity: ContentDigest,
-        policy: StorePolicy,
+        opening: ProjectOpening,
         control: &StorageRequest,
     ) -> Result<ProjectAccess> {
-        self.open_with(
-            root,
-            identity,
-            policy,
-            control,
-            |root, identity, policy, control| {
-                ProjectStore::open_controlled(root, identity, policy, Some(control.clone()))
-            },
-        )
+        self.open_with(opening, control, |opening, control| {
+            opening.open(Some(control.clone()))
+        })
     }
 
     pub(super) fn open_with(
         self: &Arc<Self>,
-        root: &Path,
-        identity: ContentDigest,
-        policy: StorePolicy,
+        mut opening: ProjectOpening,
         control: &StorageRequest,
-        open_store: impl FnOnce(
-            &Path,
-            &ContentDigest,
-            StorePolicy,
-            &StorageRequest,
-        ) -> Result<ProjectStore>,
+        open_store: impl FnOnce(&ProjectOpening, &StorageRequest) -> Result<ProjectStore>,
     ) -> Result<ProjectAccess> {
-        let policy = policy.validate()?;
-        let root = root.canonicalize().map_err(|_| RocksError::Directory)?;
+        opening.policy = opening.policy.validate()?;
+        opening.root = opening
+            .root
+            .canonicalize()
+            .map_err(|_| RocksError::Directory)?;
+        let ProjectOpening {
+            root,
+            identity,
+            policy,
+        } = &opening;
         control.check()?;
-        if !self.already_open(&root, &identity, policy)? {
+        if !self.already_open(root, identity, *policy)? {
             // Serialize primary creation without holding the registry lock:
             // existing projects remain usable throughout slow native I/O.
             let _opening = self
@@ -78,8 +72,8 @@ impl Projects {
                 .lock()
                 .map_err(|_| super::super::operation("project_open"))?;
             control.check()?;
-            if !self.already_open(&root, &identity, policy)? {
-                let store = open_store(&root, &identity, policy, control)?;
+            if !self.already_open(root, identity, *policy)? {
+                let store = open_store(&opening, control)?;
                 let mut state = self
                     .state
                     .lock()
@@ -92,15 +86,15 @@ impl Projects {
                 state.entries.insert(
                     identity.as_str().to_owned(),
                     Entry {
-                        root,
+                        root: opening.root,
                         store,
-                        policy,
+                        policy: opening.policy,
                     },
                 );
             }
         }
         Ok(ProjectAccess {
-            identity,
+            identity: opening.identity,
             projects: Arc::clone(self),
         })
     }

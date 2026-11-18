@@ -117,6 +117,108 @@ async fn native_and_source_comparison_share_short_safety_and_composite_rules()
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rust_mapping_and_proof_ownership_match_native_and_git_findings()
+-> Result<(), Box<dyn std::error::Error>> {
+    use codevetra_agent::{RocksIndexOptions, RocksProjectRuntime};
+    use codevetra_db::rocks::StorageRequest;
+    use std::{collections::BTreeSet, fmt::Write as _, time::Duration};
+
+    let repository = repository_fixture();
+    let mut arms = String::new();
+    for name in 'A'..='T' {
+        writeln!(arms, "Kind::{name} => 1000,")?;
+    }
+    let variants = ('A'..='T')
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let ordinary = arms.replacen("1000", "compute(1000)", 1);
+    let source = format!(
+        "enum Kind {{ {variants} }}\n\
+        fn mapping(kind: Kind) -> u32 {{ match kind {{\n{arms}}} }}\n\
+        #[cfg(not(test))]\nfn production_only(kind: Kind) -> u32 {{ match kind {{\n{ordinary}}} }}\n\
+        #[kani::proof]\nfn proof_harness() {{ let kind: Kind = kani::any(); match kind {{\n{ordinary}}}; }}\n"
+    );
+    write(repository.path().join("src/precision.rs"), &source);
+    write(
+        repository.path().join("src/precision_tests.rs"),
+        &source.replace("production_only", "fixture_only"),
+    );
+    write(
+        repository.path().join("src/test-precision.py"),
+        "def fixture_only(a, b, c, d, e, f, g):\n    value = 1000\n    value += 1001\n    value += 1002\n    value += 1003\n    value += 1004\n    return value + 1005\n",
+    );
+    let request = StorageRequest::new(Duration::from_secs(60))?;
+    let runtime = RocksProjectRuntime::open(repository.path(), &request).await?;
+    runtime
+        .index(RocksIndexOptions::default(), &request)
+        .await?;
+    let database = runtime.database();
+    database
+        .refresh_current_structural_findings(database.project_id(), Duration::from_secs(30))
+        .await?;
+    let native = serde_json::to_value(
+        database
+            .current_structural_findings(database.project_id(), 100)
+            .await?,
+    )?;
+    let report = serde_json::to_value(
+        discover_source_comparison(
+            repository.path(),
+            SourceCompareOptions::new("HEAD")?
+                .with_findings(true)
+                .with_findings_delta(true),
+        )
+        .await?,
+    )?;
+    let pairs = |rows: &[serde_json::Value]| {
+        rows.iter()
+            .filter_map(|row| {
+                let finding = row["finding"].as_str()?;
+                ["complex_method", "magic_number", "long_parameter_list"]
+                    .contains(&finding)
+                    .then(|| {
+                        (
+                            row["qualifiedName"].as_str().unwrap_or_default().to_owned(),
+                            finding.to_owned(),
+                        )
+                    })
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let native = pairs(native.as_array().ok_or("missing native findings")?);
+    let compared_paths = report["files"]
+        .as_array()
+        .ok_or("missing compared files")?
+        .iter()
+        .filter_map(|file| file["path"].as_str())
+        .collect::<BTreeSet<_>>();
+    for path in [
+        "src/precision.rs",
+        "src/precision_tests.rs",
+        "src/test-precision.py",
+    ] {
+        assert!(compared_paths.contains(path), "{path}");
+    }
+    let introduced = report["files"]
+        .as_array()
+        .ok_or("missing compared files")?
+        .iter()
+        .filter_map(|file| file["findingsDelta"]["introduced"].as_array())
+        .flat_map(|rows| rows.iter().cloned())
+        .collect::<Vec<_>>();
+    let expected = BTreeSet::from([
+        ("mapping".to_owned(), "magic_number".to_owned()),
+        ("production_only".to_owned(), "complex_method".to_owned()),
+        ("production_only".to_owned(), "magic_number".to_owned()),
+    ]);
+    assert_eq!(native, expected);
+    assert_eq!(pairs(&introduced), expected);
+    runtime.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn compare_to_head_discovers_dirty_tracked_and_untracked_files_deterministically() {
     let repository = repository_fixture();

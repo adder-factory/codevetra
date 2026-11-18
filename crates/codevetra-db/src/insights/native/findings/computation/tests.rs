@@ -4,8 +4,8 @@ use super::*;
 use crate::{
     GenerationFacts, GenerationValidationLimits,
     rocks::{
-        AsyncProjectStore, GraphBase, GraphPolicy, GraphPublicationInput, GraphRevision,
-        StorageRequest, StorageRuntime, StorePolicy, WorkerPolicy,
+        AsyncProjectStore, GraphBase, GraphPolicy, GraphRevision, StorageRequest, StorageRuntime,
+        StorePolicy, WorkerPolicy,
     },
     validate_generation_facts,
 };
@@ -30,9 +30,11 @@ impl Fixture {
         let identity = ContentDigest::from_bytes([1; 32]);
         let store = AsyncProjectStore::open(
             &runtime,
-            root.path().to_owned(),
-            identity.clone(),
-            StorePolicy::default(),
+            crate::rocks::ProjectOpening::new(
+                root.path().to_owned(),
+                identity.clone(),
+                StorePolicy::default(),
+            ),
             &request()?,
         )
         .await?;
@@ -59,7 +61,7 @@ impl Fixture {
             || false,
         )?
         .0;
-        let input = GraphPublicationInput::new(
+        let input = crate::rocks::GraphPreparation::new(
             GraphRevision {
                 generation_id: GenerationId::from_uuid_v8([number; 16]),
                 source_revision: ContentDigest::from_bytes([number; 32]),
@@ -69,27 +71,34 @@ impl Fixture {
                     GraphBase::Current(GenerationId::from_uuid_v8([number - 1; 16]))
                 },
             },
-            facts,
             GraphPolicy::default(),
             &request()?,
-        )?;
-        self.database
-            .store
-            .publish_graph(input, &request()?)
-            .await?;
+        )
+        .resident(facts)?;
+        {
+            let request_bound_input = input;
+            self.database
+                .store
+                .with_request(&request()?)
+                .publish_graph(request_bound_input)
+                .await
+        }?;
         Ok(())
     }
 
     async fn head(&self) -> TestResult<Option<Vec<u8>>> {
         Ok(self
             .database
-            .state(None, 0, 0, |transaction, budget| {
-                transaction.get(
-                    StateNamespace::Derived,
-                    b"dataset/h/structural-findings",
-                    budget,
-                )
-            })
+            .state(
+                crate::rocks::StateAccess::read_only(None),
+                |transaction, budget| {
+                    transaction.get(
+                        StateNamespace::Derived,
+                        b"dataset/h/structural-findings",
+                        budget,
+                    )
+                },
+            )
             .await?)
     }
 
@@ -140,9 +149,16 @@ async fn staged_analysis_rejects_changed_source_or_auxiliary_inputs_without_repl
         } else {
             fixture
                 .database
-                .state(None, 64, 1, |transaction, _| {
-                    transaction.put(StateNamespace::Metadata, b"coverage_epoch", encode(&1_u64)?)
-                })
+                .state(
+                    crate::rocks::StateAccess::write(None, 64, 1),
+                    |transaction, _| {
+                        transaction.put(
+                            StateNamespace::Metadata,
+                            b"coverage_epoch",
+                            encode(&1_u64)?,
+                        )
+                    },
+                )
                 .await?;
         }
         release.send(())?;

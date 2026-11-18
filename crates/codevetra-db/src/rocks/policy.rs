@@ -22,26 +22,57 @@ pub struct StorePolicy {
 
 impl Default for StorePolicy {
     fn default() -> Self {
-        Self {
-            cache_bytes: 64 * MIB,
-            memtable_bytes: 32 * MIB,
-            maximum_batch_bytes: 64 * MIB,
-            maximum_batch_rows: 100_000,
-        }
+        Self::DEFAULT
     }
 }
 
 impl StorePolicy {
+    const DEFAULT: Self = Self {
+        cache_bytes: 64 * MIB,
+        memtable_bytes: 32 * MIB,
+        maximum_batch_bytes: 64 * MIB,
+        maximum_batch_rows: 100_000,
+    };
+
     pub(super) fn validate(self) -> Result<Self> {
-        if !super::arithmetic::valid_store_policy(
-            self.cache_bytes,
-            self.memtable_bytes,
-            self.maximum_batch_bytes,
-            self.maximum_batch_rows,
-        ) {
+        if !super::arithmetic::valid_store_policy(&self) {
             return Err(RocksError::Limit { resource: "policy" });
         }
         Ok(self)
+    }
+}
+
+/// Generation fence and write capacity admitted for one state transaction.
+///
+/// Read-only access never acquires the mutation lock. Writable access retains
+/// both row and byte limits through worker reservation and WAL publication.
+#[derive(Clone, Debug)]
+pub struct StateAccess {
+    pub(super) expected: Option<codevetra_domain::GenerationId>,
+    pub(super) maximum_write_bytes: u32,
+    pub(super) maximum_write_rows: u32,
+}
+
+impl StateAccess {
+    /// Read project state, optionally fenced to the current graph generation.
+    #[must_use]
+    pub fn read_only(expected: Option<codevetra_domain::GenerationId>) -> Self {
+        Self::write(expected, 0, 0)
+    }
+
+    /// Bound writes by encoded bytes and changed rows, with an optional graph fence.
+    /// Store policy and worker admission validate these limits before execution.
+    #[must_use]
+    pub fn write(
+        expected: Option<codevetra_domain::GenerationId>,
+        maximum_write_bytes: u32,
+        maximum_write_rows: u32,
+    ) -> Self {
+        Self {
+            expected,
+            maximum_write_bytes,
+            maximum_write_rows,
+        }
     }
 }
 
@@ -57,12 +88,18 @@ pub struct ReadBudget {
 }
 
 impl ReadBudget {
+    const MAXIMUM_TIMEOUT: Duration = Duration::from_secs(300);
+    const MAXIMUM_STREAM_ROWS: usize = 2_000_000;
+    const MAXIMUM_STREAM_BYTES: usize = 8 * 1024 * MIB;
+    // Both audited streaming consumers use this fixed retained workspace.
+    const STREAMING_WORKSPACE_BYTES: usize = 64 * MIB;
+
     /// Admit a finite request. No zero/unbounded deadline is accepted.
     ///
     /// # Errors
     /// Returns a limit error for invalid rows, bytes, or deadlines.
     pub fn new(rows: usize, bytes: usize, timeout: Duration) -> Result<Self> {
-        if rows == 0 || bytes == 0 || timeout.is_zero() || timeout > Duration::from_secs(300) {
+        if rows == 0 || bytes == 0 || timeout.is_zero() || timeout > Self::MAXIMUM_TIMEOUT {
             return Err(RocksError::Limit {
                 resource: "read_policy",
             });
@@ -84,19 +121,14 @@ impl ReadBudget {
     /// Streaming operators retain a separately bounded workspace while charging
     /// every physical read, including repeated reads, against a finite total.
     /// Only audited native operators may use this admission contract.
-    pub(crate) fn streaming(
-        rows: usize,
-        bytes: usize,
-        workspace: usize,
-        timeout: Duration,
-    ) -> Result<Self> {
-        if rows > 2_000_000 || bytes > 8 * 1024 * MIB || !(MIB..=128 * MIB).contains(&workspace) {
+    pub(crate) fn streaming(rows: usize, bytes: usize, timeout: Duration) -> Result<Self> {
+        if rows > Self::MAXIMUM_STREAM_ROWS || bytes > Self::MAXIMUM_STREAM_BYTES {
             return Err(RocksError::Limit {
                 resource: "streaming_read_policy",
             });
         }
         let mut budget = Self::new(rows, bytes, timeout)?;
-        budget.workspace_bytes = workspace;
+        budget.workspace_bytes = Self::STREAMING_WORKSPACE_BYTES;
         Ok(budget)
     }
 

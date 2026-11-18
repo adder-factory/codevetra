@@ -20,6 +20,8 @@ struct FileScopes {
     impls: Vec<(u64, u64)>,
     lifetime_functions: Vec<(u64, u64)>,
     macros: Vec<(u64, u64)>,
+    /// Argument scopes that remain opaque even to qualified type/module paths.
+    opaque_qualified_arguments: Vec<(u64, u64)>,
     /// Item-position invocations can introduce items throughout a module scope.
     item_macros: Vec<(u64, u64)>,
     /// Unknown statement macros can introduce items throughout their block.
@@ -85,6 +87,7 @@ where
     scopes.impls.sort_unstable();
     scopes.lifetime_functions.sort_unstable();
     scopes.macros.sort_unstable();
+    merge_block_scopes(&mut scopes.opaque_qualified_arguments, cancelled)?;
     scopes.item_macros.sort_unstable();
     merge_block_scopes(&mut scopes.block_macros, cancelled)?;
     merge_block_scopes(&mut scopes.standard_blocks, cancelled)?;
@@ -116,6 +119,7 @@ fn scopes_empty(scopes: &FileScopes) -> bool {
         scopes.impls.is_empty(),
         scopes.lifetime_functions.is_empty(),
         scopes.macros.is_empty(),
+        scopes.opaque_qualified_arguments.is_empty(),
         scopes.block_macros.is_empty(),
         scopes.standard_blocks.is_empty(),
         scopes.standard_items.is_empty(),
@@ -307,6 +311,7 @@ fn retain_binding(
             push_scope(budget, (&mut scopes.lifetime_functions, binding))
         }
         "<rust-opaque-root-macro>" => {
+            push_scope(budget, (&mut scopes.opaque_qualified_arguments, binding))?;
             if matches!(binding.local_name.as_str(), "std" | "core") {
                 push_scope(budget, (&mut scopes.standard_items, binding))?;
             }
@@ -316,7 +321,7 @@ fn retain_binding(
             }
             push_scope(budget, (&mut scopes.macros, binding))
         }
-        "<rust-opaque-macro>" => push_scope(budget, (&mut scopes.macros, binding)),
+        "<rust-opaque-macro>" => retain_macro_arguments(budget, (scopes, binding), imports),
         "<rust-opaque-block-macro>" => retain_macro_block(budget, (scopes, binding), imports),
         "<rust-standard-macro-definition>" => {
             retain_local(budget, (&mut scopes.defined_macros, binding))
@@ -328,6 +333,21 @@ fn retain_binding(
         "<rust-inline-file-module>" | "<rust-scoped-module-glob>" => Ok(()),
         _ => retain_local(budget, (&mut scopes.locals, binding)),
     }
+}
+
+fn retain_macro_arguments(
+    budget: &mut super::ResolveBudget,
+    (scopes, binding): (&mut FileScopes, &ExtractedImportBinding),
+    imports: &MacroImports<'_>,
+) -> Result<(), StageItemFailure> {
+    push_scope(budget, (&mut scopes.macros, binding))?;
+    if matches!(binding.local_name.as_str(), "std" | "core") {
+        push_scope(budget, (&mut scopes.standard_blocks, binding))?;
+    }
+    if uncertain_macro(binding, imports) {
+        push_scope(budget, (&mut scopes.opaque_qualified_arguments, binding))?;
+    }
+    Ok(())
 }
 
 fn retain_macro_block(
@@ -458,10 +478,12 @@ pub(super) fn opaque_macro(index: &ResolutionIndex, request: &ResolutionRequest<
     let Some(file) = file_scopes(index, request.file_id) else {
         return false;
     };
-    contains_span(
-        &file.macros,
-        (request.span.start_byte(), request.span.end_byte()),
-    )
+    let scopes = if request.name.contains("::") {
+        &file.opaque_qualified_arguments
+    } else {
+        &file.macros
+    };
+    contains_span(scopes, (request.span.start_byte(), request.span.end_byte()))
 }
 
 pub(super) fn root_macro(index: &ResolutionIndex, file: &FileId) -> bool {
@@ -636,18 +658,37 @@ where
         if module.is_some_and(|module| scope == module.module) {
             return Ok(true);
         }
-        for candidate in candidates {
-            if cancelled() {
-                return Err(StageItemFailure);
-            }
-            if candidate.parent_symbol_id.as_ref() == scope {
-                return Ok(false);
-            }
+        if scope_shadows_name(candidates, (request.name, scope), cancelled)? {
+            return Ok(false);
         }
         let Some(owner) = scope else {
             return Ok(true);
         };
         scope = index.parents.get(owner);
+    }
+    Ok(false)
+}
+
+fn scope_shadows_name<Cancel>(
+    candidates: &[ResolutionCandidate],
+    (name, scope): (&str, Option<&super::SymbolId>),
+    cancelled: &mut Cancel,
+) -> Result<bool, StageItemFailure>
+where
+    Cancel: FnMut() -> bool,
+{
+    for candidate in candidates {
+        if cancelled() {
+            return Err(StageItemFailure);
+        }
+        // Qualified heads use the type namespace; an associated method names
+        // a callable through its type and cannot shadow a module import.
+        if name.contains("::") && candidate.kind == SymbolKind::Method {
+            continue;
+        }
+        if candidate.parent_symbol_id.as_ref() == scope {
+            return Ok(true);
+        }
     }
     Ok(false)
 }

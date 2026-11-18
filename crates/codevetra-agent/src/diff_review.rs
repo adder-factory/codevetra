@@ -655,8 +655,9 @@ impl crate::ProjectRuntime {
             ),
             _ => (None, IndexFreshness::Unknown),
         };
-        let coordinates =
-            coordinates::verify(self, &input, &comparison, project_id.as_ref()).await?;
+        let coordinates = self
+            .verify_diff_coordinates(&input, &comparison, project_id.as_ref())
+            .await?;
         let request = ReviewRequest::new(
             project_id.clone(),
             comparison

@@ -27,6 +27,7 @@ Thumbs.db
 
 # Test coverage
 /coverage/
+*.profraw
 
 # SonarQube scanner working directory
 /.scannerwork/

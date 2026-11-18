@@ -11,6 +11,7 @@ use crate::{
 };
 
 mod javascript_safety;
+mod value_mapping;
 
 const MAX_DIAGNOSTICS: usize = 32;
 const MAX_BODY_SEARCH_BYTES: usize = 16 * 1024;
@@ -175,7 +176,7 @@ struct HealthWalkInput<'tree, 'source> {
 #[derive(Clone, Copy)]
 struct HealthNodeInput<'tree, 'source> {
     node: Node<'tree>,
-    nesting: u16,
+    nesting: u32,
     root: bool,
     source: &'source str,
     language: SourceLanguage,
@@ -191,7 +192,7 @@ struct LiteralHealthInput<'tree, 'source> {
 #[derive(Clone, Copy)]
 struct ControlHealthInput<'tree, 'source> {
     node: Node<'tree>,
-    nesting: u16,
+    nesting: u32,
     source: &'source str,
 }
 
@@ -302,7 +303,7 @@ pub(crate) fn symbol_health_metrics(
             language,
             source,
         }),
-        cyclomatic: u16::from(body.is_some()),
+        cyclomatic: u32::from(body.is_some()),
         ..SymbolHealthMetrics::default()
     };
     populate_sensitive_and_documentation_metrics(
@@ -338,6 +339,9 @@ pub(crate) fn symbol_health_metrics(
             source,
         },
     );
+    if language == SourceLanguage::Rust {
+        metrics.flat_value_mapping = value_mapping::is_flat_mapping(body, cancelled)?;
+    }
     Ok(metrics)
 }
 
@@ -425,8 +429,8 @@ fn walk_symbol_health(
     input: HealthWalkInput<'_, '_>,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<(), ExtractError> {
-    let mut safety = javascript_safety::Analysis::default();
-    let mut stack = vec![(input.body, 0_u16, true)];
+    let mut safety = javascript_safety::Analysis::new(input);
+    let mut stack = vec![(input.body, 0_u32, true)];
     let mut visited = 0_usize;
     while let Some((node, nesting, root)) = stack.pop() {
         visited = visited.saturating_add(1);
@@ -449,7 +453,7 @@ fn walk_symbol_health(
             continue;
         };
         if is_javascript_language(input.language) {
-            safety.record(metrics, node, &input, cancelled)?;
+            safety.record(metrics, node, cancelled)?;
         }
         for child in named_children(node) {
             stack.push((child, child_nesting, false));
@@ -470,7 +474,7 @@ fn walk_symbol_health(
 fn inspect_health_node(
     metrics: &mut SymbolHealthMetrics,
     input: HealthNodeInput<'_, '_>,
-) -> Option<u16> {
+) -> Option<u32> {
     if !input.root && is_callable_node(input.node.kind()) {
         return None;
     }
@@ -529,7 +533,8 @@ fn record_literal_health(metrics: &mut SymbolHealthMetrics, input: LiteralHealth
             .unwrap_or(u32::MAX),
         );
     }
-    if numeric_literal && is_magic_number(node_text, input.language) {
+    if numeric_literal && is_magic_number(node_text, input.language) && !named_rust_constant(input)
+    {
         metrics.magic_numbers = metrics.magic_numbers.saturating_add(1);
     }
     if string_literal && contains_hardcoded_url(node_text) {
@@ -582,7 +587,7 @@ const fn is_javascript_language(language: SourceLanguage) -> bool {
 fn record_control_health(
     metrics: &mut SymbolHealthMetrics,
     input: ControlHealthInput<'_, '_>,
-) -> u16 {
+) -> u32 {
     if !is_control_node(input.node.kind()) {
         return input.nesting;
     }
@@ -720,7 +725,7 @@ fn record_facade_health(metrics: &mut SymbolHealthMetrics, input: FacadeHealthIn
     let mut nested_callables = Vec::new();
     let mut outer_stack = named_children(input.body).collect::<Vec<_>>();
     let mut has_returned_object = false;
-    let mut outer_side_effects = 0_u16;
+    let mut outer_side_effects = 0_u32;
     while let Some(node) = outer_stack.pop() {
         if is_callable_node(node.kind()) {
             nested_callables.push(node);
@@ -749,12 +754,12 @@ fn record_facade_health(metrics: &mut SymbolHealthMetrics, input: FacadeHealthIn
         && outer_side_effects == 0
     {
         metrics.facade_factory = true;
-        metrics.facade_factory_delegates = u16::try_from(delegate_count).unwrap_or(u16::MAX);
+        metrics.facade_factory_delegates = u32::try_from(delegate_count).unwrap_or(u32::MAX);
     }
 }
 
 fn callable_is_focused_delegate(callable: Node<'_>, _source: &str) -> bool {
-    let mut calls = 0_u16;
+    let mut calls = 0_u32;
     let mut stack = named_children(callable).collect::<Vec<_>>();
     while let Some(node) = stack.pop() {
         if node != callable && is_callable_node(node.kind()) {
@@ -779,8 +784,8 @@ fn callable_is_focused_delegate(callable: Node<'_>, _source: &str) -> bool {
     calls == 1
 }
 
-fn incomplete_marker_count(body: Node<'_>, source: &str) -> u16 {
-    let mut count = 0_u16;
+fn incomplete_marker_count(body: Node<'_>, source: &str) -> u32 {
+    let mut count = 0_u32;
     let mut stack = named_children(body).collect::<Vec<_>>();
     while let Some(node) = stack.pop() {
         if is_callable_node(node.kind()) {
@@ -793,7 +798,7 @@ fn incomplete_marker_count(body: Node<'_>, source: &str) -> u16 {
                 .fold(count, |total, marker| {
                     total.saturating_add(count_word_ascii_case_insensitive(text, marker))
                 });
-            count = count.saturating_add(u16::from(contains_ascii_case_insensitive(
+            count = count.saturating_add(u32::from(contains_ascii_case_insensitive(
                 text,
                 INCOMPLETE_COMMENT_PHRASE,
             )));
@@ -834,14 +839,14 @@ fn contains_incomplete_syntax_marker(node: Node<'_>, source: &str) -> bool {
     }
 }
 
-fn parameter_count(input: ParameterMetricInput<'_, '_>) -> u16 {
+fn parameter_count(input: ParameterMetricInput<'_, '_>) -> u32 {
     input
         .declaration
         .child_by_field_name("parameters")
         .map_or_else(
-            || u16::from(input.declaration.child_by_field_name("parameter").is_some()),
+            || u32::from(input.declaration.child_by_field_name("parameter").is_some()),
             |parameters| {
-                u16::try_from(
+                u32::try_from(
                     named_children(parameters)
                         .enumerate()
                         .filter(|(index, parameter)| {
@@ -849,7 +854,7 @@ fn parameter_count(input: ParameterMetricInput<'_, '_>) -> u16 {
                         })
                         .count(),
                 )
-                .unwrap_or(u16::MAX)
+                .unwrap_or(u32::MAX)
             },
         )
 }
@@ -862,17 +867,32 @@ fn is_implicit_receiver_parameter(
     if parameter.kind() == "self_parameter" {
         return true;
     }
+    if input.language == SourceLanguage::Rust {
+        return input.symbol_kind == SymbolKind::Method
+            && index == 0
+            && rust_self_parameter(parameter);
+    }
     let Some(name) = leading_parameter_identifier(text_for(input.source, parameter)) else {
         return false;
     };
-    matches!(
-        input.language,
-        SourceLanguage::TypeScript | SourceLanguage::Tsx
-    ) && name == "this"
-        || (input.language == SourceLanguage::Python
-            && input.symbol_kind == SymbolKind::Method
-            && index == 0
-            && matches!(name, "self" | "cls"))
+    match input.language {
+        SourceLanguage::TypeScript | SourceLanguage::Tsx => name == "this",
+        SourceLanguage::Python => {
+            input.symbol_kind == SymbolKind::Method && index == 0 && matches!(name, "self" | "cls")
+        }
+        _ => false,
+    }
+}
+
+fn rust_self_parameter(parameter: Node<'_>) -> bool {
+    let Some(pattern) = parameter.child_by_field_name("pattern") else {
+        return false;
+    };
+    match pattern.kind() {
+        "self" => true,
+        "mut_pattern" => named_children(pattern).any(|child| child.kind() == "self"),
+        _ => false,
+    }
 }
 
 fn leading_parameter_identifier(parameter: &str) -> Option<&str> {
@@ -906,7 +926,7 @@ fn populate_sensitive_and_documentation_metrics(
     if is_test_symbol_name(input.symbol_name) {
         score /= 2;
     }
-    metrics.secrets_score = score.min(MAX_SENSITIVE_SCORE);
+    metrics.secrets_score = u32::from(score.min(MAX_SENSITIVE_SCORE));
     metrics.secrets_signal_mask = signal_mask;
     metrics.secrets_actionable = actionable;
     if input.symbol_kind == SymbolKind::Constant
@@ -919,7 +939,7 @@ fn populate_sensitive_and_documentation_metrics(
             && !value_claims.is_empty()
             && doc_claims.is_disjoint(&value_claims)
         {
-            metrics.stale_doc_numbers = u16::try_from(doc_claims.len()).unwrap_or(u16::MAX);
+            metrics.stale_doc_numbers = u32::try_from(doc_claims.len()).unwrap_or(u32::MAX);
         }
     }
 }
@@ -1246,7 +1266,7 @@ fn add_sensitive_signal(score: &mut SensitiveScore, signal: SensitiveSignal) {
     }
 }
 
-fn count_word_ascii_case_insensitive(haystack: &str, needle: &str) -> u16 {
+fn count_word_ascii_case_insensitive(haystack: &str, needle: &str) -> u32 {
     if needle.is_empty() || haystack.len() < needle.len() {
         return 0;
     }
@@ -1254,8 +1274,8 @@ fn count_word_ascii_case_insensitive(haystack: &str, needle: &str) -> u16 {
         .as_bytes()
         .windows(needle.len())
         .enumerate()
-        .fold(0_u16, |count, (index, window)| {
-            count.saturating_add(u16::from(
+        .fold(0_u32, |count, (index, window)| {
+            count.saturating_add(u32::from(
                 window.eq_ignore_ascii_case(needle.as_bytes())
                     && index
                         .checked_sub(1)
@@ -1531,6 +1551,33 @@ fn is_numeric_literal(kind: &str) -> bool {
             | "integer"
             | "float"
     )
+}
+
+/// A local named constant documents the value just as a module constant does.
+/// Anonymous const blocks and ordinary immutable bindings remain executable
+/// literal evidence. Stop at callable scopes and conservatively retain evidence
+/// when the bounded ancestor inspection cannot establish a named constant.
+fn named_rust_constant(input: LiteralHealthInput<'_, '_>) -> bool {
+    const MAX_CONSTANT_ANCESTORS: usize = 32;
+    if input.language != SourceLanguage::Rust {
+        return false;
+    }
+    let mut node = input.node;
+    for _ in 0..MAX_CONSTANT_ANCESTORS {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if is_callable_node(parent.kind()) {
+            return false;
+        }
+        if parent.kind() == "const_item" {
+            return parent.child_by_field_name("name").is_some_and(|name| {
+                name.kind() == "identifier" && text_for(input.source, name) != "_"
+            });
+        }
+        node = parent;
+    }
+    false
 }
 
 fn is_magic_number(raw: &str, language: SourceLanguage) -> bool {
@@ -1819,20 +1866,20 @@ fn condition_node(node: Node<'_>) -> Option<Node<'_>> {
         .or_else(|| node.child_by_field_name("value"))
 }
 
-fn logical_operator_count(node: Node<'_>, source: &str) -> u16 {
-    descendants_including_root(node).fold(0_u16, |count, node| {
+fn logical_operator_count(node: Node<'_>, source: &str) -> u32 {
+    descendants_including_root(node).fold(0_u32, |count, node| {
         count.saturating_add(direct_logical_operator_count(node, source))
     })
 }
 
-fn direct_logical_operator_count(node: Node<'_>, source: &str) -> u16 {
+fn direct_logical_operator_count(node: Node<'_>, source: &str) -> u32 {
     if !matches!(
         node.kind(),
         "binary_expression" | "boolean_operator" | "logical_expression"
     ) {
         return 0;
     }
-    let mut count = 0_u16;
+    let mut count = 0_u32;
     for index in 0..node.child_count() {
         let Some(child) = node.child(index) else {
             continue;
@@ -1870,7 +1917,7 @@ fn populate_text_metrics(metrics: &mut SymbolHealthMetrics, input: TextMetricInp
     if typescript {
         populate_typescript_metrics(metrics, input.raw);
     }
-    metrics.empty_body = u16::from(body_is_empty(input.raw));
+    metrics.empty_body = u32::from(body_is_empty(input.raw));
 }
 
 fn populate_typescript_metrics(metrics: &mut SymbolHealthMetrics, raw: &str) {
@@ -1947,15 +1994,15 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     count_ascii_case_insensitive(haystack, needle) > 0
 }
 
-fn count_ascii_case_insensitive(haystack: &str, needle: &str) -> u16 {
+fn count_ascii_case_insensitive(haystack: &str, needle: &str) -> u32 {
     if needle.is_empty() || haystack.len() < needle.len() {
         return 0;
     }
     haystack
         .as_bytes()
         .windows(needle.len())
-        .fold(0_u16, |count, window| {
-            count.saturating_add(u16::from(window.eq_ignore_ascii_case(needle.as_bytes())))
+        .fold(0_u32, |count, window| {
+            count.saturating_add(u32::from(window.eq_ignore_ascii_case(needle.as_bytes())))
         })
 }
 
@@ -2403,15 +2450,47 @@ pub(crate) fn clone_shape_digest(
     root: Node<'_>,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<ContentDigest, ExtractError> {
+    let hasher = clone_shape_hasher(root, cancelled, false)?;
+    Ok(ContentDigest::from_bytes(*hasher.finalize().as_bytes()))
+}
+
+/// Normalize declaration and output tokens while preserving exact mapping pattern domains.
+pub(super) fn mapping_clone_digest(
+    root: Node<'_>,
+    source: &str,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<ContentDigest, ExtractError> {
+    let Some(body) = root.child_by_field_name("body") else {
+        return clone_shape_digest(root, cancelled);
+    };
+    let Some(patterns) = value_mapping::clone_discriminator(body, source, cancelled)? else {
+        return clone_shape_digest(root, cancelled);
+    };
+    let mut hasher = clone_shape_hasher(root, cancelled, true)?;
+    hash_field(&mut hasher, b"mapping-patterns-v1");
+    hash_field(&mut hasher, patterns.as_str().as_bytes());
+    Ok(ContentDigest::from_bytes(*hasher.finalize().as_bytes()))
+}
+
+fn clone_shape_hasher(
+    root: Node<'_>,
+    cancelled: &mut dyn FnMut() -> bool,
+    prune_comments: bool,
+) -> Result<blake3::Hasher, ExtractError> {
     let mut hasher =
         blake3::Hasher::new_derive_key("cartograph.v2.clone-token-shape-digest.2026-07-24");
-    for node in descendants_including_root(root) {
+    let mut nodes = descendants_including_root(root);
+    while let Some(node) = nodes.next() {
         if cancelled() {
             return Err(ExtractError::Cancelled);
         }
-        if clone_token_class(node.kind()) == CloneTokenClass::Comment
-            || children(node).next().is_some()
-        {
+        if clone_token_class(node.kind()) == CloneTokenClass::Comment {
+            if prune_comments {
+                nodes.skip_children();
+            }
+            continue;
+        }
+        if children(node).next().is_some() {
             continue;
         }
         let normalized = match clone_token_class(node.kind()) {
@@ -2422,7 +2501,7 @@ pub(crate) fn clone_shape_digest(
         };
         hash_field(&mut hasher, normalized.as_bytes());
     }
-    Ok(ContentDigest::from_bytes(*hasher.finalize().as_bytes()))
+    Ok(hasher)
 }
 
 pub(crate) fn clone_token_profile(
@@ -2996,12 +3075,19 @@ thread_local! {
     pub(super) static DIRECT_CHILD_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TraversalPhase {
+    Initial,
+    Visiting,
+    Finished,
+}
+
 pub(super) struct Descendants<'tree> {
     cursor: TreeCursor<'tree>,
     depth: usize,
     include_root: bool,
-    started: bool,
-    finished: bool,
+    phase: TraversalPhase,
+    skip_children: bool,
 }
 
 impl<'tree> Descendants<'tree> {
@@ -3010,9 +3096,13 @@ impl<'tree> Descendants<'tree> {
             cursor: node.walk(),
             depth: 0,
             include_root,
-            started: false,
-            finished: false,
+            phase: TraversalPhase::Initial,
+            skip_children: false,
         }
+    }
+
+    fn skip_children(&mut self) {
+        self.skip_children = true;
     }
 }
 
@@ -3020,29 +3110,29 @@ impl<'tree> Iterator for Descendants<'tree> {
     type Item = Node<'tree>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
+        if self.phase == TraversalPhase::Finished {
             return None;
         }
-        if !self.started {
-            self.started = true;
+        if self.phase == TraversalPhase::Initial {
+            self.phase = TraversalPhase::Visiting;
             if self.include_root {
                 return Some(self.cursor.node());
             }
         }
-        if self.cursor.goto_first_child() {
+        if !std::mem::take(&mut self.skip_children) && self.cursor.goto_first_child() {
             self.depth = self.depth.saturating_add(1);
             return Some(self.cursor.node());
         }
         loop {
             if self.depth == 0 {
-                self.finished = true;
+                self.phase = TraversalPhase::Finished;
                 return None;
             }
             if self.cursor.goto_next_sibling() {
                 return Some(self.cursor.node());
             }
             if !self.cursor.goto_parent() {
-                self.finished = true;
+                self.phase = TraversalPhase::Finished;
                 return None;
             }
             self.depth = self.depth.saturating_sub(1);

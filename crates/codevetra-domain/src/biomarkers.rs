@@ -9,7 +9,7 @@ pub use capabilities::{
 };
 
 /// Fences persisted findings when source-local formulas or eligibility change.
-pub const SOURCE_RULE_CONTRACT: &str = "source_rules_v2";
+pub const SOURCE_RULE_CONTRACT: &str = "source_rules_v4";
 
 /// A metric extracted from one callable, independent of a storage adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +68,36 @@ pub enum SourceHealthMetric {
 }
 
 impl SourceHealthMetric {
+    const fn unit(self) -> &'static str {
+        match self {
+            Self::CodeLines => "lines",
+            Self::Cyclomatic => "cyclomatic",
+            Self::MaxNesting => "max_nesting",
+            Self::MaxConditionalOperands => "conditional_operands",
+            Self::ParameterCount => "parameters",
+            Self::SecretsScore => "confidence_percent",
+            Self::BrainRisk => "composite_risk",
+            Self::EmptyBody
+            | Self::MagicNumbers
+            | Self::HardcodedUrls
+            | Self::AccidentalQuadratic
+            | Self::EmptyCatches
+            | Self::SyncIoInAsync
+            | Self::SequentialAwaitLoops
+            | Self::TsAnyCasts
+            | Self::TsSuppressions
+            | Self::DebugLogs
+            | Self::IncompleteMarkers
+            | Self::DynamicEval
+            | Self::InsecureHash
+            | Self::InsecureRandom
+            | Self::HttpWithoutTimeout
+            | Self::SqlStringConcatenation
+            | Self::UnsafeJsonParse
+            | Self::UnvalidatedEnv => "occurrences",
+        }
+    }
+
     /// Canonical metadata field; composite risk is calculated by the evaluator.
     #[must_use]
     pub const fn field(self) -> &'static str {
@@ -127,20 +157,21 @@ pub struct SourceRule {
     pub risk_direction: RiskDirection,
 }
 
-const fn rule(
-    name: &'static str,
-    metric_name: &'static str,
-    metric: SourceHealthMetric,
-    thresholds: [f64; 3],
-    minimum_code_lines: u32,
-) -> SourceRule {
-    SourceRule {
-        name,
-        metric_name,
-        metric,
-        thresholds,
-        minimum_code_lines,
-        risk_direction: RiskDirection::Higher,
+impl SourceRule {
+    const fn new(name: &'static str, metric: SourceHealthMetric, thresholds: [f64; 3]) -> Self {
+        Self {
+            name,
+            metric_name: metric.unit(),
+            metric,
+            thresholds,
+            minimum_code_lines: 0,
+            risk_direction: RiskDirection::Higher,
+        }
+    }
+
+    const fn with_minimum_lines(mut self, minimum_code_lines: u32) -> Self {
+        self.minimum_code_lines = minimum_code_lines;
+        self
     }
 }
 
@@ -155,180 +186,131 @@ pub struct HealthOperationSite {
 
 /// All shared source-local rules. Graph, history and coverage rules remain separate.
 pub const SOURCE_RULES: &[SourceRule] = &[
-    rule(
+    SourceRule::new(
         "large_method",
-        "lines",
         SourceHealthMetric::CodeLines,
         [100.0, 100.0, 200.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "complex_method",
-        "cyclomatic",
         SourceHealthMetric::Cyclomatic,
         [15.0, 15.0, 25.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "nested_complexity",
-        "max_nesting",
         SourceHealthMetric::MaxNesting,
         [5.0, 5.0, 7.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "complex_conditional",
-        "conditional_operands",
         SourceHealthMetric::MaxConditionalOperands,
         [6.0, 6.0, 8.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "long_parameter_list",
-        "parameters",
         SourceHealthMetric::ParameterCount,
         [4.0, 5.0, 7.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "empty_function_body",
-        "occurrences",
         SourceHealthMetric::EmptyBody,
         [1.0, 999.0, 999.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "magic_number",
-        "occurrences",
         SourceHealthMetric::MagicNumbers,
         [3.0, 5.0, 8.0],
-        5,
-    ),
-    rule(
+    )
+    .with_minimum_lines(5),
+    SourceRule::new(
         "hardcoded_url",
-        "occurrences",
         SourceHealthMetric::HardcodedUrls,
         [1.0, 2.0, 3.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "accidental_quadratic",
-        "occurrences",
         SourceHealthMetric::AccidentalQuadratic,
         [1.0, 1.0, 5.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "empty_catch",
-        "occurrences",
         SourceHealthMetric::EmptyCatches,
         [1.0, 1.0, 3.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "sync_io_in_async",
-        "occurrences",
         SourceHealthMetric::SyncIoInAsync,
         [1.0, 1.0, 3.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "forof_await",
-        "occurrences",
         SourceHealthMetric::SequentialAwaitLoops,
         [1.0, 2.0, 5.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "ts_any_cast",
-        "occurrences",
         SourceHealthMetric::TsAnyCasts,
         [2.0, 3.0, 5.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "ts_ignore_suppression",
-        "occurrences",
         SourceHealthMetric::TsSuppressions,
         [1.0, 1.0, 3.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "agent_debug_log",
-        "occurrences",
         SourceHealthMetric::DebugLogs,
         [1.0, 1.0, 5.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "incomplete_marker",
-        "occurrences",
         SourceHealthMetric::IncompleteMarkers,
         [1.0, 5.0, 50.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "dynamic_eval",
-        "occurrences",
         SourceHealthMetric::DynamicEval,
         [1.0, 1.0, 1.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "insecure_hash",
-        "occurrences",
         SourceHealthMetric::InsecureHash,
         [1.0, 1.0, 3.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "random_for_security",
-        "occurrences",
         SourceHealthMetric::InsecureRandom,
         [1.0, 1.0, 1.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "http_no_timeout",
-        "occurrences",
         SourceHealthMetric::HttpWithoutTimeout,
         [1.0, 1.0, 3.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "sql_string_concat",
-        "occurrences",
         SourceHealthMetric::SqlStringConcatenation,
         [1.0, 1.0, 2.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "unsafe_json_parse",
-        "occurrences",
         SourceHealthMetric::UnsafeJsonParse,
         [1.0, 1.0, 3.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "env_no_validation",
-        "occurrences",
         SourceHealthMetric::UnvalidatedEnv,
         [1.0, 1.0, 3.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "secrets_handling",
-        "confidence_percent",
         SourceHealthMetric::SecretsScore,
         [50.0, 50.0, 70.0],
-        0,
     ),
-    rule(
+    SourceRule::new(
         "brain_method",
-        "composite_risk",
         SourceHealthMetric::BrainRisk,
         [5.0, 10.0, 20.0],
-        0,
     ),
 ];
 
@@ -372,6 +354,8 @@ pub struct SourceRuleContext {
     pub framework_owned: bool,
     /// Secret evidence is actionable rather than a name-only heuristic.
     pub secrets_actionable: bool,
+    /// Bounded syntax proof of an unguarded Rust value mapping, never inferred from counts.
+    pub flat_value_mapping: bool,
 }
 
 /// Ordered severity, shared by both projections and delta comparison.
@@ -430,6 +414,8 @@ pub fn evaluate_source_rules(
                 || lines < f64::from(rule.minimum_code_lines)
                 || (rule.metric == M::ParameterCount && context.framework_owned)
                 || (rule.metric == M::SecretsScore && !context.secrets_actionable)
+                || rule
+                    .excludes_value_mapping(context.analyzed_language, context.flat_value_mapping)
             {
                 return None;
             }
@@ -453,6 +439,15 @@ pub fn evaluate_source_rules(
         .collect()
 }
 
+// Composite-risk calibration. These scales and eligibility floors are part of
+// SOURCE_RULE_CONTRACT; changing one requires a new persisted-rule contract.
+const BRAIN_MINIMUM_LINES: f64 = 50.0;
+const BRAIN_MINIMUM_COMPLEXITY: f64 = 8.0;
+const BRAIN_LINES_SCALE: f64 = 100.0;
+const BRAIN_COMPLEXITY_SCALE: f64 = 10.0;
+const BRAIN_NESTING_SCALE: f64 = 3.0;
+const BRAIN_CONDITIONAL_SCALE: f64 = 4.0;
+
 fn source_rule_value(
     metric: SourceHealthMetric,
     lines: f64,
@@ -463,14 +458,14 @@ fn source_rule_value(
         return Some(health(metric));
     }
     let complexity = health(M::Cyclomatic);
-    if lines < 50.0 || complexity < 8.0 {
+    if lines < BRAIN_MINIMUM_LINES || complexity < BRAIN_MINIMUM_COMPLEXITY {
         return None;
     }
     Some(
-        (lines / 100.0)
-            * (complexity / 10.0)
-            * (health(M::MaxNesting) / 3.0).max(1.0)
-            * (health(M::MaxConditionalOperands) / 4.0).max(1.0),
+        (lines / BRAIN_LINES_SCALE)
+            * (complexity / BRAIN_COMPLEXITY_SCALE)
+            * (health(M::MaxNesting) / BRAIN_NESTING_SCALE).max(1.0)
+            * (health(M::MaxConditionalOperands) / BRAIN_CONDITIONAL_SCALE).max(1.0),
     )
 }
 
@@ -491,6 +486,21 @@ pub struct SourceFindingLocations {
 }
 
 impl SourceRule {
+    /// Flat mappings are intentionally outside branching-logic risk, not evaluated as clean.
+    #[must_use]
+    pub fn excludes_value_mapping(
+        &self,
+        language: Option<crate::SourceLanguage>,
+        flat_value_mapping: bool,
+    ) -> bool {
+        flat_value_mapping
+            && language == Some(crate::SourceLanguage::Rust)
+            && matches!(
+                self.metric,
+                SourceHealthMetric::Cyclomatic | SourceHealthMetric::BrainRisk
+            )
+    }
+
     /// Project retained locations without inventing precision for coarse detectors.
     #[must_use]
     pub fn locations(
@@ -529,6 +539,51 @@ impl SourceRule {
             total_count: exact.then_some(value),
             truncated: exact && value > retained,
             sites,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mapping_precision_tests {
+    use super::*;
+
+    #[test]
+    fn mapping_exception_is_rust_specific_and_preserves_unrelated_risks() {
+        for language in [
+            crate::SourceLanguage::Rust,
+            crate::SourceLanguage::TypeScript,
+        ] {
+            for flat_value_mapping in [false, true] {
+                let findings = evaluate_source_rules(
+                    SourceRuleContext {
+                        analyzed_language: Some(language),
+                        scope: SourceRuleScope::Callable,
+                        framework_owned: false,
+                        secrets_actionable: true,
+                        flat_value_mapping,
+                    },
+                    |metric| match metric {
+                        SourceHealthMetric::CodeLines => 200.0,
+                        SourceHealthMetric::Cyclomatic => 50.0,
+                        SourceHealthMetric::MagicNumbers => 10.0,
+                        SourceHealthMetric::HardcodedUrls => 3.0,
+                        SourceHealthMetric::SecretsScore => 100.0,
+                        _ => 0.0,
+                    },
+                );
+                let has = |name| findings.iter().any(|finding| finding.rule.name == name);
+                let excluded = language == crate::SourceLanguage::Rust && flat_value_mapping;
+                assert_eq!(has("complex_method"), !excluded);
+                assert_eq!(has("brain_method"), !excluded);
+                for name in [
+                    "large_method",
+                    "magic_number",
+                    "hardcoded_url",
+                    "secrets_handling",
+                ] {
+                    assert!(has(name), "{name}");
+                }
+            }
         }
     }
 }

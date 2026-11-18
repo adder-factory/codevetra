@@ -12,6 +12,11 @@ pub(super) const ID_BYTES: usize = 16;
 pub(super) const ENTRY_BYTES: usize = ID_BYTES + 1 + 32;
 pub(super) const BLOCK_CAPACITY: usize = 128;
 pub(super) const BLOCK_HEADER: &[u8] = b"CGA1";
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+const NIBBLE_BITS: u32 = 4;
+const NIBBLE_MASK: u8 = 0x0f;
+const UUID_GROUP_STARTS: [usize; 4] = [4, 6, 8, 10];
+const UUID_TEXT_BYTES: usize = ID_BYTES * 2 + UUID_GROUP_STARTS.len();
 
 pub(super) fn radix_prefix(entry: &[u8; ENTRY_BYTES], depth: usize) -> Result<[u8; ENTRY_BYTES]> {
     let (bytes, remainder) = arithmetic::radix_geometry(depth, ENTRY_BYTES).ok_or_else(corrupt)?;
@@ -35,7 +40,7 @@ pub(crate) fn uuid(raw: &str) -> Result<[u8; ID_BYTES]> {
     for byte in &mut bytes {
         let upper = hex.next().and_then(nibble).ok_or_else(corrupt)?;
         let lower = hex.next().and_then(nibble).ok_or_else(corrupt)?;
-        *byte = (upper << 4) | lower;
+        *byte = (upper << NIBBLE_BITS) | lower;
     }
     if hex.next().is_some() {
         return Err(corrupt());
@@ -48,17 +53,16 @@ pub(super) fn symbol(bytes: &[u8]) -> Result<SymbolId> {
 }
 
 pub(crate) fn uuid_text(bytes: &[u8]) -> Result<String> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     if bytes.len() != ID_BYTES {
         return Err(corrupt());
     }
-    let mut raw = String::with_capacity(36);
+    let mut raw = String::with_capacity(UUID_TEXT_BYTES);
     for (index, byte) in bytes.iter().enumerate() {
-        if [4, 6, 8, 10].contains(&index) {
+        if UUID_GROUP_STARTS.contains(&index) {
             raw.push('-');
         }
-        raw.push(char::from(HEX[usize::from(byte >> 4)]));
-        raw.push(char::from(HEX[usize::from(byte & 15)]));
+        raw.push(char::from(HEX_DIGITS[usize::from(byte >> NIBBLE_BITS)]));
+        raw.push(char::from(HEX_DIGITS[usize::from(byte & NIBBLE_MASK)]));
     }
     Ok(raw)
 }
@@ -123,4 +127,23 @@ impl io::Write for BoundedJson {
 
 pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     serde_json::from_slice(bytes).map_err(|_| corrupt())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_codec_preserves_canonical_grouping_and_both_nibbles() -> Result<()> {
+        let bytes = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba,
+            0xdc, 0xfe,
+        ];
+        let canonical = "01234567-89ab-cdef-1032-547698badcfe";
+        assert_eq!(uuid_text(&bytes)?, canonical);
+        assert_eq!(uuid(canonical)?, bytes);
+        assert!(uuid_text(&bytes[..15]).is_err());
+        assert!(uuid_text(&[0; 17]).is_err());
+        Ok(())
+    }
 }

@@ -2787,7 +2787,7 @@ mod tests {
             .config_location()
             .unwrap_or_else(|error| panic!("config: {error}"))
             .path;
-        let original = "# retained\nmcp_servers:\n  cartograph:\n    command: with-secret\n    args:\n      - KEY=TOKEN\n      - --\n      - /old/bin/cartograph\n      - serve\n      - --mcp\n      - --no-write-tools\n    env:\n      CARTOGRAPH_ALLOWED_PROJECTS: /restricted\n  other:\n    command: keep\nplatform_toolsets:\n  cli:\n    - mcp-cartograph\n    - keep\n";
+        let original = "# retained\nmcp_servers:\n  before:\n    command: keep-before\n    args:\n      - /unrelated/codevetra\n  cartograph:\n    command: with-secret\n    args:\n      - KEY=TOKEN\n      - --\n      - /old/bin/cartograph\n      - serve\n      - --mcp\n      - --no-write-tools\n    env:\n      CARTOGRAPH_ALLOWED_PROJECTS: /restricted\n  other:\n    command: keep\nplatform_toolsets:\n  cli:\n    - mcp-cartograph\n    - keep\n";
         seed(&path, original);
         assert!(
             install_registration(&hermes)
@@ -2804,6 +2804,9 @@ mod tests {
             text.contains("/opt/codevetra/bin/codevetra")
                 && text.contains("  other:\n    command: keep")
         );
+        assert!(text.contains(
+            "  before:\n    command: keep-before\n    args:\n      - /unrelated/codevetra\n"
+        ));
         assert!(!text.contains("  cartograph:") && !text.contains("- mcp-cartograph"));
         assert_eq!(text.matches("  codevetra:").count(), 1);
         assert!(

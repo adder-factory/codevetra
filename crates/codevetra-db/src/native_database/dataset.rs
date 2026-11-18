@@ -15,6 +15,15 @@ const TIMEOUT: Duration = Duration::from_secs(300);
 // One published head must fit a typed reader's 1 GiB physical allowance,
 // including page keys, the manifest, and other snapshot metadata.
 const MAXIMUM_DATASET_BYTES: u64 = 512 * 1_048_576;
+const MAXIMUM_DATASET_ROWS: u64 = 3_000_000;
+const MAXIMUM_DATASET_PARTS: u32 = 12_000;
+const MAXIMUM_METADATA_BYTES: usize = 1_048_576;
+const PREPARATION_METADATA_ALLOWANCE: u32 = 1_048_576;
+const GC_WRITE_BYTES: u32 = 16 * 1_048_576;
+const GC_WRITE_ROWS: u32 = 10_000;
+const GC_MAXIMUM_SNAPSHOTS: usize = 4;
+const GC_MAXIMUM_PAYLOAD_ROWS: u32 = 9990;
+const GC_MINIMUM_AGE_SECONDS: i64 = 600;
 
 #[cfg(test)]
 mod tests;
@@ -34,6 +43,16 @@ pub(crate) struct Manifest {
 /// Exact metadata read set captured while computing a derived dataset.
 #[derive(Default)]
 pub(crate) struct CommitGuard(pub(crate) Vec<(&'static [u8], Option<Vec<u8>>)>);
+
+/// A dataset's destination, generation and auxiliary read fence travel together.
+/// Rows remain a separate streaming input; metadata is encoded before native work starts.
+pub(crate) struct DatasetReplacement<M> {
+    pub(crate) namespace: StateNamespace,
+    pub(crate) name: String,
+    pub(crate) expected: Option<GenerationId>,
+    pub(crate) metadata: M,
+    pub(crate) guard: CommitGuard,
+}
 
 impl CommitGuard {
     pub(crate) fn capture(
@@ -77,6 +96,16 @@ struct Prepared {
     reclaimed: u32,
 }
 
+impl Prepared {
+    fn new(name: &str, manifest: &Manifest) -> Self {
+        Self {
+            name: name.to_owned(),
+            manifest: manifest.clone(),
+            reclaimed: 0,
+        }
+    }
+}
+
 /// Committed cleanup progress for obsolete auxiliary snapshots.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct NativeAuxiliaryPruneReport {
@@ -107,10 +136,7 @@ impl NativeDatabase {
     /// A concurrent replacement fails its pointer comparison; partial pages stay invisible.
     pub(crate) async fn replace_dataset<T, I, M>(
         &self,
-        namespace: StateNamespace,
-        name: &str,
-        expected: Option<GenerationId>,
-        metadata: &M,
+        replacement: DatasetReplacement<M>,
         rows: I,
     ) -> Result<(), StorageError>
     where
@@ -118,34 +144,9 @@ impl NativeDatabase {
         I: Iterator<Item = T> + Send,
         M: Serialize + Sync,
     {
-        self.replace_dataset_guarded(
-            namespace,
-            name,
-            expected,
-            metadata,
-            rows,
-            CommitGuard::default(),
-        )
-        .await
-    }
-
-    pub(crate) async fn replace_dataset_guarded<T, I, M>(
-        &self,
-        namespace: StateNamespace,
-        name: &str,
-        expected: Option<GenerationId>,
-        metadata: &M,
-        rows: I,
-        guard: CommitGuard,
-    ) -> Result<(), StorageError>
-    where
-        T: Serialize + Send + 'static,
-        I: Iterator<Item = T> + Send,
-        M: Serialize + Sync,
-    {
-        validate_name(name)?;
-        let metadata = encode(metadata).map_err(super::storage_error)?;
-        if metadata.len() > 1_048_576 {
+        validate_name(&replacement.name)?;
+        let metadata = encode(&replacement.metadata).map_err(super::storage_error)?;
+        if metadata.len() > MAXIMUM_METADATA_BYTES {
             return Err(StorageError::InvalidInput {
                 field: "dataset_metadata_bytes",
             });
@@ -154,31 +155,38 @@ impl NativeDatabase {
             serde_json::from_slice(&metadata).map_err(|_| StorageError::InvalidInput {
                 field: "dataset_metadata",
             })?;
-        Self::with_preparation_deadline(
-            TIMEOUT,
-            self.prepare_dataset(namespace, name.to_owned(), expected, metadata, rows, guard),
-        )
-        .await
+        let replacement = DatasetReplacement {
+            namespace: replacement.namespace,
+            name: replacement.name,
+            expected: replacement.expected,
+            metadata,
+            guard: replacement.guard,
+        };
+        Self::with_preparation_deadline(TIMEOUT, self.prepare_dataset(replacement, rows)).await
     }
 
     async fn prepare_dataset<T, I>(
         &self,
-        namespace: StateNamespace,
-        name: String,
-        expected: Option<GenerationId>,
-        metadata: serde_json::Value,
+        replacement: DatasetReplacement<serde_json::Value>,
         mut rows: I,
-        guard: CommitGuard,
     ) -> Result<(), StorageError>
     where
         T: Serialize + Send + 'static,
         I: Iterator<Item = T> + Send,
     {
+        let DatasetReplacement {
+            namespace,
+            name,
+            expected,
+            metadata,
+            guard,
+        } = replacement;
         let pointer = head_key(&name);
         let before = self
-            .state(None, 0, 0, move |transaction, budget| {
-                transaction.get(namespace, &pointer, budget)
-            })
+            .state(
+                crate::rocks::StateAccess::read_only(None),
+                move |transaction, budget| transaction.get(namespace, &pointer, budget),
+            )
             .await?;
         let mut manifest = Manifest {
             token: token()?,
@@ -191,7 +199,7 @@ impl NativeDatabase {
             created: now(),
         };
         let mut digest = blake3::Hasher::new();
-        self.write_preparation(namespace, &name, &manifest, None)
+        self.write_preparation(namespace, Prepared::new(&name, &manifest), None)
             .await?;
         loop {
             let part = rows.by_ref().take(ROWS_PER_PART).collect::<Vec<_>>();
@@ -200,7 +208,7 @@ impl NativeDatabase {
             }
             let count = part.len();
             let encoded = self
-                .state(None, 0, 0, move |_, _| {
+                .state(crate::rocks::StateAccess::read_only(None), move |_, _| {
                     let mut encoded = BoundedWriter(Vec::new());
                     serde_json::to_writer(&mut encoded, &part).map_err(|_| RocksError::Limit {
                         resource: "dataset_part_bytes",
@@ -220,7 +228,7 @@ impl NativeDatabase {
                     field: "dataset_bytes",
                 },
             )?;
-            if manifest.rows > 3_000_000 || manifest.bytes > MAXIMUM_DATASET_BYTES {
+            if manifest.rows > MAXIMUM_DATASET_ROWS || manifest.bytes > MAXIMUM_DATASET_BYTES {
                 return Err(StorageError::InvalidInput {
                     field: "dataset_capacity",
                 });
@@ -233,14 +241,20 @@ impl NativeDatabase {
                 .ok_or(StorageError::InvalidInput {
                     field: "dataset_parts",
                 })?;
-            self.write_preparation(namespace, &name, &manifest, Some((part, encoded)))
-                .await?;
+            self.write_preparation(
+                namespace,
+                Prepared::new(&name, &manifest),
+                Some((part, encoded)),
+            )
+            .await?;
         }
         manifest.digest = ContentDigest::from_bytes(*digest.finalize().as_bytes());
         self.state(
-            expected,
-            PART_BYTES + 1_048_576,
-            3,
+            crate::rocks::StateAccess::write(
+                expected,
+                PART_BYTES + PREPARATION_METADATA_ALLOWANCE,
+                3,
+            ),
             move |transaction, budget| {
                 if transaction.get(namespace, &head_key(&name), budget)? != before {
                     return Err(RocksError::GenerationChanged);
@@ -252,11 +266,7 @@ impl NativeDatabase {
                 transaction.put(
                     namespace,
                     &prepared_key(&name, &manifest.token),
-                    encode(&Prepared {
-                        name: name.clone(),
-                        manifest: manifest.clone(),
-                        reclaimed: 0,
-                    })?,
+                    encode(&Prepared::new(&name, &manifest))?,
                 )?;
                 transaction.put(namespace, &head_key(&name), encode(&manifest)?)
             },
@@ -267,26 +277,23 @@ impl NativeDatabase {
     async fn write_preparation(
         &self,
         namespace: StateNamespace,
-        name: &str,
-        manifest: &Manifest,
+        prepared: Prepared,
         part: Option<(u32, Vec<u8>)>,
     ) -> Result<(), StorageError> {
-        let marker = prepared_key(name, &manifest.token);
-        let encoded = encode(&Prepared {
-            name: name.to_owned(),
-            manifest: manifest.clone(),
-            reclaimed: 0,
-        })
-        .map_err(super::storage_error)?;
+        let marker = prepared_key(&prepared.name, &prepared.manifest.token);
+        let encoded = encode(&prepared).map_err(super::storage_error)?;
         let key = part
             .as_ref()
-            .map(|(part, _)| part_key(name, &manifest.token, *part));
-        self.state(None, PART_BYTES + 1_048_576, 2, move |transaction, _| {
-            if let Some((_, bytes)) = part {
-                transaction.put(namespace, key.as_deref().ok_or(corrupt())?, bytes)?;
-            }
-            transaction.put(namespace, &marker, encoded)
-        })
+            .map(|(part, _)| part_key(&prepared.name, &prepared.manifest.token, *part));
+        self.state(
+            crate::rocks::StateAccess::write(None, PART_BYTES + PREPARATION_METADATA_ALLOWANCE, 2),
+            move |transaction, _| {
+                if let Some((_, bytes)) = part {
+                    transaction.put(namespace, key.as_deref().ok_or(corrupt())?, bytes)?;
+                }
+                transaction.put(namespace, &marker, encoded)
+            },
+        )
         .await
     }
 
@@ -298,14 +305,17 @@ impl NativeDatabase {
         validate_name(name)?;
         let key = head_key(name);
         let epoch = input_epoch(namespace, name);
-        self.state(None, 4096, 2, move |transaction, budget| {
-            let present = transaction.get(namespace, &key, budget)?.is_some();
-            if present && let Some(epoch) = epoch {
-                crate::artifacts::native::bump_epoch(transaction, budget, epoch)?;
-            }
-            transaction.delete(namespace, &key)?;
-            Ok(present)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, 4096, 2),
+            move |transaction, budget| {
+                let present = transaction.get(namespace, &key, budget)?.is_some();
+                if present && let Some(epoch) = epoch {
+                    crate::artifacts::native::bump_epoch(transaction, budget, epoch)?;
+                }
+                transaction.delete(namespace, &key)?;
+                Ok(present)
+            },
+        )
         .await
     }
 
@@ -361,9 +371,7 @@ impl NativeDatabase {
         request: &crate::rocks::StorageRequest,
     ) -> Result<NativeAuxiliaryPruneReport, StorageError> {
         self.state_with_request(
-            None,
-            16 * 1_048_576,
-            10_000,
+            crate::rocks::StateAccess::write(None, GC_WRITE_BYTES, GC_WRITE_ROWS),
             request,
             |transaction, budget| {
                 let mut plan = AuxiliaryGc::default();
@@ -378,7 +386,13 @@ impl NativeDatabase {
                         plan.report.incomplete = true;
                         break;
                     }
-                    plan.scan_namespace(transaction, budget, namespace, timestamp)?;
+                    plan.scan_namespace(
+                        GcScan {
+                            reader: Reader::new(transaction, namespace),
+                            timestamp,
+                        },
+                        budget,
+                    )?;
                 }
                 apply_gc_cursors(transaction, plan.cursors)?;
                 apply_gc_plans(transaction, plan.plans)?;
@@ -397,21 +411,31 @@ struct AuxiliaryGc {
     rows: u32,
 }
 
+#[derive(Clone, Copy)]
+struct GcScan<'a, 'store> {
+    reader: Reader<'a, 'store>,
+    timestamp: jiff::Timestamp,
+}
+
 impl AuxiliaryGc {
     fn at_capacity(&self) -> bool {
-        self.plans.len() >= 4 || self.rows >= 9990
+        self.plans.len() >= GC_MAXIMUM_SNAPSHOTS || self.rows >= GC_MAXIMUM_PAYLOAD_ROWS
     }
 
     fn scan_namespace(
         &mut self,
-        transaction: &StateTransaction<'_>,
+        scan: GcScan<'_, '_>,
         budget: &mut ReadBudget,
-        namespace: StateNamespace,
-        timestamp: jiff::Timestamp,
     ) -> Result<(), RocksError> {
+        let Reader {
+            transaction,
+            namespace,
+        } = scan.reader;
         let cursor_key = format!("gc/dataset/{namespace:?}");
         let after = transaction.get(StateNamespace::Metadata, cursor_key.as_bytes(), budget)?;
-        let page = transaction.scan(namespace, b"dataset/s/", after.as_deref(), 64, budget)?;
+        let page = transaction
+            .scan(namespace, b"dataset/s/")
+            .page(after.as_deref(), 64, budget)?;
         self.report.incomplete |= page.next_after.is_some();
         let mut visited = None;
         let mut exhausted = true;
@@ -422,14 +446,7 @@ impl AuxiliaryGc {
                 break;
             }
             visited = Some(key.as_bytes().to_vec());
-            self.consider_prepared(
-                transaction,
-                budget,
-                namespace,
-                key.as_bytes(),
-                &bytes,
-                timestamp,
-            )?;
+            self.consider_prepared(scan, budget, (key.as_bytes(), &bytes))?;
         }
         let next = if page.next_after.is_some() || !exhausted {
             visited
@@ -442,13 +459,16 @@ impl AuxiliaryGc {
 
     fn consider_prepared(
         &mut self,
-        transaction: &StateTransaction<'_>,
+        scan: GcScan<'_, '_>,
         budget: &mut ReadBudget,
-        namespace: StateNamespace,
-        key: &[u8],
-        bytes: &[u8],
-        timestamp: jiff::Timestamp,
+        record: (&[u8], &[u8]),
     ) -> Result<(), RocksError> {
+        let Reader {
+            transaction,
+            namespace,
+        } = scan.reader;
+        let timestamp = scan.timestamp;
+        let (key, bytes) = record;
         let mut prepared: Prepared = super::decode(bytes)?;
         validate_manifest(&prepared.manifest)?;
         let created = prepared
@@ -456,17 +476,19 @@ impl AuxiliaryGc {
             .created
             .parse::<jiff::Timestamp>()
             .map_err(|_| corrupt())?;
-        if timestamp.as_second().saturating_sub(created.as_second()) < 600 {
+        if timestamp.as_second().saturating_sub(created.as_second()) < GC_MINIMUM_AGE_SECONDS {
             return Ok(());
         }
         validate_name(&prepared.name).map_err(|_| corrupt())?;
         if key != prepared_key(&prepared.name, &prepared.manifest.token)
-            || prepared.manifest.parts > 12_000
+            || prepared.manifest.parts > MAXIMUM_DATASET_PARTS
             || prepared.reclaimed > prepared.manifest.parts
         {
             return Err(corrupt());
         }
-        if manifest(transaction, namespace, &prepared.name, budget)?
+        if Reader::new(transaction, namespace)
+            .at(&prepared.name)
+            .manifest(budget)?
             .is_some_and(|head| head.token == prepared.manifest.token)
         {
             return Ok(());
@@ -475,7 +497,7 @@ impl AuxiliaryGc {
         let end = prepared
             .manifest
             .parts
-            .min(first.saturating_add(9990 - self.rows));
+            .min(first.saturating_add(GC_MAXIMUM_PAYLOAD_ROWS - self.rows));
         self.rows = self.rows.saturating_add(end - first).saturating_add(1);
         prepared.reclaimed = end;
         self.report.pages_removed += end - first;
@@ -523,91 +545,131 @@ fn apply_gc_cursors(
     Ok(())
 }
 
-pub(crate) fn manifest(
-    transaction: &StateTransaction<'_>,
+/// Dataset reads retain one transaction snapshot and namespace across metadata and payload pages.
+#[derive(Clone, Copy)]
+pub(crate) struct Reader<'a, 'store> {
+    transaction: &'a StateTransaction<'store>,
     namespace: StateNamespace,
-    name: &str,
-    budget: &mut ReadBudget,
-) -> Result<Option<Manifest>, RocksError> {
-    transaction
-        .get(namespace, &head_key(name), budget)?
-        .map(|bytes| {
-            let manifest = decode::<Manifest>(&bytes)?;
-            validate_manifest(&manifest)?;
-            Ok(manifest)
-        })
-        .transpose()
 }
 
-pub(crate) fn visit<T: DeserializeOwned>(
-    transaction: &StateTransaction<'_>,
-    namespace: StateNamespace,
-    name: &str,
-    manifest: &Manifest,
-    budget: &mut ReadBudget,
-    mut visitor: impl FnMut(T, &mut ReadBudget) -> Result<(), RocksError>,
-) -> Result<(), RocksError> {
-    validate_manifest(manifest)?;
-    let mut rows = 0_u64;
-    let mut bytes = 0_u64;
-    let mut digest = blake3::Hasher::new();
-    for part in 0..manifest.parts {
-        let encoded = transaction
-            .get(namespace, &part_key(name, &manifest.token, part), budget)?
-            .ok_or(corrupt())?;
-        if encoded.len() > PART_BYTES as usize {
-            return Err(corrupt());
-        }
-        bytes = bytes.checked_add(encoded.len() as u64).ok_or(corrupt())?;
-        digest.update(&encoded);
-        let values: Vec<T> = decode(&encoded)?;
-        if values.is_empty() || values.len() > ROWS_PER_PART {
-            return Err(corrupt());
-        }
-        rows = rows.checked_add(values.len() as u64).ok_or(corrupt())?;
-        for value in values {
-            budget.checkpoint()?;
-            visitor(value, budget)?;
+impl<'a, 'store> Reader<'a, 'store> {
+    pub(crate) const fn new(
+        transaction: &'a StateTransaction<'store>,
+        namespace: StateNamespace,
+    ) -> Self {
+        Self {
+            transaction,
+            namespace,
         }
     }
-    if rows != manifest.rows
-        || bytes != manifest.bytes
-        || ContentDigest::from_bytes(*digest.finalize().as_bytes()) != manifest.digest
-    {
-        return Err(corrupt());
+    pub(crate) const fn at(self, name: &'a str) -> Dataset<'a, 'store> {
+        Dataset { reader: self, name }
     }
-    Ok(())
 }
 
-pub(crate) fn list(
-    transaction: &StateTransaction<'_>,
-    namespace: StateNamespace,
-    prefix: &str,
-    budget: &mut ReadBudget,
-) -> Result<BTreeMap<String, Manifest>, RocksError> {
-    let mut output = BTreeMap::new();
-    let prefix = format!("dataset/h/{prefix}");
-    let mut bytes = 0_usize;
-    super::visit_state::<Manifest>(
-        transaction,
-        namespace,
-        prefix.as_bytes(),
-        budget,
-        |key, manifest, _| {
-            validate_manifest(&manifest)?;
-            bytes = bytes.saturating_add(key.len() + encode(&manifest)?.len());
-            if bytes > 16 * 1_048_576 || output.len() >= 8192 {
-                return Err(RocksError::Limit {
-                    resource: "dataset_headers",
-                });
+pub(crate) struct Dataset<'a, 'store> {
+    reader: Reader<'a, 'store>,
+    name: &'a str,
+}
+
+impl Dataset<'_, '_> {
+    pub(crate) fn manifest(&self, budget: &mut ReadBudget) -> Result<Option<Manifest>, RocksError> {
+        let Reader {
+            transaction,
+            namespace,
+        } = self.reader;
+        let name = self.name;
+
+        transaction
+            .get(namespace, &head_key(name), budget)?
+            .map(|bytes| {
+                let manifest = decode::<Manifest>(&bytes)?;
+                validate_manifest(&manifest)?;
+                Ok(manifest)
+            })
+            .transpose()
+    }
+}
+
+impl Dataset<'_, '_> {
+    pub(crate) fn visit<T: DeserializeOwned>(
+        &self,
+        manifest: &Manifest,
+        budget: &mut ReadBudget,
+        mut visitor: impl FnMut(T, &mut ReadBudget) -> Result<(), RocksError>,
+    ) -> Result<(), RocksError> {
+        let Reader {
+            transaction,
+            namespace,
+        } = self.reader;
+        let name = self.name;
+
+        validate_manifest(manifest)?;
+        let mut rows = 0_u64;
+        let mut bytes = 0_u64;
+        let mut digest = blake3::Hasher::new();
+        for part in 0..manifest.parts {
+            let encoded = transaction
+                .get(namespace, &part_key(name, &manifest.token, part), budget)?
+                .ok_or(corrupt())?;
+            if encoded.len() > PART_BYTES as usize {
+                return Err(corrupt());
             }
-            let name = std::str::from_utf8(key.get(b"dataset/h/".len()..).ok_or(corrupt())?)
-                .map_err(|_| corrupt())?;
-            output.insert(name.to_owned(), manifest);
-            Ok(())
-        },
-    )?;
-    Ok(output)
+            bytes = bytes.checked_add(encoded.len() as u64).ok_or(corrupt())?;
+            digest.update(&encoded);
+            let values: Vec<T> = decode(&encoded)?;
+            if values.is_empty() || values.len() > ROWS_PER_PART {
+                return Err(corrupt());
+            }
+            rows = rows.checked_add(values.len() as u64).ok_or(corrupt())?;
+            for value in values {
+                budget.checkpoint()?;
+                visitor(value, budget)?;
+            }
+        }
+        if rows != manifest.rows
+            || bytes != manifest.bytes
+            || ContentDigest::from_bytes(*digest.finalize().as_bytes()) != manifest.digest
+        {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+}
+
+impl Reader<'_, '_> {
+    pub(crate) fn list(
+        &self,
+        prefix: &str,
+        budget: &mut ReadBudget,
+    ) -> Result<BTreeMap<String, Manifest>, RocksError> {
+        let Self {
+            transaction,
+            namespace,
+        } = *self;
+
+        let mut output = BTreeMap::new();
+        let prefix = format!("dataset/h/{prefix}");
+        let mut bytes = 0_usize;
+        super::visit_state::<Manifest>(
+            &transaction.scan(namespace, prefix.as_bytes()),
+            budget,
+            |key, manifest, _| {
+                validate_manifest(&manifest)?;
+                bytes = bytes.saturating_add(key.len() + encode(&manifest)?.len());
+                if bytes > 16 * 1_048_576 || output.len() >= 8192 {
+                    return Err(RocksError::Limit {
+                        resource: "dataset_headers",
+                    });
+                }
+                let name = std::str::from_utf8(key.get(b"dataset/h/".len()..).ok_or(corrupt())?)
+                    .map_err(|_| corrupt())?;
+                output.insert(name.to_owned(), manifest);
+                Ok(())
+            },
+        )?;
+        Ok(output)
+    }
 }
 
 fn head_key(name: &str) -> Vec<u8> {
@@ -625,15 +687,21 @@ fn valid_token(value: &str) -> bool {
 }
 
 fn validate_manifest(manifest: &Manifest) -> Result<(), RocksError> {
-    if manifest.rows > 3_000_000
-        || manifest.parts > 12_000
+    if !valid_token(&manifest.token) || manifest.created.parse::<jiff::Timestamp>().is_err() {
+        return Err(corrupt());
+    }
+    if manifest.rows > MAXIMUM_DATASET_ROWS
+        || manifest.parts > MAXIMUM_DATASET_PARTS
         || manifest.bytes > MAXIMUM_DATASET_BYTES
-        || !valid_token(&manifest.token)
-        || manifest.created.parse::<jiff::Timestamp>().is_err()
-        || (manifest.parts == 0 && (manifest.rows != 0 || manifest.bytes != 0))
-        || u64::from(manifest.parts) > manifest.rows
-        || manifest.rows > u64::from(manifest.parts) * ROWS_PER_PART as u64
     {
+        return Err(corrupt());
+    }
+    // Empty heads have no payload. Every nonempty part represents one to ROWS_PER_PART rows.
+    if manifest.parts == 0 && (manifest.rows != 0 || manifest.bytes != 0) {
+        return Err(corrupt());
+    }
+    let parts = u64::from(manifest.parts);
+    if !(parts..=parts * ROWS_PER_PART as u64).contains(&manifest.rows) {
         return Err(corrupt());
     }
     Ok(())

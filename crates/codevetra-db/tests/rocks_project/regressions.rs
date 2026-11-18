@@ -1,5 +1,6 @@
 //! Failure cases found during independent review of the native owner.
 
+use codevetra_db::rocks::RetentionPolicy;
 use std::{collections::BTreeMap, path::Path, sync::mpsc};
 
 use super::{
@@ -63,9 +64,7 @@ fn current_scan_seeks_past_shadowed_versions_without_resurrecting_tombstones() -
     scan_history(&native)?;
     let snapshot = native.current_snapshot(None)?;
     let mut complete_allowance = ReadBudget::new(16, 1024, Duration::from_secs(10))?;
-    let complete = snapshot.scan_prefix(
-        Collection::Graph,
-        b"scan/",
+    let complete = snapshot.scan_prefix(Collection::Graph, b"scan/").page(
         None,
         10,
         &mut complete_allowance,
@@ -80,11 +79,11 @@ fn current_scan_seeks_past_shadowed_versions_without_resurrecting_tombstones() -
     );
     assert!(complete.next_after.is_none());
     let mut allowance = ReadBudget::new(16, 1024, Duration::from_secs(10))?;
-    let first = snapshot.scan_prefix(Collection::Graph, b"scan/", None, 1, &mut allowance)?;
+    let first = snapshot
+        .scan_prefix(Collection::Graph, b"scan/")
+        .page(None, 1, &mut allowance)?;
     assert_eq!(first.rows, [(key(b"scan/a")?, b"current".to_vec())]);
-    let rest = snapshot.scan_prefix(
-        Collection::Graph,
-        b"scan/",
+    let rest = snapshot.scan_prefix(Collection::Graph, b"scan/").page(
         first.next_after.as_ref(),
         10,
         &mut allowance,
@@ -107,7 +106,9 @@ fn retained_scan_seeks_past_future_versions_and_keeps_the_exact_pinned_value() -
     scan_history(&native)?;
     let snapshot = native.retained_snapshot(&generation(8))?;
     let mut allowance = ReadBudget::new(16, 24 * 1024, Duration::from_secs(10))?;
-    let page = snapshot.scan_prefix(Collection::Graph, b"scan/", None, 10, &mut allowance)?;
+    let page = snapshot
+        .scan_prefix(Collection::Graph, b"scan/")
+        .page(None, 10, &mut allowance)?;
     assert_eq!(
         page.rows,
         [
@@ -231,7 +232,7 @@ fn bounded_retirement_never_exposes_an_incomplete_historical_graph() -> TestResu
     let pinned = store.current_snapshot(None)?;
     publish(&store, 2, &[put(b"two")?])?;
     publish(&store, 3, &[put(b"three")?])?;
-    let report = store.prune(0, 1, 100, &mut budget()?)?;
+    let report = store.prune(RetentionPolicy::new(0, 1, 100), &mut budget()?)?;
     assert_eq!(report.generations_removed, 1);
     assert!(!report.complete);
     // Generation one still has metadata because retirement is bounded. Its
@@ -251,7 +252,7 @@ fn bounded_retirement_never_exposes_an_incomplete_historical_graph() -> TestResu
             pinned.get(Collection::Graph, &key(b"moving")?, &mut budget()?)?,
             Some(b"one".to_vec())
         );
-        store.prune(keep, 1, 1, &mut budget()?)?;
+        store.prune(RetentionPolicy::new(keep, 1, 1), &mut budget()?)?;
     }
     assert!(matches!(
         store.retained_snapshot(&generation(1)),
@@ -445,7 +446,7 @@ fn retention_commits_partial_progress_when_long_keys_fill_its_batch() -> TestRes
     let mut removed = 0;
     let mut completed = false;
     for _ in 0..20 {
-        let report = store.prune(0, 1, 10_000, &mut budget()?)?;
+        let report = store.prune(RetentionPolicy::new(0, 1, 10_000), &mut budget()?)?;
         removed += report.versions_removed;
         if report.complete {
             completed = true;
@@ -459,8 +460,11 @@ fn retention_commits_partial_progress_when_long_keys_fill_its_batch() -> TestRes
     let mut after = None;
     let mut read_budget = budget()?;
     loop {
-        let page =
-            snapshot.scan_prefix(Collection::Graph, b"", after.as_ref(), 50, &mut read_budget)?;
+        let page = snapshot.scan_prefix(Collection::Graph, b"").page(
+            after.as_ref(),
+            50,
+            &mut read_budget,
+        )?;
         assert!(
             page.rows
                 .iter()

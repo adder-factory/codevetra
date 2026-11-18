@@ -7,15 +7,18 @@ use codevetra_db::{CanonicalGenerationFacts, CanonicalSearchDocument, SearchDocu
 
 use super::{
     BTreeMap, CacheWriteRequest, DUPLICATE_MAXIMUM_LITERAL_RATIO_PPM, DUPLICATE_MINIMUM_LINES,
-    ExtractedFile, GenerationFacts, NativeEvidencePolicy, NativeFileFacts, NativeParseCache,
-    NativeParseCacheReport, NativePipelineConfig, NormalizedPath, ParseSourceRequest,
-    SourceLanguage, SourceManifestEntry, SourceReadOptions, SourceRoot, SymbolKind, block_in_place,
-    decode_cached_file, exact_limit_ceiling, is_production_clone_path, json, native_file_symbol_id,
+    ExtractedFile, GenerationFacts, NativeFileFacts, NativeParseCache, NativeParseCacheReport,
+    NativePipelineConfig, NormalizedPath, ParseSourceRequest, SourceLanguage, SourceManifestEntry,
+    SourceReadOptions, SourceRoot, SymbolKind, block_in_place, decode_cached_file,
+    exact_limit_ceiling, is_production_clone_path, json, native_file_symbol_id,
     numerical_site_input, parse_manifest_entry, store_cached_manifest, symbol_document_code,
     symbol_health_metadata,
 };
 
 const MAXIMUM_LOCAL_SOURCE_BYTES: u64 = 256 * 1024;
+const MAXIMUM_LOCAL_EDIT_FILES: usize = 16;
+const MAXIMUM_LOCAL_CACHE_BYTES: usize = 4 * 1_048_576;
+const MAXIMUM_LOCAL_REPLACEMENT_BYTES: u64 = 32 * 1_048_576;
 
 /// Inputs borrowed from the existing project owner and its validated warm base.
 pub struct NativeLocalEditRequest<'a> {
@@ -52,7 +55,10 @@ async fn local_edit(
     request: &StorageRequest,
 ) -> Result<Option<GenerationFacts>, RocksError> {
     request.check()?;
-    if input.paths.is_empty() || input.paths.len() > 16 || !input.cache.read_enabled {
+    if input.paths.is_empty()
+        || input.paths.len() > MAXIMUM_LOCAL_EDIT_FILES
+        || !input.cache.read_enabled
+    {
         return Ok(None);
     }
     let cache = input
@@ -89,13 +95,13 @@ async fn local_edit(
         let Ok(Some(record)) = loaded else {
             return Ok(None);
         };
-        if record.payload().len() > 4 * 1_048_576 {
+        if record.payload().len() > MAXIMUM_LOCAL_CACHE_BYTES {
             return Ok(None);
         }
         let Some(old) = block_in_place(|| decode_cached_file(&old_manifest, &record)) else {
             return Ok(None);
         };
-        let parsed = block_in_place(|| parse_local_edit(&input, path, &old, request));
+        let parsed = block_in_place(|| input.parse_local_edit(path, &old, request));
         request.check()?;
         let Some(next) = parsed else {
             return Ok(None);
@@ -119,14 +125,11 @@ async fn local_edit(
         .await;
         request.check()?;
         let built = block_in_place(|| {
-            replacement_facts(
-                input.base,
-                next,
-                input.config.evidence_policy(),
-                &mut replacements,
-            )?;
+            input.replacement_facts(next, &mut replacements)?;
             replacements
-                .measure_retained_bytes(32 * 1_048_576, || request.check().is_err())
+                .measure_retained_bytes(MAXIMUM_LOCAL_REPLACEMENT_BYTES, || {
+                    request.check().is_err()
+                })
                 .ok()?;
             Some(())
         });
@@ -138,102 +141,141 @@ async fn local_edit(
     Ok(Some(replacements))
 }
 
-fn parse_local_edit(
-    input: &NativeLocalEditRequest<'_>,
-    path: &NormalizedPath,
-    old: &ExtractedFile,
-    request: &StorageRequest,
-) -> Option<ExtractedFile> {
-    let limits = exact_limit_ceiling(MAXIMUM_LOCAL_SOURCE_BYTES).ok()?;
-    let snapshot = input
-        .source_root
-        .read_with_cancellation(
-            path,
-            SourceReadOptions::new(limits, || request.check().is_err()),
+impl NativeLocalEditRequest<'_> {
+    fn parse_local_edit(
+        &self,
+        path: &NormalizedPath,
+        old: &ExtractedFile,
+        request: &StorageRequest,
+    ) -> Option<ExtractedFile> {
+        let limits = exact_limit_ceiling(MAXIMUM_LOCAL_SOURCE_BYTES).ok()?;
+        let snapshot = self
+            .source_root
+            .read_with_cancellation(
+                path,
+                SourceReadOptions::new(limits, || request.check().is_err()),
+            )
+            .ok()?;
+        let manifest = SourceManifestEntry {
+            path: path.clone(),
+            language: snapshot.language(),
+            file_id: snapshot.file_id().clone(),
+            content_hash: snapshot.content_hash().clone(),
+            byte_size: snapshot.byte_size(),
+        };
+        let next = parse_manifest_entry(
+            &ParseSourceRequest {
+                source_root: self.source_root,
+                manifest,
+                maximum_ast_depth: self.config.maximum_ast_depth(),
+            },
+            || request.check().is_err(),
         )
         .ok()?;
-    let manifest = SourceManifestEntry {
-        path: path.clone(),
-        language: snapshot.language(),
-        file_id: snapshot.file_id().clone(),
-        content_hash: snapshot.content_hash().clone(),
-        byte_size: snapshot.byte_size(),
-    };
-    let next = parse_manifest_entry(
-        &ParseSourceRequest {
-            source_root: input.source_root,
-            manifest,
-            maximum_ast_depth: input.config.maximum_ast_depth(),
-        },
-        || request.check().is_err(),
-    )
-    .ok()?;
-    preserves_resolution(old, &next, input, request).then_some(next)
+        ResolutionPreservation {
+            input: self,
+            old,
+            next: &next,
+            request,
+        }
+        .preserved()
+        .then_some(next)
+    }
 }
 
-fn preserves_resolution(
-    old: &ExtractedFile,
-    next: &ExtractedFile,
-    input: &NativeLocalEditRequest<'_>,
-    request: &StorageRequest,
-) -> bool {
-    if old.parse_status != codevetra_domain::FileParseStatus::Parsed
-        || !same_file_resolution(old, next)
-        || old.symbols.len() != next.symbols.len()
-    {
-        return false;
-    }
-    let clone_enabled = is_production_clone_path(old.path.as_str())
-        && !input
-            .source_root
-            .duplicate_code_allowlisted(old.path.as_str());
-    for (previous, current) in old.symbols.iter().zip(&next.symbols) {
-        if request.check().is_err() || !same_symbol_resolution(previous, current) {
-            return false;
-        }
-        // MyBatis uses XML body hints as declaration roles when resolving
-        // references from other files. These are global resolution inputs.
-        if old.language == SourceLanguage::Xml
-            && (previous.body_search_text != current.body_search_text
-                || previous.body_search_truncated != current.body_search_truncated)
+// A preservation decision binds both extracted files to one base and control.
+struct ResolutionPreservation<'a, 'input> {
+    input: &'a NativeLocalEditRequest<'input>,
+    old: &'a ExtractedFile,
+    next: &'a ExtractedFile,
+    request: &'a StorageRequest,
+}
+
+impl ResolutionPreservation<'_, '_> {
+    fn preserved(&self) -> bool {
+        let Self {
+            input,
+            old,
+            next,
+            request,
+        } = *self;
+        if old.parse_status != codevetra_domain::FileParseStatus::Parsed
+            || !same_file_resolution(old, next)
+            || old.symbols.len() != next.symbols.len()
         {
             return false;
         }
-        if clone_enabled && !preserves_clone_membership(previous, current, input, next, request) {
+        let clone_enabled = is_production_clone_path(old.path.as_str())
+            && !input
+                .source_root
+                .duplicate_code_allowlisted(old.path.as_str());
+        for (previous, current) in old.symbols.iter().zip(&next.symbols) {
+            if request.check().is_err() || !same_symbol_resolution(previous, current) {
+                return false;
+            }
+            // MyBatis uses XML body hints as declaration roles when resolving
+            // references from other files. These are global resolution inputs.
+            if old.language == SourceLanguage::Xml
+                && (previous.body_search_text != current.body_search_text
+                    || previous.body_search_truncated != current.body_search_truncated)
+            {
+                return false;
+            }
+            if clone_enabled && !self.preserves_clone_membership(previous, current) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn preserves_clone_membership(
+        &self,
+        previous: &codevetra_extract::ExtractedSymbol,
+        current: &codevetra_extract::ExtractedSymbol,
+    ) -> bool {
+        if !matches!(
+            previous.kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Component
+        ) || [previous, current].iter().all(|symbol| {
+            symbol
+                .span
+                .end_line()
+                .saturating_sub(symbol.span.start_line())
+                .saturating_add(1)
+                < DUPLICATE_MINIMUM_LINES
+        }) {
+            return true;
+        }
+        if previous.clone_shape_digest != current.clone_shape_digest
+            || previous.clone_token_profile != current.clone_token_profile
+            || clone_literal_heavy(previous) != clone_literal_heavy(current)
+        {
             return false;
         }
+        previous.structural_digest == current.structural_digest
+            || self.input.paths.len() == 1 && self.unique_exact_edit(previous, current)
     }
-    true
-}
 
-fn preserves_clone_membership(
-    previous: &codevetra_extract::ExtractedSymbol,
-    current: &codevetra_extract::ExtractedSymbol,
-    input: &NativeLocalEditRequest<'_>,
-    next: &ExtractedFile,
-    request: &StorageRequest,
-) -> bool {
-    if !matches!(
-        previous.kind,
-        SymbolKind::Function | SymbolKind::Method | SymbolKind::Component
-    ) || [previous, current].iter().all(|symbol| {
-        symbol
-            .span
-            .end_line()
-            .saturating_sub(symbol.span.start_line())
-            .saturating_add(1)
-            < DUPLICATE_MINIMUM_LINES
-    }) {
-        return true;
+    fn unique_exact_edit(
+        &self,
+        old: &codevetra_extract::ExtractedSymbol,
+        next: &codevetra_extract::ExtractedSymbol,
+    ) -> bool {
+        // Literal edits keep normalized clone inputs. Both concrete digests must be
+        // unique so Type-1 membership and Type-2/3 precedence stay unchanged.
+        for symbol in self.input.base.symbols() {
+            if self.request.check().is_err()
+                || symbol.symbol_id != old.id
+                    && (symbol.structural_digest == old.structural_digest
+                        || symbol.structural_digest == next.structural_digest)
+            {
+                return false;
+            }
+        }
+        !self.next.symbols.iter().any(|symbol| {
+            symbol.id != next.id && symbol.structural_digest == next.structural_digest
+        })
     }
-    if previous.clone_shape_digest != current.clone_shape_digest
-        || previous.clone_token_profile != current.clone_token_profile
-        || clone_literal_heavy(previous) != clone_literal_heavy(current)
-    {
-        return false;
-    }
-    previous.structural_digest == current.structural_digest
-        || input.paths.len() == 1 && unique_exact_edit(input.base, previous, current, next, request)
 }
 
 fn same_file_resolution(old: &ExtractedFile, next: &ExtractedFile) -> bool {
@@ -314,30 +356,6 @@ fn same_symbol_resolution(
         && visibility == &next.visibility
 }
 
-fn unique_exact_edit(
-    base: &CanonicalGenerationFacts,
-    old: &codevetra_extract::ExtractedSymbol,
-    next: &codevetra_extract::ExtractedSymbol,
-    file: &ExtractedFile,
-    request: &StorageRequest,
-) -> bool {
-    // Literal edits keep normalized clone inputs. Both concrete digests must be
-    // unique so Type-1 membership and Type-2/3 precedence stay unchanged.
-    for symbol in base.symbols() {
-        if request.check().is_err()
-            || symbol.symbol_id != old.id
-                && (symbol.structural_digest == old.structural_digest
-                    || symbol.structural_digest == next.structural_digest)
-        {
-            return false;
-        }
-    }
-    !file
-        .symbols
-        .iter()
-        .any(|symbol| symbol.id != next.id && symbol.structural_digest == next.structural_digest)
-}
-
 fn clone_literal_heavy(symbol: &codevetra_extract::ExtractedSymbol) -> bool {
     u64::from(symbol.health.literal_bytes).saturating_mul(1_000_000)
         > symbol
@@ -348,70 +366,69 @@ fn clone_literal_heavy(symbol: &codevetra_extract::ExtractedSymbol) -> bool {
             .saturating_mul(DUPLICATE_MAXIMUM_LITERAL_RATIO_PPM)
 }
 
-fn replacement_facts(
-    base: &CanonicalGenerationFacts,
-    next: ExtractedFile,
-    policy: NativeEvidencePolicy,
-    output: &mut GenerationFacts,
-) -> Option<()> {
-    let file = NativeFileFacts::from_extracted(next).ok()?;
-    let old_symbols = base
-        .symbols()
-        .iter()
-        .filter(|row| row.file_id == file.file.file_id)
-        .map(|row| (&row.symbol_id, row))
-        .collect::<BTreeMap<_, _>>();
-    let documents = base
-        .documents()
-        .iter()
-        .filter(|row| row.file_id() == Some(&file.file.file_id))
-        .filter_map(|row| Some((row.symbol_id()?, row)))
-        .collect::<BTreeMap<_, _>>();
-    let file_symbol_id = native_file_symbol_id(&file.file.file_id);
-    let mut file_symbol = (*old_symbols.get(&file_symbol_id)?).clone();
-    file_symbol.end_byte = file.file.byte_size;
-    file_symbol.end_line = file.line_count;
-    file_symbol.structural_digest = file.file.content_hash.clone();
-    output.symbols.push(file_symbol);
-    let old_document = documents.get(&file_symbol_id)?;
-    let mut file_document = raw_document(old_document)?;
-    file_document
-        .natural_text
-        .clone_from(&file.test_search_text);
-    file_document.metadata["byte_size"] = json!(file.file.byte_size);
-    file_document.metadata["test_search_truncated"] = json!(file.test_search_truncated);
-    output.documents.push(file_document);
-    for mut symbol in file.symbols {
-        let previous = old_symbols.get(&symbol.input.symbol_id)?;
-        symbol.input.pagerank_ppb = previous.pagerank_ppb;
-        symbol.input.betweenness_ppb = previous.betweenness_ppb;
-        let previous_document = documents.get(&symbol.input.symbol_id)?;
-        let mut document = raw_document(previous_document)?;
-        document.code = symbol_document_code(&symbol).ok()?;
-        document.natural_text = if policy.retention.docstrings {
-            symbol.docstring.take().unwrap_or_default()
-        } else {
-            String::new()
-        };
-        document.metadata["health"] = symbol_health_metadata(&symbol.health);
-        document.metadata["body_search_truncated"] = json!(symbol.body_search_truncated);
-        document.metadata["clone_shape_digest"] = json!(symbol.clone_shape_digest.as_str());
-        output.documents.push(document);
-        output.symbols.push(symbol.input);
-    }
-    output.references.extend(
-        base.references()
+impl NativeLocalEditRequest<'_> {
+    fn replacement_facts(&self, next: ExtractedFile, output: &mut GenerationFacts) -> Option<()> {
+        let base = self.base;
+        let policy = self.config.evidence_policy();
+        let file = NativeFileFacts::from_extracted(next).ok()?;
+        let old_symbols = base
+            .symbols()
             .iter()
             .filter(|row| row.file_id == file.file.file_id)
-            .cloned(),
-    );
-    output.numerical_sites.extend(
-        file.numerical_sites
-            .into_iter()
-            .map(|site| numerical_site_input(&file.file.file_id, site)),
-    );
-    output.files.push(file.file);
-    Some(())
+            .map(|row| (&row.symbol_id, row))
+            .collect::<BTreeMap<_, _>>();
+        let documents = base
+            .documents()
+            .iter()
+            .filter(|row| row.file_id() == Some(&file.file.file_id))
+            .filter_map(|row| Some((row.symbol_id()?, row)))
+            .collect::<BTreeMap<_, _>>();
+        let file_symbol_id = native_file_symbol_id(&file.file.file_id);
+        let mut file_symbol = (*old_symbols.get(&file_symbol_id)?).clone();
+        file_symbol.end_byte = file.file.byte_size;
+        file_symbol.end_line = file.line_count;
+        file_symbol.structural_digest = file.file.content_hash.clone();
+        output.symbols.push(file_symbol);
+        let old_document = documents.get(&file_symbol_id)?;
+        let mut file_document = raw_document(old_document)?;
+        file_document
+            .natural_text
+            .clone_from(&file.test_search_text);
+        file_document.metadata["byte_size"] = json!(file.file.byte_size);
+        file_document.metadata["test_search_truncated"] = json!(file.test_search_truncated);
+        output.documents.push(file_document);
+        for mut symbol in file.symbols {
+            let previous = old_symbols.get(&symbol.input.symbol_id)?;
+            symbol.input.pagerank_ppb = previous.pagerank_ppb;
+            symbol.input.betweenness_ppb = previous.betweenness_ppb;
+            let previous_document = documents.get(&symbol.input.symbol_id)?;
+            let mut document = raw_document(previous_document)?;
+            document.code = symbol_document_code(&symbol).ok()?;
+            document.natural_text = if policy.retention.docstrings {
+                symbol.docstring.take().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            document.metadata["health"] = symbol_health_metadata(&symbol.health);
+            document.metadata["body_search_truncated"] = json!(symbol.body_search_truncated);
+            document.metadata["clone_shape_digest"] = json!(symbol.clone_shape_digest.as_str());
+            output.documents.push(document);
+            output.symbols.push(symbol.input);
+        }
+        output.references.extend(
+            base.references()
+                .iter()
+                .filter(|row| row.file_id == file.file.file_id)
+                .cloned(),
+        );
+        output.numerical_sites.extend(
+            file.numerical_sites
+                .into_iter()
+                .map(|site| numerical_site_input(&file.file.file_id, site)),
+        );
+        output.files.push(file.file);
+        Some(())
+    }
 }
 
 fn raw_document(document: &CanonicalSearchDocument) -> Option<SearchDocumentInput> {

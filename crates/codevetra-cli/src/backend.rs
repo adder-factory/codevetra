@@ -363,6 +363,33 @@ enum PidState {
     Invalid(String),
 }
 
+impl PidState {
+    /// Probe only a validated recorded process, retaining any state or probe failure.
+    async fn probe(self) -> (Option<BackendPidRecord>, bool, Option<String>) {
+        let (pid_record, state_error) = match self {
+            PidState::Missing => (None, None),
+            PidState::Valid(record) => (Some(record), None),
+            PidState::UnsupportedVersion => {
+                (None, Some("state file version is unsupported".to_owned()))
+            }
+            PidState::Invalid(message) => (None, Some(message)),
+        };
+        let (pid_alive, state_error) = match &pid_record {
+            Some(record) => match process_alive(record.pid).await {
+                Some(alive) => (alive, state_error),
+                None => (
+                    false,
+                    state_error.or_else(|| {
+                        Some("pid probe unavailable; retry before managing this process".to_owned())
+                    }),
+                ),
+            },
+            None => (false, state_error),
+        };
+        (pid_record, pid_alive, state_error)
+    }
+}
+
 /// Counts a valid record's argv instead of printing it: it carries the
 /// operator's `llamaServerArgs`, which may hold a secret such as `--api-key`.
 impl std::fmt::Debug for PidState {
@@ -719,27 +746,7 @@ async fn build_status_row(
 ) -> BackendRow {
     let pid_file_path = directory.join(format!("{}.json", spec.id));
     let log_path = directory.join(format!("{}.log", spec.id));
-    let pid_state = read_pid_record(&pid_file_path);
-    let (pid_record, state_error) = match pid_state {
-        PidState::Missing => (None, None),
-        PidState::Valid(record) => (Some(record), None),
-        PidState::UnsupportedVersion => {
-            (None, Some("state file version is unsupported".to_owned()))
-        }
-        PidState::Invalid(message) => (None, Some(message)),
-    };
-    let (pid_alive, state_error) = match &pid_record {
-        Some(record) => match process_alive(record.pid).await {
-            Some(alive) => (alive, state_error),
-            None => (
-                false,
-                state_error.or_else(|| {
-                    Some("pid probe unavailable; retry before managing this process".to_owned())
-                }),
-            ),
-        },
-        None => (false, state_error),
-    };
+    let (pid_record, pid_alive, state_error) = read_pid_record(&pid_file_path).probe().await;
     let endpoint_reachable =
         probe_openai_compatible_endpoint(&spec.endpoint, ENDPOINT_PROBE_TIMEOUT)
             .await

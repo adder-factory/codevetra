@@ -33,8 +33,8 @@ const FILLING_CALLS: usize = 4_500;
 /// Comment padding that leaves the filling file's core facts no room for
 /// another fact once its optional facts are omitted. Each vector field added to
 /// `ExtractedFile` moves this exact boundary. Sparse operation sites and boxed
-/// clone profiles reduce the modeled allocation in this fixture.
-const FILLING_PADDING_BYTES: usize = 9_226;
+/// clone profiles and sparse immutable health records reduce its allocation.
+const FILLING_PADDING_BYTES: usize = 9_220;
 /// Names of a multi-name Go declaration whose facts fit the output limit.
 const MULTI_NAME_FIELDS: usize = 200;
 /// Names of a long multi-name Go constant declaration in a body.
@@ -106,13 +106,29 @@ fn optional_facts_that_leave_no_room_for_framework_facts_are_omitted() {
 fn a_fallback_without_room_for_its_diagnostic_keeps_its_core_facts() {
     // The core facts alone fit, and the constant read pushes the first pass
     // over the limit; the fallback must not then fail on its own diagnostic.
-    let source = format!(
-        "fn f(){{{}let _=LIMIT;}}\n/*{}*/\n",
-        "a();".repeat(FILLING_CALLS),
-        " ".repeat(FILLING_PADDING_BYTES)
-    );
+    let source = |padding| {
+        format!(
+            "fn f(){{{}let _=LIMIT;}}\n/*{}*/\n",
+            "a();".repeat(FILLING_CALLS),
+            " ".repeat(padding)
+        )
+    };
 
-    let file = extract("src/a.rs", &source);
+    let file = extract("src/a.rs", &source(FILLING_PADDING_BYTES));
+    let limit = codevetra_extract::native_output_limit(file.byte_size)
+        .unwrap_or_else(|| panic!("fixture output limit overflowed"));
+    let remaining = limit
+        .checked_sub(file.modeled_retained_bytes())
+        .unwrap_or_else(|| panic!("core facts exceed the output limit"));
+    assert!(
+        remaining
+            < u64::try_from(std::mem::size_of::<codevetra_extract::ExtractionDiagnostic>())
+                .unwrap_or_else(|error| panic!("diagnostic size overflowed: {error}"))
+    );
+    assert!(
+        file.diagnostics.is_empty(),
+        "the diagnostic must not displace core facts"
+    );
 
     assert!(
         diagnostic_codes(&file)
@@ -127,6 +143,21 @@ fn a_fallback_without_room_for_its_diagnostic_keeps_its_core_facts() {
             .count(),
         FILLING_CALLS
     );
+
+    let roomy = extract("src/a.rs", &source(FILLING_PADDING_BYTES + 2));
+    assert!(has_reference(&roomy, "LIMIT", ReferenceKind::References));
+    let tight = source(FILLING_PADDING_BYTES - 1);
+    let limits = SourceLimits::new(SOURCE_LIMIT_BYTES)
+        .unwrap_or_else(|error| panic!("invalid fixture limits: {error}"));
+    let snapshot = SourceSnapshot::from_bytes("src/a.rs", tight.as_bytes(), limits)
+        .unwrap_or_else(|error| panic!("invalid fixture snapshot: {error}"));
+    let result = NativeExtractor::new(snapshot.language())
+        .unwrap_or_else(|error| panic!("missing fixture extractor: {error}"))
+        .extract(&snapshot);
+    assert!(matches!(
+        result,
+        Err(codevetra_extract::ExtractError::OutputLimit)
+    ));
 }
 
 #[test]

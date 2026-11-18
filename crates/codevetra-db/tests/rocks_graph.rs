@@ -7,6 +7,8 @@ mod corruption;
 mod dependency_ownership;
 #[path = "rocks_graph/features.rs"]
 mod features;
+#[path = "rocks_graph/file_dependencies.rs"]
+mod file_dependencies;
 #[path = "rocks_graph/findings.rs"]
 mod findings;
 #[path = "rocks_graph/layout.rs"]
@@ -19,6 +21,8 @@ mod lifecycle;
 mod local_edits;
 #[path = "rocks_graph/names.rs"]
 mod names;
+#[path = "rocks_graph/qualified.rs"]
+mod qualified;
 #[path = "rocks_graph/soak.rs"]
 mod soak;
 #[path = "rocks_graph/state_concurrency.rs"]
@@ -135,7 +139,7 @@ fn edge(source: u64, target: u64, provenance: &str) -> EdgeInput {
 }
 
 fn input(sequence: u64, facts: CanonicalGenerationFacts) -> TestResult<GraphPublicationInput> {
-    Ok(GraphPublicationInput::new(
+    Ok(codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(sequence),
             source_revision: digest(9),
@@ -145,10 +149,10 @@ fn input(sequence: u64, facts: CanonicalGenerationFacts) -> TestResult<GraphPubl
                 GraphBase::Current(generation(sequence - 1))
             },
         },
-        facts,
         GraphPolicy::default(),
         &request()?,
-    )?)
+    )
+    .resident(facts)?)
 }
 
 #[test]
@@ -168,13 +172,10 @@ fn canonical_edges_preserve_both_directions_and_distinct_provenance() -> TestRes
     assert_eq!(published.revision.content_digest, Some(logical_digest));
     let snapshot = store.current_snapshot(None)?;
     let graph = snapshot.graph(&mut budget()?)?;
-    let incoming = graph.neighbors(
-        &symbol(2),
-        GraphDirection::Incoming,
-        None,
-        20,
-        &mut budget()?,
-    )?;
+    let incoming =
+        graph
+            .adjacency(&symbol(2), GraphDirection::Incoming)
+            .page(None, 20, &mut budget()?)?;
     assert_eq!(incoming.links.len(), 3);
     for link in &incoming.links {
         assert_eq!(link.target_symbol_id(), &symbol(2));
@@ -182,23 +183,15 @@ fn canonical_edges_preserve_both_directions_and_distinct_provenance() -> TestRes
         assert_eq!(property.site_count, 3);
         assert_eq!(property.confidence, 0.875);
     }
-    let outgoing = graph.neighbors(
-        &symbol(1),
-        GraphDirection::Outgoing,
-        None,
-        20,
-        &mut budget()?,
-    )?;
+    let outgoing =
+        graph
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(None, 20, &mut budget()?)?;
     assert_eq!(outgoing.links.len(), 2);
     assert!(
         graph
-            .neighbors(
-                &symbol(2),
-                GraphDirection::Outgoing,
-                None,
-                20,
-                &mut budget()?
-            )?
+            .adjacency(&symbol(2), GraphDirection::Outgoing)
+            .page(None, 20, &mut budget()?)?
             .links
             .is_empty()
     );
@@ -224,25 +217,15 @@ fn replacement_removes_reverse_edges_and_old_snapshots_remain_complete() -> Test
     let graph = snapshot.graph(&mut budget()?)?;
     assert!(
         graph
-            .neighbors(
-                &symbol(2),
-                GraphDirection::Incoming,
-                None,
-                20,
-                &mut budget()?
-            )?
+            .adjacency(&symbol(2), GraphDirection::Incoming)
+            .page(None, 20, &mut budget()?)?
             .links
             .is_empty()
     );
     assert_eq!(
         graph
-            .neighbors(
-                &symbol(3),
-                GraphDirection::Incoming,
-                None,
-                20,
-                &mut budget()?
-            )?
+            .adjacency(&symbol(3), GraphDirection::Incoming)
+            .page(None, 20, &mut budget()?)?
             .links
             .len(),
         1
@@ -250,13 +233,8 @@ fn replacement_removes_reverse_edges_and_old_snapshots_remain_complete() -> Test
     let old_graph = old.graph(&mut budget()?)?;
     assert_eq!(
         old_graph
-            .neighbors(
-                &symbol(2),
-                GraphDirection::Incoming,
-                None,
-                20,
-                &mut budget()?
-            )?
+            .adjacency(&symbol(2), GraphDirection::Incoming)
+            .page(None, 20, &mut budget()?)?
             .links
             .len(),
         1

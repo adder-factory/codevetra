@@ -33,11 +33,11 @@ pub use artifacts::{
     ModuleSummarySaveRequest, NeighborSummarySaveInput, NeighborSummarySaveRequest,
     NeighborSummarySource, NewAgentArtifact, PendingFileSummary, PendingModelSummaryQuery,
     PendingModuleSummary, PendingNeighborSummary, PendingNeighborSummaryQuery, PendingRoleSymbol,
-    PendingStructuralSummary, PendingStructuralSummaryQuery, PendingSummaryRollupQuery,
-    PendingSummarySymbol, RoleSweepModel, StructuralRoleCursor, StructuralRolePage,
-    StructuralSummaryEdge, StructuralSymbolSummarySaveInput, SummaryCandidatePolicy,
-    SummaryCoverageStats, SummaryRollupItem, SummarySaveInput, SymbolRoleSaveInput,
-    SymbolSummarySaveInput,
+    PendingStructuralRoleQuery, PendingStructuralSummary, PendingStructuralSummaryQuery,
+    PendingSummaryRollupQuery, PendingSummarySymbol, RoleSweepModel, StructuralRoleCursor,
+    StructuralRolePage, StructuralSummaryEdge, StructuralSymbolSummarySaveInput,
+    SummaryCandidatePolicy, SummaryCoverageStats, SummaryRollupItem, SummarySaveInput,
+    SymbolRoleSaveInput, SymbolSummarySaveInput,
 };
 pub use centrality::{
     BetweennessError, BetweennessReport, PageRankError, PageRankReport, SymbolBetweennessScore,
@@ -93,7 +93,7 @@ pub use parse_cache::{
     MAX_NATIVE_PARSE_CACHE_PAYLOAD_BYTES, NativeParseCacheBatchWrite,
     NativeParseCacheBudgetPressure, NativeParseCacheEntry, NativeParseCacheError,
     NativeParseCacheKey, NativeParseCacheKeyInput, NativeParseCacheRecord,
-    NativeParseCacheRetentionCapacity, NativeParseCacheRetentionPolicy,
+    NativeParseCacheRetention, NativeParseCacheRetentionCapacity, NativeParseCacheRetentionPolicy,
     NativeParseCacheRetentionPolicyInput, NativeParseCacheRetentionReport, NativeParseCacheStats,
     NativeParseCacheWrite,
 };

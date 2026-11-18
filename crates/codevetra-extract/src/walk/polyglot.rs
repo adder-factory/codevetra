@@ -992,27 +992,30 @@ fn visit_rust_external_module(
     if !builder.owners.is_empty() {
         return emit_import_symbol_and_reference(builder, node, module_specifier);
     }
-    // Attributes can replace the conventional path or make the module conditional.
-    // Keep the import fact, but do not claim a default filesystem binding.
-    if node
-        .prev_named_sibling()
-        .is_some_and(|attribute| attribute.kind() == "attribute_item")
+    let explicit_file = rust_module_scopes::explicit_file(builder, node)?;
+    // Ordinary cfg changes presence, not the conventional source path. A plain
+    // path attribute instead identifies one exact file, with no suffix search.
+    if node.has_error()
+        || (explicit_file.is_none()
+            && !rust_module_scopes::conventional_attributes(builder, node, true)?)
     {
         return emit_import_symbol_and_reference(builder, node, module_specifier);
     }
     let visibility = rust_visibility(builder, node);
     let symbol_position = builder.facts.symbols.len();
-    emit_import(
-        builder,
-        PolyglotImport {
-            node,
-            module_specifier,
-            kind: ImportBindingKind::Namespace,
-            imported_name: "*".to_owned(),
-            local_name,
-            binding_node: name_node,
-        },
-    )?;
+    // Keep declaration identity independent of the physical source filename.
+    emit_import_symbol_and_reference(builder, node, module_specifier.clone())?;
+    let (kind, module_specifier, binding_node) = explicit_file.map_or(
+        (ImportBindingKind::Namespace, module_specifier, name_node),
+        |path| (ImportBindingKind::RustFileModule, path, node),
+    );
+    builder.emit_import_binding(crate::ExtractedImportBinding {
+        kind,
+        module_specifier,
+        imported_name: "*".to_owned(),
+        local_name,
+        span: span_for(binding_node)?,
+    })?;
     let symbol = builder
         .facts
         .symbols

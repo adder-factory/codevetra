@@ -2,8 +2,10 @@
 
 CodeVetra 4 changes the product name, repository, executable, Rust packages, MCP
 registration and tools. It preserves the native RocksDB durable format and project
-identity. The new generation contract is V27; re-index source after upgrading so
-operation-local biomarkers and application boundaries are current. Old generations,
+identity. The current generation contract is V34; re-index source after upgrading so
+full-width health counters, uniform-call value mappings, operation-local biomarkers,
+Rust test/proof ownership and
+application boundaries are current. Old generations,
 configuration, exclusions, SCIP overlays and mutable user state are preserved.
 
 ## Existing installations

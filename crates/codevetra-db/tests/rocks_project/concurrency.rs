@@ -213,32 +213,31 @@ async fn busy_native_read_leaves_async_executor_and_another_reader_responsive() 
     let runtime = StorageRuntime::new(WorkerPolicy::default())?;
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_path_buf(),
-        identity(7),
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            root.path().to_path_buf(),
+            identity(7),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
+    let revision = generation(1);
+    let source_revision = identity(1);
     let writer = store
-        .begin_revision(
-            generation(1),
-            identity(1),
-            Duration::from_secs(30),
-            &request()?,
-        )
+        .with_request(&request()?)
+        .begin_revision(revision, source_revision, Duration::from_secs(30))
         .await?;
+    let changes = revision_changes(1)?;
     store
-        .stage(&writer, revision_changes(1)?, &request()?)
+        .with_request(&request()?)
+        .stage(&writer, changes)
         .await?;
+    let content_digest = identity(2);
     store
-        .seal(
-            &writer,
-            identity(2),
-            GenerationDigestVersion::V23,
-            &request()?,
-        )
+        .with_request(&request()?)
+        .seal(&writer, content_digest, GenerationDigestVersion::V23)
         .await?;
-    store.publish(&writer, &request()?).await?;
+    store.with_request(&request()?).publish(&writer).await?;
     let (entered, started) = tokio::sync::oneshot::channel();
     let (release, held) = mpsc::sync_channel(1);
     let busy_store = store.clone();
@@ -246,7 +245,8 @@ async fn busy_native_read_leaves_async_executor_and_another_reader_responsive() 
     let busy_budget = async_budget()?;
     let busy = tokio::spawn(async move {
         busy_store
-            .read(None, busy_budget, &busy_request, move |snapshot, _| {
+            .with_request(&busy_request)
+            .read(None, busy_budget, move |snapshot, _| {
                 entered.send(()).map_err(|()| RocksError::Cancelled)?;
                 held.recv_timeout(Duration::from_secs(5))
                     .map_err(|_| RocksError::Cancelled)?;
@@ -255,15 +255,24 @@ async fn busy_native_read_leaves_async_executor_and_another_reader_responsive() 
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), started).await??;
-    let other = store
-        .read(None, async_budget()?, &request()?, |snapshot, budget| {
-            snapshot.get(
-                Collection::Search,
-                &RecordKey::new(b"revision".to_vec())?,
-                budget,
+    let other = {
+        let request_bound_expected = None;
+        let request_bound_budget = async_budget()?;
+        store
+            .with_request(&request()?)
+            .read(
+                request_bound_expected,
+                request_bound_budget,
+                |snapshot, budget| {
+                    snapshot.get(
+                        Collection::Search,
+                        &RecordKey::new(b"revision".to_vec())?,
+                        budget,
+                    )
+                },
             )
-        })
-        .await?;
+            .await
+    }?;
     assert_eq!(other, Some(1_u64.to_be_bytes().to_vec()));
     let drain_deadline = StorageRequest::new(Duration::from_millis(20))?;
     assert_eq!(
@@ -278,11 +287,18 @@ async fn busy_native_read_leaves_async_executor_and_another_reader_responsive() 
     assert_eq!(busy.await??, 1);
     runtime.shutdown(&request()?).await?;
     assert!(matches!(
-        store
-            .read(None, async_budget()?, &request()?, |snapshot, _| Ok(
-                snapshot.revision().sequence
-            ))
-            .await,
+        {
+            let request_bound_expected = None;
+            let request_bound_budget = async_budget()?;
+            store
+                .with_request(&request()?)
+                .read(
+                    request_bound_expected,
+                    request_bound_budget,
+                    |snapshot, _| Ok(snapshot.revision().sequence),
+                )
+                .await
+        },
         Err(RocksError::Closed)
     ));
     // The native handle closed on a worker even though the async facade lives.

@@ -201,6 +201,15 @@ holding the moment the index refreshes is not an exclusion.
   re-included once a parent directory has been excluded — use the `exclude`
   array when you need that re-include.
 
+Built-in output-directory names can also name handwritten source. For example,
+CodeVetra's own `crates/codevetra-db/src/artifacts/` contains production Rust
+modules. When indexing this repository, append
+`!crates/codevetra-db/src/artifacts/**` to the existing `exclude` array in
+`.codevetra/config.json`. Keep the other settings and patterns intact. This
+re-includes the source namespace while generated `artifacts/` output elsewhere
+still follows the default exclusions. Confirm a known declaration from that
+namespace with `codevetra find pending_neighbor_summaries` after indexing.
+
 Exclusions are never silent. Native index metrics report `excluded_paths`, the
 files a configured exclusion skipped, and `excluded_trees`, the directory
 subtrees skipped without being descended into. A pruned tree is deliberately not

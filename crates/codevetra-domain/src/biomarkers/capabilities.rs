@@ -213,87 +213,79 @@ pub(super) fn source_capability(
     }
 }
 
-const fn project(
-    name: &'static str,
-    scope: DetectorScope,
-    input: DetectorInput,
-    assumptions: &'static str,
-) -> DetectorCapability {
-    DetectorCapability {
-        name,
-        scope,
-        input,
-        languages: match input {
-            DetectorInput::SourceMetrics => DetectorLanguages::NativeAst,
-            _ => DetectorLanguages::IndexedGraph,
-        },
-        evidence: match input {
-            DetectorInput::SourceMetrics => DetectorEvidence::AstLocal,
-            _ => DetectorEvidence::GraphSupported,
-        },
-        assumptions,
+impl DetectorInput {
+    const fn capability(
+        self,
+        name: &'static str,
+        scope: DetectorScope,
+        assumptions: &'static str,
+    ) -> DetectorCapability {
+        DetectorCapability {
+            name,
+            scope,
+            input: self,
+            languages: match self {
+                DetectorInput::SourceMetrics => DetectorLanguages::NativeAst,
+                _ => DetectorLanguages::IndexedGraph,
+            },
+            evidence: match self {
+                DetectorInput::SourceMetrics => DetectorEvidence::AstLocal,
+                _ => DetectorEvidence::GraphSupported,
+            },
+            assumptions,
+        }
     }
 }
 
 const PROJECT_RULES: &[DetectorCapability] = &[
-    project(
+    DetectorInput::Graph.capability(
         "god_class",
         DetectorScope::Container,
-        DetectorInput::Graph,
         "behavioral and complex member population required",
     ),
-    project(
+    DetectorInput::Graph.capability(
         "feature_envy",
         DetectorScope::Method,
-        DetectorInput::Graph,
         "resolved own and foreign member evidence; uncertainty retained",
     ),
-    project(
+    DetectorInput::PreviousGeneration.capability(
         "recently_grew",
         DetectorScope::Callable,
-        DetectorInput::PreviousGeneration,
         "comparable retained generation within thirty days; physical-line growth",
     ),
-    project(
+    DetectorInput::SourceMetrics.capability(
         "stale_doc",
         DetectorScope::Constant,
-        DetectorInput::SourceMetrics,
         "native documented-number evidence; no natural-language correctness proof",
     ),
-    project(
+    DetectorInput::Graph.capability(
         "unused_export",
         DetectorScope::ProductionSymbol,
-        DetectorInput::Graph,
         "framework exports and dynamic external references abstain; never authorizes deletion",
     ),
-    project(
+    DetectorInput::CloneEvidence.capability(
         "duplicate_code",
         DetectorScope::Callable,
-        DetectorInput::CloneEvidence,
         "exact and structural hashes; bounded partial-clone profiles; embeddings optional",
     ),
-    project(
+    DetectorInput::Coverage.capability(
         "low_coverage",
         DetectorScope::Callable,
-        DetectorInput::Coverage,
         "generation-fenced LCOV and complexity percentile",
     ),
-    project(
+    DetectorInput::LayerPolicy.capability(
         "illegal_import",
         DetectorScope::ModuleDependency,
-        DetectorInput::LayerPolicy,
         "evaluated by project layer analysis rather than the native symbol cascade",
     ),
-    project(
+    DetectorInput::Graph.capability(
         "high_fan_out",
         DetectorScope::ProductionSymbol,
-        DetectorInput::Graph,
         "grouped graph dependencies and orchestration policy",
     ),
-    project(
+    DetectorInput::Graph.capability(
         "unresolved_reference_pressure",
         DetectorScope::ProductionSymbol,
-        DetectorInput::Graph,
         "CodeVetra resolution coverage; not a compiler diagnostic",
     ),
 ];

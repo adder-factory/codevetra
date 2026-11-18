@@ -8,6 +8,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Short-lived admission before resolving state paths or acquiring original locks.
 /// The sibling `.codevetra.lock` stays in place across migration and process loss.
 /// Never delete it: another process may already have opened the same lock identity.
@@ -34,14 +39,14 @@ impl StateAdmission {
             .create(true)
             .truncate(false)
             // Open the reparse point itself, and deny deletion/replacement while open.
-            .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
-            .share_mode(0x0000_0003) // FILE_SHARE_READ | FILE_SHARE_WRITE
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ_WRITE)
             .open(path)
             .map_err(|_| NameMigrationError::AdmissionUnavailable)?;
         let metadata = file
             .metadata()
             .map_err(|_| NameMigrationError::AdmissionUnavailable)?;
-        if !metadata.is_file() || metadata.file_attributes() & 0x0000_0400 != 0 {
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(NameMigrationError::AdmissionUnavailable);
         }
         loop {
@@ -49,7 +54,7 @@ impl StateAdmission {
                 Ok(()) => return Ok(Self { _file: file }),
                 Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     thread::sleep(
-                        Duration::from_millis(10)
+                        ADMISSION_POLL_INTERVAL
                             .min(deadline.saturating_duration_since(Instant::now())),
                     );
                 }

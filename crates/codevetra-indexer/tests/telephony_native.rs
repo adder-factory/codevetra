@@ -7,8 +7,8 @@ use std::{error::Error, fs, time::Duration};
 use codevetra_db::{
     CurrentGenerationLookup, NativeDatabase, SearchQuery,
     rocks::{
-        AsyncProjectStore, GraphBase, GraphPolicy, GraphRevision, StorageRequest, StorageRuntime,
-        StorePolicy, WorkerPolicy,
+        AsyncProjectStore, GraphBase, GraphPolicy, GraphPreparation, GraphRevision, StorageRequest,
+        StorageRuntime, StorePolicy, WorkerPolicy,
     },
 };
 use codevetra_domain::{ContentDigest, GenerationDigestVersion, GenerationId};
@@ -64,29 +64,33 @@ async fn telephony_publishes_searchable_identical_facts_at_all_worker_counts()
         let identity = ContentDigest::from_bytes([17; 32]);
         let store = AsyncProjectStore::open(
             &runtime,
-            directory.path().to_owned(),
-            identity.clone(),
-            StorePolicy::default(),
+            codevetra_db::rocks::ProjectOpening::new(
+                directory.path().to_owned(),
+                identity.clone(),
+                StorePolicy::default(),
+            ),
             &request,
         )
         .await?;
         let database = NativeDatabase::new(store.clone(), &identity);
         let (input, report) = build_native_rocks_graph_owned(
             NativeGenerationBuild::new(SourceRoot::open(source.path())?, pipeline_config(workers)?),
-            GraphRevision {
-                generation_id: GenerationId::from_uuid_v8([17; 16]),
-                source_revision: ContentDigest::from_bytes([31; 32]),
-                base: GraphBase::Empty,
-            },
-            GraphPolicy::default(),
-            &request,
+            GraphPreparation::new(
+                GraphRevision {
+                    generation_id: GenerationId::from_uuid_v8([17; 16]),
+                    source_revision: ContentDigest::from_bytes([31; 32]),
+                    base: GraphBase::Empty,
+                },
+                GraphPolicy::default(),
+                &request,
+            ),
         )
         .await?;
         assert_eq!(report.discovered_files(), 5);
-        let published = store.publish_graph(input, &request).await?;
+        let published = store.with_request(&request).publish_graph(input).await?;
         assert_eq!(
             published.revision.digest_version,
-            Some(GenerationDigestVersion::V27)
+            Some(GenerationDigestVersion::V34)
         );
         let mut identities = Vec::new();
         for (query, qualified) in [

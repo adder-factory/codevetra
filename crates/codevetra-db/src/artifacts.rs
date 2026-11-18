@@ -1014,6 +1014,35 @@ pub enum RoleSweepModel<'a> {
     Judge(&'a str),
 }
 
+/// Metadata-only role selection with a model-bound continuation and finite page size.
+pub struct PendingStructuralRoleQuery<'a> {
+    project: &'a ProjectId,
+    model: &'a str,
+    after: Option<&'a StructuralRoleCursor>,
+    limit: u16,
+}
+
+impl<'a> PendingStructuralRoleQuery<'a> {
+    /// Select the project and producer; execution validates both before storage admission.
+    #[must_use]
+    pub const fn new(project: &'a ProjectId, model: &'a str) -> Self {
+        Self {
+            project,
+            model,
+            after: None,
+            limit: 0,
+        }
+    }
+
+    /// Continue an exact source/model sweep with the requested bounded page size.
+    #[must_use]
+    pub const fn page(mut self, after: Option<&'a StructuralRoleCursor>, limit: u16) -> Self {
+        self.after = after;
+        self.limit = limit;
+        self
+    }
+}
+
 /// Opaque native scan position for a structural role sweep, pinned to its source and model.
 #[derive(Clone)]
 pub struct StructuralRoleCursor {

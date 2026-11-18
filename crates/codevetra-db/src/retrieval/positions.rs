@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::{CurrentFileRecord, DEFAULT_INTERACTIVE_READ_TIMEOUT, native::file_record};
 use crate::{
     NativeDatabase, ReferenceInput, StorageError,
-    rocks::{RecordKey, RocksError},
+    rocks::{GraphSnapshot, ReadBudget, RecordKey, RocksError},
 };
 
 const SCAN_LIMIT: usize = 16_384;
@@ -123,7 +123,12 @@ impl NativeDatabase {
                     sites,
                     scanned,
                     next_key,
-                } = scan_reference_sites(graph, budget, &selector, &generation, limit, after)?;
+                } = ReferenceReader {
+                    graph,
+                    budget,
+                    selector: &selector,
+                }
+                .scan(limit, after)?;
                 let next = next_key
                     .map(|key| {
                         serde_json::to_string(&Continuation {
@@ -154,62 +159,71 @@ struct ScannedReferences {
     next_key: Option<RecordKey>,
 }
 
-fn scan_reference_sites(
-    graph: &crate::rocks::GraphSnapshot<'_, '_>,
-    budget: &mut crate::rocks::ReadBudget,
-    selector: &ReferenceSelector,
-    generation: &GenerationId,
-    limit: usize,
-    after: Option<RecordKey>,
-) -> Result<ScannedReferences, RocksError> {
-    let mut cursor = after;
-    let mut sites = Vec::new();
-    let mut scanned = 0;
-    let mut next_key = None;
-    'pages: loop {
-        let page = graph.reference_sites(selector.file(), cursor.as_ref(), 256, budget)?;
-        let (records, next) = (page.rows, page.next);
-        let last_index = records.len().saturating_sub(1);
-        for (index, (key, occurrence)) in records.into_iter().enumerate() {
-            scanned += 1;
-            append_matching_site(graph, budget, selector, generation, occurrence, &mut sites)?;
-            if sites.len() == limit || scanned == SCAN_LIMIT {
-                if index < last_index || next.is_some() {
-                    next_key = Some(key);
-                }
-                break 'pages;
-            }
-        }
-        cursor = next;
-        if cursor.is_none() {
-            break;
-        }
-    }
-    Ok(ScannedReferences {
-        sites,
-        scanned,
-        next_key,
-    })
+/// Every match and its enclosing-file identity come from this exact graph view.
+struct ReferenceReader<'read, 'view, 'store> {
+    graph: &'read GraphSnapshot<'view, 'store>,
+    budget: &'read mut ReadBudget,
+    selector: &'read ReferenceSelector,
 }
 
-fn append_matching_site(
-    graph: &crate::rocks::GraphSnapshot<'_, '_>,
-    budget: &mut crate::rocks::ReadBudget,
-    selector: &ReferenceSelector,
-    generation: &GenerationId,
-    occurrence: ReferenceInput,
-    sites: &mut Vec<CurrentReferenceSite>,
-) -> Result<(), RocksError> {
-    if selector.matches(&occurrence) {
-        let file = graph
-            .file(&occurrence.file_id, budget)?
-            .ok_or(RocksError::Format)?;
-        sites.push(CurrentReferenceSite {
-            file: file_record(generation, file)?,
-            occurrence,
-        });
+impl ReferenceReader<'_, '_, '_> {
+    fn scan(
+        mut self,
+        limit: usize,
+        after: Option<RecordKey>,
+    ) -> Result<ScannedReferences, RocksError> {
+        let mut cursor = after;
+        let mut sites = Vec::new();
+        let mut scanned = 0;
+        let mut next_key = None;
+        'pages: loop {
+            let page = self.graph.reference_sites(self.selector.file()).page(
+                cursor.as_ref(),
+                256,
+                self.budget,
+            )?;
+            let (records, next) = (page.rows, page.next);
+            let last_index = records.len().saturating_sub(1);
+            for (index, (key, occurrence)) in records.into_iter().enumerate() {
+                scanned += 1;
+                if let Some(site) = self.matching_site(occurrence)? {
+                    sites.push(site);
+                }
+                if sites.len() != limit && scanned != SCAN_LIMIT {
+                    continue;
+                }
+                next_key = (index < last_index || next.is_some()).then_some(key);
+                break 'pages;
+            }
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(ScannedReferences {
+            sites,
+            scanned,
+            next_key,
+        })
     }
-    Ok(())
+
+    fn matching_site(
+        &mut self,
+        occurrence: ReferenceInput,
+    ) -> Result<Option<CurrentReferenceSite>, RocksError> {
+        if self.selector.matches(&occurrence) {
+            let file = self
+                .graph
+                .file(&occurrence.file_id, self.budget)?
+                .ok_or(RocksError::Format)?;
+            Ok(Some(CurrentReferenceSite {
+                file: file_record(self.graph.generation_id(), file)?,
+                occurrence,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn parse_continuation(

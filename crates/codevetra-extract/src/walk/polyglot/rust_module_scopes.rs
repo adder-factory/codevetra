@@ -2,6 +2,60 @@
 use crate::{ExtractError, ExtractedImportBinding, ImportBindingKind, walk::ExtractionBuilder};
 use tree_sitter::Node;
 
+const MAX_ADJACENT_ATTRIBUTE_NODES: usize = 128;
+
+/// A single literal path on a top-level external module. Unsupported adjacent
+/// attributes invalidate the whole binding; comments never terminate the scan.
+pub(super) fn explicit_file(
+    builder: &mut ExtractionBuilder<'_, '_>,
+    node: Node<'_>,
+) -> Result<Option<String>, ExtractError> {
+    let mut previous = node.prev_named_sibling();
+    let mut path = None;
+    for _ in 0..MAX_ADJACENT_ATTRIBUTE_NODES {
+        builder.context.ensure_active()?;
+        let Some(sibling) = previous else {
+            return Ok(path);
+        };
+        previous = sibling.prev_named_sibling();
+        if matches!(sibling.kind(), "line_comment" | "block_comment") {
+            continue;
+        }
+        if sibling.kind() != "attribute_item" {
+            return Ok(path);
+        }
+        if sibling.has_error() || path.is_some() || sibling.byte_range().len() > 1_100 {
+            return Ok(None);
+        }
+        let text = builder.context.text(sibling);
+        let Some(value) = literal_path(text) else {
+            return Ok(None);
+        };
+        builder.context.budget.ensure_string_length(value.len())?;
+        path = Some(value.to_owned());
+    }
+    Ok(None)
+}
+
+fn literal_path(attribute: &str) -> Option<&str> {
+    let value = attribute
+        .strip_prefix("#[")?
+        .strip_suffix(']')?
+        .trim()
+        .strip_prefix("path")?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim()
+        .strip_prefix('"')?
+        .strip_suffix('"')?;
+    (!value.is_empty()
+        && value.len() <= 1_024
+        && !value.starts_with('/')
+        && !value.contains(['\\', '"', ':'])
+        && !value.chars().any(char::is_control))
+    .then_some(value)
+}
+
 pub(super) fn file_module(
     builder: &mut ExtractionBuilder<'_, '_>,
     node: Node<'_>,
@@ -77,14 +131,19 @@ fn inline_scope(
     Ok(false)
 }
 
-fn conventional_attributes(
+pub(super) fn conventional_attributes(
     builder: &mut ExtractionBuilder<'_, '_>,
     node: Node<'_>,
     allow_cfg: bool,
 ) -> Result<bool, ExtractError> {
     let mut previous = node.prev_named_sibling();
+    let mut remaining = MAX_ADJACENT_ATTRIBUTE_NODES;
     while let Some(sibling) = previous {
         builder.context.ensure_active()?;
+        if remaining == 0 {
+            return Ok(false);
+        }
+        remaining -= 1;
         if matches!(sibling.kind(), "line_comment" | "block_comment") {
             previous = sibling.prev_named_sibling();
             continue;
@@ -92,14 +151,12 @@ fn conventional_attributes(
         if sibling.kind() != "attribute_item" {
             return Ok(true);
         }
-        let Some(path) = sibling
-            .named_child(0)
-            .and_then(|attribute| attribute.named_child(0))
-            .filter(|path| path.kind() == "identifier")
-        else {
-            return Ok(false);
-        };
-        if !allow_cfg || builder.context.text(path) != "cfg" {
+        if !allow_cfg
+            || !crate::walk::rust_test_attributes::well_formed_cfg(
+                sibling,
+                builder.context.source(),
+            )
+        {
             return Ok(false);
         }
         previous = sibling.prev_named_sibling();

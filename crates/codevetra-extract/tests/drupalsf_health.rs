@@ -8,8 +8,8 @@ use codevetra_domain::{ReferenceKind, SymbolKind};
 use codevetra_extract::{NativeExtractor, SourceLimits, SourceSnapshot};
 
 const SOURCE_BYTES: usize = 1_024 * 1_024;
-const MAX_CYCLOMATIC: u16 = 14;
-const MAX_PARAMETERS: u16 = 3;
+const MAX_CYCLOMATIC: u32 = 14;
+const MAX_PARAMETERS: u32 = 3;
 const MAX_LINES: u32 = 99;
 const MAX_CALLEES: usize = 24;
 

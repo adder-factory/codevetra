@@ -1164,6 +1164,7 @@ fn findings_for_symbol(symbol: &ExtractedSymbol, path: &NormalizedPath) -> Vec<S
         ),
         framework_owned: framework_convention_export(path, symbol),
         secrets_actionable: symbol.health.secrets_actionable,
+        flat_value_mapping: symbol.health.flat_value_mapping,
     };
     evaluate_source_rules(context, |metric| symbol.health.source_metric(metric))
         .into_iter()

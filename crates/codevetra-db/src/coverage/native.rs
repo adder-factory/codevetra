@@ -8,7 +8,7 @@ use super::{
 use crate::{
     GraphDirection, NativeDatabase, StorageError,
     native_database::{dataset, now},
-    retrieval::native::{retain, test_path, visit_files, visit_symbols},
+    retrieval::native::{test_path, visit_files, visit_symbols},
     rocks::{GraphSnapshot, ReadBudget, RocksError, StateNamespace, StateTransaction},
 };
 use codevetra_domain::{FileId, NormalizedPath, ProjectId, SymbolId};
@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 const NAMESPACE: StateNamespace = StateNamespace::Coverage;
+const SELECTED_FACT_OVERHEAD: usize = 256;
+const MAXIMUM_SELECTED_FACT_BYTES: usize = 32 * 1_048_576;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Metadata {
@@ -138,10 +140,13 @@ impl NativeDatabase {
             symbols_written: request.facts.len() as u64,
         };
         self.replace_dataset(
-            NAMESPACE,
-            &source_name(&request.source_label),
-            Some(request.generation_id),
-            &metadata,
+            crate::native_database::dataset::DatasetReplacement {
+                namespace: NAMESPACE,
+                name: source_name(&request.source_label),
+                expected: Some(request.generation_id),
+                metadata: &metadata,
+                guard: crate::native_database::dataset::CommitGuard::default(),
+            },
             request.facts.into_iter(),
         )
         .await?;
@@ -159,50 +164,64 @@ impl NativeDatabase {
         self.require_project(project)?;
         validate_source_and_limit(request.source.as_deref(), request.limit)?;
         let request = request.clone();
-        self.state(None, 0, 0, move |transaction, budget| {
-            if transaction.current()?.is_none() {
-                return Ok(Vec::new());
-            }
-            let selected = selected(transaction, budget, request.source.as_deref(), false)?;
-            let snapshot = transaction.graph_snapshot()?;
-            let graph = snapshot.graph(budget)?;
-            let tests = test_files(&graph, budget)?;
-            let mut population = 0_u64;
-            visit_symbols(&graph, budget, |symbol, _| {
-                if !matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter") {
-                    population += 1;
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                if transaction.current()?.is_none() {
+                    return Ok(Vec::new());
                 }
-                Ok(())
-            })?;
-            let mut output = Vec::new();
-            for (id, row) in selected {
-                if request
-                    .symbol_id
-                    .as_ref()
-                    .is_some_and(|expected| expected != &id)
-                {
-                    continue;
-                }
-                let Some(record) = coverage_record(&graph, budget, &id, row, &tests, population)?
-                else {
-                    continue;
+                let selected = SelectedFacts::new(false).read(
+                    transaction,
+                    budget,
+                    request.source.as_deref(),
+                )?;
+                let snapshot = transaction.graph_snapshot()?;
+                let graph = snapshot.graph(budget)?;
+                let tests = test_files(&graph, budget)?;
+                let mut population = 0_u64;
+                visit_symbols(&graph, budget, |symbol, _| {
+                    if !matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter") {
+                        population += 1;
+                    }
+                    Ok(())
+                })?;
+                let reader = CoverageReader {
+                    graph: &graph,
+                    tests: &tests,
+                    population,
                 };
-                if !matches_record(&record, &request) {
-                    continue;
+                let mut output = crate::retrieval::native::RankedRows::new(
+                    usize::from(request.limit),
+                    |a: &SymbolCoverageRecord, b| {
+                        a.coverage_fraction
+                            .partial_cmp(&b.coverage_fraction)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(b.degree_centrality.total_cmp(&a.degree_centrality))
+                            .then(b.incoming_edges.cmp(&a.incoming_edges))
+                            .then(a.path.cmp(&b.path))
+                            .then(a.qualified_name.cmp(&b.qualified_name))
+                            .then(a.symbol_id.cmp(&b.symbol_id))
+                    },
+                );
+                for (id, row) in selected {
+                    if request
+                        .symbol_id
+                        .as_ref()
+                        .is_some_and(|expected| expected != &id)
+                    {
+                        continue;
+                    }
+                    let Some(record) = reader.record(budget, row)? else {
+                        continue;
+                    };
+                    if !matches_record(&record, &request) {
+                        continue;
+                    }
+                    output.insert(record);
                 }
-                retain(&mut output, record, usize::from(request.limit), |a, b| {
-                    a.coverage_fraction
-                        .partial_cmp(&b.coverage_fraction)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(b.degree_centrality.total_cmp(&a.degree_centrality))
-                        .then(b.incoming_edges.cmp(&a.incoming_edges))
-                        .then(a.path.cmp(&b.path))
-                        .then(a.qualified_name.cmp(&b.qualified_name))
-                        .then(a.symbol_id.cmp(&b.symbol_id))
-                });
-            }
-            Ok(output)
-        })
+                Ok(output.into_vec())
+            },
+        )
         .await
     }
 
@@ -217,32 +236,36 @@ impl NativeDatabase {
         self.require_project(project)?;
         validate_source(source)?;
         let source = source.map(ToOwned::to_owned);
-        self.state(None, 0, 0, move |transaction, budget| {
-            let selected = selected(transaction, budget, source.as_deref(), true)?;
-            let mut stats = CoverageStats {
-                symbols: 0,
-                lines_found: 0,
-                lines_hit: 0,
-                coverage_fraction: None,
-                sources: 0,
-            };
-            let mut sources = BTreeSet::new();
-            for (_, row) in selected {
-                stats.symbols += 1;
-                stats.lines_found = stats
-                    .lines_found
-                    .checked_add(row.fact.lines_found)
-                    .ok_or(corrupt())?;
-                stats.lines_hit = stats
-                    .lines_hit
-                    .checked_add(row.fact.lines_hit)
-                    .ok_or(corrupt())?;
-                sources.insert(row.id);
-            }
-            stats.sources = sources.len() as u64;
-            stats.coverage_fraction = fraction(stats.lines_found, stats.lines_hit)?;
-            Ok(stats)
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let selected =
+                    SelectedFacts::new(true).read(transaction, budget, source.as_deref())?;
+                let mut stats = CoverageStats {
+                    symbols: 0,
+                    lines_found: 0,
+                    lines_hit: 0,
+                    coverage_fraction: None,
+                    sources: 0,
+                };
+                let mut sources = BTreeSet::new();
+                for (_, row) in selected {
+                    stats.symbols += 1;
+                    stats.lines_found = stats
+                        .lines_found
+                        .checked_add(row.fact.lines_found)
+                        .ok_or(corrupt())?;
+                    stats.lines_hit = stats
+                        .lines_hit
+                        .checked_add(row.fact.lines_hit)
+                        .ok_or(corrupt())?;
+                    sources.insert(row.id);
+                }
+                stats.sources = sources.len() as u64;
+                stats.coverage_fraction = fraction(stats.lines_found, stats.lines_hit)?;
+                Ok(stats)
+            },
+        )
         .await
     }
 
@@ -254,38 +277,38 @@ impl NativeDatabase {
         project: &ProjectId,
     ) -> Result<Vec<CoverageSourceRecord>, StorageError> {
         self.require_project(project)?;
-        self.state(None, 0, 0, |transaction, budget| {
-            let current = transaction
-                .current()?
-                .map(|revision| revision.generation_id);
-            let mut output = Vec::new();
-            for (name, manifest) in dataset::list(transaction, NAMESPACE, "source/", budget)? {
-                let metadata = metadata(&manifest)?;
-                let mut count = 0_u64;
-                if manifest.generation == current && current.is_some() {
-                    dataset::visit::<SymbolCoverageFact>(
-                        transaction,
-                        NAMESPACE,
-                        &name,
-                        &manifest,
-                        budget,
-                        |_, _| {
-                            count += 1;
-                            Ok(())
-                        },
-                    )?;
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            |transaction, budget| {
+                let current = transaction
+                    .current()?
+                    .map(|revision| revision.generation_id);
+                let mut output = Vec::new();
+                for (name, manifest) in
+                    dataset::Reader::new(transaction, NAMESPACE).list("source/", budget)?
+                {
+                    let metadata = metadata(&manifest)?;
+                    let mut count = 0_u64;
+                    if manifest.generation == current && current.is_some() {
+                        dataset::Reader::new(transaction, NAMESPACE)
+                            .at(&name)
+                            .visit::<SymbolCoverageFact>(&manifest, budget, |_, _| {
+                                count += 1;
+                                Ok(())
+                            })?;
+                    }
+                    output.push(CoverageSourceRecord {
+                        source_id: metadata.id,
+                        label: metadata.label,
+                        report_digest: metadata.digest,
+                        loaded_at: metadata.loaded,
+                        current_symbols: count,
+                    });
                 }
-                output.push(CoverageSourceRecord {
-                    source_id: metadata.id,
-                    label: metadata.label,
-                    report_digest: metadata.digest,
-                    loaded_at: metadata.loaded,
-                    current_symbols: count,
-                });
-            }
-            output.sort_by(|a, b| a.label.cmp(&b.label));
-            Ok(output)
-        })
+                output.sort_by(|a, b| a.label.cmp(&b.label));
+                Ok(output)
+            },
+        )
         .await
     }
 
@@ -303,73 +326,88 @@ impl NativeDatabase {
     }
 }
 
-fn selected(
-    transaction: &StateTransaction<'_>,
-    budget: &mut ReadBudget,
-    source: Option<&str>,
+struct SelectedFacts {
+    rows: BTreeMap<SymbolId, Selected>,
+    bytes: usize,
     tie_id: bool,
-) -> Result<BTreeMap<SymbolId, Selected>, RocksError> {
-    let mut output = BTreeMap::<SymbolId, Selected>::new();
-    let Some(current) = transaction.current()? else {
-        return Ok(output);
-    };
-    let mut bytes = 0_usize;
-    for (name, manifest) in dataset::list(transaction, NAMESPACE, "source/", budget)? {
-        if manifest.generation.as_ref() != Some(&current.generation_id) {
-            continue;
+}
+impl SelectedFacts {
+    fn new(tie_id: bool) -> Self {
+        Self {
+            rows: BTreeMap::new(),
+            bytes: 0,
+            tie_id,
         }
-        let metadata = metadata(&manifest)?;
-        if source.is_some_and(|source| source != metadata.label) {
-            continue;
-        }
-        dataset::visit::<SymbolCoverageFact>(
-            transaction,
-            NAMESPACE,
-            &name,
-            &manifest,
-            budget,
-            |fact, _| select_fact(&mut output, &mut bytes, &metadata, fact, tie_id),
-        )?;
     }
-    Ok(output)
+    fn read(
+        mut self,
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+        source: Option<&str>,
+    ) -> Result<BTreeMap<SymbolId, Selected>, RocksError> {
+        let Some(current) = transaction.current()? else {
+            return Ok(self.rows);
+        };
+        for (name, manifest) in
+            dataset::Reader::new(transaction, NAMESPACE).list("source/", budget)?
+        {
+            if manifest.generation.as_ref() != Some(&current.generation_id) {
+                continue;
+            }
+            let metadata = metadata(&manifest)?;
+            if source.is_some_and(|source| source != metadata.label) {
+                continue;
+            }
+            dataset::Reader::new(transaction, NAMESPACE)
+                .at(&name)
+                .visit::<SymbolCoverageFact>(&manifest, budget, |fact, _| {
+                    self.select_fact(&metadata, fact)
+                })?;
+        }
+        Ok(self.rows)
+    }
 }
 
-fn select_fact(
-    output: &mut BTreeMap<SymbolId, Selected>,
-    bytes: &mut usize,
-    metadata: &Metadata,
-    fact: SymbolCoverageFact,
-    tie_id: bool,
-) -> Result<(), RocksError> {
-    if fact.lines_hit > fact.lines_found || fact.functions_hit > fact.functions_found {
-        return Err(corrupt());
-    }
-    let score = fraction(fact.lines_found, fact.lines_hit)?;
-    if let Some(existing) = output.get(&fact.symbol_id) {
-        let old = fraction(existing.fact.lines_found, existing.fact.lines_hit)?;
-        let earlier = if tie_id {
-            metadata.id < existing.id
+impl SelectedFacts {
+    fn select_fact(
+        &mut self,
+        metadata: &Metadata,
+        fact: SymbolCoverageFact,
+    ) -> Result<(), RocksError> {
+        let tie_id = self.tie_id;
+
+        if fact.lines_hit > fact.lines_found || fact.functions_hit > fact.functions_found {
+            return Err(corrupt());
+        }
+        let score = fraction(fact.lines_found, fact.lines_hit)?;
+        if let Some(existing) = self.rows.get(&fact.symbol_id) {
+            let old = fraction(existing.fact.lines_found, existing.fact.lines_hit)?;
+            let earlier = if tie_id {
+                metadata.id < existing.id
+            } else {
+                metadata.label < existing.source
+            };
+            if !(score > old || (score == old && earlier)) {
+                return Ok(());
+            }
         } else {
-            metadata.label < existing.source
-        };
-        if !(score > old || (score == old && earlier)) {
-            return Ok(());
+            self.bytes = self
+                .bytes
+                .saturating_add(metadata.label.len() + metadata.id.len() + SELECTED_FACT_OVERHEAD);
+            if self.bytes > MAXIMUM_SELECTED_FACT_BYTES {
+                return Err(workspace());
+            }
         }
-    } else {
-        *bytes = bytes.saturating_add(metadata.label.len() + metadata.id.len() + 256);
-        if *bytes > 32 * 1_048_576 {
-            return Err(workspace());
-        }
+        self.rows.insert(
+            fact.symbol_id.clone(),
+            Selected {
+                fact,
+                source: metadata.label.clone(),
+                id: metadata.id.clone(),
+            },
+        );
+        Ok(())
     }
-    output.insert(
-        fact.symbol_id.clone(),
-        Selected {
-            fact,
-            source: metadata.label.clone(),
-            id: metadata.id.clone(),
-        },
-    );
-    Ok(())
 }
 
 pub(crate) fn fractions(
@@ -377,7 +415,7 @@ pub(crate) fn fractions(
     budget: &mut ReadBudget,
 ) -> Result<BTreeMap<SymbolId, f64>, RocksError> {
     let mut output = BTreeMap::new();
-    for (id, selected) in selected(transaction, budget, None, true)? {
+    for (id, selected) in SelectedFacts::new(true).read(transaction, budget, None)? {
         if let Some(value) = fraction(selected.fact.lines_found, selected.fact.lines_hit)? {
             output.insert(id, value);
         }
@@ -385,68 +423,79 @@ pub(crate) fn fractions(
     Ok(output)
 }
 
-fn coverage_record(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    id: &SymbolId,
-    selected: Selected,
-    tests: &BTreeSet<FileId>,
+struct CoverageReader<'a, 'view, 'store> {
+    graph: &'a GraphSnapshot<'view, 'store>,
+    tests: &'a BTreeSet<FileId>,
     population: u64,
-) -> Result<Option<SymbolCoverageRecord>, RocksError> {
-    let Some(symbol) = graph.symbol(id, budget)? else {
-        return Ok(None);
-    };
-    let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
-    let (incoming, direct_tests) = pressure(graph, budget, id, tests)?;
-    Ok(Some(SymbolCoverageRecord {
-        symbol_id: id.as_str().to_owned(),
-        path: file.normalized_path,
-        language: file.language,
-        symbol_kind: symbol.symbol_kind,
-        qualified_name: symbol.qualified_name,
-        source: selected.source,
-        lines_found: selected.fact.lines_found,
-        lines_hit: selected.fact.lines_hit,
-        coverage_fraction: fraction(selected.fact.lines_found, selected.fact.lines_hit)?,
-        incoming_edges: incoming,
-        direct_test_files: direct_tests,
-        degree_centrality: (incoming.to_f64().ok_or(corrupt())?
-            / population
-                .saturating_sub(1)
-                .max(1)
-                .to_f64()
-                .ok_or(corrupt())?)
-        .min(1.0),
-    }))
+}
+impl CoverageReader<'_, '_, '_> {
+    fn record(
+        &self,
+        budget: &mut ReadBudget,
+        selected: Selected,
+    ) -> Result<Option<SymbolCoverageRecord>, RocksError> {
+        let graph = self.graph;
+        let population = self.population;
+        let id = &selected.fact.symbol_id;
+
+        let Some(symbol) = graph.symbol(id, budget)? else {
+            return Ok(None);
+        };
+        let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
+        let (incoming, direct_tests) = self.pressure(budget, id)?;
+        Ok(Some(SymbolCoverageRecord {
+            symbol_id: id.as_str().to_owned(),
+            path: file.normalized_path,
+            language: file.language,
+            symbol_kind: symbol.symbol_kind,
+            qualified_name: symbol.qualified_name,
+            source: selected.source,
+            lines_found: selected.fact.lines_found,
+            lines_hit: selected.fact.lines_hit,
+            coverage_fraction: fraction(selected.fact.lines_found, selected.fact.lines_hit)?,
+            incoming_edges: incoming,
+            direct_test_files: direct_tests,
+            degree_centrality: (incoming.to_f64().ok_or(corrupt())?
+                / population
+                    .saturating_sub(1)
+                    .max(1)
+                    .to_f64()
+                    .ok_or(corrupt())?)
+            .min(1.0),
+        }))
+    }
 }
 
-fn pressure(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    id: &SymbolId,
-    tests: &BTreeSet<FileId>,
-) -> Result<(u64, u64), RocksError> {
-    let mut incoming = 0_u64;
-    let mut test_files = BTreeSet::new();
-    let mut cursor = None;
-    loop {
-        let page = graph.neighbors(id, GraphDirection::Incoming, cursor.as_ref(), 256, budget)?;
-        for link in page.links {
-            if link.kind() != codevetra_domain::EdgeKind::Contains {
-                incoming = incoming
-                    .checked_add(u64::from(graph.edge(&link, budget)?.site_count))
+impl CoverageReader<'_, '_, '_> {
+    fn pressure(&self, budget: &mut ReadBudget, id: &SymbolId) -> Result<(u64, u64), RocksError> {
+        let graph = self.graph;
+        let tests = self.tests;
+
+        let mut incoming = 0_u64;
+        let mut test_files = BTreeSet::new();
+        let mut cursor = None;
+        loop {
+            let page =
+                graph
+                    .adjacency(id, GraphDirection::Incoming)
+                    .page(cursor.as_ref(), 256, budget)?;
+            for link in page.links {
+                if link.kind() != codevetra_domain::EdgeKind::Contains {
+                    incoming = incoming
+                        .checked_add(u64::from(graph.edge(&link, budget)?.site_count))
+                        .ok_or(corrupt())?;
+                }
+                let source = graph
+                    .symbol(link.source_symbol_id(), budget)?
                     .ok_or(corrupt())?;
+                if tests.contains(&source.file_id) {
+                    test_files.insert(source.file_id);
+                }
             }
-            let source = graph
-                .symbol(link.source_symbol_id(), budget)?
-                .ok_or(corrupt())?;
-            if tests.contains(&source.file_id) {
-                test_files.insert(source.file_id);
+            cursor = page.next;
+            if cursor.is_none() {
+                return Ok((incoming, test_files.len() as u64));
             }
-        }
-        cursor = page.next;
-        if cursor.is_none() {
-            return Ok((incoming, test_files.len() as u64));
         }
     }
 }

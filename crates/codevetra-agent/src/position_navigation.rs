@@ -173,19 +173,32 @@ impl ProjectRuntime {
         }
         crate::cancellable_project_read(
             &cancellation,
-            self.navigate_position_inner(request, cancellation.clone()),
+            PositionNavigation {
+                runtime: self,
+                request,
+                cancellation: cancellation.clone(),
+            }
+            .run(),
         )
         .await
     }
+}
 
-    async fn navigate_position_inner(
-        &self,
-        request: PositionRequest,
-        cancellation: ProjectCancellation,
-    ) -> Result<PositionResult, ProjectError> {
-        let snapshot = self
+/// One navigation request retains its project owner and cancellation through every read.
+struct PositionNavigation<'a> {
+    runtime: &'a ProjectRuntime,
+    request: PositionRequest,
+    cancellation: ProjectCancellation,
+}
+
+impl PositionNavigation<'_> {
+    async fn run(&self) -> Result<PositionResult, ProjectError> {
+        let runtime = self.runtime;
+        let request = &self.request;
+        let cancellation = &self.cancellation;
+        let snapshot = runtime
             .database()
-            .project_snapshot_by_root(self.root_identity())
+            .project_snapshot_by_root(runtime.root_identity())
             .await
             .map_err(|_| ProjectError::SourceContextUnavailable)?
             .ok_or(ProjectError::SourceContextUnavailable)?;
@@ -197,7 +210,7 @@ impl ProjectRuntime {
             PositionAnchor::Cursor { path, .. } => Some(path.clone()),
             PositionAnchor::Symbol(_) => None,
         };
-        let source = self.scan_source(path, cancellation.clone()).await?;
+        let source = runtime.scan_source(path, cancellation.clone()).await?;
         let fresh = current.source_revision == source.digest.as_str()
             && current.digest_version == GenerationDigestVersion::CURRENT;
         let mut result =
@@ -208,11 +221,11 @@ impl ProjectRuntime {
             return Ok(result);
         }
         let targets = self
-            .resolve_position_anchor(&request, &snapshot, &source, &cancellation, &mut result)
+            .resolve_position_anchor(&snapshot, source, &mut result)
             .await?;
         if !targets.is_empty() {
             let ids = targets.into_iter().collect::<Vec<_>>();
-            result.definitions = self
+            result.definitions = runtime
                 .database()
                 .current_symbols_by_ids(CurrentSymbolSetLookup::new(
                     &snapshot.project_id,
@@ -230,10 +243,10 @@ impl ProjectRuntime {
             }
         }
         if result.state == PositionState::Resolved {
-            self.navigate_resolved(&snapshot.project_id, &request, &mut result)
+            self.navigate_resolved(&snapshot.project_id, &mut result)
                 .await?;
         }
-        let final_generation = self
+        let final_generation = runtime
             .database()
             .current_generation_record(&snapshot.project_id)
             .await
@@ -249,12 +262,13 @@ impl ProjectRuntime {
 
     async fn resolve_position_anchor(
         &self,
-        request: &PositionRequest,
         snapshot: &codevetra_db::ProjectSnapshot,
-        source: &crate::SourceRevision,
-        cancellation: &ProjectCancellation,
+        mut source: crate::SourceRevision,
         result: &mut PositionResult,
     ) -> Result<BTreeSet<SymbolId>, ProjectError> {
+        let runtime = self.runtime;
+        let request = &self.request;
+        let cancellation = &self.cancellation;
         let targets = match &request.anchor {
             PositionAnchor::Symbol(id) => {
                 result.state = PositionState::Resolved;
@@ -262,7 +276,7 @@ impl ProjectRuntime {
                 BTreeSet::from([id.clone()])
             }
             PositionAnchor::Cursor { path, line, column } => {
-                let file = self
+                let file = runtime
                     .database()
                     .exact_current_file_by_path(CurrentFileLookup::new(
                         &snapshot.project_id,
@@ -274,20 +288,19 @@ impl ProjectRuntime {
                     .ok_or(ProjectError::FileNotFound)?;
                 let capture = source
                     .captures
-                    .get(path)
+                    .remove(path)
                     .ok_or(ProjectError::SourceContextUnavailable)?;
                 if &capture.content_hash != file.content_hash() {
                     return Err(ProjectError::SourceContextUnavailable);
                 }
-                let captured = capture.source.clone();
                 let token = cancellation.clone();
                 let (line, column) = (*line, *column);
                 let byte = tokio::task::spawn_blocking(move || {
-                    cursor_offset(&captured, line, column, &token)
+                    capture.cursor_offset(line, column, &token)
                 })
                 .await
                 .map_err(|_| ProjectError::SourceContextUnavailable)??;
-                let page = self
+                let page = runtime
                     .database()
                     .current_reference_page(ReferencePageRequest {
                         project: &snapshot.project_id,
@@ -312,16 +325,17 @@ impl ProjectRuntime {
     async fn navigate_resolved(
         &self,
         project: &codevetra_domain::ProjectId,
-        request: &PositionRequest,
         result: &mut PositionResult,
     ) -> Result<(), ProjectError> {
+        let runtime = self.runtime;
+        let request = &self.request;
         let Some(target) = result.definitions.first() else {
             return Err(ProjectError::SourceContextUnavailable);
         };
         match request.operation {
             PositionOperation::Definition => {}
             PositionOperation::References => {
-                let page = self
+                let page = runtime
                     .database()
                     .current_reference_page(ReferencePageRequest {
                         project,
@@ -339,7 +353,7 @@ impl ProjectRuntime {
             PositionOperation::Implementation => {
                 let roots = [target.symbol_id().clone()];
                 let kinds = [EdgeKind::Implements, EdgeKind::Overrides];
-                result.relations = self
+                result.relations = runtime
                     .database()
                     .current_graph_edges(
                         CurrentGraphLookup::new(
@@ -364,7 +378,7 @@ impl ProjectRuntime {
                     result.state = PositionState::Unsupported;
                     result.reason = "no_indexed_implementation_or_override_evidence";
                 } else {
-                    result.implementations = self
+                    result.implementations = runtime
                         .database()
                         .current_symbols_by_ids(CurrentSymbolSetLookup::new(
                             project,
@@ -387,52 +401,70 @@ fn position_storage_error(error: &codevetra_db::StorageError) -> ProjectError {
     }
 }
 
-fn cursor_offset(
-    source: &str,
-    line: u32,
-    column: u32,
-    cancellation: &ProjectCancellation,
-) -> Result<u64, ProjectError> {
-    if line == 0 {
-        return Err(ProjectError::InvalidOptions);
-    }
-    let mut offset = 0_usize;
-    for (index, text) in source.split_inclusive('\n').enumerate() {
-        if cancellation.is_cancelled() {
-            return Err(ProjectError::RequestCancelled);
+impl crate::CapturedSource {
+    fn cursor_offset(
+        &self,
+        line: u32,
+        column: u32,
+        cancellation: &ProjectCancellation,
+    ) -> Result<u64, ProjectError> {
+        if line == 0 {
+            return Err(ProjectError::InvalidOptions);
         }
-        if u32::try_from(index).map_err(|_| ProjectError::InvalidOptions)? == line - 1 {
-            let text = text.trim_suffix('\n').trim_suffix('\r');
-            let column = usize::try_from(column).map_err(|_| ProjectError::InvalidOptions)?;
-            if column > text.len() || !text.is_char_boundary(column) {
-                return Err(ProjectError::InvalidOptions);
+        let mut offset = 0_usize;
+        for (index, text) in self.source.split_inclusive('\n').enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(ProjectError::RequestCancelled);
             }
-            return u64::try_from(offset + column).map_err(|_| ProjectError::InvalidOptions);
+            if u32::try_from(index).map_err(|_| ProjectError::InvalidOptions)? == line - 1 {
+                let text = text.trim_suffix('\n').trim_suffix('\r');
+                let column = usize::try_from(column).map_err(|_| ProjectError::InvalidOptions)?;
+                if column > text.len() || !text.is_char_boundary(column) {
+                    return Err(ProjectError::InvalidOptions);
+                }
+                return u64::try_from(offset + column).map_err(|_| ProjectError::InvalidOptions);
+            }
+            offset += text.len();
         }
-        offset += text.len();
+        Err(ProjectError::InvalidOptions)
     }
-    Err(ProjectError::InvalidOptions)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn capture(source: &str) -> crate::CapturedSource {
+        crate::CapturedSource {
+            source: source.into(),
+            content_hash: codevetra_domain::ContentDigest::from_bytes(
+                *blake3::hash(source.as_bytes()).as_bytes(),
+            ),
+        }
+    }
+
     #[test]
     fn cursor_coordinates_preserve_utf8_non_bmp_crlf_and_half_open_boundaries() {
-        let source = "α😀\r\ncall();\n";
+        let source = capture("α😀\r\ncall();\n");
         let cancellation = ProjectCancellation::new();
-        assert_eq!(cursor_offset(source, 1, 2, &cancellation).ok(), Some(2));
-        assert_eq!(cursor_offset(source, 1, 6, &cancellation).ok(), Some(6));
-        assert_eq!(cursor_offset(source, 2, 0, &cancellation).ok(), Some(8));
-        assert_eq!(cursor_offset("x\r\r\n", 1, 2, &cancellation).ok(), Some(2));
-        assert!(cursor_offset("x\r\r\n", 1, 3, &cancellation).is_err());
+        assert_eq!(source.cursor_offset(1, 2, &cancellation).ok(), Some(2));
+        assert_eq!(source.cursor_offset(1, 6, &cancellation).ok(), Some(6));
+        assert_eq!(source.cursor_offset(2, 0, &cancellation).ok(), Some(8));
+        assert_eq!(
+            capture("x\r\r\n").cursor_offset(1, 2, &cancellation).ok(),
+            Some(2)
+        );
+        assert!(
+            capture("x\r\r\n")
+                .cursor_offset(1, 3, &cancellation)
+                .is_err()
+        );
         for column in [1, 3, 4, 5, 7] {
-            assert!(cursor_offset(source, 1, column, &cancellation).is_err());
+            assert!(source.cursor_offset(1, column, &cancellation).is_err());
         }
         cancellation.cancel();
         assert!(matches!(
-            cursor_offset(source, 2, 0, &cancellation),
+            source.cursor_offset(2, 0, &cancellation),
             Err(ProjectError::RequestCancelled)
         ));
     }

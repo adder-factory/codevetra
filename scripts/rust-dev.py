@@ -13,6 +13,18 @@ import time
 
 from build_tools import ROOT, admission, cache_path, cache_policy, cache_root, environment
 
+KIB_PER_MIB = 1024
+MAXIMUM_BUILD_RSS_KIB = 8 * 1024 * KIB_PER_MIB
+MAXIMUM_SOCKET_PATH_BYTES = 100
+SERVER_IDLE_GRACE_SECONDS = 30
+SERVER_START_ATTEMPTS = 100
+SERVER_POLL_SECONDS = 0.1
+BUILD_POLL_SECONDS = 0.5
+STATS_TIMEOUT_SECONDS = 10
+TERMINATION_GRACE_SECONDS = 10
+TERMINATION_POLL_SECONDS = 0.05
+TASKKILL_TIMEOUT_SECONDS = 15
+
 
 def exit_status(child):
     if os.name == 'nt':
@@ -42,14 +54,15 @@ def signal_group(pid, value):
 def terminate(child):
     if os.name == 'nt':
         if child.poll() is None:
-            subprocess.run(['taskkill', '/PID', str(child.pid), '/T', '/F'], check=True, timeout=15)
+            subprocess.run(['taskkill', '/PID', str(child.pid), '/T', '/F'], stdout=sys.stderr,
+                           check=True, timeout=TASKKILL_TIMEOUT_SECONDS)
     else:
         signal_group(child.pid, signal.SIGTERM)
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
         while exit_status(child) is None and time.monotonic() < deadline:
-            time.sleep(0.05)
+            time.sleep(TERMINATION_POLL_SECONDS)
         signal_group(child.pid, signal.SIGKILL)
-    child.wait(timeout=10)
+    child.wait(timeout=TERMINATION_GRACE_SECONDS)
 
 
 def rss_kib(roots):
@@ -66,86 +79,116 @@ def rss_kib(roots):
     return sum(rss for pid, _, rss in processes if pid in owned)
 
 
-def run(command, env, timeout, lock=None):
-    def interrupted(_signal, _frame):
-        raise KeyboardInterrupt
+class BuildRun:
+    """Own one Cargo process and its private compiler server until both are reaped."""
 
-    server = None
-    child = None
-    endpoint = None
-    started = time.monotonic()
-    peak = 0
-    # Own a foreground server so cancellation reaps its compiler children too.
-    # Do not stop or reconfigure another project's existing sccache daemon.
-    env = dict(env)
-    for key in ('SCCACHE_SERVER_UDS', 'SCCACHE_SERVER_PORT', 'SCCACHE_START_SERVER', 'SCCACHE_NO_DAEMON'):
-        env.pop(key, None)
-    if os.name == 'nt':
-        with socket.socket() as probe:
-            probe.bind(('127.0.0.1', 0))
-            env['SCCACHE_SERVER_PORT'] = str(probe.getsockname()[1])
-    else:
-        endpoint = cache_root() / f'run-{os.getpid()}.sock'
-        if len(os.fsencode(endpoint)) >= 100:
-            raise ValueError('Cache root is too long for a private compiler-server socket')
-        if endpoint.exists():
-            raise ValueError('Compiler-server endpoint already exists; refusing to reuse it')
-        env['SCCACHE_SERVER_UDS'] = str(endpoint)
-    previous = signal.signal(signal.SIGTERM, interrupted)
-    inherited = {'pass_fds': (lock.fileno(),)} if lock is not None and os.name != 'nt' else {}
-    try:
-        # Long test/soak phases legitimately make no compiler requests. Keep
-        # the server beyond our deadline/cleanup, but retain a finite idle
-        # exit if the supervisor is killed and cannot clean up its server.
-        server_env = dict(env, SCCACHE_START_SERVER='1', SCCACHE_NO_DAEMON='1',
-                          SCCACHE_IDLE_TIMEOUT=str(timeout + 30))
-        # sccache closes inherited descriptors. A waiting wrapper retains our
-        # admission FD for its entire lifetime, including after parent SIGKILL.
-        # Catch (rather than ignore) SIGTERM so the exec'd server gets the
-        # default disposition and the wrapper waits for group cleanup.
-        server_command = [sys.executable, '-c',
-                          'import signal,subprocess,sys; '
-                          'signal.signal(signal.SIGTERM, lambda *_: None); '
-                          'sys.exit(subprocess.call(["sccache"]))']
-        server = subprocess.Popen(server_command, env=server_env, start_new_session=os.name != 'nt', **inherited)
-        for _ in range(100):
-            if exit_status(server) is not None:
-                raise RuntimeError('Owned compiler server exited during startup')
-            if os.name == 'nt':
-                try:
-                    with socket.create_connection(('127.0.0.1', int(env['SCCACHE_SERVER_PORT'])), timeout=0.1):
-                        break
-                except OSError:
-                    pass
-            elif endpoint.exists():
-                break
-            time.sleep(0.1)
+    def __init__(self, command, env, timeout):
+        self.command = command
+        self.env = dict(env)
+        self.timeout = timeout
+        self.server = None
+        self.child = None
+        self.endpoint = None
+        self.started = None
+        self.peak = 0
+
+    def configure_endpoint(self):
+        # Do not stop or reconfigure another project's existing daemon.
+        for key in ('SCCACHE_SERVER_UDS', 'SCCACHE_SERVER_PORT', 'SCCACHE_START_SERVER', 'SCCACHE_NO_DAEMON'):
+            self.env.pop(key, None)
+        if os.name == 'nt':
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1', 0))
+                self.env['SCCACHE_SERVER_PORT'] = str(probe.getsockname()[1])
         else:
-            raise RuntimeError('Owned compiler server did not start within 10 seconds')
-        child = subprocess.Popen(command, cwd=ROOT, env=env, start_new_session=os.name != 'nt', **inherited)
-        while exit_status(child) is None:
-            if exit_status(server) is not None:
+            self.endpoint = cache_root() / f'run-{os.getpid()}.sock'
+            if len(os.fsencode(self.endpoint)) >= MAXIMUM_SOCKET_PATH_BYTES:
+                raise ValueError('Cache root is too long for a private compiler-server socket')
+            if self.endpoint.exists():
+                raise ValueError('Compiler-server endpoint already exists; refusing to reuse it')
+            self.env['SCCACHE_SERVER_UDS'] = str(self.endpoint)
+
+    def launch_server(self, inherited):
+        # Idle test/soak phases can make no compiler requests. The finite idle
+        # exit still releases an orphan's admission after supervisor SIGKILL.
+        server_env = dict(self.env, SCCACHE_START_SERVER='1', SCCACHE_NO_DAEMON='1',
+                          SCCACHE_IDLE_TIMEOUT=str(self.timeout + SERVER_IDLE_GRACE_SECONDS))
+        # sccache closes inherited descriptors; this waiting wrapper retains
+        # the admission FD and lets the child keep default SIGTERM handling.
+        command = [sys.executable, '-c',
+                   'import signal,subprocess,sys; '
+                   'signal.signal(signal.SIGTERM, lambda *_: None); '
+                   'sys.exit(subprocess.call(["sccache"]))']
+        self.server = subprocess.Popen(command, env=server_env, stdout=sys.stderr,
+                                       start_new_session=os.name != 'nt', **inherited)
+        self.wait_for_server()
+
+    def server_ready(self):
+        if exit_status(self.server) is not None:
+            raise RuntimeError('Owned compiler server exited during startup')
+        if os.name != 'nt':
+            return self.endpoint.exists()
+        try:
+            with socket.create_connection(('127.0.0.1', int(self.env['SCCACHE_SERVER_PORT'])), timeout=SERVER_POLL_SECONDS):
+                return True
+        except OSError:
+            return False
+
+    def wait_for_server(self):
+        for _ in range(SERVER_START_ATTEMPTS):
+            if self.server_ready():
+                return
+            time.sleep(SERVER_POLL_SECONDS)
+        raise RuntimeError('Owned compiler server did not start within 10 seconds')
+
+    def supervise(self, inherited):
+        self.launch_server(inherited)
+        self.child = subprocess.Popen(self.command, cwd=ROOT, env=self.env, start_new_session=os.name != 'nt', **inherited)
+        while exit_status(self.child) is None:
+            if exit_status(self.server) is not None:
                 raise RuntimeError('Owned compiler server exited during the build')
-            if time.monotonic() - started > timeout:
+            if time.monotonic() - self.started > self.timeout:
                 raise TimeoutError('Build deadline exceeded')
             if os.name != 'nt':
-                peak = max(peak, rss_kib([child.pid, server.pid]))
-                if peak > 8 * 1024 * 1024:
+                self.peak = max(self.peak, rss_kib([self.child.pid, self.server.pid]))
+                if self.peak > MAXIMUM_BUILD_RSS_KIB:
                     raise RuntimeError('Build and compiler-server descendants exceeded the 8 GiB RSS budget')
-            time.sleep(0.5)
-        subprocess.run(['sccache', '--show-stats'], env=env, check=True, timeout=10)
-        return exit_status(child)
-    finally:
+            time.sleep(BUILD_POLL_SECONDS)
+        # Cargo owns stdout, including JSON diagnostics and llvm-cov shell exports.
+        subprocess.run(['sccache', '--show-stats'], env=self.env, stdout=sys.stderr,
+                       check=True, timeout=STATS_TIMEOUT_SECONDS)
+        return exit_status(self.child)
+
+    def cleanup(self):
         try:
-            if child is not None:
-                terminate(child)
+            if self.child is not None:
+                terminate(self.child)
         finally:
-            if server is not None:
-                terminate(server)
-            if endpoint is not None:
-                endpoint.unlink(missing_ok=True)
-            signal.signal(signal.SIGTERM, previous)
-        print(f'[rust-dev] elapsed {time.monotonic() - started:.2f}s; peak {peak / 1024:.1f} MiB', flush=True)
+            if self.server is not None:
+                terminate(self.server)
+            if self.endpoint is not None:
+                self.endpoint.unlink(missing_ok=True)
+
+    def run(self, lock=None):
+        if self.started is not None:
+            raise RuntimeError('A build owner cannot be reused')
+        self.started = time.monotonic()
+        self.configure_endpoint()
+
+        def interrupted(_signal, _frame):
+            raise KeyboardInterrupt
+
+        previous = signal.signal(signal.SIGTERM, interrupted)
+        try:
+            inherited = {'pass_fds': (lock.fileno(),)} if lock is not None and os.name != 'nt' else {}
+            return self.supervise(inherited)
+        finally:
+            try:
+                self.cleanup()
+            finally:
+                # Failed cleanup must not strand the caller's signal handler.
+                signal.signal(signal.SIGTERM, previous)
+                print(f'[rust-dev] elapsed {time.monotonic() - self.started:.2f}s; peak {self.peak / KIB_PER_MIB:.1f} MiB', file=sys.stderr, flush=True)
 
 
 def validate_arguments(arguments, policy):
@@ -195,7 +238,7 @@ def main():
         if pressure != '1':
             raise RuntimeError('Build admission refused: macOS memory pressure is not normal')
     with admission() as lock:
-        return run(['cargo', *command], env, args.timeout, lock)
+        return BuildRun(['cargo', *command], env, args.timeout).run(lock)
 
 
 if __name__ == '__main__':

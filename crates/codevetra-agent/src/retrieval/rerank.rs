@@ -9,8 +9,8 @@ use super::{
     RetrievalStageError, SEMANTIC_QUERY_TIMEOUT, SemanticReadiness, SemanticStorageError,
     fuse_search, rerank_report_without_candidates,
 };
-use codevetra_db::RerankDocumentsRequest;
-use codevetra_domain::{GenerationId, ProjectId};
+use codevetra_db::{CurrentGenerationLookup, RerankDocumentsRequest};
+use codevetra_domain::{DocumentId, GenerationId, ProjectId};
 
 pub(super) struct MergedRerankRequest<'request> {
     pub(super) runtime: &'request ProjectRuntime,
@@ -28,44 +28,29 @@ pub(super) struct MergedRerankRequest<'request> {
 pub(super) async fn rerank_merged_candidates(
     input: MergedRerankRequest<'_>,
 ) -> Result<RetrievalChannels, RetrievalStageError> {
+    let RerankClientState::Ready(client) = input.client else {
+        return Ok(input
+            .channels
+            .with_rerank_report(rerank_report_without_candidates(input.client)?));
+    };
+    let ids = input.shortlist_ids()?;
     let MergedRerankRequest {
         runtime,
         project_id,
         generation,
         query,
-        options,
-        readiness,
-        preference,
         channels,
-        client,
         cancellation,
+        ..
     } = input;
-    let RerankClientState::Ready(client) = client else {
-        return Ok(channels.with_rerank_report(rerank_report_without_candidates(client)?));
-    };
-    // Joining channels must not double the operator's existing model work budget.
-    let shortlist_limit = options.candidate_limit;
-    let shortlist = fuse_search(
-        HybridSearchInput::new(options.mode, readiness, shortlist_limit)
-            .map_err(|_| RetrievalStageError::Failed)?
-            .with_preference(preference)
-            .with_channels(channels.clone()),
-    )
-    .map_err(|_| RetrievalStageError::Failed)?;
-    if shortlist.items().is_empty() {
+    if ids.is_empty() {
         return Ok(channels.with_rerank_report(
             RerankReport::skipped_no_candidates(client.model())
                 .map_err(|_| RetrievalStageError::Failed)?,
         ));
     }
-    let ids = shortlist
-        .items()
-        .iter()
-        .map(|item| item.document().document_id().clone())
-        .collect::<Vec<_>>();
     let request = RerankDocumentsRequest::new(
-        project_id.clone(),
-        generation.clone(),
+        CurrentGenerationLookup::new(project_id, generation),
         ids.clone(),
         SEMANTIC_QUERY_TIMEOUT,
     )
@@ -121,6 +106,28 @@ pub(super) async fn rerank_merged_candidates(
     match channels.clone().with_fused_rerank(batch.model(), scores) {
         Ok(reranked) => Ok(reranked),
         Err(_) => unavailable(channels, client.model()),
+    }
+}
+
+impl MergedRerankRequest<'_> {
+    fn shortlist_ids(&self) -> Result<Vec<DocumentId>, RetrievalStageError> {
+        // Fusion shares the operator's model budget; channel joining cannot double it.
+        let shortlist = fuse_search(
+            HybridSearchInput::new(
+                self.options.mode,
+                self.readiness,
+                self.options.candidate_limit,
+            )
+            .map_err(|_| RetrievalStageError::Failed)?
+            .with_preference(self.preference)
+            .with_channels(self.channels.clone()),
+        )
+        .map_err(|_| RetrievalStageError::Failed)?;
+        Ok(shortlist
+            .items()
+            .iter()
+            .map(|item| item.document().document_id().clone())
+            .collect())
     }
 }
 

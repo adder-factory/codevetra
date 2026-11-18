@@ -16,7 +16,8 @@ fn adjacency_continues_after_a_deleted_block_prefix() -> TestResult {
     )?;
     let old = store.current_snapshot(None)?;
     let first = old
-        .scan_prefix(Collection::Graph, b"cg1/o/", None, 1, &mut budget()?)?
+        .scan_prefix(Collection::Graph, b"cg1/o/")
+        .page(None, 1, &mut budget()?)?
         .rows
         .remove(0)
         .0;
@@ -38,9 +39,7 @@ fn adjacency_continues_after_a_deleted_block_prefix() -> TestResult {
     let mut after = None;
     let mut actual = std::collections::BTreeSet::new();
     loop {
-        let page = graph.neighbors(
-            &symbol(1),
-            GraphDirection::Outgoing,
+        let page = graph.adjacency(&symbol(1), GraphDirection::Outgoing).page(
             after.as_ref(),
             33,
             &mut budget()?,
@@ -89,20 +88,18 @@ fn topology_traversal_does_not_load_properties_and_hydration_rejects_corruption(
         )?;
         let old = store.current_snapshot(None)?;
         let key = old
-            .scan_prefix(Collection::Graph, b"cg1/e/", None, 1, &mut budget()?)?
+            .scan_prefix(Collection::Graph, b"cg1/e/")
+            .page(None, 1, &mut budget()?)?
             .rows
             .remove(0)
             .0;
         replace_raw(&store, key, invalid.to_vec())?;
         let snapshot = store.current_snapshot(None)?;
         let graph = snapshot.graph(&mut budget()?)?;
-        let page = graph.neighbors(
-            &symbol(1),
-            GraphDirection::Outgoing,
-            None,
-            1,
-            &mut budget()?,
-        )?;
+        let page =
+            graph
+                .adjacency(&symbol(1), GraphDirection::Outgoing)
+                .page(None, 1, &mut budget()?)?;
         assert_eq!(page.links.len(), 1);
         assert_eq!(page.links[0].target_symbol_id(), &symbol(2));
         assert!(matches!(
@@ -111,13 +108,8 @@ fn topology_traversal_does_not_load_properties_and_hydration_rejects_corruption(
         ));
         let previous = old.graph(&mut budget()?)?;
         let link = previous
-            .neighbors(
-                &symbol(1),
-                GraphDirection::Outgoing,
-                None,
-                1,
-                &mut budget()?,
-            )?
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(None, 1, &mut budget()?)?
             .links
             .remove(0);
         assert_eq!(previous.edge(&link, &mut budget()?)?.provenance, "native");
@@ -136,7 +128,8 @@ fn malformed_packed_blocks_fail_without_returning_partial_topology() -> TestResu
         )?;
         let snapshot = store.current_snapshot(None)?;
         let (key, mut bytes) = snapshot
-            .scan_prefix(Collection::Graph, b"cg1/o/", None, 1, &mut budget()?)?
+            .scan_prefix(Collection::Graph, b"cg1/o/")
+            .page(None, 1, &mut budget()?)?
             .rows
             .remove(0);
         match defect {
@@ -154,25 +147,16 @@ fn malformed_packed_blocks_fail_without_returning_partial_topology() -> TestResu
         let current = store.current_snapshot(None)?;
         let graph = current.graph(&mut budget()?)?;
         assert!(matches!(
-            graph.neighbors(
-                &symbol(1),
-                GraphDirection::Outgoing,
-                None,
-                20,
-                &mut budget()?
-            ),
+            graph
+                .adjacency(&symbol(1), GraphDirection::Outgoing)
+                .page(None, 20, &mut budget()?),
             Err(RocksError::Corrupt { .. })
         ));
         assert_eq!(
             snapshot
                 .graph(&mut budget()?)?
-                .neighbors(
-                    &symbol(1),
-                    GraphDirection::Outgoing,
-                    None,
-                    20,
-                    &mut budget()?
-                )?
+                .adjacency(&symbol(1), GraphDirection::Outgoing)
+                .page(None, 20, &mut budget()?)?
                 .links
                 .len(),
             1

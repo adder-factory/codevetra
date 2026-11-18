@@ -74,13 +74,28 @@ fn candidate_visible<Cancel>(
 where
     Cancel: FnMut() -> bool,
 {
-    if declaration_visible(index, (request, scope, candidate.visibility), cancelled)? {
+    if candidate.declaration_syntax == super::DeclarationSyntax::RustCrateVisible {
+        crate_candidate_visible(index, (request, scope), cancelled)
+    } else {
+        declaration_visible(index, (request, scope, candidate.visibility), cancelled)
+    }
+}
+
+fn crate_candidate_visible<Cancel>(
+    index: &ResolutionIndex,
+    (request, scope): (&ResolutionRequest<'_>, ModuleScope<'_>),
+    cancelled: &mut Cancel,
+) -> Result<bool, StageItemFailure>
+where
+    Cancel: FnMut() -> bool,
+{
+    if declaration_visible(index, (request, scope, None), cancelled)?
+        || crate_visible(index, (request, scope))
+    {
         return Ok(true);
     }
-    Ok(
-        candidate.declaration_syntax == super::DeclarationSyntax::RustCrateVisible
-            && crate_visible(index, (request, scope)),
-    )
+    Ok(rust_root_ownership::root(index, request.file_id).is_some()
+        && super::rust_file_modules::declared_parent(index, (request, scope), cancelled)?)
 }
 
 pub(super) fn crate_visible(
@@ -102,6 +117,16 @@ where
     let (request, scope, visibility) = query;
     if visibility == Some(Visibility::Public)
         || rust_inline_modules::contains_owner(index, (request, scope))
+    {
+        return Ok(true);
+    }
+    if visibility == Some(Visibility::Internal)
+        && index
+            .languages
+            .rust_paths
+            .explicit_files
+            .contains(scope.file)
+        && super::rust_file_modules::declared_parent(index, (request, scope), cancelled)?
     {
         return Ok(true);
     }

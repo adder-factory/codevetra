@@ -174,6 +174,24 @@ pub struct NativeParseCacheRetentionPolicy {
     deletion_batch: u32,
 }
 
+/// A retention policy tied to the extractor contract whose live source must survive.
+#[derive(Clone, Copy)]
+pub struct NativeParseCacheRetention<'a> {
+    protected: &'a ContentDigest,
+    policy: NativeParseCacheRetentionPolicy,
+}
+
+impl NativeParseCacheRetentionPolicy {
+    /// Protect current source for this extractor while applying these retention bounds.
+    #[must_use]
+    pub const fn protecting(self, protected: &ContentDigest) -> NativeParseCacheRetention<'_> {
+        NativeParseCacheRetention {
+            protected,
+            policy: self,
+        }
+    }
+}
+
 /// Cross-contract logical capacity retained for one project's native parse cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeParseCacheRetentionCapacity {

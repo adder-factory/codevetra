@@ -9,6 +9,11 @@ use super::{
     RocksError, family_names, merge_counter, operation,
 };
 
+#[cfg(unix)]
+const DIRECTORY_PERMISSION_MASK: u32 = 0o7777;
+#[cfg(unix)]
+const OWNER_DIRECTORY_PERMISSIONS: u32 = 0o700;
+
 const MARKER: &str = "CARTOGRAPH_OWNER";
 const HEADER: &[u8] = b"Cartograph RocksDB owner\ncartograph-rocks-v1\n";
 
@@ -32,15 +37,17 @@ fn secure_owned_directory(directory: &File, uid: u32) -> Result<()> {
     if !metadata.is_dir() || metadata.uid() != uid {
         return Err(RocksError::Directory);
     }
-    if metadata.mode() & 0o7777 != 0o700 {
+    if metadata.mode() & DIRECTORY_PERMISSION_MASK != OWNER_DIRECTORY_PERMISSIONS {
         // Change only the verified owned descriptor, never a path that could
         // have been replaced by a symlink between inspection and chmod.
         directory
-            .set_permissions(fs::Permissions::from_mode(0o700))
+            .set_permissions(fs::Permissions::from_mode(OWNER_DIRECTORY_PERMISSIONS))
             .map_err(|_| RocksError::Directory)?;
     }
     let protected = directory.metadata().map_err(|_| RocksError::Directory)?;
-    if protected.uid() != uid || protected.mode() & 0o7777 != 0o700 {
+    if protected.uid() != uid
+        || protected.mode() & DIRECTORY_PERMISSION_MASK != OWNER_DIRECTORY_PERMISSIONS
+    {
         return Err(RocksError::Directory);
     }
     Ok(())

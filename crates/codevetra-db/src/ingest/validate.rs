@@ -255,192 +255,212 @@ where
     )
 }
 
-/// Replace complete file-local tables while preserving the validated topology.
-///
-/// The caller proves that resolution inputs are unchanged. This boundary still
-/// validates every replacement, requires the same file and symbol identities,
-/// checks cross-table relations, and recomputes the ordinary logical digest.
-/// A failed operation consumes the candidate; it can never become a cache base.
-pub(crate) fn replace_file_facts<Cancel>(
-    mut base: CanonicalGenerationFacts,
-    replacements: GenerationFacts,
-    limits: GenerationValidationLimits,
-    cancelled: Cancel,
-) -> Result<CanonicalGenerationFacts, GenerationValidationError>
-where
-    Cancel: FnMut() -> bool,
-{
-    let mut control = ValidationControl::new(limits, cancelled);
-    control.admit(&replacements)?;
-    let retained =
-        base.admission_measurement(limits.maximum_output_bytes(), || (control.cancelled)())?;
-    control.charge(
-        retained
-            .retained_bytes()
-            .checked_add(retained.transient_bytes())
-            .ok_or(GenerationValidationError::RetainedLimit)?,
-    )?;
-    if !replacements.edges.is_empty() || base.digest_version != GenerationDigestVersion::CURRENT {
-        return Err(invalid("incremental_topology").into());
-    }
-    let tables = ValidatedFactTables {
-        files: reduce_files(replacements.files, &mut control)?,
-        symbols: reduce_symbols(replacements.symbols, &mut control)?,
-        edges: Vec::new(),
-        references: reduce_references(replacements.references, &mut control)?,
-        numerical_sites: reduce_numerical_sites(replacements.numerical_sites, &mut control)?,
-        documents: reduce_documents(replacements.documents, &mut control)?,
-    };
-    let affected = validate_file_replacements(&base, &tables, &mut control)?;
-    validate_replacement_relations(&base.tables, &tables, &mut control)?;
-    base.retained_measurement = None;
-    replace_tables(&mut base.tables, tables, &affected, &mut control)?;
-    base.digest = logical_digest(&base.tables, base.digest_version, || (control.cancelled)())
-        .map_err(|()| GenerationValidationError::Cancelled)?;
-    control.finish(&mut base)?;
-    Ok(base)
-}
-
-fn validate_file_replacements<Cancel: FnMut() -> bool>(
-    base: &CanonicalGenerationFacts,
-    next: &ValidatedFactTables,
-    control: &mut ValidationControl<Cancel>,
-) -> Result<std::collections::BTreeSet<FileId>, GenerationValidationError> {
-    let affected = next
-        .files
-        .iter()
-        .map(|row| row.file_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    control.charge(usize_to_u64(affected.len()).saturating_mul(256))?;
-    if affected.is_empty()
-        || affected.len() > 16
-        || next
-            .symbols
-            .iter()
-            .any(|row| !affected.contains(&row.file_id))
-        || next
-            .references
-            .iter()
-            .any(|row| !affected.contains(&row.file_id))
-        || next
-            .numerical_sites
-            .iter()
-            .any(|row| !affected.contains(&row.file_id))
-        || next
-            .documents
-            .iter()
-            .any(|row| row.file_id.as_ref().is_none_or(|id| !affected.contains(id)))
+impl CanonicalGenerationFacts {
+    /// Replace complete file-local tables while preserving the validated topology.
+    ///
+    /// The caller proves that resolution inputs are unchanged. This boundary still
+    /// validates every replacement, requires the same file and symbol identities,
+    /// checks cross-table relations, and recomputes the ordinary logical digest.
+    /// A failed operation consumes the candidate; it can never become a cache base.
+    pub(crate) fn replace_files<Cancel>(
+        mut self,
+        replacements: GenerationFacts,
+        limits: GenerationValidationLimits,
+        cancelled: Cancel,
+    ) -> Result<CanonicalGenerationFacts, GenerationValidationError>
+    where
+        Cancel: FnMut() -> bool,
     {
-        return Err(invalid("incremental_file_set").into());
-    }
-    for file in &next.files {
-        control.poll()?;
-        let previous = base
-            .files()
-            .binary_search_by(|row| row.file_id.cmp(&file.file_id))
-            .ok()
-            .and_then(|index| base.files().get(index))
-            .ok_or_else(|| invalid("incremental_file_set"))?;
-        if file.normalized_path != previous.normalized_path || file.language != previous.language {
-            return Err(invalid("incremental_file_identity").into());
+        let mut control = ValidationControl::new(limits, cancelled);
+        control.admit(&replacements)?;
+        let retained =
+            self.admission_measurement(limits.maximum_output_bytes(), || (control.cancelled)())?;
+        control.charge(
+            retained
+                .retained_bytes()
+                .checked_add(retained.transient_bytes())
+                .ok_or(GenerationValidationError::RetainedLimit)?,
+        )?;
+        if !replacements.edges.is_empty() || self.digest_version != GenerationDigestVersion::CURRENT
+        {
+            return Err(invalid("incremental_topology").into());
         }
+        let tables = ValidatedFactTables {
+            files: reduce_files(replacements.files, &mut control)?,
+            symbols: reduce_symbols(replacements.symbols, &mut control)?,
+            edges: Vec::new(),
+            references: reduce_references(replacements.references, &mut control)?,
+            numerical_sites: reduce_numerical_sites(replacements.numerical_sites, &mut control)?,
+            documents: reduce_documents(replacements.documents, &mut control)?,
+        };
+        let replacements = FileReplacement::validate(&self, tables, &mut control)?;
+        self.retained_measurement = None;
+        replacements.apply(&mut self.tables, &mut control)?;
+        self.digest = logical_digest(&self.tables, self.digest_version, || (control.cancelled)())
+            .map_err(|()| GenerationValidationError::Cancelled)?;
+        control.finish(&mut self)?;
+        Ok(self)
     }
-    validate_replacement_identities(base, next, &affected, control)?;
-    Ok(affected)
 }
 
-fn validate_replacement_identities<Cancel: FnMut() -> bool>(
-    base: &CanonicalGenerationFacts,
-    next: &ValidatedFactTables,
-    affected: &std::collections::BTreeSet<FileId>,
-    control: &mut ValidationControl<Cancel>,
-) -> Result<(), GenerationValidationError> {
-    // Identity preservation protects edges and references in other files.
-    // Compare borrowed rows in canonical order without allocating global maps.
-    let mut old_symbols = base
-        .symbols()
-        .iter()
-        .filter(|row| affected.contains(&row.file_id));
-    for row in &next.symbols {
-        control.poll()?;
-        if old_symbols.next().is_none_or(|old| {
-            old.symbol_id != row.symbol_id
-                || old.file_id != row.file_id
-                || old.qualified_name != row.qualified_name
-        }) {
+/// Replacement tables and their checked file set move together into application.
+struct FileReplacement {
+    tables: ValidatedFactTables,
+    affected: std::collections::BTreeSet<FileId>,
+}
+
+impl FileReplacement {
+    fn validate<Cancel: FnMut() -> bool>(
+        base: &CanonicalGenerationFacts,
+        next: ValidatedFactTables,
+        control: &mut ValidationControl<Cancel>,
+    ) -> Result<Self, GenerationValidationError> {
+        let affected = next
+            .files
+            .iter()
+            .map(|row| row.file_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        control.charge(usize_to_u64(affected.len()).saturating_mul(256))?;
+        if !(1..=16).contains(&affected.len())
+            || next
+                .symbols
+                .iter()
+                .any(|row| !affected.contains(&row.file_id))
+            || next
+                .references
+                .iter()
+                .any(|row| !affected.contains(&row.file_id))
+            || next
+                .numerical_sites
+                .iter()
+                .any(|row| !affected.contains(&row.file_id))
+            || next
+                .documents
+                .iter()
+                .any(|row| row.file_id.as_ref().is_none_or(|id| !affected.contains(id)))
+        {
+            return Err(invalid("incremental_file_set").into());
+        }
+        for file in &next.files {
+            control.poll()?;
+            let previous = base
+                .files()
+                .binary_search_by(|row| row.file_id.cmp(&file.file_id))
+                .ok()
+                .and_then(|index| base.files().get(index))
+                .ok_or_else(|| invalid("incremental_file_set"))?;
+            if file.normalized_path != previous.normalized_path
+                || file.language != previous.language
+            {
+                return Err(invalid("incremental_file_identity").into());
+            }
+        }
+        let replacement = Self {
+            tables: next,
+            affected,
+        };
+        replacement.validate_identities(base, control)?;
+        validate_replacement_relations(&base.tables, &replacement.tables, control)?;
+        Ok(replacement)
+    }
+
+    fn validate_identities<Cancel: FnMut() -> bool>(
+        &self,
+        base: &CanonicalGenerationFacts,
+        control: &mut ValidationControl<Cancel>,
+    ) -> Result<(), GenerationValidationError> {
+        let next = &self.tables;
+        let affected = &self.affected;
+        // Identity preservation protects edges and references in other files.
+        // Compare borrowed rows in canonical order without allocating global maps.
+        let mut old_symbols = base
+            .symbols()
+            .iter()
+            .filter(|row| affected.contains(&row.file_id));
+        for row in &next.symbols {
+            control.poll()?;
+            if old_symbols.next().is_none_or(|old| {
+                old.symbol_id != row.symbol_id
+                    || old.file_id != row.file_id
+                    || old.qualified_name != row.qualified_name
+            }) {
+                return Err(invalid("incremental_symbol_set").into());
+            }
+        }
+        if old_symbols.next().is_some() {
             return Err(invalid("incremental_symbol_set").into());
         }
-    }
-    if old_symbols.next().is_some() {
-        return Err(invalid("incremental_symbol_set").into());
-    }
-    let mut old_documents = base
-        .documents()
-        .iter()
-        .filter(|row| row.file_id.as_ref().is_some_and(|id| affected.contains(id)));
-    for row in &next.documents {
-        control.poll()?;
-        if old_documents.next().is_none_or(|old| {
-            old.document_id != row.document_id
-                || old.file_id != row.file_id
-                || old.symbol_id != row.symbol_id
-        }) {
+        let mut old_documents = base
+            .documents()
+            .iter()
+            .filter(|row| row.file_id.as_ref().is_some_and(|id| affected.contains(id)));
+        for row in &next.documents {
+            control.poll()?;
+            if old_documents.next().is_none_or(|old| {
+                old.document_id != row.document_id
+                    || old.file_id != row.file_id
+                    || old.symbol_id != row.symbol_id
+            }) {
+                return Err(invalid("incremental_document_set").into());
+            }
+        }
+        if old_documents.next().is_some() {
             return Err(invalid("incremental_document_set").into());
         }
-    }
-    if old_documents.next().is_some() {
-        return Err(invalid("incremental_document_set").into());
-    }
-    for site in &next.numerical_sites {
-        control.poll()?;
-        if let Ok(index) = base
-            .numerical_sites()
-            .binary_search_by(|row| row.site_id.cmp(&site.site_id))
-            && base
+        for site in &next.numerical_sites {
+            control.poll()?;
+            if let Ok(index) = base
                 .numerical_sites()
-                .get(index)
-                .is_some_and(|row| !affected.contains(&row.file_id))
-        {
-            return Err(invalid("duplicate_numerical_site_id").into());
+                .binary_search_by(|row| row.site_id.cmp(&site.site_id))
+                && base
+                    .numerical_sites()
+                    .get(index)
+                    .is_some_and(|row| !affected.contains(&row.file_id))
+            {
+                return Err(invalid("duplicate_numerical_site_id").into());
+            }
         }
+        Ok(())
     }
-    Ok(())
-}
 
-fn replace_tables<Cancel: FnMut() -> bool>(
-    base: &mut ValidatedFactTables,
-    next: ValidatedFactTables,
-    affected: &std::collections::BTreeSet<FileId>,
-    control: &mut ValidationControl<Cancel>,
-) -> Result<(), GenerationValidationError> {
-    control.poll()?;
-    base.files.retain(|row| !affected.contains(&row.file_id));
-    base.files.extend(next.files);
-    base.files
-        .sort_unstable_by(|a, b| a.file_id.cmp(&b.file_id));
-    control.poll()?;
-    base.symbols.retain(|row| !affected.contains(&row.file_id));
-    base.symbols.extend(next.symbols);
-    base.symbols
-        .sort_unstable_by(|a, b| a.symbol_id.cmp(&b.symbol_id));
-    control.poll()?;
-    base.references
-        .retain(|row| !affected.contains(&row.file_id));
-    base.references.extend(next.references);
-    base.references.sort_unstable_by(reference_order);
-    control.poll()?;
-    base.numerical_sites
-        .retain(|row| !affected.contains(&row.file_id));
-    base.numerical_sites.extend(next.numerical_sites);
-    base.numerical_sites
-        .sort_unstable_by(|a, b| a.site_id.cmp(&b.site_id));
-    control.poll()?;
-    base.documents
-        .retain(|row| row.file_id.as_ref().is_none_or(|id| !affected.contains(id)));
-    base.documents.extend(next.documents);
-    base.documents
-        .sort_unstable_by(|a, b| a.document_id.cmp(&b.document_id));
-    Ok(())
+    fn apply<Cancel: FnMut() -> bool>(
+        self,
+        base: &mut ValidatedFactTables,
+        control: &mut ValidationControl<Cancel>,
+    ) -> Result<(), GenerationValidationError> {
+        let Self {
+            tables: next,
+            affected,
+        } = self;
+        control.poll()?;
+        base.files.retain(|row| !affected.contains(&row.file_id));
+        base.files.extend(next.files);
+        base.files
+            .sort_unstable_by(|a, b| a.file_id.cmp(&b.file_id));
+        control.poll()?;
+        base.symbols.retain(|row| !affected.contains(&row.file_id));
+        base.symbols.extend(next.symbols);
+        base.symbols
+            .sort_unstable_by(|a, b| a.symbol_id.cmp(&b.symbol_id));
+        control.poll()?;
+        base.references
+            .retain(|row| !affected.contains(&row.file_id));
+        base.references.extend(next.references);
+        base.references.sort_unstable_by(reference_order);
+        control.poll()?;
+        base.numerical_sites
+            .retain(|row| !affected.contains(&row.file_id));
+        base.numerical_sites.extend(next.numerical_sites);
+        base.numerical_sites
+            .sort_unstable_by(|a, b| a.site_id.cmp(&b.site_id));
+        control.poll()?;
+        base.documents
+            .retain(|row| row.file_id.as_ref().is_none_or(|id| !affected.contains(id)));
+        base.documents.extend(next.documents);
+        base.documents
+            .sort_unstable_by(|a, b| a.document_id.cmp(&b.document_id));
+        Ok(())
+    }
 }
 
 fn reference_order(a: &ReferenceInput, b: &ReferenceInput) -> std::cmp::Ordering {

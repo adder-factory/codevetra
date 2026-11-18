@@ -12,7 +12,7 @@ const ARGUMENT_BYTES: usize = 4096;
 
 #[derive(Default)]
 pub(super) struct Calls {
-    by_file: HashMap<FileId, HashMap<u64, u16>>,
+    by_file: HashMap<FileId, HashMap<u64, u32>>,
 }
 
 pub(super) fn index_syntax<Cancel>(
@@ -40,13 +40,13 @@ where
         };
         context
             .budget
-            .charge(RESOLUTION_MAP_NODE_ALLOWANCE + usize_to_u64(size_of::<(u64, u16)>()))?;
+            .charge(RESOLUTION_MAP_NODE_ALLOWANCE + usize_to_u64(size_of::<(u64, u32)>()))?;
         counts.try_reserve(1).map_err(|_| StageItemFailure)?;
         counts.insert(reference.span.start_byte(), count);
     }
     context.budget.charge(
         RESOLUTION_MAP_NODE_ALLOWANCE
-            .saturating_add(usize_to_u64(size_of::<(FileId, HashMap<u64, u16>)>()))
+            .saturating_add(usize_to_u64(size_of::<(FileId, HashMap<u64, u32>)>()))
             .saturating_add(usize_to_u64(file.file.file_id.as_str().len())),
     )?;
     index
@@ -63,7 +63,7 @@ where
     Ok(())
 }
 
-fn argument_count(source: &str, reference: &ExtractedReference) -> Option<u16> {
+fn argument_count(source: &str, reference: &ExtractedReference) -> Option<u32> {
     let start = usize::try_from(reference.span.start_byte()).ok()?;
     let end = usize::try_from(reference.span.end_byte()).ok()?;
     if source.get(start..end) != Some(reference.name.as_str()) {
@@ -82,7 +82,7 @@ fn argument_count(source: &str, reference: &ExtractedReference) -> Option<u16> {
     if arguments.trim().is_empty() {
         return Some(0);
     }
-    let mut count = 0_u16;
+    let mut count = 0_u32;
     for argument in arguments.split(',') {
         if argument.trim().is_empty() {
             return None;

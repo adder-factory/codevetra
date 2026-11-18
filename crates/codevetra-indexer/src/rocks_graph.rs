@@ -1,6 +1,4 @@
-use codevetra_db::rocks::{
-    GraphPolicy, GraphPublicationInput, GraphRevision, RocksError, StorageRequest,
-};
+use codevetra_db::rocks::{GraphPreparation, GraphPublicationInput, RocksError};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::{sync::watch, time::Instant};
@@ -11,6 +9,11 @@ use crate::{
 };
 
 mod prepare;
+
+const NATIVE_TASK_CAPACITY: usize = 64;
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const REAP_DEADLINE: Duration = Duration::from_secs(10);
+const REAP_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// One-shot native build and publication progress, shared with its request host.
 #[derive(Clone)]
@@ -103,18 +106,16 @@ pub enum NativeRocksGraphError {
 /// The caller retains its pipeline reservation until `publish_graph` consumes
 /// the input and must revalidate live source according to its runtime policy.
 /// Native work retains the supplied runner's cancellation and stage deadlines;
-/// `request` controls the publication handoff and storage admission.
+/// The preparation's request controls the publication handoff and storage admission.
 ///
 /// # Errors
 /// Returns native pipeline, memory-policy, cancellation, or deadline failures.
 pub async fn build_native_rocks_graph(
     runner: &StageRunner,
     build: NativeGenerationBuild,
-    identity: GraphRevision,
-    policy: GraphPolicy,
-    request: &StorageRequest,
+    preparation: GraphPreparation,
 ) -> Result<(GraphPublicationInput, NativePipelineReport), NativeRocksGraphError> {
-    request.check()?;
+    preparation.check()?;
     let preparation_bytes =
         build
             .maximum_stage_reservation_bytes()
@@ -123,19 +124,17 @@ pub async fn build_native_rocks_graph(
             })?;
     let preparation_deadlines = build.publication_deadlines();
     let generation = build_native_generation_with_scip_and_cache(runner, build).await?;
-    request.check()?;
+    preparation.check()?;
     let (facts, report) = generation.into_parts();
-    let input = prepare::run(
-        runner,
+    let input = prepare::Preparation {
         facts,
-        identity,
-        prepare::Policy {
-            graph: policy,
+        graph: preparation,
+        policy: prepare::Policy {
             maximum_bytes: preparation_bytes,
             deadlines: preparation_deadlines,
         },
-        request,
-    )
+    }
+    .run(runner)
     .await?;
     Ok((input, report))
 }
@@ -149,13 +148,11 @@ pub async fn build_native_rocks_graph(
 /// Returns build, request, or worker-cleanup errors, preserving build failure.
 pub async fn build_native_rocks_graph_owned(
     build: NativeGenerationBuild,
-    identity: GraphRevision,
-    policy: GraphPolicy,
-    request: &StorageRequest,
+    preparation: GraphPreparation,
 ) -> Result<(GraphPublicationInput, NativePipelineReport), NativeRocksGraphError> {
+    let request = preparation.request().clone();
     let progress = NativeBuildProgress::default();
-    let result =
-        build_native_rocks_graph_observed(build, identity, policy, request, &progress).await;
+    let result = build_native_rocks_graph_observed(build, preparation, &progress).await;
     progress
         .finish(result.is_ok(), request.check().is_err())
         .await;
@@ -167,11 +164,10 @@ pub async fn build_native_rocks_graph_owned(
 /// Returns bounded native, storage-admission, cancellation or worker-reaping failures.
 pub async fn build_native_rocks_graph_observed(
     build: NativeGenerationBuild,
-    identity: GraphRevision,
-    policy: GraphPolicy,
-    request: &StorageRequest,
+    preparation: GraphPreparation,
     observer: &NativeBuildProgress,
 ) -> Result<(GraphPublicationInput, NativePipelineReport), NativeRocksGraphError> {
+    let request = preparation.request().clone();
     request.check()?;
     let maximum_bytes = build
         .maximum_stage_reservation_bytes()
@@ -186,7 +182,7 @@ pub async fn build_native_rocks_graph_observed(
         .into());
     }
     progress.mark_active().await;
-    let tasks = TaskScope::new(64, maximum_bytes);
+    let tasks = TaskScope::new(NATIVE_TASK_CAPACITY, maximum_bytes);
     let (cancellation, receiver) = watch::channel(false);
     let owner = NativeGraphTasks {
         tasks,
@@ -194,9 +190,9 @@ pub async fn build_native_rocks_graph_observed(
     };
     let runner = StageRunner::new(progress, receiver, owner.tasks.clone());
     let result = {
-        let work = build_native_rocks_graph(&runner, build, identity, policy, request);
+        let work = build_native_rocks_graph(&runner, build, preparation);
         tokio::pin!(work);
-        let mut probe = tokio::time::interval(Duration::from_millis(20));
+        let mut probe = tokio::time::interval(CANCELLATION_POLL_INTERVAL);
         loop {
             tokio::select! {
                 result = &mut work => break result,
@@ -214,12 +210,12 @@ pub async fn build_native_rocks_graph_observed(
     let reaped = loop {
         let reaped = owner
             .tasks
-            .close_abort_and_reap_retained(Instant::now() + Duration::from_secs(10))
+            .close_abort_and_reap_retained(Instant::now() + REAP_DEADLINE)
             .await;
         if reaped.all_joined {
             break reaped;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(REAP_RETRY_INTERVAL).await;
     };
     if result.is_ok()
         && (!reaped.all_joined

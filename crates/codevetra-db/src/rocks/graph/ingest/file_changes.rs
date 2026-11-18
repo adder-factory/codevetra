@@ -23,31 +23,6 @@ pub(in crate::rocks::graph) struct FileChanges {
 }
 
 impl FileChanges {
-    pub(in crate::rocks::graph) fn capture(
-        facts: &CanonicalGenerationFacts,
-        affected: BTreeSet<FileId>,
-        policy: GraphPolicy,
-        request: &StorageRequest,
-    ) -> Result<Self> {
-        if affected.is_empty() || affected.len() > 16 {
-            return Err(super::super::limit());
-        }
-        let overhead = retained_overhead(&affected, facts.digest())?;
-        let remaining = policy
-            .maximum_working_bytes
-            .checked_sub(overhead)
-            .ok_or_else(super::super::limit)?;
-        let old = collect(facts, &affected, remaining, request)?;
-        Ok(Self {
-            base_digest: facts.digest().clone(),
-            affected,
-            old,
-            changes: Vec::new(),
-            candidates: 0,
-            reused: 0,
-        })
-    }
-
     pub(in crate::rocks::graph) fn finish(
         &mut self,
         facts: &CanonicalGenerationFacts,
@@ -61,7 +36,7 @@ impl FileChanges {
             .maximum_working_bytes
             .checked_sub(occupied)
             .ok_or_else(super::super::limit)?;
-        let next = collect(facts, &self.affected, remaining, request)?;
+        let next = RowCollector::new(facts, request, remaining).collect(&self.affected)?;
         let descriptors = self
             .old
             .len()
@@ -120,14 +95,17 @@ impl FileChanges {
     }
 
     pub(super) fn apply(&self, delta: &mut Delta<'_, '_>) -> Result<()> {
-        let previous = delta.previous.ok_or(RocksError::GenerationChanged)?;
+        let previous = delta
+            .publication
+            .previous
+            .ok_or(RocksError::GenerationChanged)?;
         if previous.revision().content_digest.as_ref() != Some(&self.base_digest) {
             return Err(RocksError::GenerationChanged);
         }
         delta.report.candidate_records += self.candidates;
         delta.report.reused_records += self.reused;
         for (collection, key, value) in &self.changes {
-            delta.request.check()?;
+            delta.publication.request.check()?;
             if let Some(value) = value {
                 delta.push(*collection, key.clone(), Some(value.clone()))?;
                 delta.report.written_records += 1;
@@ -139,103 +117,124 @@ impl FileChanges {
     }
 }
 
-fn collect(
-    facts: &CanonicalGenerationFacts,
-    affected: &BTreeSet<FileId>,
+/// One sparse capture owns its retained rows, cancellation scope, and accounting ceiling.
+pub(in crate::rocks::graph) struct RowCollector<'a> {
+    facts: &'a CanonicalGenerationFacts,
+    request: &'a StorageRequest,
     maximum_bytes: usize,
-    request: &StorageRequest,
-) -> Result<Rows> {
-    let mut rows = Rows::new();
-    let mut bytes = 0_usize;
-    let tables = [
-        (FILE, facts.files().len()),
-        (SYMBOL, facts.symbols().len()),
-        (NUMERICAL, facts.numerical_sites().len()),
-        (DOCUMENT, facts.documents().len()),
-    ];
-    for (prefix, length) in tables {
-        for index in 0..length {
-            request.check()?;
-            let row = super::row_at(facts, prefix, index)?;
-            let file = match row {
-                Row::File(row) => Some(&row.file_id),
-                Row::Symbol(row) => Some(&row.file_id),
-                Row::Reference(row) => Some(&row.file_id),
-                Row::Numerical(row) => Some(&row.file_id),
-                Row::Document(row) => row.file_id(),
-                Row::Edge(_) => None,
-            };
-            if file.is_none_or(|id| !affected.contains(id)) {
-                continue;
-            }
-            collect_row(
-                facts,
-                prefix,
-                index,
-                maximum_bytes,
-                request,
-                &mut rows,
-                &mut bytes,
-            )?;
-        }
-    }
-    // Canonical reference order starts with file_id. Sparse edits can seek
-    // directly to each complete file range without visiting other references.
-    for file in affected {
-        request.check()?;
-        let start = facts
-            .references()
-            .partition_point(|row| row.file_id < *file);
-        let end = facts
-            .references()
-            .partition_point(|row| row.file_id <= *file);
-        for index in start..end {
-            collect_row(
-                facts,
-                REFERENCE,
-                index,
-                maximum_bytes,
-                request,
-                &mut rows,
-                &mut bytes,
-            )?;
-        }
-    }
-    Ok(rows)
+    bytes: usize,
+    rows: Rows,
 }
 
-fn collect_row(
-    facts: &CanonicalGenerationFacts,
-    prefix: &[u8],
-    index: usize,
-    maximum_bytes: usize,
-    request: &StorageRequest,
-    rows: &mut Rows,
-    bytes: &mut usize,
-) -> Result<()> {
-    request.check()?;
-    let (key, row) = super::table_row(facts, prefix, index)?;
-    let value = row.encode()?;
-    *bytes = bytes
-        .checked_add(key.as_bytes().len())
-        .and_then(|n| n.checked_add(value.capacity()))
-        .and_then(|n| n.checked_add(256))
-        .ok_or_else(super::super::limit)?;
-    if *bytes > maximum_bytes {
-        return Err(super::super::limit());
+impl<'a> RowCollector<'a> {
+    pub(in crate::rocks::graph) fn new(
+        facts: &'a CanonicalGenerationFacts,
+        request: &'a StorageRequest,
+        maximum_bytes: usize,
+    ) -> Self {
+        Self {
+            facts,
+            request,
+            maximum_bytes,
+            bytes: 0,
+            rows: Rows::new(),
+        }
     }
-    rows.insert(
-        (
-            if prefix == DOCUMENT {
-                Collection::Search
-            } else {
-                Collection::Graph
-            },
-            key,
-        ),
-        value,
-    );
-    Ok(())
+
+    pub(in crate::rocks::graph) fn capture(
+        mut self,
+        affected: BTreeSet<FileId>,
+    ) -> Result<FileChanges> {
+        let facts = self.facts;
+        if affected.is_empty() || affected.len() > 16 {
+            return Err(super::super::limit());
+        }
+        let overhead = retained_overhead(&affected, facts.digest())?;
+        self.maximum_bytes = self
+            .maximum_bytes
+            .checked_sub(overhead)
+            .ok_or_else(super::super::limit)?;
+        let old = self.collect(&affected)?;
+        Ok(FileChanges {
+            base_digest: facts.digest().clone(),
+            affected,
+            old,
+            changes: Vec::new(),
+            candidates: 0,
+            reused: 0,
+        })
+    }
+
+    fn collect(mut self, affected: &BTreeSet<FileId>) -> Result<Rows> {
+        let tables = [
+            (FILE, self.facts.files().len()),
+            (SYMBOL, self.facts.symbols().len()),
+            (NUMERICAL, self.facts.numerical_sites().len()),
+            (DOCUMENT, self.facts.documents().len()),
+        ];
+        for (prefix, length) in tables {
+            for index in 0..length {
+                self.request.check()?;
+                let row = super::row_at(self.facts, prefix, index)?;
+                let file = match row {
+                    Row::File(row) => Some(&row.file_id),
+                    Row::Symbol(row) => Some(&row.file_id),
+                    Row::Reference(row) => Some(&row.file_id),
+                    Row::Numerical(row) => Some(&row.file_id),
+                    Row::Document(row) => row.file_id(),
+                    Row::Edge(_) => None,
+                };
+                if file.is_none_or(|id| !affected.contains(id)) {
+                    continue;
+                }
+                self.append(prefix, index)?;
+            }
+        }
+        // Canonical reference order starts with file_id. Sparse edits can seek
+        // directly to each complete file range without visiting other references.
+        for file in affected {
+            self.request.check()?;
+            let start = self
+                .facts
+                .references()
+                .partition_point(|row| row.file_id < *file);
+            let end = self
+                .facts
+                .references()
+                .partition_point(|row| row.file_id <= *file);
+            for index in start..end {
+                self.append(REFERENCE, index)?;
+            }
+        }
+        Ok(self.rows)
+    }
+
+    fn append(&mut self, prefix: &[u8], index: usize) -> Result<()> {
+        self.request.check()?;
+        let (key, row) = super::CanonicalTable::new(self.facts, prefix)?.row(index)?;
+        let value = row.encode()?;
+        self.bytes = self
+            .bytes
+            .checked_add(key.as_bytes().len())
+            .and_then(|n| n.checked_add(value.capacity()))
+            .and_then(|n| n.checked_add(256))
+            .ok_or_else(super::super::limit)?;
+        if self.bytes > self.maximum_bytes {
+            return Err(super::super::limit());
+        }
+        self.rows.insert(
+            (
+                if prefix == DOCUMENT {
+                    Collection::Search
+                } else {
+                    Collection::Graph
+                },
+                key,
+            ),
+            value,
+        );
+        Ok(())
+    }
 }
 
 fn measured(rows: &Rows) -> Result<usize> {

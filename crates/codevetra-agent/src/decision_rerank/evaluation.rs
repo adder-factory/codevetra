@@ -117,65 +117,85 @@ fn rank(case: &Case, candidates: &[Candidate], order: &[usize]) -> Option<usize>
         .map(|position| position + 1)
 }
 
-async fn evaluate_case(
-    ranker: &ContextRanker<'_, JevClient>,
-    native: &Value,
-    case: &Case,
-    generation: &Value,
+/// One native response and the elapsed time measured for that exact request.
+struct NativeObservation {
+    native: Value,
     native_millis: u128,
-) -> Value {
-    let packet = &native["evidence"]["packet"];
-    assert_eq!(
-        native["freshness"], "current",
-        "native evidence must be fresh"
-    );
-    assert_eq!(
-        &packet["generation"]["generation_id"], generation,
-        "generation changed during evaluation"
-    );
-    let candidates = candidates(packet);
-    if candidates.len() < 2 {
-        let order = (0..candidates.len()).collect::<Vec<_>>();
-        return json!({"id":case.id,"candidateCount":candidates.len(),
+}
+
+impl NativeObservation {
+    async fn capture(binary: &Path, root: &Path, case: &Case) -> Self {
+        let started = Instant::now();
+        let native = cli(binary, root, &["context", &case.task]).await;
+        Self {
+            native,
+            native_millis: started.elapsed().as_millis(),
+        }
+    }
+
+    async fn evaluate(
+        &self,
+        ranker: &ContextRanker<'_, JevClient>,
+        case: &Case,
+        generation: &Value,
+    ) -> Value {
+        let Self {
+            native,
+            native_millis,
+        } = self;
+        let packet = &native["evidence"]["packet"];
+        assert_eq!(
+            native["freshness"], "current",
+            "native evidence must be fresh"
+        );
+        assert_eq!(
+            &packet["generation"]["generation_id"], generation,
+            "generation changed during evaluation"
+        );
+        let candidates = candidates(packet);
+        if candidates.len() < 2 {
+            let order = (0..candidates.len()).collect::<Vec<_>>();
+            return json!({"id":case.id,"candidateCount":candidates.len(),
             "expectedPath":case.path,"expectedSymbol":case.symbol,
             "nativeRank":rank(case,&candidates,&order),"jevRank":rank(case,&candidates,&order),
             "nativeContextMs":native_millis,"nativeRerank":packet["retrieval"]["rerank"],
             "skipped":"fewer_than_two_candidates","cold":null,"warm":null});
-    }
-    let state = json!({"task":case.task, "generationId": generation,
+        }
+        let state = json!({"task":case.task, "generationId": generation,
         "candidates":candidates.iter().map(|c| json!({"name":c.name,"kind":c.kind,"path":c.path,"startLine":c.start,"endLine":c.end})).collect::<Vec<_>>()});
-    let (scores, cold) = ranker
-        .judge(&state, candidates.len())
-        .await
-        .unwrap_or_else(|_| panic!("evaluation was cancelled"))
-        .unwrap_or_else(|error| panic!("decision provider failed: {error}"));
-    let (warm_scores, warm) = ranker
-        .judge(&state, candidates.len())
-        .await
-        .unwrap_or_else(|_| panic!("warm evaluation was cancelled"))
-        .unwrap_or_else(|error| panic!("warm decision provider failed: {error}"));
-    assert_eq!(
-        scores, warm_scores,
-        "an exact cache hit must preserve probabilities"
-    );
-    assert_eq!(
-        cold.map(|metrics| metrics.cache),
-        Some(codevetra_domain::DecisionCacheOutcome::Miss)
-    );
-    assert_eq!(
-        warm.map(|metrics| metrics.cache),
-        Some(codevetra_domain::DecisionCacheOutcome::Hit)
-    );
-    let before = (0..candidates.len()).collect::<Vec<_>>();
-    let mut after = before.clone();
-    after.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]).then(a.cmp(b)));
-    let items = |order: &[usize]| {
-        order.iter().map(|index| json!({"name": candidates[*index].name,"path":candidates[*index].path,"relevance":scores[*index]})).collect::<Vec<_>>()
-    };
-    json!({"id":case.id,"candidateCount":candidates.len(),"expectedPath":case.path,"expectedSymbol":case.symbol,
+        let (scores, cold) = ranker
+            .judge(&state, candidates.len())
+            .await
+            .unwrap_or_else(|_| panic!("evaluation was cancelled"))
+            .unwrap_or_else(|error| panic!("decision provider failed: {error}"));
+        let (warm_scores, warm) = ranker
+            .judge(&state, candidates.len())
+            .await
+            .unwrap_or_else(|_| panic!("warm evaluation was cancelled"))
+            .unwrap_or_else(|error| panic!("warm decision provider failed: {error}"));
+        assert_eq!(
+            scores, warm_scores,
+            "an exact cache hit must preserve probabilities"
+        );
+        assert_eq!(
+            cold.map(|metrics| metrics.cache),
+            Some(codevetra_domain::DecisionCacheOutcome::Miss)
+        );
+        assert_eq!(
+            warm.map(|metrics| metrics.cache),
+            Some(codevetra_domain::DecisionCacheOutcome::Hit)
+        );
+        let before = (0..candidates.len()).collect::<Vec<_>>();
+        let mut after = before.clone();
+        after.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]).then(a.cmp(b)));
+        let items = |order: &[usize]| {
+            order.iter().map(|index| json!({"name": candidates[*index].name,"path":candidates[*index].path,"relevance":scores[*index]})).collect::<Vec<_>>()
+        };
+        json!({"id":case.id,"candidateCount":candidates.len(),"expectedPath":case.path,"expectedSymbol":case.symbol,
         "nativeRank":rank(case,&candidates,&before),"jevRank":rank(case,&candidates,&after),
         "nativeContextMs":native_millis,"nativeRerank":packet["retrieval"]["rerank"],
         "cold":cold,"warm":warm,"before":items(&before),"after":items(&after)})
+    }
 }
 
 #[tokio::test]
@@ -218,18 +238,8 @@ async fn live_fixed_candidate_context_ranking_pilot() {
         serde_json::from_str(CASES).unwrap_or_else(|e| panic!("frozen cases: {e}"));
     let mut observations = Vec::new();
     for case in &cases {
-        let started = Instant::now();
-        let native = cli(&binary, &root, &["context", &case.task]).await;
-        observations.push(
-            evaluate_case(
-                &ranker,
-                &native,
-                case,
-                generation,
-                started.elapsed().as_millis(),
-            )
-            .await,
-        );
+        let native = NativeObservation::capture(&binary, &root, case).await;
+        observations.push(native.evaluate(&ranker, case, generation).await);
         println!("JEV_CONTEXT_PILOT_CASE={}", case.id);
     }
     let after = cli(&binary, &root, &["status"]).await;

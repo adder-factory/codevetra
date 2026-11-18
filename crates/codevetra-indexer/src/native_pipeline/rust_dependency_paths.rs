@@ -258,6 +258,17 @@ fn register_target(
             &mut target.index.languages.rust_paths.dependencies.target_paths,
             path,
         )
+    } else if binding.local_name == "<cargo-target-convention>" {
+        let Some(stem) = normalize_joined_project_path(manifest, &binding.module_specifier) else {
+            return Ok(());
+        };
+        let Some(path) = conventional_target(target, &stem)? else {
+            return Ok(());
+        };
+        (
+            &mut target.index.languages.rust_paths.dependencies.target_paths,
+            path,
+        )
     } else {
         return Ok(());
     };
@@ -267,6 +278,29 @@ fn register_target(
     paths.try_reserve(1).map_err(|_| StageItemFailure)?;
     paths.insert(path);
     Ok(())
+}
+
+fn conventional_target(
+    target: &mut ResolutionIndexTarget<'_>,
+    stem: &str,
+) -> Result<Option<String>, StageItemFailure> {
+    let mut flat = try_clone_text(stem)?;
+    flat.try_reserve(3).map_err(|_| StageItemFailure)?;
+    flat.push_str(".rs");
+    let nested = joined_path(stem, "main.rs")?;
+    target
+        .budget
+        .charge(usize_to_u64(flat.capacity() + nested.capacity()))?;
+    let exists = |path: &str| {
+        super::unique_file_for_path(target.index, path)
+            .and_then(|id| target.index.modules.files.get(id))
+            .is_some_and(|file| file.language == "rust")
+    };
+    Ok(match (exists(&flat), exists(&nested)) {
+        (true, false) => Some(flat),
+        (false, true) => Some(nested),
+        (true, true) | (false, false) => None,
+    })
 }
 
 pub(super) fn target_root(index: &ResolutionIndex, path: &str) -> bool {

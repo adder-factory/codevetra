@@ -29,6 +29,59 @@ SHUTTLE_SPEC.loader.exec_module(shuttle)
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_context_resolution_and_commands_share_one_environment_snapshot(self):
+        info = {'OSType': 'linux', 'CgroupVersion': '2', 'MemoryLimit': True,
+                'SwapLimit': True, 'PidsLimit': True, 'MemTotal': 16 * 1024**3}
+        observed = []
+
+        def run(arguments, **kwargs):
+            observed.append((arguments, dict(kwargs['env'])))
+            if len(observed) == 1:
+                os.environ['DOCKER_CONTEXT'] = 'changed-after-capture'
+                return subprocess.CompletedProcess(arguments, 0, 'unix:///pinned.sock\n', '')
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(info), '')
+
+        configured = {'DOCKER_CONTEXT': 'selected', 'DOCKER_HOST': 'tcp://ignored.invalid:2375',
+                      'DOCKER_TLS_VERIFY': '1', 'DOCKER_CERT_PATH': '/private/certs'}
+        with patch.dict(os.environ, configured), patch.object(sandbox.subprocess, 'run', side_effect=run):
+            docker = sandbox.Docker()
+        self.assertEqual(observed[0][0][:4], ['docker', 'context', 'inspect', 'selected'])
+        self.assertEqual(observed[0][1]['DOCKER_CONTEXT'], 'selected')
+        self.assertEqual(observed[1][0][:3], ['docker', '--host', 'unix:///pinned.sock'])
+        for key in configured:
+            self.assertNotIn(key, observed[1][1])
+        self.assertEqual(docker.prefix, ['docker', '--host', 'unix:///pinned.sock'])
+
+    def test_command_failure_is_bounded_and_unchecked_inspection_remains_available(self):
+        docker = sandbox.Docker.__new__(sandbox.Docker)
+        docker.env = dict(os.environ)
+        docker.prefix = [sys.executable, '-c',
+                         'import sys; sys.stderr.write("x" * 2100); sys.exit(7)']
+        with self.assertRaises(sandbox.Refusal) as raised:
+            docker.call([])
+        self.assertEqual(str(raised.exception), 'Command failed (7): ' + 'x' * 2000)
+        self.assertTrue(raised.exception.__suppress_context__)
+        result = docker.call([], check=False)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stderr, 'x' * 2100)
+
+    def test_command_routing_preserves_bounded_runner_arguments(self):
+        cases = [
+            ([], ('bash', '/source/scripts/formal/prove.sh', 'verify')),
+            (['setup'], ('bash', '/source/scripts/formal/setup.sh')),
+            (['verus'], ('bash', '/source/scripts/formal/prove.sh', 'verus')),
+            (['shuttle'], ('bash', '/source/scripts/formal/shuttle.sh')),
+            (['shuttle', '--case', 'cancellation_wakes_all', '--replay', 'abcd'],
+             ('bash', '/source/scripts/formal/shuttle.sh', 'cancellation_wakes_all', 'abcd')),
+            (['kani', 'verification/kani/byte_budget.rs', '--harness',
+              'admission_is_exact_and_cannot_overflow', '--solver', 'kissat', '--counterexample'],
+             ('bash', '/source/scripts/formal/prove.sh', 'kani', 'verification/kani/byte_budget.rs',
+              'admission_is_exact_and_cannot_overflow', 'kissat', '--counterexample')),
+        ]
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(sandbox.sandbox_command(sandbox.parse_args(argv)), expected)
+
     def test_shuttle_incomplete_success_is_rejected(self):
         complete = [f'SHUTTLE_PASSED {case} random=1000 pct=1000 seed=1\n' for case in shuttle.CASES]
         shuttle.require_completed(subprocess.CompletedProcess([], 0, ''.join(complete), ''), shuttle.CASES)
@@ -99,6 +152,21 @@ class AdmissionTests(unittest.TestCase):
             with patch.object(suite, 'run_recorded', return_value=response), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
                 suite.checked(['unused'], r'Complete - 1 successfully verified harnesses, 0 failures, 1 total\.')
 
+    def test_constant_initializers_add_obligations_without_replacing_contracts(self):
+        manifest = {'modules': [{'functions': [{'ensures': ['result == 8']}],
+                                 'constants': [{'name': 'CAP'}, {'name': 'FLOOR'}]}]}
+        self.assertEqual(suite.verus_counts(manifest), (1, 2))
+        for count in (0, 1, 2, 4):
+            response = subprocess.CompletedProcess([], 0, f'verification results:: {count} verified, 0 errors', '')
+            with self.subTest(count=count), patch.object(suite, 'run_recorded', return_value=response), self.assertRaises(SystemExit):
+                suite.checked(['unused'], r'verification results:: 3 verified, 0 errors\b')
+        response = subprocess.CompletedProcess([], 0, 'verification results:: 3 verified, 0 errors', '')
+        with patch.object(suite, 'run_recorded', return_value=response):
+            suite.checked(['unused'], r'verification results:: 3 verified, 0 errors\b')
+        manifest['modules'][0]['functions'] = []
+        with self.assertRaisesRegex(SystemExit, 'Empty Verus suite'):
+            suite.verus_counts(manifest)
+
     def test_solver_annotation_cannot_restore_the_incorrect_smt_backend(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -127,12 +195,12 @@ class AdmissionTests(unittest.TestCase):
             def inspect(self, _identity):
                 return {'Config': {'Labels': {sandbox.LABEL: 'old-owner'}}}
         with self.assertRaises(sandbox.Refusal):
-            sandbox.run_container(Existing(), 'unused', sandbox.ROOT, [], sandbox.ROOT)
+            sandbox.run_container(Existing(), sandbox.ContainerSpec(image='unused', source=sandbox.ROOT, command=()), sandbox.ROOT)
 
     def test_unsafe_limits_cannot_be_requested(self):
         for memory, deadline in [(sandbox.MEMORY + 1, 300), (0, 300), (sandbox.MEMORY, 301)]:
             with self.subTest(memory=memory, deadline=deadline), self.assertRaises(sandbox.Refusal):
-                sandbox.container_args('image', Path('/source'), [], deadline, memory, False, 'name', 'token')
+                sandbox.ContainerSpec(image='image', source=Path('/source'), command=(), deadline=deadline, memory=memory, name='name').arguments('token')
 
     def test_host_verifier_override_is_rejected_before_docker(self):
         with patch.dict(os.environ, KANI_BIN='/native/kani'), patch.object(sandbox, 'Docker') as docker:
@@ -222,7 +290,7 @@ class AdmissionTests(unittest.TestCase):
             child.return_value.returncode = 0
             report_dir = Path(directory)
             with self.assertRaises(sandbox.Refusal):
-                sandbox.run_container(LostDaemon(), 'image', sandbox.ROOT, ['true'], report_dir)
+                sandbox.run_container(LostDaemon(), sandbox.ContainerSpec(image='image', source=sandbox.ROOT, command=('true',)), report_dir)
             report = json.loads((report_dir / 'result.json').read_text())
             self.assertEqual(report['outcome'], 'incomplete')
             self.assertEqual(report['cleanup'], 'unconfirmed')
@@ -236,8 +304,9 @@ def live_tests():
         reports = Path(directory)
         name = sandbox.NAME
         def run(label, command, seconds=10):
-            report = sandbox.run_container(docker, sandbox.BASE, sandbox.ROOT, command,
-                                           reports / label, deadline=seconds, memory=128 * 1024**2, name=name)
+            spec = sandbox.ContainerSpec(image=sandbox.BASE, source=sandbox.ROOT, command=tuple(command),
+                                         deadline=seconds, memory=128 * 1024**2, name=name)
+            report = sandbox.run_container(docker, spec, reports / label)
             assert report['cleanup'] == 'confirmed', report
             assert docker.inspect(name) is None
             return report
@@ -284,7 +353,8 @@ def live_tests():
                     assert report['cleanup'] == 'confirmed' and report['outcome'] == 'incomplete', report
                 else:
                     with unittest.TestCase().assertRaises(sandbox.Refusal):
-                        sandbox.run_container(docker, sandbox.BASE, sandbox.ROOT, ['true'], reports / 'overlap')
+                        spec = sandbox.ContainerSpec(image=sandbox.BASE, source=sandbox.ROOT, command=('true',))
+                        sandbox.run_container(docker, spec, reports / 'overlap')
                     deadline = time.monotonic() + 12
                     while docker.inspect(cid)['State']['Running'] and time.monotonic() < deadline:
                         time.sleep(0.2)

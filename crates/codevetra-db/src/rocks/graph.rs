@@ -5,7 +5,7 @@ use std::{mem::size_of, sync::Arc, time::Duration};
 use codevetra_domain::{ContentDigest, GenerationId};
 use serde::{Deserialize, Serialize};
 
-use crate::{CanonicalGenerationFacts, GenerationMemoryModelError};
+use crate::CanonicalGenerationFacts;
 
 use super::{ProjectStore, PruneReport, Result, RocksError, StorageRequest, StoredRevision};
 
@@ -14,10 +14,16 @@ mod ingest;
 mod lexical;
 mod names;
 mod packed;
+mod preparation;
 mod read;
 
-pub use lexical::{LexicalPosting, LexicalStatistics};
-pub use read::{GraphCursor, GraphLink, GraphNeighborPage, GraphSnapshot};
+pub use preparation::GraphPreparation;
+
+pub use lexical::{LexicalPosting, LexicalStatistics, TokenPostings};
+pub use read::{
+    FileReferences, GraphAdjacency, GraphCursor, GraphLink, GraphNeighborPage, GraphSnapshot,
+    NamedSymbols,
+};
 
 const MIB: usize = 1_048_576;
 const FILE: &[u8] = b"cg1/f/";
@@ -63,20 +69,25 @@ pub struct GraphPolicy {
 
 impl Default for GraphPolicy {
     fn default() -> Self {
-        Self {
-            maximum_input_bytes: 128 * 1_048_576,
-            maximum_working_bytes: 32 * MIB,
-            maximum_batch_bytes: 4 * MIB,
-        }
+        Self::DEFAULT
     }
 }
 
 impl GraphPolicy {
+    const DEFAULT: Self = Self {
+        maximum_input_bytes: 128 * 1_048_576,
+        maximum_working_bytes: 32 * MIB,
+        maximum_batch_bytes: 4 * MIB,
+    };
+    const MAXIMUM_INPUT_BYTES: u64 = 512 * 1_048_576;
+    const MAXIMUM_WORKING_BYTES: usize = 512 * MIB;
+    const MAXIMUM_BATCH_BYTES: usize = 16 * MIB;
+
     fn validate(self) -> Result<Self> {
         if self.maximum_input_bytes == 0
-            || self.maximum_input_bytes > 512 * 1_048_576
-            || !(MIB..=512 * MIB).contains(&self.maximum_working_bytes)
-            || !(MIB..=16 * MIB).contains(&self.maximum_batch_bytes)
+            || self.maximum_input_bytes > Self::MAXIMUM_INPUT_BYTES
+            || !(MIB..=Self::MAXIMUM_WORKING_BYTES).contains(&self.maximum_working_bytes)
+            || !(MIB..=Self::MAXIMUM_BATCH_BYTES).contains(&self.maximum_batch_bytes)
         {
             return Err(RocksError::Limit {
                 resource: "graph_policy",
@@ -132,62 +143,6 @@ impl GraphPublicationInput {
         }
     }
 
-    /// Validate a file-local replacement against an exact canonical base.
-    /// The topology is retained; changes to declarations or resolution must use
-    /// the complete native build instead. Publication fences both base identity
-    /// and digest before applying the sparse records.
-    /// # Errors
-    /// Rejects changed identities, invalid relations, oversized work, or cancellation.
-    pub fn replace_files(
-        identity: GraphRevision,
-        facts: CanonicalGenerationFacts,
-        replacements: crate::GenerationFacts,
-        policy: GraphPolicy,
-        request: &StorageRequest,
-    ) -> Result<Self> {
-        request.check()?;
-        let policy = policy.validate()?;
-        if !matches!(identity.base, GraphBase::Current(_)) {
-            return Err(RocksError::GenerationChanged);
-        }
-        let affected = replacements
-            .files
-            .iter()
-            .map(|file| file.file_id.clone())
-            .collect();
-        let mut changes = ingest::FileChanges::capture(&facts, affected, policy, request)?;
-        let limits = crate::GenerationValidationLimits::new(
-            policy.maximum_input_bytes,
-            policy
-                .maximum_input_bytes
-                .checked_mul(4)
-                .ok_or_else(limit)?,
-        )
-        .map_err(|_| limit())?;
-        let facts = crate::ingest::replace_file_facts(facts, replacements, limits, || {
-            request.check().is_err()
-        })
-        .map_err(|error| match error {
-            crate::GenerationValidationError::Cancelled => {
-                request.check().err().unwrap_or(RocksError::Cancelled)
-            }
-            crate::GenerationValidationError::RetainedLimit => limit(),
-            _ => RocksError::InvalidInput {
-                field: "incremental_facts",
-            },
-        })?;
-        changes.finish(&facts, policy, request)?;
-        let mut input = Self::new(identity, facts, policy, request)?;
-        input.retained_bytes = input
-            .retained_bytes
-            .checked_add(changes.retained_bytes()?)
-            .ok_or_else(limit)?;
-        if input.retained_bytes > policy.maximum_input_bytes {
-            return Err(limit());
-        }
-        input.changes = Some(changes);
-        Ok(input)
-    }
     /// Exact canonical counts before the input moves to a storage worker.
     ///
     /// # Errors
@@ -219,105 +174,10 @@ impl GraphPublicationInput {
         }
     }
 
-    /// Prepare a validated generation inside the caller's existing CPU reservation.
-    ///
-    /// Large canonical tables are consumed into lossless bounded blocks before
-    /// storage admission. Their original validation measurement and digest stay
-    /// unchanged. Packed inputs do not retain a warm canonical allocation.
-    /// # Errors
-    /// Rejects preparation or retained-input bounds, invalid workspace,
-    /// cancellation, and expired requests. No database I/O occurs here.
-    pub fn prepare(
-        identity: GraphRevision,
-        facts: CanonicalGenerationFacts,
-        policy: GraphPolicy,
-        maximum_preparation_bytes: u64,
-        request: &StorageRequest,
-    ) -> Result<Self> {
-        request.check()?;
-        let policy = policy.validate()?;
-        let measurement = facts
-            .admission_measurement(maximum_preparation_bytes, || request.check().is_err())
-            .map_err(|error| match error {
-                GenerationMemoryModelError::Cancelled => {
-                    request.check().err().unwrap_or(RocksError::Cancelled)
-                }
-                GenerationMemoryModelError::RetainedLimit => RocksError::Limit {
-                    resource: "graph_preparation_bytes",
-                },
-                GenerationMemoryModelError::MetadataDepth => RocksError::Corrupt {
-                    field: "graph_metadata",
-                },
-            })?;
-        ingest::validate_workspace(&facts, policy, request)?;
-        if measurement.retained_bytes() <= policy.maximum_input_bytes {
-            return Self::new(identity, facts, policy, request);
-        }
-        let peak = measurement
-            .retained_bytes()
-            .checked_add(policy.maximum_input_bytes)
-            .and_then(|bytes| bytes.checked_add(u64::try_from(policy.maximum_working_bytes).ok()?))
-            .and_then(|bytes| bytes.checked_add(96 * 1_048_576))
-            .ok_or_else(limit)?;
-        if peak > maximum_preparation_bytes {
-            return Err(RocksError::Limit {
-                resource: "graph_preparation_bytes",
-            });
-        }
-        let graph = packed::PackedGraph::build(facts, policy, request)?;
-        let retained_bytes = graph.retained_bytes()?;
-        if retained_bytes > policy.maximum_input_bytes {
-            return Err(RocksError::Limit {
-                resource: "graph_input_bytes",
-            });
-        }
-        Ok(Self {
-            identity,
-            payload: GraphPayload::Packed(graph),
-            changes: None,
-            policy,
-            retained_bytes,
-            run_excludes: Vec::new(),
-            maximum_file_bytes: None,
-        })
-    }
-
-    /// Validate policy and use the immutable retained-size proof before async admission.
-    ///
-    /// # Errors
-    /// Rejects excessive retained memory, cancellation, or expired requests.
-    pub fn new(
-        identity: GraphRevision,
-        facts: CanonicalGenerationFacts,
-        policy: GraphPolicy,
-        request: &StorageRequest,
-    ) -> Result<Self> {
-        request.check()?;
-        let policy = policy.validate()?;
-        let measurement = facts
-            .admission_measurement(policy.maximum_input_bytes, || request.check().is_err())
-            .map_err(|error| match error {
-                GenerationMemoryModelError::Cancelled => {
-                    request.check().err().unwrap_or(RocksError::Cancelled)
-                }
-                GenerationMemoryModelError::RetainedLimit => RocksError::Limit {
-                    resource: "graph_input_bytes",
-                },
-                GenerationMemoryModelError::MetadataDepth => RocksError::Corrupt {
-                    field: "graph_metadata",
-                },
-            })?;
-        request.check()?;
-        ingest::validate_workspace(&facts, policy, request)?;
-        Ok(Self {
-            identity,
-            payload: GraphPayload::Resident(Arc::new(facts)),
-            changes: None,
-            policy,
-            retained_bytes: measurement.retained_bytes(),
-            run_excludes: Vec::new(),
-            maximum_file_bytes: None,
-        })
+    /// Exact run policy retained by this input for publication and source verification.
+    #[must_use]
+    pub fn source_admission(&self) -> (&[String], Option<usize>) {
+        (&self.run_excludes, self.maximum_file_bytes)
     }
 
     /// Retain the exact run admission so later freshness checks use the same source set.
@@ -339,8 +199,8 @@ impl GraphPublicationInput {
             || bytes.is_none_or(|bytes| bytes > 4 * MIB)
             || run_excludes
                 .iter()
-                .any(|pattern| pattern.is_empty() || pattern.len() > 4096 || pattern.contains('\0'))
-            || maximum_file_bytes.is_some_and(|bytes| bytes == 0 || bytes > 32 * MIB)
+                .any(|pattern| !(1..=4096).contains(&pattern.len()) || pattern.contains('\0'))
+            || maximum_file_bytes.is_some_and(|bytes| !(1..=32 * MIB).contains(&bytes))
         {
             return Err(RocksError::InvalidInput {
                 field: "source_admission",
@@ -507,6 +367,6 @@ impl ProjectStore {
         request: &StorageRequest,
         reclaim: impl FnMut(usize) -> Result<()>,
     ) -> std::result::Result<GraphPublication, GraphPublicationError> {
-        ingest::publish(self, input, request, reclaim)
+        input.publish(self, request, reclaim)
     }
 }

@@ -2,7 +2,7 @@
 
 use super::{
     NAMESPACE,
-    vectors::{cosine_distance, current, documents_scan, read_vector, source},
+    vectors::{SourceReader, cosine_distance, current, documents_scan},
 };
 use crate::{
     NativeDatabase,
@@ -10,12 +10,10 @@ use crate::{
         dataset::{self, CommitGuard},
         visit_state,
     },
-    retrieval::native::retain,
     rocks::{GraphSnapshot, ReadBudget, RocksError, StateNamespace, StateTransaction},
     semantic::{
-        EmbeddingModelSelector, EmbeddingModelState, RegisteredEmbeddingModel,
-        SemanticStorageError as Error, SimilarityMaterializationPolicy,
-        SimilarityMaterializationReport,
+        EmbeddingModelState, RegisteredEmbeddingModel, SemanticStorageError as Error,
+        SimilarityMaterializationPolicy, SimilarityMaterializationReport,
     },
 };
 use codevetra_domain::{DocumentKind, GenerationId, ModelId, ProjectId, SymbolId};
@@ -61,9 +59,7 @@ impl NativeDatabase {
         self.require_project(project)?;
         let build = self
             .transaction(
-                None,
-                0,
-                0,
+                crate::rocks::StateAccess::read_only(None),
                 policy.statement_timeout,
                 move |transaction, budget| build(transaction, budget, policy),
             )
@@ -77,13 +73,15 @@ impl NativeDatabase {
                 .map(|(key, value)| (key.to_vec(), value.clone()))
                 .collect(),
         };
-        self.replace_dataset_guarded(
-            StateNamespace::Derived,
-            "similarity",
-            Some(build.generation),
-            &metadata,
+        self.replace_dataset(
+            crate::native_database::dataset::DatasetReplacement {
+                namespace: StateNamespace::Derived,
+                name: "similarity".to_owned(),
+                expected: Some(build.generation),
+                metadata: &metadata,
+                guard: build.guard,
+            },
             build.rows.into_iter(),
-            build.guard,
         )
         .await?;
         Ok(build.report)
@@ -99,9 +97,7 @@ fn build(
     let guard = CommitGuard::capture(transaction, INPUT_KEYS, budget)?;
     let mut models = Vec::new();
     visit_state(
-        transaction,
-        NAMESPACE,
-        b"m/",
+        &transaction.scan(NAMESPACE, b"m/"),
         budget,
         |_, model: RegisteredEmbeddingModel, _| {
             if model.state == EmbeddingModelState::Active {
@@ -131,9 +127,16 @@ fn build(
             })?,
     };
     let mut distinct = BTreeSet::new();
-    let mut rows = Vec::new();
+    let mut neighbors = Neighbors {
+        rows: Vec::new(),
+        policy,
+    };
     for model in models {
-        let sources = model_sources(transaction, &graph, budget, &generation, &model.selector)?;
+        let sources = model_sources(
+            SourceReader::new(transaction, &graph).model(&model.selector),
+            &graph,
+            budget,
+        )?;
         if sources.is_empty() {
             continue;
         }
@@ -148,30 +151,22 @@ fn build(
             });
         }
         distinct.extend(sources.iter().map(|source| source.symbol.clone()));
-        append_neighbors(
-            &sources,
-            &model.selector.model_id,
-            policy,
-            budget,
-            &mut rows,
-        )?;
+        neighbors.append(&sources, &model.selector.model_id, budget)?;
     }
     report.source_symbols = distinct.len() as u64;
-    report.edges_written = rows.len() as u64;
+    report.edges_written = neighbors.rows.len() as u64;
     Ok(Build {
         generation,
         guard,
         report,
-        rows,
+        rows: neighbors.rows,
     })
 }
 
 fn model_sources(
-    transaction: &StateTransaction<'_>,
+    reader: super::vectors::VectorReader<'_, '_, '_>,
     graph: &GraphSnapshot<'_, '_>,
     budget: &mut ReadBudget,
-    generation: &GenerationId,
-    model: &EmbeddingModelSelector,
 ) -> Result<Vec<Source>, Error> {
     let mut sources = Vec::new();
     let mut bytes = 0_usize;
@@ -180,8 +175,8 @@ fn model_sources(
             && let Some(symbol) = document.symbol_id.clone()
         {
             let id = document.document_id.clone();
-            let (_, digest) = source(transaction, graph, generation, document, budget)?;
-            if let Some(vector) = read_vector(transaction, model, &id, &digest, budget)? {
+            let (_, digest) = reader.render(document, budget)?;
+            if let Some(vector) = reader.read(&id, &digest, budget)? {
                 bytes = bytes
                     .checked_add(vector.len() * 4 + symbol.as_str().len() + 128)
                     .ok_or(workspace())?;
@@ -205,44 +200,50 @@ fn model_sources(
     Ok(sources)
 }
 
-fn append_neighbors(
-    sources: &[Source],
-    model: &ModelId,
+const MAXIMUM_SIMILARITY_ROWS: usize = 16 * 1_048_576 / 256;
+
+struct Neighbors {
+    rows: Vec<SimilarityEdge>,
     policy: SimilarityMaterializationPolicy,
-    budget: &mut ReadBudget,
-    rows: &mut Vec<SimilarityEdge>,
-) -> Result<(), Error> {
-    for source in sources {
-        let mut neighbors = Vec::new();
-        for target in sources {
-            budget.checkpoint()?;
-            if source.symbol == target.symbol {
-                continue;
+}
+
+impl Neighbors {
+    fn append(
+        &mut self,
+        sources: &[Source],
+        model: &ModelId,
+        budget: &mut ReadBudget,
+    ) -> Result<(), Error> {
+        for source in sources {
+            let mut neighbors = crate::retrieval::native::RankedRows::new(
+                usize::from(self.policy.neighbors),
+                |a: &(&SymbolId, f64), b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)),
+            );
+            for target in sources {
+                budget.checkpoint()?;
+                if source.symbol == target.symbol {
+                    continue;
+                }
+                let score = 1.0 - cosine_distance(&source.vector, &target.vector, budget)?;
+                if score >= self.policy.minimum_score {
+                    neighbors.insert((&target.symbol, score.clamp(0.0, 1.0)));
+                }
             }
-            let score = 1.0 - cosine_distance(&source.vector, &target.vector, budget)?;
-            if score >= policy.minimum_score {
-                retain(
-                    &mut neighbors,
-                    (&target.symbol, score.clamp(0.0, 1.0)),
-                    usize::from(policy.neighbors),
-                    |a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)),
-                );
+            for (index, (target, score)) in neighbors.into_iter().enumerate() {
+                if self.rows.len() >= MAXIMUM_SIMILARITY_ROWS {
+                    return Err(workspace());
+                }
+                self.rows.push(SimilarityEdge {
+                    model: model.clone(),
+                    source: source.symbol.clone(),
+                    target: target.clone(),
+                    score,
+                    rank: u16::try_from(index + 1).map_err(|_| workspace())?,
+                });
             }
         }
-        for (index, (target, score)) in neighbors.into_iter().enumerate() {
-            if rows.len() >= 16 * 1_048_576 / 256 {
-                return Err(workspace());
-            }
-            rows.push(SimilarityEdge {
-                model: model.clone(),
-                source: source.symbol.clone(),
-                target: target.clone(),
-                score,
-                rank: u16::try_from(index + 1).map_err(|_| workspace())?,
-            });
-        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Visit only a current generation build whose exact vector/summary epochs still match.
@@ -254,8 +255,9 @@ pub(crate) fn visit_current(
     let Some(current) = transaction.current()? else {
         return Ok(());
     };
-    let Some(manifest) =
-        dataset::manifest(transaction, StateNamespace::Derived, "similarity", budget)?
+    let Some(manifest) = dataset::Reader::new(transaction, StateNamespace::Derived)
+        .at("similarity")
+        .manifest(budget)?
     else {
         return Ok(());
     };
@@ -275,13 +277,9 @@ pub(crate) fn visit_current(
     if metadata.guard != actual {
         return Ok(());
     }
-    dataset::visit(
-        transaction,
-        StateNamespace::Derived,
-        "similarity",
-        &manifest,
-        budget,
-        |row: SimilarityEdge, budget| {
+    dataset::Reader::new(transaction, StateNamespace::Derived)
+        .at("similarity")
+        .visit(&manifest, budget, |row: SimilarityEdge, budget| {
             if !row.score.is_finite()
                 || !(0.0..=1.0).contains(&row.score)
                 || row.source == row.target
@@ -293,8 +291,7 @@ pub(crate) fn visit_current(
                 });
             }
             visit(row, budget)
-        },
-    )
+        })
 }
 fn workspace() -> Error {
     Error::InvalidInput {

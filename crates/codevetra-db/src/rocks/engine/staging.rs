@@ -1,10 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    Arc, BoundColumnFamily, Duration, MutexGuard, ProjectStore, ReadBudget, RecordChange, Result,
-    RevisionState, RevisionWriter, RocksError, Snapshot, StoredRevision, WriteBatch,
-    decode_sequence, operation, read_record_from, validate_fence, version_count_key,
+    Arc, BoundColumnFamily, Duration, MAXIMUM_RECORD_BYTES, MutexGuard, ProjectStore,
+    PublishedRead, ReadBudget, RecordChange, Result, RevisionState, RevisionWriter, RocksError,
+    Snapshot, StorePolicy, StoredRevision, WriteBatch, decode_sequence, operation, validate_fence,
+    version_count_key,
 };
+
+const REPLAY_READ_ROWS: usize = 1_000_000;
+const REPLAY_READ_BYTES: usize = 256 * 1_048_576;
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl ProjectStore {
     /// Persist a bounded, replay-safe delta batch without exposing it to readers.
@@ -35,24 +40,28 @@ impl ProjectStore {
         if let Some(control) = control {
             control.check()?;
         }
-        self.validate_changes(changes)?;
+        self.inner.policy.validate_changes(changes)?;
         let _lifecycle = self.staging_guard()?;
         let _keys = self.lock_change_stripes(changes)?;
         validate_fence(self.lock_writer()?.as_ref(), writer)?;
-        let revision = self.revision(writer.sequence)?;
+        let revision = self.revision(writer.identity.sequence)?;
         if revision.state != RevisionState::Staging {
             return Err(RocksError::Transition);
         }
-        let (batch, rows, bytes) = self.prepare_batch(writer, &revision, changes, control)?;
+        let (batch, rows, bytes) = self.prepare_batch(&revision, changes, control)?;
         let meta = self.meta()?;
         let mut batch = batch;
         if rows > 0 {
             batch.merge_cf(
                 &meta,
-                version_count_key(writer.sequence),
+                version_count_key(writer.identity.sequence),
                 rows.to_be_bytes(),
             );
-            batch.merge_cf(&meta, byte_count_key(writer.sequence), bytes.to_be_bytes());
+            batch.merge_cf(
+                &meta,
+                byte_count_key(writer.identity.sequence),
+                bytes.to_be_bytes(),
+            );
         }
         if batch.size_in_bytes() > self.inner.policy.maximum_batch_bytes {
             return Err(RocksError::Limit {
@@ -69,19 +78,21 @@ impl ProjectStore {
         if !batch.is_empty() {
             self.write(&batch)?;
         }
-        self.revision(writer.sequence)
+        self.revision(writer.identity.sequence)
     }
 
     fn prepare_batch(
         &self,
-        writer: &RevisionWriter,
         revision: &StoredRevision,
         changes: &[RecordChange],
         control: Option<&crate::rocks::StorageRequest>,
     ) -> Result<(WriteBatch, u64, u64)> {
+        // revision() already validated the persisted sequence against the writer
+        // reservation; every key in this batch uses that one checked identity.
         let snapshot = self.inner.database.snapshot();
         let meta = self.meta()?;
-        let mut budget = ReadBudget::new(1_000_000, 256 * 1_048_576, Duration::from_secs(60))?;
+        let published = PublishedRead::new(&snapshot, &meta, revision.base_sequence.unwrap_or(0));
+        let mut budget = ReadBudget::new(REPLAY_READ_ROWS, REPLAY_READ_BYTES, REPLAY_TIMEOUT)?;
         if let Some(control) = control {
             budget = budget.with_control(control.clone());
         }
@@ -98,38 +109,20 @@ impl ProjectStore {
                 control.check()?;
             }
             let family = self.family(change.collection)?;
-            let key = change.key.at_sequence(writer.sequence);
+            let key = change.key.at_sequence(revision.sequence);
             let value = change.encoded_value();
-            if let Some(existing) = snapshot
-                .get_cf(&family, &key)
-                .map_err(|_| operation("stage_replay"))?
-            {
-                budget.charge(key.len().saturating_add(existing.len()))?;
-                if existing != value {
-                    return Err(RocksError::ReplayConflict);
-                }
+            if published.has_staged_replay(&family, (&key, &value), &mut budget)? {
                 continue;
             }
             let reader = readers
                 .entry(change.collection)
                 .or_insert_with(|| snapshot.raw_iterator_cf(&family));
-            let prior = read_record_from(
-                &snapshot,
-                reader,
-                &meta,
-                revision.base_sequence.unwrap_or(0),
-                &change.key,
-                &mut budget,
-            )?;
-            let claim_key = claim_key(writer.sequence, change);
-            if unchanged_replay(
-                &snapshot,
-                &meta,
-                &claim_key,
-                prior.as_deref(),
-                change.value.as_deref(),
-                &mut budget,
-            )? {
+            let prior = published.read_from(reader, &change.key, &mut budget)?;
+            let claim_key = claim_key(revision.sequence, change);
+            if published.has_unchanged_claim(&claim_key, &mut budget)? {
+                if prior.as_deref() != change.value.as_deref() {
+                    return Err(RocksError::ReplayConflict);
+                }
                 continue;
             }
             if prior.as_deref() == change.value.as_deref() {
@@ -183,32 +176,6 @@ impl ProjectStore {
     }
 }
 
-fn unchanged_replay(
-    snapshot: &Snapshot<'_>,
-    meta: &Arc<BoundColumnFamily<'_>>,
-    claim_key: &[u8],
-    prior: Option<&[u8]>,
-    proposed: Option<&[u8]>,
-    budget: &mut ReadBudget,
-) -> Result<bool> {
-    let Some(claim) = snapshot
-        .get_cf(meta, claim_key)
-        .map_err(|_| operation("stage_replay"))?
-    else {
-        return Ok(false);
-    };
-    budget.charge(claim_key.len().saturating_add(claim.len()))?;
-    if !claim.is_empty() {
-        return Err(RocksError::Corrupt {
-            field: "staging_claim",
-        });
-    }
-    if prior != proposed {
-        return Err(RocksError::ReplayConflict);
-    }
-    Ok(true)
-}
-
 fn claim_prefix(sequence: u64) -> Vec<u8> {
     let mut key = b"unchanged/".to_vec();
     key.extend_from_slice(&sequence.to_be_bytes());
@@ -238,4 +205,40 @@ pub(super) fn counter(
         .get_cf(meta, key)
         .map_err(|_| operation("read_staging_counter"))?
         .map_or(Ok(0), |bytes| decode_sequence(&bytes))
+}
+
+impl StorePolicy {
+    fn validate_changes(&self, changes: &[RecordChange]) -> Result<()> {
+        if changes.len() > self.maximum_batch_rows {
+            return Err(RocksError::Limit {
+                resource: "batch_rows",
+            });
+        }
+        let mut bytes = 4_096_usize;
+        let mut keys = BTreeSet::new();
+        for change in changes {
+            let value_bytes = change.value.as_ref().map_or(0, Vec::len);
+            if value_bytes > MAXIMUM_RECORD_BYTES {
+                return Err(RocksError::Limit {
+                    resource: "record_bytes",
+                });
+            }
+            bytes = bytes
+                .checked_add(change.key.prefix().len())
+                .and_then(|sum| sum.checked_add(value_bytes))
+                .and_then(|sum| sum.checked_add(32))
+                .ok_or(RocksError::Limit {
+                    resource: "batch_bytes",
+                })?;
+            if bytes > self.maximum_batch_bytes {
+                return Err(RocksError::Limit {
+                    resource: "batch_bytes",
+                });
+            }
+            if !keys.insert((change.collection, &change.key)) {
+                return Err(RocksError::ReplayConflict);
+            }
+        }
+        Ok(())
+    }
 }

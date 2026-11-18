@@ -4,7 +4,7 @@ use rocksdb::WriteBatchIteratorCf;
 use super::*;
 use crate::{
     FileInput, GenerationFacts, GenerationValidationLimits,
-    rocks::{GraphBase, GraphPolicy, GraphPublicationInput, GraphRevision},
+    rocks::{GraphBase, GraphPolicy, GraphRevision},
     validate_generation_facts,
 };
 
@@ -57,16 +57,16 @@ fn native_batches(policy: StorePolicy, rows: &[FileInput]) -> TestResult<Vec<usi
     )?;
     let digest = facts.digest().clone();
     let request = StorageRequest::new(Duration::from_secs(30))?;
-    let input = GraphPublicationInput::new(
+    let input = crate::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: GenerationId::from_uuid_v8([1; 16]),
             source_revision: identity(1),
             base: GraphBase::Empty,
         },
-        facts,
         GraphPolicy::default(),
         &request,
-    )?;
+    )
+    .resident(facts)?;
     let start = store.inner.database.latest_sequence_number();
     let publication = store.publish_graph(input, &request)?;
     assert_eq!(publication.revision.content_digest.as_ref(), Some(&digest));

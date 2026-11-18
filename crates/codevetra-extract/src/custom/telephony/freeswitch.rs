@@ -6,7 +6,7 @@ use super::super::{
     CustomImportInput, CustomReferenceInput, MarkupTag, markup_tags, parse_markup_tag,
     poll_cancellation, tag_attribute, tag_name_eq,
 };
-use super::{CustomBuilder, ExtractError, safe_name, symbol};
+use super::{CustomBuilder, CustomSymbolInput, ExtractError, safe_name};
 use crate::ImportBindingKind;
 
 const MAXIMUM_TAGS: usize = 100_000;
@@ -153,11 +153,10 @@ fn declaration(
     let qualified = format!("{prefix}::{}::{name}", tag.name);
     let parent = parent.map(|position| builder.symbols[position].id.clone());
     let position = builder.symbols.len();
-    symbol(
-        builder,
-        (kind, name, qualified),
-        (tag.start, tag.end),
-        parent,
+    builder.add_symbol(
+        CustomSymbolInput::new(kind, name, qualified)
+            .at(tag.start, tag.end)
+            .with_parent(parent),
     )?;
     Ok(Some(position))
 }
@@ -214,15 +213,14 @@ fn references(
             if let Some((name, _)) = data.split_once('=') {
                 let name = name.trim();
                 if safe_name(name) {
-                    symbol(
-                        builder,
-                        (
+                    builder.add_symbol(
+                        CustomSymbolInput::new(
                             SymbolKind::Constant,
                             name,
                             format!("freeswitch::variable::{name}"),
-                        ),
-                        (tag.start, tag.end),
-                        owner_id,
+                        )
+                        .at(tag.start, tag.end)
+                        .with_parent(owner_id),
                     )?;
                 }
             }

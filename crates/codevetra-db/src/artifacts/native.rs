@@ -16,7 +16,6 @@ use super::{
 use crate::{
     NativeDatabase, StorageError,
     native_database::{decode, encode, now, timestamp_order, visit_state},
-    retrieval::native::retain,
     rocks::{GraphSnapshot, ReadBudget, RocksError, StateNamespace, StateTransaction},
 };
 use codevetra_domain::{ArtifactId, ContentDigest, GenerationId, ProjectId, SymbolId};
@@ -64,9 +63,10 @@ impl NativeDatabase {
         self.require_project(project)?;
         validate_artifact(artifact)?;
         let artifact = artifact.clone();
-        self.state(None, WRITE_BYTES, WRITE_ROWS, move |transaction, budget| {
-            write(transaction, budget, artifact, replace)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, WRITE_ROWS),
+            move |transaction, budget| artifact.write(transaction, budget, replace),
+        )
         .await
     }
 
@@ -84,56 +84,58 @@ impl NativeDatabase {
             request.body_equals.map(str::to_owned),
             request.note_kind.map(str::to_owned),
         );
-        self.state(None, 0, 0, move |transaction, budget| {
-            let current = transaction
-                .current()?
-                .map(|revision| revision.generation_id);
-            let snapshot = if request.current_generation_only && current.is_some() {
-                Some(transaction.graph_snapshot()?)
-            } else {
-                None
-            };
-            let graph = snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.graph(budget))
-                .transpose()?;
-            let mut output = Vec::new();
-            visit_state(
-                transaction,
-                NAMESPACE,
-                b"a/",
-                budget,
-                |_, record: Record, budget| {
-                    validate_record(&record)?;
-                    if request.kind.is_some_and(|value| record.kind != value)
-                        || request.scope.is_some_and(|value| record.scope != value)
-                        || request.state.is_some_and(|value| record.state != value)
-                        || scope_key
-                            .as_ref()
-                            .is_some_and(|value| &record.scope_key != value)
-                        || body.as_ref().is_some_and(|value| &record.body != value)
-                        || note_kind.as_deref().is_some_and(|value| {
-                            record
-                                .metadata
-                                .get("noteKind")
-                                .and_then(serde_json::Value::as_str)
-                                != Some(value)
-                        })
-                        || request.since_unix_ms.is_some_and(|value| {
-                            timestamp_ms(&record.updated_at)
-                                .is_none_or(|timestamp| timestamp < value)
-                        })
-                        || (request.current_generation_only
-                            && !is_current(&record, current.as_ref(), graph.as_ref(), budget)?)
-                    {
-                        return Ok(());
-                    }
-                    retain(&mut output, record, usize::from(request.limit), newest);
-                    Ok(())
-                },
-            )?;
-            Ok(output)
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let current = transaction
+                    .current()?
+                    .map(|revision| revision.generation_id);
+                let snapshot = if request.current_generation_only && current.is_some() {
+                    Some(transaction.graph_snapshot()?)
+                } else {
+                    None
+                };
+                let graph = snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.graph(budget))
+                    .transpose()?;
+                let mut output =
+                    crate::retrieval::native::RankedRows::new(usize::from(request.limit), newest);
+                visit_state(
+                    &transaction.scan(NAMESPACE, b"a/"),
+                    budget,
+                    |_, record: Record, budget| {
+                        validate_record(&record)?;
+                        if request.kind.is_some_and(|value| record.kind != value)
+                            || request.scope.is_some_and(|value| record.scope != value)
+                            || request.state.is_some_and(|value| record.state != value)
+                            || scope_key
+                                .as_ref()
+                                .is_some_and(|value| &record.scope_key != value)
+                            || body.as_ref().is_some_and(|value| &record.body != value)
+                            || note_kind.as_deref().is_some_and(|value| {
+                                record
+                                    .metadata
+                                    .get("noteKind")
+                                    .and_then(serde_json::Value::as_str)
+                                    != Some(value)
+                            })
+                            || request.since_unix_ms.is_some_and(|value| {
+                                timestamp_ms(&record.updated_at)
+                                    .is_none_or(|timestamp| timestamp < value)
+                            })
+                            || (request.current_generation_only
+                                && !record.is_current(current.as_ref(), graph.as_ref(), budget)?)
+                        {
+                            return Ok(());
+                        }
+                        output.insert(record);
+                        Ok(())
+                    },
+                )?;
+                Ok(output.into_vec())
+            },
+        )
         .await
     }
 
@@ -152,12 +154,15 @@ impl NativeDatabase {
             });
         }
         let key = format!("u/{}", id.to_ascii_lowercase());
-        self.state(None, WRITE_BYTES, WRITE_ROWS, move |transaction, budget| {
-            let Some(bytes) = transaction.get(NAMESPACE, key.as_bytes(), budget)? else {
-                return Ok(false);
-            };
-            remove(transaction, budget, counter(&bytes)?)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, WRITE_ROWS),
+            move |transaction, budget| {
+                let Some(bytes) = transaction.get(NAMESPACE, key.as_bytes(), budget)? else {
+                    return Ok(false);
+                };
+                remove(transaction, budget, counter(&bytes)?)
+            },
+        )
         .await
     }
 
@@ -175,9 +180,10 @@ impl NativeDatabase {
                 field: "artifact_id",
             });
         }
-        self.state(None, WRITE_BYTES, WRITE_ROWS, move |transaction, budget| {
-            remove(transaction, budget, id)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, WRITE_ROWS),
+            move |transaction, budget| remove(transaction, budget, id),
+        )
         .await
     }
 
@@ -189,40 +195,45 @@ impl NativeDatabase {
         project: &ProjectId,
     ) -> Result<Vec<AgentRoleCount>, StorageError> {
         self.require_project(project)?;
-        self.state(None, 0, 0, |transaction, budget| {
-            let Some(current) = transaction.current()? else {
-                return Ok(Vec::new());
-            };
-            let snapshot = transaction.graph_snapshot()?;
-            let graph = snapshot.graph(budget)?;
-            let mut counts = BTreeMap::<String, u64>::new();
-            visit_state(
-                transaction,
-                NAMESPACE,
-                b"a/",
-                budget,
-                |_, record: Record, budget| {
-                    validate_record(&record)?;
-                    if record.kind == Kind::Role
-                        && record.scope == Scope::Symbol
-                        && matches!(record.state, State::Active | State::Complete)
-                        && is_current(&record, Some(&current.generation_id), Some(&graph), budget)?
-                    {
-                        *counts.entry(record.body).or_default() += 1;
-                        if counts.len() > 8192 {
-                            return Err(workspace());
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            |transaction, budget| {
+                let Some(current) = transaction.current()? else {
+                    return Ok(Vec::new());
+                };
+                let snapshot = transaction.graph_snapshot()?;
+                let graph = snapshot.graph(budget)?;
+                let mut counts = BTreeMap::<String, u64>::new();
+                visit_state(
+                    &transaction.scan(NAMESPACE, b"a/"),
+                    budget,
+                    |_, record: Record, budget| {
+                        validate_record(&record)?;
+                        if record.kind == Kind::Role
+                            && record.scope == Scope::Symbol
+                            && matches!(record.state, State::Active | State::Complete)
+                            && record.is_current(
+                                Some(&current.generation_id),
+                                Some(&graph),
+                                budget,
+                            )?
+                        {
+                            *counts.entry(record.body).or_default() += 1;
+                            if counts.len() > 8192 {
+                                return Err(workspace());
+                            }
                         }
-                    }
-                    Ok(())
-                },
-            )?;
-            let mut output = counts
-                .into_iter()
-                .map(|(role, symbols)| AgentRoleCount { role, symbols })
-                .collect::<Vec<_>>();
-            output.sort_by(|a, b| b.symbols.cmp(&a.symbols).then(a.role.cmp(&b.role)));
-            Ok(output)
-        })
+                        Ok(())
+                    },
+                )?;
+                let mut output = counts
+                    .into_iter()
+                    .map(|(role, symbols)| AgentRoleCount { role, symbols })
+                    .collect::<Vec<_>>();
+                output.sort_by(|a, b| b.symbols.cmp(&a.symbols).then(a.role.cmp(&b.role)));
+                Ok(output)
+            },
+        )
         .await
     }
 
@@ -246,22 +257,29 @@ impl NativeDatabase {
             });
         }
         let paths = paths.to_vec();
-        self.state(None, 0, 0, move |transaction, budget| {
-            let Some(current) = transaction.current()? else {
-                return Ok(BTreeMap::new());
-            };
-            let mut output = BTreeMap::new();
-            for path in paths {
-                if let Some(record) =
-                    read_scope(transaction, Kind::Summary, Scope::File, &path, budget)?
-                    && record.state == State::Complete
-                    && record.generation_id.as_deref() == Some(current.generation_id.as_str())
-                {
-                    output.insert(path, record.body);
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let Some(current) = transaction.current()? else {
+                    return Ok(BTreeMap::new());
+                };
+                let mut output = BTreeMap::new();
+                for path in paths {
+                    if let Some(record) = (ScopedArtifact {
+                        kind: Kind::Summary,
+                        scope: Scope::File,
+                        key: &path,
+                    })
+                    .read(transaction, budget)?
+                        && record.state == State::Complete
+                        && record.generation_id.as_deref() == Some(current.generation_id.as_str())
+                    {
+                        output.insert(path, record.body);
+                    }
                 }
-            }
-            Ok(output)
-        })
+                Ok(output)
+            },
+        )
         .await
     }
 
@@ -277,52 +295,51 @@ impl NativeDatabase {
         self.require_project(project)?;
         super::validate_limit(limit, super::MAX_ARTIFACT_LIMIT)?;
         let directory = directory.map(|path| path.as_str().to_owned());
-        self.state(None, 0, 0, move |transaction, budget| {
-            let current = transaction
-                .current()?
-                .map(|revision| revision.generation_id);
-            let mut summaries = Vec::new();
-            let mut total = 0_u64;
-            visit_state(
-                transaction,
-                NAMESPACE,
-                b"a/",
-                budget,
-                |_, record: Record, _| {
-                    validate_record(&record)?;
-                    if record.kind == Kind::Summary
-                        && record.scope == Scope::Module
-                        && record.state == State::Complete
-                        && record.source_digest.is_some()
-                        && current
-                            .as_ref()
-                            .is_some_and(|id| record.generation_id.as_deref() == Some(id.as_str()))
-                        && directory.as_ref().is_none_or(|path| {
-                            record.scope_key == *path
-                                || record.scope_key.starts_with(&format!("{path}/"))
-                        })
-                    {
-                        total += 1;
-                        retain(
-                            &mut summaries,
-                            CurrentModuleSummary {
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let current = transaction
+                    .current()?
+                    .map(|revision| revision.generation_id);
+                let mut summaries = crate::retrieval::native::RankedRows::new(
+                    usize::from(limit),
+                    |a: &CurrentModuleSummary, b| a.directory.cmp(&b.directory),
+                );
+                let mut total = 0_u64;
+                visit_state(
+                    &transaction.scan(NAMESPACE, b"a/"),
+                    budget,
+                    |_, record: Record, _| {
+                        validate_record(&record)?;
+                        if record.kind == Kind::Summary
+                            && record.scope == Scope::Module
+                            && record.state == State::Complete
+                            && record.source_digest.is_some()
+                            && current.as_ref().is_some_and(|id| {
+                                record.generation_id.as_deref() == Some(id.as_str())
+                            })
+                            && directory.as_ref().is_none_or(|path| {
+                                record.scope_key == *path
+                                    || record.scope_key.starts_with(&format!("{path}/"))
+                            })
+                        {
+                            total += 1;
+                            summaries.insert(CurrentModuleSummary {
                                 directory: record.scope_key,
                                 summary: record.body,
                                 metadata: record.metadata,
-                            },
-                            usize::from(limit),
-                            |a, b| a.directory.cmp(&b.directory),
-                        );
-                    }
-                    Ok(())
-                },
-            )?;
-            Ok(CurrentModuleSummaryPage {
-                truncated: total > summaries.len() as u64,
-                total,
-                summaries,
-            })
-        })
+                            });
+                        }
+                        Ok(())
+                    },
+                )?;
+                Ok(CurrentModuleSummaryPage {
+                    truncated: total > summaries.len() as u64,
+                    total,
+                    summaries: summaries.into_vec(),
+                })
+            },
+        )
         .await
     }
 }
@@ -343,118 +360,129 @@ fn indexed(kind: Kind, state: State) -> bool {
     matches!(kind, Kind::Role | Kind::Summary) && state != State::Archived
 }
 
-pub(crate) fn read_scope(
-    transaction: &StateTransaction<'_>,
+#[derive(Clone, Copy)]
+struct ScopedArtifact<'a> {
     kind: Kind,
     scope: Scope,
-    key: &str,
-    budget: &mut ReadBudget,
-) -> Result<Option<Record>, RocksError> {
-    let Some(bytes) = transaction.get(NAMESPACE, scope_key(kind, scope, key).as_bytes(), budget)?
-    else {
-        return Ok(None);
-    };
-    let id = counter(&bytes)?;
-    let record: Record = transaction
-        .get(NAMESPACE, primary(id).as_bytes(), budget)?
-        .map(|bytes| decode(&bytes))
-        .transpose()?
-        .ok_or(corrupt())?;
-    validate_record(&record)?;
-    if record.id != id
-        || record.kind != kind
-        || record.scope != scope
-        || record.scope_key != key
-        || !indexed(record.kind, record.state)
-    {
-        return Err(corrupt());
-    }
-    Ok(Some(record))
+    key: &'a str,
 }
 
-fn write(
-    transaction: &mut StateTransaction<'_>,
-    budget: &mut ReadBudget,
-    input: NewAgentArtifact,
-    replace: bool,
-) -> Result<Record, RocksError> {
-    let existing = if indexed(input.kind, input.state) {
-        read_scope(
-            transaction,
-            input.kind,
-            input.scope,
-            &input.scope_key,
-            budget,
-        )?
-    } else {
-        None
-    };
-    if existing.is_some() && !replace {
-        return Err(RocksError::ReplayConflict);
-    }
-    let timestamp = now();
-    let (id, artifact_id, created_at) = if let Some(record) = existing {
-        (record.id, record.artifact_id, record.created_at)
-    } else {
-        let sequence = transaction
-            .get(StateNamespace::Metadata, b"artifact_sequence", budget)?
-            .map(|bytes| counter(&bytes))
+impl ScopedArtifact<'_> {
+    fn read(
+        &self,
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+    ) -> Result<Option<Record>, RocksError> {
+        let Self { kind, scope, key } = *self;
+        let Some(bytes) =
+            transaction.get(NAMESPACE, scope_key(kind, scope, key).as_bytes(), budget)?
+        else {
+            return Ok(None);
+        };
+        let id = counter(&bytes)?;
+        let record: Record = transaction
+            .get(NAMESPACE, primary(id).as_bytes(), budget)?
+            .map(|bytes| decode(&bytes))
             .transpose()?
-            .unwrap_or(0);
-        let next = sequence
-            .checked_add(1)
-            .filter(|value| i64::try_from(*value).is_ok())
             .ok_or(corrupt())?;
-        let mut entropy = [0_u8; 16];
-        getrandom::fill(&mut entropy).map_err(|_| RocksError::Operation {
-            operation: "artifact-identity",
-        })?;
-        let identity = ArtifactId::from_uuid_v8(entropy).to_string();
-        if transaction
-            .get(NAMESPACE, format!("u/{identity}").as_bytes(), budget)?
-            .is_some()
+        validate_record(&record)?;
+        if record.id != id
+            || record.kind != kind
+            || record.scope != scope
+            || record.scope_key != key
+            || !indexed(record.kind, record.state)
         {
+            return Err(corrupt());
+        }
+        Ok(Some(record))
+    }
+}
+
+impl NewAgentArtifact {
+    fn write(
+        self,
+        transaction: &mut StateTransaction<'_>,
+        budget: &mut ReadBudget,
+        replace: bool,
+    ) -> Result<Record, RocksError> {
+        let input = self;
+        let existing = if indexed(input.kind, input.state) {
+            (ScopedArtifact {
+                kind: input.kind,
+                scope: input.scope,
+                key: &input.scope_key,
+            })
+            .read(transaction, budget)?
+        } else {
+            None
+        };
+        if existing.is_some() && !replace {
             return Err(RocksError::ReplayConflict);
         }
-        transaction.put(
-            StateNamespace::Metadata,
-            b"artifact_sequence",
-            next.to_be_bytes().to_vec(),
-        )?;
-        (next, identity, timestamp.clone())
-    };
-    let record = Record {
-        id,
-        artifact_id,
-        kind: input.kind,
-        scope: input.scope,
-        scope_key: input.scope_key,
-        body: input.body,
-        metadata: input.metadata,
-        generation_id: input.generation_id.map(|value| value.to_string()),
-        source_digest: input.source_digest.map(|value| value.to_string()),
-        state: input.state,
-        created_at,
-        updated_at: timestamp,
-    };
-    validate_record(&record)?;
-    transaction.put(NAMESPACE, primary(id).as_bytes(), encode(&record)?)?;
-    transaction.put(
-        NAMESPACE,
-        format!("u/{}", record.artifact_id).as_bytes(),
-        id.to_be_bytes().to_vec(),
-    )?;
-    if indexed(record.kind, record.state) {
+        let timestamp = now();
+        let (id, artifact_id, created_at) = if let Some(record) = existing {
+            (record.id, record.artifact_id, record.created_at)
+        } else {
+            let sequence = transaction
+                .get(StateNamespace::Metadata, b"artifact_sequence", budget)?
+                .map(|bytes| counter(&bytes))
+                .transpose()?
+                .unwrap_or(0);
+            let next = sequence
+                .checked_add(1)
+                .filter(|value| i64::try_from(*value).is_ok())
+                .ok_or(corrupt())?;
+            let mut entropy = [0_u8; 16];
+            getrandom::fill(&mut entropy).map_err(|_| RocksError::Operation {
+                operation: "artifact-identity",
+            })?;
+            let identity = ArtifactId::from_uuid_v8(entropy).to_string();
+            if transaction
+                .get(NAMESPACE, format!("u/{identity}").as_bytes(), budget)?
+                .is_some()
+            {
+                return Err(RocksError::ReplayConflict);
+            }
+            transaction.put(
+                StateNamespace::Metadata,
+                b"artifact_sequence",
+                next.to_be_bytes().to_vec(),
+            )?;
+            (next, identity, timestamp.clone())
+        };
+        let record = Record {
+            id,
+            artifact_id,
+            kind: input.kind,
+            scope: input.scope,
+            scope_key: input.scope_key,
+            body: input.body,
+            metadata: input.metadata,
+            generation_id: input.generation_id.map(|value| value.to_string()),
+            source_digest: input.source_digest.map(|value| value.to_string()),
+            state: input.state,
+            created_at,
+            updated_at: timestamp,
+        };
+        validate_record(&record)?;
+        transaction.put(NAMESPACE, primary(id).as_bytes(), encode(&record)?)?;
         transaction.put(
             NAMESPACE,
-            scope_key(record.kind, record.scope, &record.scope_key).as_bytes(),
+            format!("u/{}", record.artifact_id).as_bytes(),
             id.to_be_bytes().to_vec(),
         )?;
+        if indexed(record.kind, record.state) {
+            transaction.put(
+                NAMESPACE,
+                scope_key(record.kind, record.scope, &record.scope_key).as_bytes(),
+                id.to_be_bytes().to_vec(),
+            )?;
+        }
+        if record.kind == Kind::Summary {
+            bump_epoch(transaction, budget, b"summary_epoch")?;
+        }
+        Ok(record)
     }
-    if record.kind == Kind::Summary {
-        bump_epoch(transaction, budget, b"summary_epoch")?;
-    }
-    Ok(record)
 }
 
 pub(crate) fn decode_primary(key: &[u8], bytes: &[u8]) -> Result<Record, RocksError> {
@@ -513,7 +541,7 @@ fn current_summary_input(
     };
     let snapshot = transaction.graph_snapshot()?;
     let graph = snapshot.graph(budget)?;
-    is_current(record, Some(&current.generation_id), Some(&graph), budget)
+    record.is_current(Some(&current.generation_id), Some(&graph), budget)
 }
 
 pub(crate) fn bump_epoch(
@@ -538,50 +566,60 @@ pub(crate) fn bump_epoch(
 }
 
 fn validate_record(record: &Record) -> Result<(), RocksError> {
-    if record.id == 0
-        || record.id > i64::MAX as u64
-        || !canonical_uuid(&record.artifact_id)
-        || validate_scope_key(&record.scope_key).is_err()
-        || validate_body(&record.body, record.state).is_err()
-        || validate_metadata(&record.metadata).is_err()
-        || record
-            .generation_id
-            .as_ref()
-            .is_some_and(|value| GenerationId::parse(value).is_err())
-        || record
-            .source_digest
-            .as_ref()
-            .is_some_and(|value| ContentDigest::parse(value).is_err())
-        || record.created_at.parse::<jiff::Timestamp>().is_err()
-        || record.updated_at.parse::<jiff::Timestamp>().is_err()
-    {
+    if record.id == 0 || record.id > i64::MAX as u64 || !canonical_uuid(&record.artifact_id) {
         return Err(corrupt());
     }
+    validate_scope_key(&record.scope_key).map_err(|_| corrupt())?;
+    validate_body(&record.body, record.state).map_err(|_| corrupt())?;
+    validate_metadata(&record.metadata).map_err(|_| corrupt())?;
+    record
+        .generation_id
+        .as_ref()
+        .map(|value| GenerationId::parse(value))
+        .transpose()
+        .map_err(|_| corrupt())?;
+    record
+        .source_digest
+        .as_ref()
+        .map(|value| ContentDigest::parse(value))
+        .transpose()
+        .map_err(|_| corrupt())?;
+    record
+        .created_at
+        .parse::<jiff::Timestamp>()
+        .map_err(|_| corrupt())?;
+    record
+        .updated_at
+        .parse::<jiff::Timestamp>()
+        .map_err(|_| corrupt())?;
     Ok(())
 }
 
-pub(crate) fn is_current(
-    record: &Record,
-    current: Option<&GenerationId>,
-    graph: Option<&GraphSnapshot<'_, '_>>,
-    budget: &mut ReadBudget,
-) -> Result<bool, RocksError> {
-    if matches!(record.kind, Kind::Role | Kind::Summary) && record.scope == Scope::Symbol {
-        let Some(graph) = graph else {
-            return Ok(false);
-        };
-        let id = SymbolId::parse(&record.scope_key).map_err(|_| corrupt())?;
-        return Ok(graph.symbol(&id, budget)?.is_some_and(|symbol| {
-            record.source_digest.as_deref() == Some(symbol.structural_digest.as_str())
-        }));
+impl Record {
+    pub(crate) fn is_current(
+        &self,
+        current: Option<&GenerationId>,
+        graph: Option<&GraphSnapshot<'_, '_>>,
+        budget: &mut ReadBudget,
+    ) -> Result<bool, RocksError> {
+        let record = self;
+        if matches!(record.kind, Kind::Role | Kind::Summary) && record.scope == Scope::Symbol {
+            let Some(graph) = graph else {
+                return Ok(false);
+            };
+            let id = SymbolId::parse(&record.scope_key).map_err(|_| corrupt())?;
+            return Ok(graph.symbol(&id, budget)?.is_some_and(|symbol| {
+                record.source_digest.as_deref() == Some(symbol.structural_digest.as_str())
+            }));
+        }
+        Ok(
+            current.is_some_and(|id| record.generation_id.as_deref() == Some(id.as_str()))
+                && (!matches!(record.kind, Kind::Role | Kind::Summary)
+                    || (record.kind == Kind::Summary
+                        && matches!(record.scope, Scope::File | Scope::Module | Scope::Project)
+                        && record.source_digest.is_some())),
+        )
     }
-    Ok(
-        current.is_some_and(|id| record.generation_id.as_deref() == Some(id.as_str()))
-            && (!matches!(record.kind, Kind::Role | Kind::Summary)
-                || (record.kind == Kind::Summary
-                    && matches!(record.scope, Scope::File | Scope::Module | Scope::Project)
-                    && record.source_digest.is_some())),
-    )
 }
 
 fn newest(a: &Record, b: &Record) -> std::cmp::Ordering {

@@ -16,11 +16,17 @@ import tomllib
 from build_tools import admission, cache_root, environment
 
 
+SOURCE_FILE_COUNT = 1024
+PROBE_TIMEOUT_SECONDS = 120
+NATIVE_RUN_TIMEOUT_SECONDS = 30
+
+
 def run(arguments, **kwargs):
-    return subprocess.run(arguments, check=True, timeout=120, **kwargs)
+    return subprocess.run(arguments, check=True, timeout=PROBE_TIMEOUT_SECONDS, **kwargs)
 
 
-def verify(root, environment, config, target):
+def verify(root, probe_environment, config):
+    target = probe_environment['CODEVETRA_RELEASE_TARGET']
     source = root / 'src'
     source.mkdir()
     (root / '.cargo').mkdir()
@@ -29,13 +35,13 @@ def verify(root, environment, config, target):
         '[workspace]\n[package]\nname="release_cache_probe"\nversion="0.0.0"\nedition="2024"\n')
     # Many source files exercise the input shape that triggered Rust hash
     # fan-out; a restored Rust wrapper also fails the statistics check below.
-    for index in range(1024):
+    for index in range(SOURCE_FILE_COUNT):
         (source / f'part{index}.rs').write_text(f'pub const VALUE: usize = {index};\n')
     main = source / 'main.rs'
-    main.write_text(''.join(f'mod part{i};\n' for i in range(1024)) +
+    main.write_text(''.join(f'mod part{i};\n' for i in range(SOURCE_FILE_COUNT)) +
                     'fn main() { println!("{}", [' +
-                    ','.join(f'part{i}::VALUE' for i in range(1024)) + '].iter().sum::<usize>()); }\n')
-    env = dict(environment, CARGO_TARGET_DIR=str(root / 'target'),
+                    ','.join(f'part{i}::VALUE' for i in range(SOURCE_FILE_COUNT)) + '].iter().sum::<usize>()); }\n')
+    env = dict(probe_environment, CARGO_TARGET_DIR=str(root / 'target'),
                CARGO_BUILD_BUILD_DIR=str(root / 'target'))
     cargo = ['cargo', '+' + env['CODEVETRA_RELEASE_TOOLCHAIN']]
     run([*cargo, 'generate-lockfile', '--offline'], cwd=root, env=env)
@@ -43,7 +49,7 @@ def verify(root, environment, config, target):
     run(build, cwd=root, env=env)
     binary = root / 'target/debug/release_cache_probe'
     def output(arguments):
-        return subprocess.check_output(arguments, env=env, text=True, timeout=120).strip()
+        return subprocess.check_output(arguments, env=env, text=True, timeout=PROBE_TIMEOUT_SECONDS).strip()
     if output([str(binary)]) != '523776':
         raise RuntimeError('Rust fixture produced an unexpected result')
     timestamp = binary.stat().st_mtime_ns
@@ -65,7 +71,7 @@ def verify(root, environment, config, target):
     cpp.write_text('int main() { return 42; }\n')
     run([*compiler, '-c', str(cpp), '-o', str(obj)], env=env)
     run(['c++', str(obj), '-o', str(native)], env=env)
-    if subprocess.run([str(native)], timeout=30).returncode != 42:
+    if subprocess.run([str(native)], timeout=NATIVE_RUN_TIMEOUT_SECONDS).returncode != 42:
         raise RuntimeError('Changed native input reused a stale object')
     stats = json.loads(output(['sccache', '--show-stats', '--stats-format', 'json']))['stats']
     hits = sum(stats['cache_hits']['counts'].values())
@@ -81,12 +87,12 @@ def main():
         raise RuntimeError('The bounded Linux release must explicitly clear both Rust wrappers')
     config = Path(__file__).resolve().parent.parent / '.cargo/config.toml'
     if sys.argv[1:] == ['--probe']:
-        verify(Path.cwd(), dict(os.environ), config, os.environ['CODEVETRA_RELEASE_TARGET'])
+        verify(Path.cwd(), dict(os.environ), config)
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--timeout', type=int, default=120)
+    parser.add_argument('--timeout', type=int, default=PROBE_TIMEOUT_SECONDS)
     args = parser.parse_args()
-    if not 1 <= args.timeout <= 120:
+    if not 1 <= args.timeout <= PROBE_TIMEOUT_SECONDS:
         parser.error('timeout must be between 1 and 120 seconds')
     spec = importlib.util.spec_from_file_location('rust_dev', Path(__file__).with_name('rust-dev.py'))
     runner = importlib.util.module_from_spec(spec)
@@ -96,8 +102,8 @@ def main():
         root = Path(directory)
         env['SCCACHE_DIR'] = str(root / 'cache')
         runner.ROOT = root
-        result = runner.run([sys.executable, str(Path(__file__).resolve()), '--probe'],
-                            env, args.timeout, lock)
+        result = runner.BuildRun([sys.executable, str(Path(__file__).resolve()), '--probe'],
+                                 env, args.timeout).run(lock)
         if result:
             raise SystemExit(result)
 

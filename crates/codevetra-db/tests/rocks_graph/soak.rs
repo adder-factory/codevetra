@@ -133,13 +133,8 @@ fn observe(store: &ProjectStore, stop: &AtomicBool) -> Result<ReaderSamples, Roc
         let packed = || -> Result<_, RocksError> {
             let start = Instant::now();
             let links = graph
-                .neighbors(
-                    &symbol(1),
-                    GraphDirection::Outgoing,
-                    None,
-                    64,
-                    &mut read_budget()?,
-                )?
+                .adjacency(&symbol(1), GraphDirection::Outgoing)
+                .page(None, 64, &mut read_budget()?)?
                 .links;
             let ids = links
                 .iter()
@@ -151,8 +146,11 @@ fn observe(store: &ProjectStore, stop: &AtomicBool) -> Result<ReaderSamples, Roc
             let mut prefix = b"cg1/e/".to_vec();
             prefix.extend_from_slice(&uuid_bytes(&symbol(1))?);
             let start = Instant::now();
-            let page =
-                snapshot.scan_prefix(Collection::Graph, &prefix, None, 64, &mut read_budget()?)?;
+            let page = snapshot.scan_prefix(Collection::Graph, &prefix).page(
+                None,
+                64,
+                &mut read_budget()?,
+            )?;
             let ids = page
                 .rows
                 .iter()
@@ -196,13 +194,8 @@ fn verify_dynamic_edge(
         3
     };
     let links = graph
-        .neighbors(
-            &symbol(3_000),
-            GraphDirection::Outgoing,
-            None,
-            10,
-            &mut budget,
-        )?
+        .adjacency(&symbol(3_000), GraphDirection::Outgoing)
+        .page(None, 10, &mut budget)?
         .links;
     if links.len() != 1 || links[0].target_symbol_id() != &symbol(target) {
         return Err(RocksError::Corrupt {
@@ -210,13 +203,8 @@ fn verify_dynamic_edge(
         });
     }
     let reverse = graph
-        .neighbors(
-            &symbol(target),
-            GraphDirection::Incoming,
-            None,
-            10,
-            &mut budget,
-        )?
+        .adjacency(&symbol(target), GraphDirection::Incoming)
+        .page(None, 10, &mut budget)?
         .links;
     if !reverse
         .iter()
@@ -227,13 +215,11 @@ fn verify_dynamic_edge(
         });
     }
     let old = graph
-        .neighbors(
+        .adjacency(
             &symbol(if target == 2 { 3 } else { 2 }),
             GraphDirection::Incoming,
-            None,
-            10,
-            &mut budget,
-        )?
+        )
+        .page(None, 10, &mut budget)?
         .links;
     if old
         .iter()

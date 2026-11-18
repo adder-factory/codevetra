@@ -1,55 +1,43 @@
 //! Bounded protobuf arithmetic and byte decoding used by the actual codec.
 
+pub(super) const VARINT_PAYLOAD_BITS: usize = 7;
+pub(super) const VARINT_PAYLOAD_MASK: u8 = 0x7f;
+pub(super) const VARINT_CONTINUATION_BIT: u8 = 0x80;
+
+pub(super) const WIRE_VARINT: u8 = 0;
+pub(super) const WIRE_I64: u8 = 1;
+pub(super) const WIRE_LEN: u8 = 2;
+pub(super) const WIRE_I32: u8 = 5;
+pub(super) const PROTOBUF_TAG_SHIFT: u32 = 3;
+pub(super) const PROTOBUF_WIRE_TYPE_MASK: u64 = 7;
+const MAXIMUM_FIELD_NUMBER: u32 = 0x1fff_ffff;
+
 pub(super) fn varint_length(value: u64) -> usize {
-    if value < (1 << 7) {
-        1
-    } else if value < (1 << 14) {
-        2
-    } else if value < (1 << 21) {
-        3
-    } else if value < (1 << 28) {
-        4
-    } else if value < (1 << 35) {
-        5
-    } else if value < (1 << 42) {
-        6
-    } else if value < (1 << 49) {
-        7
-    } else if value < (1 << 56) {
-        8
-    } else if value < (1 << 63) {
-        9
-    } else {
-        10
+    let mut value = value;
+    let mut length = 1;
+    while value > u64::from(VARINT_PAYLOAD_MASK) {
+        value >>= VARINT_PAYLOAD_BITS;
+        length += 1;
     }
+    length
 }
 
-pub(super) fn delimited_end(
-    current: usize,
+pub(super) fn delimited_size(
     tag_bytes: usize,
     length_bytes: usize,
     payload: usize,
-    maximum: usize,
 ) -> Option<usize> {
-    if current > maximum || tag_bytes > maximum - current {
-        return None;
-    }
-    let after_tag = current + tag_bytes;
-    if length_bytes > maximum - after_tag {
-        return None;
-    }
-    let after_length = after_tag + length_bytes;
-    if payload > maximum - after_length {
-        return None;
-    }
-    Some(after_length + payload)
+    tag_bytes.checked_add(length_bytes)?.checked_add(payload)
 }
 
 pub(super) fn field_tag(field: u32, wire: u8) -> Option<u64> {
-    if field == 0 || field > 0x1fff_ffff || wire > 5 || wire == 3 || wire == 4 {
+    if field == 0
+        || field > MAXIMUM_FIELD_NUMBER
+        || !matches!(wire, WIRE_VARINT | WIRE_I64 | WIRE_LEN | WIRE_I32)
+    {
         return None;
     }
-    Some((u64::from(field) << 3) | u64::from(wire))
+    Some((u64::from(field) << PROTOBUF_TAG_SHIFT) | u64::from(wire))
 }
 
 pub(super) fn cursor_end(position: usize, length: usize, total: usize) -> Option<usize> {
@@ -63,15 +51,15 @@ pub(super) fn cursor_end(position: usize, length: usize, total: usize) -> Option
 pub(super) fn read_varint(bytes: &[u8], start: usize) -> Option<(u64, usize)> {
     let mut value = 0_u64;
     let mut position = start;
-    for shift in (0..64).step_by(7) {
+    for shift in (0..u64::BITS).step_by(VARINT_PAYLOAD_BITS) {
         let byte = *bytes.get(position)?;
         position = position.checked_add(1)?;
-        let payload = u64::from(byte & 0x7f);
-        if shift == 63 && payload > 1 {
+        let payload = u64::from(byte & VARINT_PAYLOAD_MASK);
+        if shift == u64::BITS - 1 && payload > 1 {
             return None;
         }
         value |= payload << shift;
-        if byte & 0x80 == 0 {
+        if byte & VARINT_CONTINUATION_BIT == 0 {
             return Some((value, position));
         }
     }

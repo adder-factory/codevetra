@@ -110,6 +110,7 @@ fn file_edge(
             file: child,
             visibility: super::rust_path_resolution::ModuleVisibility::Private,
             parent_module: Some(parent_id),
+            source: super::rust_path_resolution::ModuleSource::Conventional,
         }),
     );
     Ok(())

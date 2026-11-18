@@ -5,6 +5,14 @@ use codevetra_domain::SourceLanguage;
 use serde::Serialize;
 use tree_sitter::{Node, Parser};
 
+const MAXIMUM_SOURCE_BYTES: usize = 256 * 1024;
+const MAXIMUM_STEPS: usize = 512;
+const MAXIMUM_DEPTH: usize = 32;
+const MAXIMUM_AST_NODES: usize = 32_768;
+const MAXIMUM_DECLARATION_DEPTH: usize = 64;
+const MAXIMUM_PENDING_DECLARATIONS: usize = 4096;
+const MAXIMUM_PREVIEW_BYTES: usize = 160;
+
 /// Original file coordinates for a source-backed step.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +81,31 @@ pub struct StaticTraceInput<'a> {
     pub maximum_depth: usize,
 }
 
+impl StaticTraceInput<'_> {
+    fn validate(&self) -> Result<(), ExtractError> {
+        if self.source.len() > MAXIMUM_SOURCE_BYTES
+            || self.maximum_steps == 0
+            || self.maximum_steps > MAXIMUM_STEPS
+            || self.maximum_depth == 0
+            || self.maximum_depth > MAXIMUM_DEPTH
+        {
+            return Err(ExtractError::OutputLimit);
+        }
+        let window_end = self
+            .byte_offset
+            .checked_add(self.source.len() as u64)
+            .ok_or(ExtractError::InvalidSpan)?;
+        if self.start_line == 0
+            || self.symbol_start < self.byte_offset
+            || self.symbol_end > window_end
+            || self.symbol_start > self.symbol_end
+        {
+            return Err(ExtractError::InvalidSpan);
+        }
+        Ok(())
+    }
+}
+
 /// Parse a supported selected body with the existing cancellation-aware parser.
 /// # Errors
 /// Returns grammar, invalid-bound or parser errors. Cancellation retains an explicit partial prefix. Unsupported
@@ -91,25 +124,7 @@ pub fn static_syntax_trace(
         output.unknowns.push("cancelled");
         return Ok(output);
     }
-    if input.source.len() > 256 * 1024
-        || input.maximum_steps == 0
-        || input.maximum_steps > 512
-        || input.maximum_depth == 0
-        || input.maximum_depth > 32
-    {
-        return Err(ExtractError::OutputLimit);
-    }
-    let window_end = input
-        .byte_offset
-        .checked_add(input.source.len() as u64)
-        .ok_or(ExtractError::InvalidSpan)?;
-    if input.start_line == 0
-        || input.symbol_start < input.byte_offset
-        || input.symbol_end > window_end
-        || input.symbol_start > input.symbol_end
-    {
-        return Err(ExtractError::InvalidSpan);
-    }
+    input.validate()?;
     if !matches!(
         input.language,
         SourceLanguage::JavaScript
@@ -154,11 +169,25 @@ pub fn static_syntax_trace(
     };
     let root = walker.find_body(tree.root_node())?;
     if let Some(root) = root {
-        walker.visit(root, None, "body", 0)?;
+        walker.visit(
+            root,
+            TracePosition {
+                parent: None,
+                relation: "body",
+                depth: 0,
+            },
+        )?;
     } else {
         walker.unknown("unsupported_or_missing_callable_body");
     }
     Ok(walker.output)
+}
+
+#[derive(Clone, Copy)]
+struct TracePosition {
+    parent: Option<usize>,
+    relation: &'static str,
+    depth: usize,
 }
 
 struct Walker<'a, 'b> {
@@ -181,7 +210,7 @@ impl Walker<'_, '_> {
             return false;
         }
         self.visited += 1;
-        if self.visited > 32_768 {
+        if self.visited > MAXIMUM_AST_NODES {
             self.unknown("ast_work_limit");
             return false;
         }
@@ -194,7 +223,7 @@ impl Walker<'_, '_> {
             if !self.poll() {
                 break;
             }
-            if depth > 64 {
+            if depth > MAXIMUM_DECLARATION_DEPTH {
                 self.unknown("declaration_search_depth_limit");
                 continue;
             }
@@ -225,7 +254,7 @@ impl Walker<'_, '_> {
         pending: &mut Vec<(Node<'tree>, usize)>,
     ) -> Result<(), ExtractError> {
         for index in (0..node.named_child_count()).rev() {
-            if pending.len() >= 4096 {
+            if pending.len() >= MAXIMUM_PENDING_DECLARATIONS {
                 self.unknown("declaration_search_width_limit");
                 break;
             }
@@ -241,7 +270,6 @@ impl Walker<'_, '_> {
         &mut self,
         node: Node<'_>,
         parent: Option<usize>,
-        kind: &str,
         relation: &str,
     ) -> Result<Option<usize>, ExtractError> {
         if self.output.steps.len() >= self.input.maximum_steps {
@@ -253,7 +281,7 @@ impl Walker<'_, '_> {
             .source
             .get(node.byte_range())
             .ok_or(ExtractError::InvalidSpan)?;
-        let preview_end = source.floor_char_boundary(source.len().min(160));
+        let preview_end = source.floor_char_boundary(source.len().min(MAXIMUM_PREVIEW_BYTES));
         let id = self.output.steps.len();
         let call_anchor = if node.kind() == "call_expression" || node.kind() == "new_expression" {
             node.child_by_field_name("function")
@@ -268,7 +296,12 @@ impl Walker<'_, '_> {
         self.output.steps.push(SyntaxTraceStep {
             id,
             parent,
-            kind: kind.to_owned(),
+            kind: if callable(node.kind()) {
+                "deferred_callable"
+            } else {
+                node.kind()
+            }
+            .to_owned(),
             relation: relation.to_owned(),
             span: TraceSpan {
                 start_byte: self.input.byte_offset + node.start_byte() as u64,
@@ -296,13 +329,12 @@ impl Walker<'_, '_> {
         });
         Ok(Some(id))
     }
-    fn visit(
-        &mut self,
-        node: Node<'_>,
-        parent: Option<usize>,
-        relation: &str,
-        depth: usize,
-    ) -> Result<(), ExtractError> {
+    fn visit(&mut self, node: Node<'_>, position: TracePosition) -> Result<(), ExtractError> {
+        let TracePosition {
+            parent,
+            relation,
+            depth,
+        } = position;
         if !self.poll() {
             return Ok(());
         }
@@ -316,12 +348,7 @@ impl Walker<'_, '_> {
         }
         let kind = node.kind();
         if callable(kind) {
-            self.emit(
-                node,
-                parent,
-                "deferred_callable",
-                "declaration_or_callback_not_executed_inline",
-            )?;
+            self.emit(node, parent, "declaration_or_callback_not_executed_inline")?;
             return Ok(());
         }
         let visible = relation != "source_order"
@@ -358,7 +385,7 @@ impl Walker<'_, '_> {
             );
         let relation = call_relation(node, relation);
         let next_parent = if visible {
-            self.emit(node, parent, kind, relation)?
+            self.emit(node, parent, relation)?
         } else {
             parent
         };
@@ -374,7 +401,14 @@ impl Walker<'_, '_> {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             let branch = child_relation(node, child);
-            self.visit(child, next_parent, branch, depth + 1)?;
+            self.visit(
+                child,
+                TracePosition {
+                    parent: next_parent,
+                    relation: branch,
+                    depth: depth + 1,
+                },
+            )?;
             if self.output.steps.len() >= self.input.maximum_steps {
                 self.unknown("step_limit");
                 break;
@@ -412,15 +446,11 @@ fn callable(kind: &str) -> bool {
 fn child_relation(parent: Node<'_>, child: Node<'_>) -> &'static str {
     let field = |name| parent.child_by_field_name(name) == Some(child);
     match parent.kind() {
-        "if_statement" | "ternary_expression" if field("condition") => "guard",
-        "if_statement" | "ternary_expression" if field("consequence") => "guard_true",
-        "if_statement" | "ternary_expression" if field("alternative") => "guard_false",
+        "if_statement" | "ternary_expression" => conditional_relation(parent, child),
         "switch_statement" if field("value") => "switch_discriminant",
         "switch_case" if field("value") => "case_guard",
         "switch_case" | "switch_default" => "case_body_fallthrough_possible",
-        "try_statement" if field("handler") => "exception_path",
-        "try_statement" if field("finalizer") => "cleanup_on_normal_or_abrupt_exit",
-        "try_statement" => "try_body",
+        "try_statement" => exception_relation(parent, child),
         "for_statement" | "for_in_statement" | "while_statement" | "do_statement"
             if field("body") =>
         {
@@ -433,6 +463,29 @@ fn child_relation(parent: Node<'_>, child: Node<'_>) -> &'static str {
         "binary_expression" => "expression_operand_short_circuit_possible",
         "arguments" if callable(child.kind()) => "callback_argument_not_executed_inline",
         _ => "source_order",
+    }
+}
+
+fn conditional_relation(parent: Node<'_>, child: Node<'_>) -> &'static str {
+    for (field, relation) in [
+        ("condition", "guard"),
+        ("consequence", "guard_true"),
+        ("alternative", "guard_false"),
+    ] {
+        if parent.child_by_field_name(field) == Some(child) {
+            return relation;
+        }
+    }
+    "source_order"
+}
+
+fn exception_relation(parent: Node<'_>, child: Node<'_>) -> &'static str {
+    if parent.child_by_field_name("handler") == Some(child) {
+        "exception_path"
+    } else if parent.child_by_field_name("finalizer") == Some(child) {
+        "cleanup_on_normal_or_abrupt_exit"
+    } else {
+        "try_body"
     }
 }
 

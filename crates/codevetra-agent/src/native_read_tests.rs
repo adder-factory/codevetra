@@ -13,9 +13,11 @@ async fn cancelled_project_native_read_drains_its_worker_before_returning()
     let identity = ContentDigest::from_bytes([42; 32]);
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        identity,
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            identity,
+            StorePolicy::default(),
+        ),
         &StorageRequest::new(Duration::from_secs(30))?,
     )
     .await?;
@@ -29,13 +31,11 @@ async fn cancelled_project_native_read_drains_its_worker_before_returning()
             let request = CodeVetraDatabase::request_control(Duration::from_secs(30))
                 .map_err(|_| ProjectError::RequestCancelled)?;
             reading
+                .with_request(&request)
                 .state(
-                    None,
+                    codevetra_db::rocks::StateAccess::read_only(None),
                     ReadBudget::new(100, 1_048_576, Duration::from_secs(30))
                         .map_err(|_| ProjectError::StatusFailed)?,
-                    0,
-                    0,
-                    &request,
                     move |_, budget| {
                         let _entered = entered.send(());
                         released
@@ -55,16 +55,14 @@ async fn cancelled_project_native_read_drains_its_worker_before_returning()
     tokio::time::sleep(Duration::from_millis(25)).await;
     let returned_early = work.is_finished();
     // Unrelated work can still use the other native worker during the drain.
-    store
-        .state(
-            None,
-            ReadBudget::new(100, 1_048_576, Duration::from_secs(3))?,
-            0,
-            0,
-            &StorageRequest::new(Duration::from_secs(3))?,
-            |_, _| Ok(()),
-        )
-        .await?;
+    {
+        let request_bound_access = codevetra_db::rocks::StateAccess::read_only(None);
+        let request_bound_budget = ReadBudget::new(100, 1_048_576, Duration::from_secs(3))?;
+        store
+            .with_request(&StorageRequest::new(Duration::from_secs(3))?)
+            .state(request_bound_access, request_bound_budget, |_, _| Ok(()))
+            .await
+    }?;
     release.send(())?;
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(3), work).await??,

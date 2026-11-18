@@ -19,45 +19,6 @@ use std::time::Duration;
 
 const NAMESPACE: StateNamespace = StateNamespace::Embeddings;
 
-/// Test exact source-compatible vectors without retaining the corpus's vector payloads.
-pub(crate) fn embedded_symbols(
-    transaction: &StateTransaction<'_>,
-    graph: &crate::rocks::GraphSnapshot<'_, '_>,
-    model_id: &codevetra_domain::ModelId,
-    budget: &mut ReadBudget,
-) -> Result<std::collections::BTreeSet<codevetra_domain::SymbolId>, SemanticStorageError> {
-    let bytes = transaction
-        .get(NAMESPACE, format!("m/{model_id}").as_bytes(), budget)?
-        .ok_or(SemanticStorageError::ModelNotFound)?;
-    let model: RegisteredEmbeddingModel = decode(&bytes)?;
-    if model.selector.model_id != *model_id {
-        return Err(SemanticStorageError::ModelMismatch);
-    }
-    vectors::active(transaction, &model.selector, budget)?;
-    let generation = vectors::current(transaction)?;
-    let mut output = std::collections::BTreeSet::new();
-    vectors::documents_scan(graph, budget, |_, document, budget| {
-        if document.kind == codevetra_domain::DocumentKind::Symbol
-            && let Some(id) = document.symbol_id.clone()
-        {
-            let document_id = document.document_id.clone();
-            let (_, digest) = vectors::source(transaction, graph, &generation, document, budget)?;
-            if vectors::read_vector(transaction, &model.selector, &document_id, &digest, budget)?
-                .is_some()
-            {
-                output.insert(id);
-                if output.len() > 131_072 {
-                    return Err(SemanticStorageError::InvalidInput {
-                        field: "embedding_symbol_workspace",
-                    });
-                }
-            }
-        }
-        Ok(std::ops::ControlFlow::Continue(()))
-    })?;
-    Ok(output)
-}
-
 pub(crate) fn feature_error(error: SemanticStorageError) -> StorageError {
     match error {
         SemanticStorageError::InvalidInput { field } => StorageError::InvalidInput { field },
@@ -87,9 +48,11 @@ impl NativeDatabase {
     ) -> Result<RegisteredEmbeddingModel, SemanticStorageError> {
         validate_timeout(timeout)?;
         let selector = selector.clone();
-        self.transaction(None, 0, 0, timeout, move |transaction, budget| {
-            load_model(transaction, &selector, budget)
-        })
+        self.transaction(
+            crate::rocks::StateAccess::read_only(None),
+            timeout,
+            move |transaction, budget| load_model(transaction, &selector, budget),
+        )
         .await
     }
     /// Register one immutable non-secret model identity in this project database.
@@ -101,58 +64,60 @@ impl NativeDatabase {
         timeout: Duration,
     ) -> Result<RegisteredEmbeddingModel, SemanticStorageError> {
         validate_timeout(timeout)?;
-        self.transaction(None, 1_048_576, 2, timeout, move |transaction, budget| {
-            let proposed = RegisteredEmbeddingModel {
-                selector: registration.selector(),
-                provider: registration.provider().to_owned(),
-                model_name: registration.model_name().to_owned(),
-                normalization: registration.normalization(),
-                state: EmbeddingModelState::Active,
-            };
-            let mut present = None;
-            let mut count = 0_u16;
-            visit_state::<RegisteredEmbeddingModel>(
-                transaction,
-                NAMESPACE,
-                b"m/",
-                budget,
-                |_, model, _| {
-                    count = count
-                        .checked_add(1)
-                        .ok_or(crate::rocks::RocksError::Limit {
-                            resource: "embedding_models",
-                        })?;
-                    if model.selector.model_id == proposed.selector.model_id
-                        || model.selector.fingerprint == proposed.selector.fingerprint
+        self.transaction(
+            crate::rocks::StateAccess::write(None, 1_048_576, 2),
+            timeout,
+            move |transaction, budget| {
+                let proposed = RegisteredEmbeddingModel {
+                    selector: registration.selector(),
+                    provider: registration.provider().to_owned(),
+                    model_name: registration.model_name().to_owned(),
+                    normalization: registration.normalization(),
+                    state: EmbeddingModelState::Active,
+                };
+                let mut present = None;
+                let mut count = 0_u16;
+                visit_state::<RegisteredEmbeddingModel>(
+                    &transaction.scan(NAMESPACE, b"m/"),
+                    budget,
+                    |_, model, _| {
+                        count = count
+                            .checked_add(1)
+                            .ok_or(crate::rocks::RocksError::Limit {
+                                resource: "embedding_models",
+                            })?;
+                        if model.selector.model_id == proposed.selector.model_id
+                            || model.selector.fingerprint == proposed.selector.fingerprint
+                        {
+                            present = Some(model);
+                        }
+                        Ok(())
+                    },
+                )?;
+                if let Some(model) = present {
+                    if model.selector != proposed.selector
+                        || model.provider != proposed.provider
+                        || model.model_name != proposed.model_name
+                        || model.normalization != proposed.normalization
                     {
-                        present = Some(model);
+                        return Err(SemanticStorageError::ModelConflict);
                     }
-                    Ok(())
-                },
-            )?;
-            if let Some(model) = present {
-                if model.selector != proposed.selector
-                    || model.provider != proposed.provider
-                    || model.model_name != proposed.model_name
-                    || model.normalization != proposed.normalization
-                {
-                    return Err(SemanticStorageError::ModelConflict);
+                    return Ok(model);
                 }
-                return Ok(model);
-            }
-            if count >= 256 {
-                return Err(SemanticStorageError::InvalidInput {
-                    field: "embedding_models",
-                });
-            }
-            crate::artifacts::native::bump_epoch(transaction, budget, b"vector_epoch")?;
-            transaction.put(
-                NAMESPACE,
-                &model_key(&proposed.selector),
-                encode(&proposed)?,
-            )?;
-            Ok(proposed)
-        })
+                if count >= 256 {
+                    return Err(SemanticStorageError::InvalidInput {
+                        field: "embedding_models",
+                    });
+                }
+                crate::artifacts::native::bump_epoch(transaction, budget, b"vector_epoch")?;
+                transaction.put(
+                    NAMESPACE,
+                    &model_key(&proposed.selector),
+                    encode(&proposed)?,
+                )?;
+                Ok(proposed)
+            },
+        )
         .await
     }
 }

@@ -12,6 +12,54 @@ const CURSOR_KEY: &[u8] = b"retention/cursor";
 const COMPLETED_KEY: &[u8] = b"retention/completed-v1";
 pub(super) const FLOOR_KEY: &[u8] = b"retention/floor";
 
+/// Retained history and bounded work admitted for one resumable collection pass.
+#[derive(Clone, Copy, Debug)]
+pub struct RetentionPolicy {
+    keep_superseded: u8,
+    maximum_generations: u16,
+    maximum_versions: u32,
+}
+
+impl RetentionPolicy {
+    /// Small automatic pass after publication or abandoned-generation cleanup.
+    pub const AUTOMATIC: Self = Self::new(2, 4, 10_000);
+    const MAXIMUM_SUPERSEDED: u8 = 32;
+    const MAXIMUM_GENERATIONS: u16 = 100;
+    const MAXIMUM_VERSIONS: u32 = 10_000;
+    const READ_ROWS: usize = 20_000;
+    const READ_BYTES: usize = 64 * 1_048_576;
+
+    /// Describe the retained history and finite per-pass work bounds.
+    /// The store validates the policy before acquiring mutation ownership.
+    #[must_use]
+    pub const fn new(keep_superseded: u8, maximum_generations: u16, maximum_versions: u32) -> Self {
+        Self {
+            keep_superseded,
+            maximum_generations,
+            maximum_versions,
+        }
+    }
+
+    fn validate(self) -> Result<Self> {
+        if self.keep_superseded > Self::MAXIMUM_SUPERSEDED
+            || !(1..=Self::MAXIMUM_GENERATIONS).contains(&self.maximum_generations)
+            || !(1..=Self::MAXIMUM_VERSIONS).contains(&self.maximum_versions)
+        {
+            return Err(RocksError::Limit {
+                resource: "retention_policy",
+            });
+        }
+        Ok(self)
+    }
+
+    /// Admit the standard bounded read workspace for a maintenance pass.
+    /// # Errors
+    /// Rejects invalid or unrepresentable deadlines.
+    pub fn read_budget(timeout: std::time::Duration) -> Result<ReadBudget> {
+        ReadBudget::new(Self::READ_ROWS, Self::READ_BYTES, timeout)
+    }
+}
+
 /// Committed progress from one bounded project-local retention transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct PruneReport {
@@ -29,13 +77,13 @@ pub struct PruneReport {
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cursor {
-    floor: u64,
+    #[serde(flatten)]
+    anchor: super::VersionAnchor,
     #[serde(default)]
     reservation_sequence: Option<u64>,
     collection: usize,
     resume: Option<Vec<u8>>,
     logical_key: Option<Vec<u8>>,
-    kept_anchor: bool,
     obsolete_tombstone: Option<Vec<u8>>,
 }
 
@@ -65,21 +113,12 @@ impl ProjectStore {
     /// # Errors
     /// Rejects a live writer, invalid limits, exhausted read allowance, corrupt
     /// state, or native failures. No deletion commits when this call fails.
-    pub fn prune(
-        &self,
-        keep_superseded: u8,
-        maximum_generations: u16,
-        maximum_versions: u32,
-        budget: &mut ReadBudget,
-    ) -> Result<PruneReport> {
-        if keep_superseded > 32
-            || !(1..=100).contains(&maximum_generations)
-            || !(1..=10_000).contains(&maximum_versions)
-        {
-            return Err(RocksError::Limit {
-                resource: "retention_policy",
-            });
-        }
+    pub fn prune(&self, policy: RetentionPolicy, budget: &mut ReadBudget) -> Result<PruneReport> {
+        let RetentionPolicy {
+            keep_superseded,
+            maximum_generations,
+            maximum_versions,
+        } = policy.validate()?;
         budget.checkpoint()?;
         self.check_control()?;
         let _serial = self.lock_mutation()?;
@@ -95,21 +134,21 @@ impl ProjectStore {
         // Invalidate completion in the same transaction as partial progress.
         // Returning to an earlier keep policy must still resume that cursor.
         batch.delete_cf(&meta, COMPLETED_KEY);
-        let snapshot = self.inner.database.snapshot();
-        let plan = self.prune_generation_metadata(
-            &snapshot,
-            &mut batch,
-            keep_superseded,
-            maximum_generations,
+        let mut pass = RetentionPass {
+            store: self,
+            snapshot: self.inner.database.snapshot(),
+            maximum_versions,
             budget,
-        )?;
+        };
+        let plan =
+            pass.prune_generation_metadata(&mut batch, keep_superseded, maximum_generations)?;
         batch.put_cf(&meta, FLOOR_KEY, plan.floor.to_be_bytes());
         let cursor = self.retention_cursor(plan.floor, last_sequence)?;
         let report = PruneReport {
             generations_removed: plan.removed,
             versions_visited: 0,
             versions_removed: 0,
-            oldest_retained_sequence: cursor.floor,
+            oldest_retained_sequence: cursor.anchor.floor,
             complete: false,
         };
         let mut traversal = VersionTraversal {
@@ -118,8 +157,13 @@ impl ProjectStore {
             batch,
             decrements: BTreeMap::new(),
         };
-        self.prune_versions(&snapshot, &mut traversal, maximum_versions, budget)?;
-        self.commit_retention(traversal, &plan, last_sequence, keep_superseded)
+        pass.prune_versions(&mut traversal)?;
+        let completed = Completed {
+            last_sequence,
+            floor: traversal.report.oldest_retained_sequence,
+            keep_superseded,
+        };
+        traversal.commit(self, &plan, &completed)
     }
 
     fn retention_cursor(&self, floor: u64, last_sequence: u64) -> Result<Cursor> {
@@ -132,12 +176,15 @@ impl ProjectStore {
             })
             .transpose()?
             .unwrap_or(Cursor {
-                floor,
+                anchor: super::VersionAnchor {
+                    floor,
+                    kept_anchor: false,
+                },
                 reservation_sequence: Some(last_sequence),
                 ..Cursor::default()
             });
         if cursor.collection > Collection::ALL.len()
-            || cursor.floor > floor
+            || cursor.anchor.floor > floor
             || cursor
                 .reservation_sequence
                 .is_some_and(|sequence| sequence > last_sequence)
@@ -150,69 +197,6 @@ impl ProjectStore {
         // traversal's end, a changed or unknown starting watermark forces a
         // fresh pass so newly inserted versions behind this cursor are visited.
         Ok(cursor)
-    }
-
-    fn commit_retention(
-        &self,
-        traversal: VersionTraversal,
-        plan: &MetadataPlan,
-        last_sequence: u64,
-        keep_superseded: u8,
-    ) -> Result<PruneReport> {
-        let meta = self.meta()?;
-        let VersionTraversal {
-            mut cursor,
-            mut report,
-            mut batch,
-            decrements,
-        } = traversal;
-        for (sequence, removed) in decrements {
-            let count = self
-                .optional_sequence(&version_count_key(sequence))?
-                .ok_or(RocksError::Corrupt {
-                    field: "version_count",
-                })?;
-            let remaining = count.checked_sub(removed).ok_or(RocksError::Corrupt {
-                field: "version_count",
-            })?;
-            if remaining == 0 && sequence < plan.floor {
-                batch.delete_cf(&meta, version_count_key(sequence));
-                batch.delete_cf(&meta, published_key(sequence));
-            } else {
-                batch.put_cf(&meta, version_count_key(sequence), remaining.to_be_bytes());
-            }
-        }
-        if cursor.collection == Collection::ALL.len() {
-            if cursor.floor < plan.floor || cursor.reservation_sequence != Some(last_sequence) {
-                cursor = Cursor {
-                    floor: plan.floor,
-                    reservation_sequence: Some(last_sequence),
-                    ..Cursor::default()
-                };
-                put_cursor(&mut batch, &meta, &cursor)?;
-            } else {
-                report.complete = !plan.more;
-                batch.delete_cf(&meta, CURSOR_KEY);
-            }
-        } else {
-            put_cursor(&mut batch, &meta, &cursor)?;
-        }
-        if report.complete {
-            let completed = serde_json::to_vec(&Completed {
-                last_sequence,
-                floor: report.oldest_retained_sequence,
-                keep_superseded,
-            })
-            .map_err(|_| operation("retention_completed"))?;
-            batch.put_cf(&meta, COMPLETED_KEY, completed);
-        }
-        if batch.size_in_bytes() > self.inner.policy.maximum_batch_bytes {
-            return Err(RocksError::Limit {
-                resource: "retention_batch_bytes",
-            });
-        }
-        self.write(&batch)?;
-        Ok(report)
     }
 
     fn completed_retention(
@@ -256,7 +240,7 @@ impl ProjectStore {
         let meta = self.meta()?;
         let mut batch = WriteBatch::default();
         if let Some(abandoned) = active.as_ref() {
-            let mut revision = self.revision(abandoned.sequence)?;
+            let mut revision = self.revision(abandoned.identity.sequence)?;
             revision.state = RevisionState::Failed;
             put_revision(&mut batch, &meta, &revision)?;
             batch.delete_cf(&meta, ACTIVE_KEY);
@@ -269,151 +253,6 @@ impl ProjectStore {
         }
         Ok(active)
     }
-
-    fn prune_versions(
-        &self,
-        snapshot: &Snapshot<'_>,
-        traversal: &mut VersionTraversal,
-        maximum_versions: u32,
-        budget: &mut ReadBudget,
-    ) -> Result<()> {
-        while let Some(&collection) = Collection::ALL.get(traversal.cursor.collection) {
-            let family = self.family(collection)?;
-            if !self.prune_collection(snapshot, &family, traversal, maximum_versions, budget)? {
-                break;
-            }
-            let VersionTraversal {
-                cursor,
-                report,
-                batch,
-                decrements,
-            } = traversal;
-            finish_tombstone(cursor, &family, batch, decrements, report)?;
-            cursor.collection += 1;
-            cursor.resume = None;
-            cursor.logical_key = None;
-            cursor.kept_anchor = false;
-        }
-        Ok(())
-    }
-
-    fn prune_collection(
-        &self,
-        snapshot: &Snapshot<'_>,
-        family: &Arc<BoundColumnFamily<'_>>,
-        traversal: &mut VersionTraversal,
-        maximum_versions: u32,
-        budget: &mut ReadBudget,
-    ) -> Result<bool> {
-        let meta = self.meta()?;
-        let start = traversal.cursor.resume.clone().unwrap_or_default();
-        let mut options = ReadOptions::default();
-        options.fill_cache(false);
-        for entry in snapshot.iterator_cf_opt(
-            family,
-            options,
-            IteratorMode::From(&start, Direction::Forward),
-        ) {
-            let (encoded_key, value) = entry.map_err(|_| operation("retention_scan"))?;
-            if traversal
-                .cursor
-                .resume
-                .as_deref()
-                .is_some_and(|resume| encoded_key.as_ref() <= resume)
-            {
-                continue;
-            }
-            if !traversal
-                .can_stage_version(encoded_key.len(), self.inner.policy.maximum_batch_bytes)
-            {
-                return Ok(false);
-            }
-            traversal.visit_version(snapshot, &meta, family, &encoded_key, &value, budget)?;
-            if traversal.report.versions_visited == maximum_versions {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn prune_generation_metadata(
-        &self,
-        snapshot: &Snapshot<'_>,
-        batch: &mut WriteBatch,
-        keep_superseded: u8,
-        maximum_generations: u16,
-        budget: &mut ReadBudget,
-    ) -> Result<MetadataPlan> {
-        let meta = self.meta()?;
-        let prefix = b"revision/";
-        let start = b"revision0";
-        let mut retained = 0_u8;
-        // This is also the logical retirement boundary. Increasing retention
-        // later cannot resurrect generations whose versions were collected.
-        let previous_floor = self.optional_sequence(FLOOR_KEY)?.unwrap_or(0);
-        let mut floor = self.optional_sequence(CURRENT_KEY)?.unwrap_or(
-            self.optional_sequence(LAST_SEQUENCE_KEY)?
-                .unwrap_or(0)
-                .saturating_add(1),
-        );
-        let mut removed = 0_u16;
-        let mut more = false;
-        for entry in snapshot.iterator_cf(&meta, IteratorMode::From(start, Direction::Reverse)) {
-            let (key, bytes) = entry.map_err(|_| operation("retention_generations"))?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            budget.charge(key.len().saturating_add(bytes.len()))?;
-            let revision: StoredRevision = serde_json::from_slice(&bytes)
-                .map_err(|_| RocksError::Corrupt { field: "revision" })?;
-            let eligible = match revision.state {
-                RevisionState::Current => false,
-                RevisionState::Superseded
-                    if super::lifecycle::keep_superseded(
-                        revision.sequence,
-                        previous_floor,
-                        retained,
-                        keep_superseded,
-                    ) =>
-                {
-                    retained += 1;
-                    floor = floor.min(revision.sequence);
-                    false
-                }
-                RevisionState::Superseded | RevisionState::Failed => true,
-                RevisionState::Ready | RevisionState::Staging => {
-                    return Err(RocksError::Corrupt {
-                        field: "unowned_revision",
-                    });
-                }
-            };
-            if !eligible {
-                continue;
-            }
-            if removed == maximum_generations {
-                more = true;
-                // Unknown older history may still be protected when a long
-                // failed-generation backlog precedes the retained set.
-                if retained < keep_superseded {
-                    floor = previous_floor;
-                }
-                break;
-            }
-            batch.delete_cf(&meta, key);
-            batch.delete_cf(&meta, identity_key(&revision.generation_id));
-            batch.delete_cf(&meta, super::staging::byte_count_key(revision.sequence));
-            if self.optional_sequence(&version_count_key(revision.sequence))? == Some(0) {
-                batch.delete_cf(&meta, version_count_key(revision.sequence));
-                batch.delete_cf(&meta, published_key(revision.sequence));
-            }
-            removed += 1;
-        }
-        Ok(MetadataPlan {
-            floor: floor.max(previous_floor),
-            removed,
-            more,
-        })
-    }
 }
 
 struct VersionTraversal {
@@ -424,58 +263,80 @@ struct VersionTraversal {
 }
 
 impl VersionTraversal {
+    fn commit(
+        self,
+        store: &ProjectStore,
+        plan: &MetadataPlan,
+        completed: &Completed,
+    ) -> Result<PruneReport> {
+        let last_sequence = completed.last_sequence;
+        let meta = store.meta()?;
+        let VersionTraversal {
+            mut cursor,
+            mut report,
+            mut batch,
+            decrements,
+        } = self;
+        for (sequence, removed) in decrements {
+            let count = store
+                .optional_sequence(&version_count_key(sequence))?
+                .ok_or(RocksError::Corrupt {
+                    field: "version_count",
+                })?;
+            let remaining = count.checked_sub(removed).ok_or(RocksError::Corrupt {
+                field: "version_count",
+            })?;
+            if remaining == 0 && sequence < plan.floor {
+                batch.delete_cf(&meta, version_count_key(sequence));
+                batch.delete_cf(&meta, published_key(sequence));
+            } else {
+                batch.put_cf(&meta, version_count_key(sequence), remaining.to_be_bytes());
+            }
+        }
+        if cursor.collection == Collection::ALL.len() {
+            if cursor.anchor.floor < plan.floor
+                || cursor.reservation_sequence != Some(last_sequence)
+            {
+                cursor = Cursor {
+                    anchor: super::VersionAnchor {
+                        floor: plan.floor,
+                        kept_anchor: false,
+                    },
+                    reservation_sequence: Some(last_sequence),
+                    ..Cursor::default()
+                };
+                put_cursor(&mut batch, &meta, &cursor)?;
+            } else {
+                report.complete = !plan.more;
+                batch.delete_cf(&meta, CURSOR_KEY);
+            }
+        } else {
+            put_cursor(&mut batch, &meta, &cursor)?;
+        }
+        if report.complete {
+            let completed =
+                serde_json::to_vec(completed).map_err(|_| operation("retention_completed"))?;
+            batch.put_cf(&meta, COMPLETED_KEY, completed);
+        }
+        if batch.size_in_bytes() > store.inner.policy.maximum_batch_bytes {
+            return Err(RocksError::Limit {
+                resource: "retention_batch_bytes",
+            });
+        }
+        store.write(&batch)?;
+        Ok(report)
+    }
+
     fn can_stage_version(&self, key_bytes: usize, maximum_batch_bytes: usize) -> bool {
         // Leave room for counters, the JSON cursor (binary keys can expand
         // fourfold), and a pending tombstone. Long-key batches commit bounded
         // progress instead of repeatedly attempting oversized transactions.
-        super::super::arithmetic::retention_batch_fits(
+        super::super::arithmetic::retention_workspace(
             self.batch.size_in_bytes(),
             self.decrements.len(),
             key_bytes,
-            maximum_batch_bytes,
         )
-    }
-
-    fn visit_version(
-        &mut self,
-        snapshot: &Snapshot<'_>,
-        meta: &Arc<BoundColumnFamily<'_>>,
-        family: &Arc<BoundColumnFamily<'_>>,
-        encoded_key: &[u8],
-        value: &[u8],
-        budget: &mut ReadBudget,
-    ) -> Result<()> {
-        let VersionTraversal {
-            cursor,
-            report,
-            batch,
-            decrements,
-        } = self;
-        budget.charge(encoded_key.len().saturating_add(value.len()))?;
-        let (logical_key, sequence) = key::decode(encoded_key)?;
-        if cursor.logical_key.as_deref() != Some(logical_key.as_bytes()) {
-            finish_tombstone(cursor, family, batch, decrements, report)?;
-            cursor.logical_key = Some(logical_key.as_bytes().to_vec());
-            cursor.kept_anchor = false;
-        }
-        let published = is_published(snapshot, meta, sequence)?;
-        if super::lifecycle::remove_version(published, sequence, cursor.floor, cursor.kept_anchor) {
-            batch.delete_cf(family, encoded_key);
-            decrement(decrements, sequence)?;
-            report.versions_removed += 1;
-        } else if sequence == cursor.floor {
-            // The oldest retained revision already has its own value.
-            // No older anchor is required for this logical record.
-            cursor.kept_anchor = true;
-        } else if sequence < cursor.floor {
-            cursor.kept_anchor = true;
-            if decode_value(value)?.is_none() {
-                cursor.obsolete_tombstone = Some(encoded_key.to_vec());
-            }
-        }
-        cursor.resume = Some(encoded_key.to_vec());
-        report.versions_visited += 1;
-        Ok(())
+        .is_some_and(|bytes| bytes <= maximum_batch_bytes)
     }
 }
 
@@ -493,20 +354,16 @@ fn decrement(counts: &mut BTreeMap<u64, u64>, sequence: u64) -> Result<()> {
     Ok(())
 }
 
-fn finish_tombstone(
-    cursor: &mut Cursor,
-    family: &Arc<BoundColumnFamily<'_>>,
-    batch: &mut WriteBatch,
-    counts: &mut BTreeMap<u64, u64>,
-    report: &mut PruneReport,
-) -> Result<()> {
-    if let Some(key) = cursor.obsolete_tombstone.take() {
-        let (_, sequence) = key::decode(&key)?;
-        batch.delete_cf(family, key);
-        decrement(counts, sequence)?;
-        report.versions_removed += 1;
+impl VersionTraversal {
+    fn finish_tombstone(&mut self, family: &Arc<BoundColumnFamily<'_>>) -> Result<()> {
+        if let Some(key) = self.cursor.obsolete_tombstone.take() {
+            let (_, sequence) = key::decode(&key)?;
+            self.batch.delete_cf(family, key);
+            decrement(&mut self.decrements, sequence)?;
+            self.report.versions_removed += 1;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn put_cursor(
@@ -517,4 +374,249 @@ fn put_cursor(
     let bytes = serde_json::to_vec(cursor).map_err(|_| operation("retention_cursor"))?;
     batch.put_cf(meta, CURSOR_KEY, bytes);
     Ok(())
+}
+
+struct RetentionPass<'store, 'budget> {
+    store: &'store ProjectStore,
+    snapshot: Snapshot<'store>,
+    maximum_versions: u32,
+    budget: &'budget mut ReadBudget,
+}
+
+impl<'store> RetentionPass<'store, '_> {
+    fn prune_versions(&mut self, traversal: &mut VersionTraversal) -> Result<()> {
+        while let Some(&collection) = Collection::ALL.get(traversal.cursor.collection) {
+            let family = self.store.family(collection)?;
+            if !self.prune_collection(&family, traversal)? {
+                break;
+            }
+            traversal.finish_tombstone(&family)?;
+            traversal.cursor.collection += 1;
+            traversal.cursor.resume = None;
+            traversal.cursor.logical_key = None;
+            traversal.cursor.anchor.kept_anchor = false;
+        }
+        Ok(())
+    }
+
+    fn prune_collection(
+        &mut self,
+        family: &Arc<BoundColumnFamily<'store>>,
+        traversal: &mut VersionTraversal,
+    ) -> Result<bool> {
+        let meta = self.store.meta()?;
+        let start = traversal.cursor.resume.clone().unwrap_or_default();
+        let mut options = ReadOptions::default();
+        options.fill_cache(false);
+        for entry in self.snapshot.iterator_cf_opt(
+            family,
+            options,
+            IteratorMode::From(&start, Direction::Forward),
+        ) {
+            let (encoded_key, value) = entry.map_err(|_| operation("retention_scan"))?;
+            if traversal
+                .cursor
+                .resume
+                .as_deref()
+                .is_some_and(|resume| encoded_key.as_ref() <= resume)
+            {
+                continue;
+            }
+            if !traversal.can_stage_version(
+                encoded_key.len(),
+                self.store.inner.policy.maximum_batch_bytes,
+            ) {
+                return Ok(false);
+            }
+            VersionReader {
+                snapshot: &self.snapshot,
+                meta: &meta,
+                family,
+            }
+            .visit(
+                traversal,
+                VersionRecord {
+                    encoded_key: &encoded_key,
+                    value: &value,
+                },
+                self.budget,
+            )?;
+            if traversal.report.versions_visited == self.maximum_versions {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn prune_generation_metadata(
+        &mut self,
+        batch: &mut WriteBatch,
+        keep_superseded: u8,
+        maximum_generations: u16,
+    ) -> Result<MetadataPlan> {
+        let meta = self.store.meta()?;
+        let prefix = b"revision/";
+        let start = b"revision0";
+        // This is also the logical retirement boundary. Increasing retention
+        // later cannot resurrect generations whose versions were collected.
+        let previous_floor = self.store.optional_sequence(FLOOR_KEY)?.unwrap_or(0);
+        let mut selection = super::RetentionSelection {
+            previous_floor,
+            retained: 0,
+            keep: keep_superseded,
+        };
+        let mut floor = self.store.optional_sequence(CURRENT_KEY)?.unwrap_or(
+            self.store
+                .optional_sequence(LAST_SEQUENCE_KEY)?
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        let mut removed = 0_u16;
+        let mut more = false;
+        for entry in self
+            .snapshot
+            .iterator_cf(&meta, IteratorMode::From(start, Direction::Reverse))
+        {
+            let (key, bytes) = entry.map_err(|_| operation("retention_generations"))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            self.budget.charge(key.len().saturating_add(bytes.len()))?;
+            let revision: StoredRevision = serde_json::from_slice(&bytes)
+                .map_err(|_| RocksError::Corrupt { field: "revision" })?;
+            let eligible = match revision.state {
+                RevisionState::Current => false,
+                RevisionState::Superseded
+                    if super::lifecycle::keep_superseded(revision.sequence, &selection) =>
+                {
+                    selection.retained += 1;
+                    floor = floor.min(revision.sequence);
+                    false
+                }
+                RevisionState::Superseded | RevisionState::Failed => true,
+                RevisionState::Ready | RevisionState::Staging => {
+                    return Err(RocksError::Corrupt {
+                        field: "unowned_revision",
+                    });
+                }
+            };
+            if !eligible {
+                continue;
+            }
+            if removed == maximum_generations {
+                more = true;
+                // Unknown older history may still be protected when a long
+                // failed-generation backlog precedes the retained set.
+                if selection.retained < selection.keep {
+                    floor = previous_floor;
+                }
+                break;
+            }
+            batch.delete_cf(&meta, key);
+            batch.delete_cf(&meta, identity_key(&revision.generation_id));
+            batch.delete_cf(&meta, super::staging::byte_count_key(revision.sequence));
+            if self
+                .store
+                .optional_sequence(&version_count_key(revision.sequence))?
+                == Some(0)
+            {
+                batch.delete_cf(&meta, version_count_key(revision.sequence));
+                batch.delete_cf(&meta, published_key(revision.sequence));
+            }
+            removed += 1;
+        }
+        Ok(MetadataPlan {
+            floor: floor.max(previous_floor),
+            removed,
+            more,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct VersionRecord<'a> {
+    encoded_key: &'a [u8],
+    value: &'a [u8],
+}
+
+struct VersionReader<'read, 'store> {
+    snapshot: &'read Snapshot<'store>,
+    meta: &'read Arc<BoundColumnFamily<'store>>,
+    family: &'read Arc<BoundColumnFamily<'store>>,
+}
+
+impl VersionReader<'_, '_> {
+    fn visit(
+        &self,
+        traversal: &mut VersionTraversal,
+        record: VersionRecord<'_>,
+        budget: &mut ReadBudget,
+    ) -> Result<()> {
+        let VersionRecord { encoded_key, value } = record;
+        budget.charge(encoded_key.len().saturating_add(value.len()))?;
+        let (logical_key, sequence) = key::decode(encoded_key)?;
+        if traversal.cursor.logical_key.as_deref() != Some(logical_key.as_bytes()) {
+            traversal.finish_tombstone(self.family)?;
+            traversal.cursor.logical_key = Some(logical_key.as_bytes().to_vec());
+            traversal.cursor.anchor.kept_anchor = false;
+        }
+        let VersionTraversal {
+            cursor,
+            report,
+            batch,
+            decrements,
+        } = traversal;
+        let published = is_published(self.snapshot, self.meta, sequence)?;
+        if super::lifecycle::remove_version(published, sequence, &cursor.anchor) {
+            batch.delete_cf(self.family, encoded_key);
+            decrement(decrements, sequence)?;
+            report.versions_removed += 1;
+        } else if sequence == cursor.anchor.floor {
+            // The oldest retained revision already has its own value.
+            // No older anchor is required for this logical record.
+            cursor.anchor.kept_anchor = true;
+        } else if sequence < cursor.anchor.floor {
+            cursor.anchor.kept_anchor = true;
+            if decode_value(value)?.is_none() {
+                cursor.obsolete_tombstone = Some(encoded_key.to_vec());
+            }
+        }
+        cursor.resume = Some(encoded_key.to_vec());
+        report.versions_visited += 1;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cursor;
+
+    #[test]
+    fn typed_anchor_preserves_existing_durable_cursor_fields() {
+        let legacy = r#"{"floor":7,"collection":2,"resume":[1,2],"logical_key":[3],"kept_anchor":true,"obsolete_tombstone":null}"#;
+        let cursor: Cursor = serde_json::from_str(legacy)
+            .unwrap_or_else(|error| panic!("legacy cursor failed: {error}"));
+        assert_eq!(cursor.anchor.floor, 7);
+        assert!(cursor.anchor.kept_anchor);
+        assert_eq!(cursor.reservation_sequence, None);
+        let encoded = serde_json::to_value(cursor)
+            .unwrap_or_else(|error| panic!("cursor encoding failed: {error}"));
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "floor":7,"collection":2,"resume":[1,2],"logical_key":[3],
+                "kept_anchor":true,"obsolete_tombstone":null,"reservation_sequence":null
+            })
+        );
+        for invalid in [
+            r#"{"collection":0,"kept_anchor":false}"#,
+            r#"{"floor":0,"collection":0}"#,
+            r#"{"floor":0,"floor":1,"collection":0,"kept_anchor":false}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Cursor>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 }

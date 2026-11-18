@@ -1,7 +1,7 @@
 //! Exact source compatibility for native summary and role workflows.
 
 use super::{
-    Kind, Record, Scope, State, WRITE_BYTES, WRITE_ROWS, corrupt, read_scope, workspace, write,
+    Kind, Record, Scope, ScopedArtifact, State, WRITE_BYTES, WRITE_ROWS, corrupt, workspace,
 };
 use crate::{
     CanonicalSearchDocument, NativeDatabase, NewAgentArtifact, StorageError, SymbolInput,
@@ -10,16 +10,43 @@ use crate::{
         SummaryCandidatePolicy, SummaryCoverageStats, SymbolRoleSaveInput, SymbolSummarySaveInput,
         validate_body, validate_limit, validate_model,
     },
-    retrieval::native::{retain, visit_symbols},
+    retrieval::native::visit_symbols,
     rocks::{GraphSnapshot, ReadBudget, RocksError, StateNamespace, StateTransaction},
 };
-use codevetra_domain::{
-    ContentDigest, DocumentKind, GenerationId, ProjectId, SymbolId, Visibility,
-};
+use codevetra_domain::{ContentDigest, DocumentKind, ProjectId, SymbolId, Visibility};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
 mod tests;
+
+struct SummarySelection<'a> {
+    model: Option<&'a str>,
+    limit: u16,
+    policy: &'a SummaryCandidatePolicy,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SummaryReader<'a, 'view, 'store> {
+    transaction: &'a StateTransaction<'store>,
+    graph: &'a GraphSnapshot<'view, 'store>,
+}
+
+impl<'a, 'view, 'store> SummaryReader<'a, 'view, 'store> {
+    pub(crate) const fn new(
+        transaction: &'a StateTransaction<'store>,
+        graph: &'a GraphSnapshot<'view, 'store>,
+    ) -> Self {
+        Self { transaction, graph }
+    }
+
+    pub(crate) const fn transaction(&self) -> &'a StateTransaction<'store> {
+        self.transaction
+    }
+
+    pub(crate) const fn graph(&self) -> &'a GraphSnapshot<'view, 'store> {
+        self.graph
+    }
+}
 
 impl NativeDatabase {
     /// Publish a summary only if its echoed structural digest remains current.
@@ -38,25 +65,27 @@ impl NativeDatabase {
             input.summary.to_owned(),
             input.model.to_owned(),
         );
-        self.state(None, WRITE_BYTES, WRITE_ROWS, move |transaction, budget| {
-            let input = symbol_input(
-                transaction,
-                budget,
-                &id,
-                Some(&digest),
-                Kind::Summary,
-                body,
-                serde_json::json!({"model": model}),
-            )?
-            .ok_or(RocksError::GenerationChanged)?;
-            let generation = input.generation_id.clone().ok_or(corrupt())?;
-            let record = write(transaction, budget, input, true)?;
-            transaction.delete(
-                StateNamespace::Derived,
-                &crate::summary_priority::native::key(&generation, &id),
-            )?;
-            Ok(record)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, WRITE_ROWS),
+            move |transaction, budget| {
+                let input = SymbolArtifact {
+                    id: &id,
+                    expected: Some(&digest),
+                    kind: Kind::Summary,
+                    body,
+                    metadata: serde_json::json!({"model": model}),
+                }
+                .prepare(transaction, budget)?
+                .ok_or(RocksError::GenerationChanged)?;
+                let generation = input.generation_id.clone().ok_or(corrupt())?;
+                let record = input.write(transaction, budget, true)?;
+                transaction.delete(
+                    StateNamespace::Derived,
+                    &crate::summary_priority::native::key(&generation, &id),
+                )?;
+                Ok(record)
+            },
+        )
         .await
     }
 
@@ -74,26 +103,12 @@ impl NativeDatabase {
             input.source_digest.clone(),
             input.summary.to_owned(),
         );
-        self.state(None, WRITE_BYTES, WRITE_ROWS, move |transaction, budget| {
-            let Some(input) = symbol_input(
-                transaction,
-                budget,
-                &id,
-                Some(&digest),
-                Kind::Summary,
-                body,
-                serde_json::json!({"model":"structural:v2", "generationMode":"structural_rule"}),
-            )?
+        self.state(crate::rocks::StateAccess::write(None, WRITE_BYTES, WRITE_ROWS),  move |transaction, budget| {
+            let Some(input) = SymbolArtifact { id: &id, expected: Some(&digest), kind: Kind::Summary, body, metadata: serde_json::json!({"model":"structural:v2", "generationMode":"structural_rule"}) }.prepare(transaction, budget)?
             else {
                 return Ok(None);
             };
-            if let Some(existing) = read_scope(
-                transaction,
-                Kind::Summary,
-                Scope::Symbol,
-                id.as_str(),
-                budget,
-            )? && existing.source_digest.as_deref() == Some(digest.as_str())
+            if let Some(existing) = (ScopedArtifact { kind: Kind::Summary, scope: Scope::Symbol, key: id.as_str() }).read(transaction, budget)? && existing.source_digest.as_deref() == Some(digest.as_str())
                 && !existing
                     .metadata
                     .get("model")
@@ -103,7 +118,7 @@ impl NativeDatabase {
             {
                 return Ok(None);
             }
-            write(transaction, budget, input, true).map(Some)
+            input.write(transaction, budget, true).map(Some)
         })
         .await
     }
@@ -145,43 +160,46 @@ impl NativeDatabase {
     ) -> Result<SummaryCoverageStats, StorageError> {
         self.require_project(project)?;
         let policy = policy.clone();
-        self.state(None, 0, 0, move |transaction, budget| {
-            let mut output = SummaryCoverageStats {
-                eligible_symbols: 0,
-                summarized_symbols: 0,
-                pending_symbols: 0,
-                by_model: BTreeMap::new(),
-            };
-            if transaction.current()?.is_none() {
-                return Ok(output);
-            }
-            let snapshot = transaction.graph_snapshot()?;
-            let graph = snapshot.graph(budget)?;
-            let lengths = documentation_lengths(&graph, budget)?;
-            visit_symbols(&graph, budget, |symbol, budget| {
-                if !eligible(&symbol, &policy, &lengths) {
-                    return Ok(());
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let mut output = SummaryCoverageStats {
+                    eligible_symbols: 0,
+                    summarized_symbols: 0,
+                    pending_symbols: 0,
+                    by_model: BTreeMap::new(),
+                };
+                if transaction.current()?.is_none() {
+                    return Ok(output);
                 }
-                output.eligible_symbols += 1;
-                if let Some(summary) = current_symbol_summary(transaction, &symbol, budget)? {
-                    output.summarized_symbols += 1;
-                    let model = summary
-                        .metadata
-                        .get("model")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or("unknown")
-                        .to_owned();
-                    *output.by_model.entry(model).or_default() += 1;
-                    if output.by_model.len() > 8192 {
-                        return Err(workspace());
+                let snapshot = transaction.graph_snapshot()?;
+                let graph = snapshot.graph(budget)?;
+                let lengths = documentation_lengths(&graph, budget)?;
+                visit_symbols(&graph, budget, |symbol, budget| {
+                    if !eligible(&symbol, &policy, &lengths) {
+                        return Ok(());
                     }
-                }
-                Ok(())
-            })?;
-            output.pending_symbols = output.eligible_symbols - output.summarized_symbols;
-            Ok(output)
-        })
+                    output.eligible_symbols += 1;
+                    if let Some(summary) = current_symbol_summary(transaction, &symbol, budget)? {
+                        output.summarized_symbols += 1;
+                        let model = summary
+                            .metadata
+                            .get("model")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or("unknown")
+                            .to_owned();
+                        *output.by_model.entry(model).or_default() += 1;
+                        if output.by_model.len() > 8192 {
+                            return Err(workspace());
+                        }
+                    }
+                    Ok(())
+                })?;
+                output.pending_symbols = output.eligible_symbols - output.summarized_symbols;
+                Ok(output)
+            },
+        )
         .await
     }
 
@@ -210,7 +228,15 @@ impl NativeDatabase {
         limit: u16,
         policy: &SummaryCandidatePolicy,
     ) -> Result<Vec<PendingSummarySymbol>, StorageError> {
-        self.pending_summaries(project, None, limit, policy).await
+        self.pending_summaries(
+            project,
+            SummarySelection {
+                model: None,
+                limit,
+                policy,
+            },
+        )
+        .await
     }
 
     /// Select candidates without this exact model and structural digest.
@@ -223,9 +249,11 @@ impl NativeDatabase {
         validate_model(request.model)?;
         self.pending_summaries(
             request.project_id,
-            Some(request.model),
-            request.limit,
-            request.policy,
+            SummarySelection {
+                model: Some(request.model),
+                limit: request.limit,
+                policy: request.policy,
+            },
         )
         .await
     }
@@ -233,97 +261,111 @@ impl NativeDatabase {
     async fn pending_summaries(
         &self,
         project: &ProjectId,
-        model: Option<&str>,
-        limit: u16,
-        policy: &SummaryCandidatePolicy,
+        selection: SummarySelection<'_>,
     ) -> Result<Vec<PendingSummarySymbol>, StorageError> {
+        let SummarySelection {
+            model,
+            limit,
+            policy,
+        } = selection;
         self.require_project(project)?;
         validate_limit(limit, super::super::MAX_SUMMARY_BATCH)?;
         let (model, policy) = (model.map(str::to_owned), policy.clone());
-        self.state(None, 0, 0, move |transaction, budget| {
-            let Some(current) = transaction.current()? else {
-                return Ok(Vec::new());
-            };
-            let snapshot = transaction.graph_snapshot()?;
-            let graph = snapshot.graph(budget)?;
-            let lengths = documentation_lengths(&graph, budget)?;
-            let mut selected = Vec::new();
-            visit_symbols(&graph, budget, |symbol, budget| {
-                if !eligible(&symbol, &policy, &lengths) {
-                    return Ok(());
-                }
-                if let Some(record) = current_symbol_summary(transaction, &symbol, budget)? {
-                    let producer = record
-                        .metadata
-                        .get("model")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    if model.as_ref().map_or_else(
-                        || !producer.starts_with("structural:"),
-                        |model| producer == model,
-                    ) {
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let Some(current) = transaction.current()? else {
+                    return Ok(Vec::new());
+                };
+                let snapshot = transaction.graph_snapshot()?;
+                let graph = snapshot.graph(budget)?;
+                let lengths = documentation_lengths(&graph, budget)?;
+                let mut selected =
+                    crate::retrieval::native::RankedRows::new(usize::from(limit), candidate_order);
+                visit_symbols(&graph, budget, |symbol, budget| {
+                    if !eligible(&symbol, &policy, &lengths) {
                         return Ok(());
                     }
-                }
-                let priority = crate::summary_priority::native::read(
-                    transaction,
-                    &current.generation_id,
-                    &symbol.symbol_id,
-                    budget,
-                )?;
-                let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
-                retain(
-                    &mut selected,
-                    Candidate {
+                    if let Some(record) = current_symbol_summary(transaction, &symbol, budget)? {
+                        let producer = record
+                            .metadata
+                            .get("model")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        if model.as_ref().map_or_else(
+                            || !producer.starts_with("structural:"),
+                            |model| producer == model,
+                        ) {
+                            return Ok(());
+                        }
+                    }
+                    let priority = crate::summary_priority::native::QueueReader::new(
+                        transaction,
+                        &current.generation_id,
+                    )
+                    .read(&symbol.symbol_id, budget)?;
+                    let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
+                    selected.insert(Candidate {
                         symbol,
                         path: file.normalized_path,
                         language: file.language,
                         priority,
-                    },
-                    usize::from(limit),
-                    candidate_order,
-                );
-                if selected.iter().map(candidate_bytes).sum::<usize>() > 32 * 1_048_576 {
-                    return Err(workspace());
-                }
-                Ok(())
-            })?;
-            hydrate_pending(&graph, budget, &current.generation_id, selected)
-        })
+                    });
+                    if selected.iter().map(candidate_bytes).sum::<usize>() > 32 * 1_048_576 {
+                        return Err(workspace());
+                    }
+                    Ok(())
+                })?;
+                hydrate_pending(&graph, budget, selected.into_vec())
+            },
+        )
         .await
     }
 }
 
-pub(super) fn symbol_input(
-    transaction: &StateTransaction<'_>,
-    budget: &mut ReadBudget,
-    id: &SymbolId,
-    expected: Option<&ContentDigest>,
-    kind: Kind,
-    body: String,
-    metadata: serde_json::Value,
-) -> Result<Option<NewAgentArtifact>, RocksError> {
-    let Some(current) = transaction.current()? else {
-        return Ok(None);
-    };
-    let snapshot = transaction.graph_snapshot()?;
-    let graph = snapshot.graph(budget)?;
-    let Some(symbol) = graph.symbol(id, budget)? else {
-        return Ok(None);
-    };
-    if expected.is_some_and(|digest| digest != &symbol.structural_digest) {
-        return Ok(None);
+pub(super) struct SymbolArtifact<'a> {
+    pub(super) id: &'a SymbolId,
+    pub(super) expected: Option<&'a ContentDigest>,
+    pub(super) kind: Kind,
+    pub(super) body: String,
+    pub(super) metadata: serde_json::Value,
+}
+
+impl SymbolArtifact<'_> {
+    pub(super) fn prepare(
+        self,
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+    ) -> Result<Option<NewAgentArtifact>, RocksError> {
+        let Self {
+            id,
+            expected,
+            kind,
+            body,
+            metadata,
+        } = self;
+        let Some(current) = transaction.current()? else {
+            return Ok(None);
+        };
+        let snapshot = transaction.graph_snapshot()?;
+        let graph = snapshot.graph(budget)?;
+        let Some(symbol) = graph.symbol(id, budget)? else {
+            return Ok(None);
+        };
+        if expected.is_some_and(|digest| digest != &symbol.structural_digest) {
+            return Ok(None);
+        }
+        Ok(Some(NewAgentArtifact {
+            kind,
+            scope: Scope::Symbol,
+            scope_key: id.to_string(),
+            body,
+            metadata,
+            generation_id: Some(current.generation_id),
+            source_digest: Some(symbol.structural_digest),
+            state: State::Complete,
+        }))
     }
-    Ok(Some(NewAgentArtifact {
-        kind,
-        scope: Scope::Symbol,
-        scope_key: id.to_string(),
-        body,
-        metadata,
-        generation_id: Some(current.generation_id),
-        source_digest: Some(symbol.structural_digest),
-        state: State::Complete,
-    }))
 }
 
 pub(crate) fn current_symbol_summary(
@@ -331,76 +373,88 @@ pub(crate) fn current_symbol_summary(
     symbol: &SymbolInput,
     budget: &mut ReadBudget,
 ) -> Result<Option<Record>, RocksError> {
-    Ok(read_scope(
-        transaction,
-        Kind::Summary,
-        Scope::Symbol,
-        symbol.symbol_id.as_str(),
-        budget,
-    )?
+    Ok((ScopedArtifact {
+        kind: Kind::Summary,
+        scope: Scope::Symbol,
+        key: symbol.symbol_id.as_str(),
+    })
+    .read(transaction, budget)?
     .filter(|record| {
         record.state == State::Complete
             && record.source_digest.as_deref() == Some(symbol.structural_digest.as_str())
     }))
 }
 
-pub(crate) fn embedding_summary(
-    transaction: &StateTransaction<'_>,
-    graph: &GraphSnapshot<'_, '_>,
-    generation: &GenerationId,
-    document: &CanonicalSearchDocument,
-    budget: &mut ReadBudget,
-) -> Result<String, RocksError> {
-    if let Some(id) = &document.symbol_id
-        && !summary_scope_present(transaction, Scope::Symbol, id.as_str(), budget)?
-        && !summary_scope_present(transaction, Scope::File, &document.path, budget)?
-    {
-        // Neither scope can contribute text in this exact state snapshot. An
-        // unrelated symbol row need not be hydrated to prove an empty summary.
-        return Ok(String::new());
-    }
-    if let Some(id) = &document.symbol_id
-        && let Some(symbol) = graph.symbol(id, budget)?
-        && symbol.symbol_kind != "file"
-    {
-        return Ok(current_symbol_summary(transaction, &symbol, budget)?
-            .filter(|summary| {
-                !summary
-                    .metadata
-                    .get("model")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .starts_with("neighbor:")
+impl SummaryReader<'_, '_, '_> {
+    pub(crate) fn embedding_summary(
+        &self,
+        document: &CanonicalSearchDocument,
+        budget: &mut ReadBudget,
+    ) -> Result<String, RocksError> {
+        let Self { transaction, graph } = *self;
+        let generation = graph.generation_id();
+
+        if let Some(id) = &document.symbol_id
+            && !(ScopedArtifact {
+                kind: Kind::Summary,
+                scope: Scope::Symbol,
+                key: id.as_str(),
             })
-            .map_or_else(String::new, |summary| summary.body));
+            .present(transaction, budget)?
+            && !(ScopedArtifact {
+                kind: Kind::Summary,
+                scope: Scope::File,
+                key: &document.path,
+            })
+            .present(transaction, budget)?
+        {
+            // Neither scope can contribute text in this exact state snapshot. An
+            // unrelated symbol row need not be hydrated to prove an empty summary.
+            return Ok(String::new());
+        }
+        if let Some(id) = &document.symbol_id
+            && let Some(symbol) = graph.symbol(id, budget)?
+            && symbol.symbol_kind != "file"
+        {
+            return Ok(current_symbol_summary(transaction, &symbol, budget)?
+                .filter(|summary| {
+                    !summary
+                        .metadata
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .starts_with("neighbor:")
+                })
+                .map_or_else(String::new, |summary| summary.body));
+        }
+        Ok((ScopedArtifact {
+            kind: Kind::Summary,
+            scope: Scope::File,
+            key: &document.path,
+        })
+        .read(transaction, budget)?
+        .filter(|summary| {
+            summary.state == State::Complete
+                && summary.generation_id.as_deref() == Some(generation.as_str())
+        })
+        .map_or_else(String::new, |summary| summary.body))
     }
-    Ok(read_scope(
-        transaction,
-        Kind::Summary,
-        Scope::File,
-        &document.path,
-        budget,
-    )?
-    .filter(|summary| {
-        summary.state == State::Complete
-            && summary.generation_id.as_deref() == Some(generation.as_str())
-    })
-    .map_or_else(String::new, |summary| summary.body))
 }
 
-fn summary_scope_present(
-    transaction: &StateTransaction<'_>,
-    scope: Scope,
-    key: &str,
-    budget: &mut ReadBudget,
-) -> Result<bool, RocksError> {
-    transaction
-        .get(
-            super::NAMESPACE,
-            super::scope_key(Kind::Summary, scope, key).as_bytes(),
-            budget,
-        )
-        .map(|value| value.is_some())
+impl ScopedArtifact<'_> {
+    fn present(
+        &self,
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+    ) -> Result<bool, RocksError> {
+        transaction
+            .get(
+                super::NAMESPACE,
+                super::scope_key(self.kind, self.scope, self.key).as_bytes(),
+                budget,
+            )
+            .map(|value| value.is_some())
+    }
 }
 
 pub(crate) fn documentation_lengths(
@@ -525,7 +579,6 @@ fn candidate_bytes(candidate: &Candidate) -> usize {
 fn hydrate_pending(
     graph: &GraphSnapshot<'_, '_>,
     budget: &mut ReadBudget,
-    generation: &GenerationId,
     selected: Vec<Candidate>,
 ) -> Result<Vec<PendingSummarySymbol>, RocksError> {
     let wanted = selected
@@ -555,7 +608,7 @@ fn hydrate_pending(
                 .remove(&candidate.symbol.symbol_id)
                 .unwrap_or_default();
             PendingSummarySymbol {
-                generation_id: generation.to_string(),
+                generation_id: graph.generation_id().to_string(),
                 symbol_id: candidate.symbol.symbol_id.to_string(),
                 path: candidate.path,
                 language: candidate.language,

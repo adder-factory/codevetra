@@ -9,6 +9,7 @@ mod idle_retention;
 mod regressions;
 
 use codevetra_config as _;
+use codevetra_db::rocks::RetentionPolicy;
 use std::{error::Error, path::Path, time::Duration};
 
 use codevetra_db::rocks::{
@@ -236,7 +237,8 @@ fn failed_versions_and_deletions_do_not_leak_into_later_revisions() -> TestResul
     );
     assert_eq!(
         current
-            .scan_prefix(Collection::Graph, b"", None, 10, &mut budget()?)?
+            .scan_prefix(Collection::Graph, b"")
+            .page(None, 10, &mut budget()?)?
             .rows,
         vec![
             (key(b"a")?, b"original".to_vec()),
@@ -383,11 +385,12 @@ fn snapshot_pagination_is_binary_safe_and_ignores_other_prefixes() -> TestResult
         ],
     )?;
     let snapshot = store.current_snapshot(None)?;
-    let first = snapshot.scan_prefix(Collection::Graph, b"edge\0a\0", None, 1, &mut budget()?)?;
+    let first =
+        snapshot
+            .scan_prefix(Collection::Graph, b"edge\0a\0")
+            .page(None, 1, &mut budget()?)?;
     assert_eq!(first.rows, vec![(key(b"edge\0a\0b")?, b"first".to_vec())]);
-    let second = snapshot.scan_prefix(
-        Collection::Graph,
-        b"edge\0a\0",
+    let second = snapshot.scan_prefix(Collection::Graph, b"edge\0a\0").page(
         first.next_after.as_ref(),
         1,
         &mut budget()?,
@@ -395,13 +398,8 @@ fn snapshot_pagination_is_binary_safe_and_ignores_other_prefixes() -> TestResult
     assert_eq!(second.rows, vec![(key(b"edge\0a\0c")?, b"second".to_vec())]);
     assert_eq!(
         snapshot
-            .scan_prefix(
-                Collection::Graph,
-                b"edge\0a\0",
-                second.next_after.as_ref(),
-                1,
-                &mut budget()?
-            )?
+            .scan_prefix(Collection::Graph, b"edge\0a\0")
+            .page(second.next_after.as_ref(), 1, &mut budget()?)?
             .rows,
         Vec::new()
     );
@@ -473,7 +471,7 @@ fn retention_resumes_without_resurrection_or_losing_unchanged_anchors() -> TestR
     let mut removed = 0;
     let mut complete = false;
     for _ in 0..200 {
-        let report = store.prune(2, 2, 1, &mut budget()?)?;
+        let report = store.prune(RetentionPolicy::new(2, 2, 1), &mut budget()?)?;
         assert!(report.versions_visited <= 1);
         removed += report.generations_removed;
         assert_eq!(
@@ -518,12 +516,13 @@ fn retention_resumes_without_resurrection_or_losing_unchanged_anchors() -> TestR
             b"21".to_vec(),
         )],
     )?;
-    let interrupted = store.prune(2, 100, 1, &mut budget()?)?;
+    let interrupted = store.prune(RetentionPolicy::new(2, 100, 1), &mut budget()?)?;
     assert!(!interrupted.complete);
     drop(store);
     store = self::store(root.path())?;
     for _ in 0..100 {
-        if store.prune(2, 100, 2, &mut budget()?)?.complete {
+        let report = store.prune(RetentionPolicy::new(2, 100, 2), &mut budget()?)?;
+        if report.complete {
             complete = true;
             break;
         }

@@ -6,8 +6,8 @@ use crate::{
     GenerationValidationLimits, NewAgentArtifact, PendingEmbeddingPageInput,
     PendingEmbeddingPageRequest, SearchDocumentInput, SymbolInput,
     rocks::{
-        AsyncProjectStore, GraphBase, GraphPolicy, GraphPublicationInput, GraphRevision,
-        StorageRuntime, StorePolicy, WorkerPolicy,
+        AsyncProjectStore, GraphBase, GraphPolicy, GraphRevision, StorageRuntime, StorePolicy,
+        WorkerPolicy,
     },
     validate_generation_facts,
 };
@@ -88,7 +88,7 @@ fn facts(count: u64) -> TestResult<CanonicalGenerationFacts> {
     .0)
 }
 async fn publish(store: &AsyncProjectStore, number: u64, count: u64) -> TestResult {
-    let input = GraphPublicationInput::new(
+    let input = crate::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(number),
             source_revision: digest(9),
@@ -98,11 +98,17 @@ async fn publish(store: &AsyncProjectStore, number: u64, count: u64) -> TestResu
                 GraphBase::Current(generation(number - 1))
             },
         },
-        facts(count)?,
         GraphPolicy::default(),
         &request()?,
-    )?;
-    store.publish_graph(input, &request()?).await?;
+    )
+    .resident(facts(count)?)?;
+    {
+        let request_bound_input = input;
+        store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
     Ok(())
 }
 async fn collect_at(
@@ -110,9 +116,10 @@ async fn collect_at(
     seconds: i64,
 ) -> TestResult<NativeDerivedPruneReport> {
     Ok(database
-        .state(None, 4 * 1_048_576, 1024, move |tx, budget| {
-            collect(tx, budget, seconds)
-        })
+        .state(
+            crate::rocks::StateAccess::write(None, 4 * 1_048_576, 1024),
+            move |tx, budget| collect(tx, budget, seconds),
+        )
         .await?)
 }
 async fn count(
@@ -121,18 +128,23 @@ async fn count(
     prefix: &'static [u8],
 ) -> TestResult<usize> {
     Ok(database
-        .state(None, 0, 0, move |tx, budget| {
-            let mut cursor = None;
-            let mut count = 0;
-            loop {
-                let page = tx.scan(namespace, prefix, cursor.as_deref(), 64, budget)?;
-                count += page.rows.len();
-                cursor = page.next_after.map(|key| key.as_bytes().to_vec());
-                if cursor.is_none() {
-                    return Ok(count);
+        .state(
+            crate::rocks::StateAccess::read_only(None),
+            move |tx, budget| {
+                let mut cursor = None;
+                let mut count = 0;
+                loop {
+                    let page = tx
+                        .scan(namespace, prefix)
+                        .page(cursor.as_deref(), 64, budget)?;
+                    count += page.rows.len();
+                    cursor = page.next_after.map(|key| key.as_bytes().to_vec());
+                    if cursor.is_none() {
+                        return Ok(count);
+                    }
                 }
-            }
-        })
+            },
+        )
         .await?)
 }
 
@@ -169,21 +181,24 @@ async fn seed_cold_rows(
         .await?;
     seed_embeddings(database, project).await?;
     database
-        .state(None, 1_048_576, 132, |tx, _| {
-            for number in 1..=131 {
+        .state(
+            crate::rocks::StateAccess::write(None, 1_048_576, 132),
+            |tx, _| {
+                for number in 1..=131 {
+                    tx.put(
+                        Ns::Derived,
+                        format!("q/{}/{number}", generation(1)).as_bytes(),
+                        b"old-demand".to_vec(),
+                    )?;
+                }
                 tx.put(
                     Ns::Derived,
-                    format!("q/{}/{number}", generation(1)).as_bytes(),
-                    b"old-demand".to_vec(),
+                    format!("q/{}/current", generation(2)).as_bytes(),
+                    b"current-demand".to_vec(),
                 )?;
-            }
-            tx.put(
-                Ns::Derived,
-                format!("q/{}/current", generation(2)).as_bytes(),
-                b"current-demand".to_vec(),
-            )?;
-            Ok(())
-        })
+                Ok(())
+            },
+        )
         .await?;
     Ok(())
 }
@@ -262,9 +277,11 @@ async fn cold_derived_rows_drain_in_bounded_pages_across_reopen_without_deleting
     let identity = digest(42);
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        identity.clone(),
-        StorePolicy::default(),
+        crate::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            identity.clone(),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
@@ -298,9 +315,11 @@ async fn cold_derived_rows_drain_in_bounded_pages_across_reopen_without_deleting
     let reopened = NativeDatabase::new(
         AsyncProjectStore::open(
             &reopened_runtime,
-            root.path().to_owned(),
-            identity.clone(),
-            StorePolicy::default(),
+            crate::rocks::ProjectOpening::new(
+                root.path().to_owned(),
+                identity.clone(),
+                StorePolicy::default(),
+            ),
             &request()?,
         )
         .await?,
@@ -319,13 +338,15 @@ async fn cold_derived_rows_drain_in_bounded_pages_across_reopen_without_deleting
     assert_eq!(artifacts, 130);
     // Resume a computation admitted before maintenance, without weakening its fence.
     reopened
-        .replace_dataset_guarded(
-            Ns::Derived,
-            "retention-inflight",
-            Some(generation(2)),
-            &serde_json::json!({}),
+        .replace_dataset(
+            crate::native_database::dataset::DatasetReplacement {
+                namespace: Ns::Derived,
+                name: "retention-inflight".to_owned(),
+                expected: Some(generation(2)),
+                metadata: &serde_json::json!({}),
+                guard: in_flight,
+            },
             std::iter::once(1_u8),
-            in_flight,
         )
         .await?;
     assert_eq!(
@@ -385,7 +406,7 @@ async fn capture_biomarker_guard(
         crate::StructuralFindingRefresh::Recomputed,
     );
     let guard = database
-        .state(None, 0, 0, |tx, budget| {
+        .state(crate::rocks::StateAccess::read_only(None), |tx, budget| {
             crate::native_database::dataset::CommitGuard::capture(
                 tx,
                 &[
@@ -407,9 +428,11 @@ async fn replacing_an_orphan_restarts_its_full_grace_period() -> TestResult {
     let runtime = StorageRuntime::new(WorkerPolicy::default())?;
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        digest(42),
-        StorePolicy::default(),
+        crate::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            digest(42),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
@@ -417,43 +440,55 @@ async fn replacing_an_orphan_restarts_its_full_grace_period() -> TestResult {
     let database = NativeDatabase::new(store, &digest(42));
     let operation = |value: &'static [u8], timestamp| {
         move |tx: &mut StateTransaction<'_>, budget: &mut ReadBudget| {
-            let mut report = NativeDerivedPruneReport::default();
-            let removed = cold(
+            let mut collector = Collector {
                 tx,
                 budget,
-                OrphanCandidate {
-                    family: "fixture",
-                    key: b"v/example",
-                    bytes: value,
-                    incompatible: true,
-                },
                 timestamp,
-                &mut report,
-            )?;
-            Ok((removed, report.grace_started))
+                report: NativeDerivedPruneReport::default(),
+                cursors: Vec::new(),
+            };
+            let removed = collector.cold(OrphanCandidate {
+                family: "fixture",
+                key: b"v/example",
+                bytes: value,
+                incompatible: true,
+            })?;
+            Ok((removed, collector.report.grace_started))
         }
     };
     assert_eq!(
         database
-            .state(None, 1024, 4, operation(b"old", 1000))
+            .state(
+                crate::rocks::StateAccess::write(None, 1024, 4),
+                operation(b"old", 1000)
+            )
             .await?,
         (false, 1)
     );
     assert_eq!(
         database
-            .state(None, 1024, 4, operation(b"new", 1600))
+            .state(
+                crate::rocks::StateAccess::write(None, 1024, 4),
+                operation(b"new", 1600)
+            )
             .await?,
         (false, 1)
     );
     assert_eq!(
         database
-            .state(None, 1024, 4, operation(b"new", 2199))
+            .state(
+                crate::rocks::StateAccess::write(None, 1024, 4),
+                operation(b"new", 2199)
+            )
             .await?,
         (false, 0)
     );
     assert_eq!(
         database
-            .state(None, 1024, 4, operation(b"new", 2200))
+            .state(
+                crate::rocks::StateAccess::write(None, 1024, 4),
+                operation(b"new", 2200)
+            )
             .await?,
         (true, 0)
     );
@@ -468,9 +503,11 @@ async fn explicit_artifact_deletion_removes_its_orphan_marker_across_reopen() ->
     let identity = digest(42);
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        identity.clone(),
-        StorePolicy::default(),
+        crate::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            identity.clone(),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
@@ -499,9 +536,11 @@ async fn explicit_artifact_deletion_removes_its_orphan_marker_across_reopen() ->
     let reopened = NativeDatabase::new(
         AsyncProjectStore::open(
             &reopened_runtime,
-            root.path().to_owned(),
-            identity.clone(),
-            StorePolicy::default(),
+            crate::rocks::ProjectOpening::new(
+                root.path().to_owned(),
+                identity.clone(),
+                StorePolicy::default(),
+            ),
             &request()?,
         )
         .await?,
@@ -520,9 +559,11 @@ async fn malformed_artifact_identity_cannot_delete_a_different_user_note() -> Te
     let identity = digest(42);
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        identity.clone(),
-        StorePolicy::default(),
+        crate::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            identity.clone(),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
@@ -553,9 +594,10 @@ async fn malformed_artifact_identity_cannot_delete_a_different_user_note() -> Te
     let key = format!("a/{:016x}", summary.id());
     let forged = serde_json::to_vec(&forged)?;
     database
-        .state(None, 1_048_576, 4, move |tx, _| {
-            tx.put(Ns::Artifacts, key.as_bytes(), forged)
-        })
+        .state(
+            crate::rocks::StateAccess::write(None, 1_048_576, 4),
+            move |tx, _| tx.put(Ns::Artifacts, key.as_bytes(), forged),
+        )
         .await?;
     assert!(collect_at(&database, 1000).await.is_err());
     assert!(collect_at(&database, 2000).await.is_err());
@@ -580,9 +622,11 @@ async fn scoped_native_request_reaches_blocked_feature_work_and_prevents_late_co
         let database = NativeDatabase::new(
             AsyncProjectStore::open(
                 &runtime,
-                root.path().to_owned(),
-                identity.clone(),
-                StorePolicy::default(),
+                crate::rocks::ProjectOpening::new(
+                    root.path().to_owned(),
+                    identity.clone(),
+                    StorePolicy::default(),
+                ),
                 &request()?,
             )
             .await?,
@@ -601,9 +645,7 @@ async fn scoped_native_request_reaches_blocked_feature_work_and_prevents_late_co
             NativeDatabase::with_request(
                 operation_control,
                 operation_database.state_with_timeout(
-                    None,
-                    1024,
-                    4,
+                    crate::rocks::StateAccess::write(None, 1024, 4),
                     Duration::from_secs(60),
                     move |tx, budget| {
                         tx.put(Ns::Metadata, b"late-commit", b"must roll back".to_vec())?;
@@ -633,7 +675,7 @@ async fn scoped_native_request_reaches_blocked_feature_work_and_prevents_late_co
                 .is_err()
         );
         let visible = database
-            .state(None, 0, 0, |tx, budget| {
+            .state(crate::rocks::StateAccess::read_only(None), |tx, budget| {
                 tx.get(Ns::Metadata, b"late-commit", budget)
             })
             .await?;

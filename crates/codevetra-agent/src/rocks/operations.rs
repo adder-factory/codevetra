@@ -1,5 +1,6 @@
 //! Project-owned operations survive a dropped request until their work is reaped.
 
+use codevetra_db::rocks::RetentionPolicy;
 use std::{collections::BTreeMap, future::Future, mem::DropGuard, sync::Arc, time::Duration};
 
 use codevetra_db::rocks::{RocksError, StorageRequest};
@@ -58,17 +59,9 @@ impl RocksProjectRuntime {
             let contract = codevetra_indexer::native_parse_cache_contract_digest(
                 policy.index.maximum_ast_depth,
             );
-            let (graph, graph_error) = runtime.maintain(&control).await;
-            let (parse_cache, parse_cache_error, auxiliary, auxiliary_error) =
-                runtime.maintain_auxiliary(&contract, &control).await;
-            Ok(super::RocksMaintenanceReport {
-                graph,
-                graph_error,
-                parse_cache,
-                parse_cache_error,
-                auxiliary,
-                auxiliary_error,
-            })
+            Ok(super::Maintenance::new(&runtime, &control)
+                .complete(&contract)
+                .await)
         })
         .await
     }
@@ -219,20 +212,15 @@ impl RocksProjectRuntime {
     /// Rejects invalid retention limits, cancellation, active writers or native failures.
     pub async fn prune_generations(
         self: &Arc<Self>,
-        keep: u8,
-        generations: u16,
-        versions: u32,
+        policy: RetentionPolicy,
         request: &StorageRequest,
     ) -> Result<codevetra_db::rocks::PruneReport, RocksProjectError> {
         self.owned_operation(request, move |runtime, control| async move {
-            let budget = codevetra_db::rocks::ReadBudget::new(
-                20_000,
-                64 * 1_048_576,
-                Duration::from_secs(30),
-            )?;
+            let budget = RetentionPolicy::read_budget(Duration::from_secs(30))?;
             runtime
                 .store
-                .prune(keep, generations, versions, budget, &control)
+                .with_request(&control)
+                .prune(policy, budget)
                 .await
                 .map_err(Into::into)
         })
