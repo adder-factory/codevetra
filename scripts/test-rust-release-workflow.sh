@@ -293,6 +293,8 @@ contract_failure("Windows validation may not continue on error") if \
 windows_commands = {
   "Windows release path privacy regression" =>
     ["migration", "scripts/test-windows-rust-release-paths.ps1"],
+  "Windows release compiler argument regression" =>
+    ["migration", "scripts/test-windows-release-compiler.ps1"],
   "Windows physical name migration and original-lock preservation" =>
     ["migration", "cargo test --locked -p codevetra-config name_migration -- --nocapture"],
   "Windows all-target, all-feature Clippy" =>
@@ -721,6 +723,8 @@ fi
 grep -Fq 'needs: verify-main-gate' "$RELEASE" || fail 'release builds do not depend on exact main evidence'
 grep -Fq 'cache_key: release-windows-x64' "$RELEASE" || \
   fail 'Windows release artifacts do not use a release-profile cache'
+grep -Fxq "Invoke-WindowsReleaseCargo -CargoArguments @('build', '--locked', '--release', '--package', 'codevetra-cli')" "$ROOT/scripts/build-rust-release.ps1" || \
+  fail 'Windows release builds must use the tested direct-compiler Cargo helper'
 if grep -Fq 'cache_key: v2-windows' "$RELEASE"; then
   fail 'Windows release build still shares the dev and Clippy cache'
 fi

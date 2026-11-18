@@ -8,11 +8,11 @@ use super::{
     capability_symbol, generation_validation_limits, validate_generation_facts,
 };
 
-// V34 changes only the domain for this unchanged frozen corpus.
-// Independent encoding reproduces the V33 pin before deriving the V34 pin.
+// V35 changes only the domain for this unchanged frozen corpus.
+// Independent encoding reproduces the V34 pin before deriving the V35 pin.
 const PREVIOUS_RECEIVER_DIGEST: &str =
-    "38992f20e183c2a650613d2db11e04a4aaee0873b081b788941eb822862a0b41";
-const BRIDGE_ONLY_DIGEST: &str = "647b3fd0daefb162912310852418b6162347f0db9a8e5399f2e7bd7b54291364";
+    "296949b7aa374babc7cb8591342914fc1bf8834eccd02521acb1af407571aee2";
+const BRIDGE_ONLY_DIGEST: &str = "34aea88faf5da5e2c695d995e5b52007a2eb0d86686f9f8ff280d31c3fa77b42";
 const EXPECTED_RECEIVER_CONFIDENCE: f32 = 0.95;
 const RECEIVER_DELTA: &[(&str, u64, u64, &str)] = &[
     ("generic/fixture.rb", 293, 296, "native-unresolved"),

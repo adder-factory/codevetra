@@ -1715,6 +1715,52 @@ fn meaningful() {
 }
 
 #[test]
+fn powershell_numeric_wrappers_count_each_source_literal_once() {
+    const EXPECTED: [(&str, u32, u32); 3] =
+        [("Numbers", 4, 11), ("Benign", 0, 3), ("Repeated", 4, 8)];
+    let file = extract(
+        "src/numbers.ps1",
+        r"
+function Numbers { return @(41, 0x2a, 4.5, 43) }
+function Benign { return @(0, 1, 2) }
+function Repeated { return @(41, 41, 41, 41) }
+",
+    );
+    for (name, magic_numbers, literal_bytes) in EXPECTED {
+        let health = &symbol(&file, name).health;
+        assert_eq!(health.magic_numbers, magic_numbers, "{name}");
+        assert_eq!(health.literal_bytes, literal_bytes, "{name}");
+    }
+}
+
+#[test]
+fn powershell_nested_callable_literals_keep_their_own_metric_owner() {
+    const EXPECTED: [(&str, u32, u32); 4] = [
+        ("Outer", 1, 2),
+        ("Outer::Inner", 4, 8),
+        ("Container", 0, 0),
+        ("Container::Work", 1, 2),
+    ];
+    let file = extract(
+        "src/owners.ps1",
+        r"
+function Outer {
+    function Inner { return @(41, 42, 43, 44) }
+    return 45
+}
+class Container {
+    [int] Work() { return 46 }
+}
+",
+    );
+    for (name, magic_numbers, literal_bytes) in EXPECTED {
+        let health = &symbol(&file, name).health;
+        assert_eq!(health.magic_numbers, magic_numbers, "{name}");
+        assert_eq!(health.literal_bytes, literal_bytes, "{name}");
+    }
+}
+
+#[test]
 fn symbol_health_keeps_else_if_ladders_flat_but_counts_true_nesting() {
     let rust = extract(
         "src/branches.rs",

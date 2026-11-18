@@ -35,10 +35,10 @@ abstention instead of presenting stale or incomplete data as certainty.
 > before indexing or reconnecting hosts. Existing RocksDB state is preserved;
 > PostgreSQL-era v2 projects also need a source rebuild. See [Upgrade](#upgrade).
 
-Version [4.0.7](docs/releases/v4.0.7.md) improves biomarker precision, Rust
+Version [4.0.8](docs/releases/v4.0.8.md) improves biomarker precision, Rust
 resolution, and CLI/MCP argument guidance. Health counters retain their full
 range, empty metrics use less memory, and native lifecycle operations keep
-request ownership and replay checks together. Generation contract V34 requires
+request ownership and replay checks together. Generation contract V35 requires
 one source re-index after upgrading; restart existing MCP hosts to load the new
 binary. Rust 1.100.0 and RocksDB 11.12.0 remain pinned.
 
@@ -431,7 +431,7 @@ audience.
 | Area | Guides |
 | --- | --- |
 | **Set up** | [Agent-assisted installation](docs/AGENT-INSTALL.md) · [Configuration](docs/CONFIGURATION.md) · [MCP usage](docs/MCP-USAGE.md) |
-| **Upgrade** | [Cartograph to CodeVetra](docs/CODEVETRA-MIGRATION.md) · [RocksDB migration](docs/v2/ROCKSDB-MIGRATION.md) · [v4.0.7 release notes](docs/releases/v4.0.7.md) |
+| **Upgrade** | [Cartograph to CodeVetra](docs/CODEVETRA-MIGRATION.md) · [RocksDB migration](docs/v2/ROCKSDB-MIGRATION.md) · [v4.0.8 release notes](docs/releases/v4.0.8.md) |
 | **Use** | [CLI reference](docs/CLI-REFERENCE.md) · [CLI/MCP alignment](docs/cli-mcp-alignment.md) · [Language support matrix](docs/SUPPORT-MATRIX.md) · [Graph export formats](docs/GRAPH-EXPORT-FORMATS.md) |
 | **Operate** | [Storage and operations](docs/STORAGE-BACKENDS.md) · [Performance tuning](docs/PERF-TUNING.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | **Extend** | [Architecture](docs/v2/ARCHITECTURE.md) · [Native extraction](docs/v2/EXTRACTION.md) · [Extending languages and resolvers](docs/EXTENDING-EXTRACTORS-RESOLVERS.md) |

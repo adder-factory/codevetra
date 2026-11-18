@@ -14803,15 +14803,15 @@ mod tests {
 
     const FULL_TEST_EVIDENCE: NativeEvidencePolicy = NativeEvidencePolicy::FULL;
     const STRUCTURAL_TEST_EVIDENCE: NativeEvidencePolicy = NativeEvidencePolicy::STRUCTURAL;
-    // V34 changes only the domain for these frozen fixtures.
-    // Independent encoding reproduces each V33 digest before deriving its V34 pin.
+    // V35 changes only the domain for these frozen fixtures.
+    // Independent encoding reproduces each V34 digest before deriving its V35 pin.
     const PARSER_ONLY_FILE_COUNT: usize = 6;
     const EXPECTED_PARSER_ONLY_DIGEST: &str =
-        "4a42f886ea1910c017352ea84137920cf3993e2e593700482f85b73af64bfb16";
+        "2710e10df47b11abe72df567f38686229bbf858ae03e264da533c98e888cba9f";
     const EXPECTED_PARSER_ONLY_PROJECTION: (usize, usize, usize, usize, usize) = (6, 6, 0, 0, 6);
     const ADMITTED_FAMILY_FILE_COUNT: usize = 14;
     const EXPECTED_ADMITTED_FAMILY_DIGEST: &str =
-        "62b01cc63726634a7dd649ff95c400d25737ef201d24d28cf6108fe41f01a422";
+        "018236c946f20a79443f6cab36f557b86d641bd59d6104632ab4a16a63793f17";
     const EXPECTED_ADMITTED_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
         (14, 33, 19, 6, 33);
     const GENERIC_FAMILY_FILE_COUNT: usize = 28;
@@ -14838,7 +14838,7 @@ mod tests {
     // references and centrality; bridge_digest_proof then removes six alias
     // links to recover 04a9f9b9... exactly under the V23 domain.
     const EXPECTED_GENERIC_FAMILY_DIGEST: &str =
-        "b608ff030c2adb11bb2eefd8d3e8923b820945bd25842c8e3e73d23b2a9c4cb8";
+        "1aad348e35d21f5483354c24b6fe8602f310eccc55d299630703441ec9d8d030";
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
         (28, 260, 292, 135, 260);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
@@ -14849,7 +14849,7 @@ mod tests {
     // frameworks::routes::mybatis_local_sql_roles_preserve_the_frozen_custom_digest
     // regression removes the hint and compares every fact table and digest.
     const EXPECTED_CUSTOM_FAMILY_DIGEST: &str =
-        "138f3cb8980341578a87023b577ef3fce16b1d2e0628d0b60c5aa324ab9b3727";
+        "a8719903b6ccb4d18edcd642f9e466a686c61a0331019d394224ed783bbe6d98";
     // A Liquid `{% render %}` partner is a Component as well as an Import
     // (+1 symbol and its containment).
     const EXPECTED_CUSTOM_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =

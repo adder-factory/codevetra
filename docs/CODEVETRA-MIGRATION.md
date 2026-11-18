@@ -2,7 +2,7 @@
 
 CodeVetra 4 changes the product name, repository, executable, Rust packages, MCP
 registration and tools. It preserves the native RocksDB durable format and project
-identity. The current generation contract is V34; re-index source after upgrading so
+identity. The current generation contract is V35; re-index source after upgrading so
 full-width health counters, uniform-call value mappings, operation-local biomarkers,
 Rust test/proof ownership and
 application boundaries are current. Old generations,

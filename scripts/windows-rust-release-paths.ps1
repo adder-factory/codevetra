@@ -1,3 +1,41 @@
+function Invoke-WindowsReleaseCargo {
+  param([Parameter(Mandatory = $true)][string[]]$CargoArguments)
+
+  # sccache 0.19 expands rustc arguments while collecting dependencies. The
+  # resulting command can exceed CreateProcessW's limit even when Cargo's
+  # original command fits. Let Cargo invoke rustc with its argfile fallback.
+  $SavedWrappers = @{}
+  foreach ($Name in @(
+    'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
+    'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER'
+  )) {
+    $SavedWrappers[$Name] = [Environment]::GetEnvironmentVariable($Name)
+  }
+  try {
+    foreach ($Name in $SavedWrappers.Keys) {
+      if (Test-Path -LiteralPath "Env:$Name") {
+        Remove-Item -LiteralPath "Env:$Name"
+      }
+    }
+    # Explicit config overrides also work on PowerShell versions where an
+    # empty environment assignment removes the variable instead of setting it.
+    & cargo --config "build.rustc-wrapper=''" --config "build.rustc-workspace-wrapper=''" @CargoArguments
+    if ($LASTEXITCODE -ne 0) {
+      throw "Windows release Cargo command failed (exit $LASTEXITCODE)"
+    }
+  } finally {
+    foreach ($Name in $SavedWrappers.Keys) {
+      if ($null -eq $SavedWrappers[$Name]) {
+        if (Test-Path -LiteralPath "Env:$Name") {
+          Remove-Item -LiteralPath "Env:$Name"
+        }
+      } else {
+        [Environment]::SetEnvironmentVariable($Name, $SavedWrappers[$Name])
+      }
+    }
+  }
+}
+
 function Get-RustHostTarget {
   $HostOutput = @(& rustc --print host-tuple 2>&1)
   $RustcExitCode = $LASTEXITCODE

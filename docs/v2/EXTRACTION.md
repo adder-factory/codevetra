@@ -135,7 +135,11 @@ path/content-digest pairs in deterministic order. The encoding lives in
 source context, indexing, and v1 import. An exact set mismatch fails closed.
 
 Generation freshness additionally requires the current native generation-digest
-contract. Contract V34 admits qualified paths inside bounded, proven standard
+contract. Contract V35 counts coincident numeric syntax wrappers once for literal
+bytes and magic-number evidence, while retaining separate source literals even
+when their values are equal. Numeric body roots retain their own evidence;
+nested PowerShell functions and methods keep their numeric and control metrics
+with the declared callable. Contract V34 admits qualified paths inside bounded, proven standard
 expression-macro arguments. Blocks, declarations, nested invocations, diagnostic
 macros, unproven macro imports, and unqualified argument names remain opaque.
 Extern-crate macro-use imports cover their entire enclosing scope. Explicit named
@@ -167,10 +171,11 @@ separate from the source-manifest digest so v1 import still compares exact
 checkout bytes rather than a binary-specific identity.
 
 <details>
-<summary>Details: generation-digest contract history (V5–V34)</summary>
+<summary>Details: generation-digest contract history (V5–V35)</summary>
 
 | Contract | What it fences |
 | --- | --- |
+| V35 | Unique numeric source spans, retained numeric body roots, and PowerShell callable metric ownership; requires a source rebuild |
 | V34 | Proven qualified standard-macro arguments, macro-use prelude scope, and explicit named Cargo target roots; requires a source rebuild |
 | V33 | Exact literal Rust file-module paths, physical loading directories, and declaration-scoped visibility; requires a source rebuild |
 | V32 | Bounded cfg-only conventional Rust module bindings; configuration activation remains unevaluated; requires a source rebuild |

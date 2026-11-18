@@ -219,8 +219,8 @@ const CORPUS_FINGERPRINT_DOMAIN: &[u8] = b"cartograph-v2-native-real-corpus-v1";
 const EXPECTED_CORPUS_FINGERPRINT: &str =
     "ab91088c482ed36d31759382283342654ce6958be4e601429b8181da531c5fc1";
 
-// V34 changes only the hash domain for this non-Rust corpus; independent wire
-// encoding reproduces V33 before deriving V34. Corpus bytes and facts are unchanged.
+// V35 changes only the hash domain for this non-Rust corpus; independent wire
+// encoding reproduces V34 before deriving V35. Corpus bytes and facts are unchanged.
 // V27 adds health-analyzer language and exact operation evidence, corrects nine
 // substring-eval false positives and three caught initializer parses, and detects
 // thirteen previously missed environment-access owners. Independently reconstructed
@@ -230,7 +230,7 @@ const EXPECTED_CORPUS_FINGERPRINT: &str =
 // targets, declarations, documents, source bytes and BM25 identities stay fixed.
 // Independent wire encoding reproduces the old V25 digest before deriving V26.
 const EXPECTED_LOGICAL_DIGEST: &str =
-    "89946b718bbb22c79f849c43025fc747274bb55f88bac1c2dadc5bdbdf35bde9";
+    "484b6197b523ba2a2da1241b7438abffe2e73e3e31c849747b3f150a07b1f0b8";
 
 // Native scoring uses k1=1.2, b=.75 and name/code/natural weights 4/1/2.
 // Independently checked corpus statistics: N=6362, weighted tokens=348835,

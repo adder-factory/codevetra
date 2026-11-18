@@ -86,7 +86,8 @@ Inside the bounded Linux release container, Rust uses Cargo's persistent target
 cache and C/C++ uses sccache. Rust sccache is explicitly disabled there because
 version 0.19 eagerly hashes Rust inputs through a blocking pool without a
 configurable thread limit, which exhausted the 256-PID budget. Other builds
-retain Rust sccache. A real compiler probe checks this split, native cache hits
+retain Rust sccache, except for Windows release builds described below. A real
+compiler probe checks this split, native cache hits
 and changed-input behavior; reaching the container's PID limit fails the build.
 They stage public source without copying private graph or Git state, check for
 source changes before publishing artifacts, and retain all archive/privacy
@@ -98,6 +99,16 @@ Clock skew or filesystem precision that prevents proving freshness is an error.
 A local Docker endpoint with cgroup v2 is required;
 build containers have 4 GiB RAM, no swap, two CPUs, 256 PIDs and a 55-minute
 deadline. A surviving build container fences the next run until inspected.
+
+Windows release builds invoke Cargo without Rust compiler wrappers and reuse
+Cargo's persisted target artifacts. The pinned sccache expands dependency
+arguments past Windows' process command-line limit for the release graph;
+direct Cargo-to-rustc execution supports response files instead. The scoped
+build helper preserves compiler flags, MSVC discovery, concurrency, and path
+remapping, and restores inherited wrapper settings on success or failure.
+Windows CI first reproduces the pinned wrapper's overflow, then compiles and
+runs the same fixture through the release helper with arguments exceeding
+Windows' 32,767-character limit, including a required flag at the end of the list.
 
 ## Test execution
 
