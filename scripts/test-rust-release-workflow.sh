@@ -138,6 +138,22 @@ def nonblocking_quality?(source, label)
   end
 end
 
+def shared_ubuntu_cache?(document)
+  prefix = 'codevetra-rust-${{ runner.os }}-v2-ubuntu-'
+  key = <<~'KEY'.strip
+    codevetra-rust-${{ runner.os }}-v2-ubuntu-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'scripts/build-tools.json') }}
+  KEY
+  %w[unit-tests quality rocksdb].all? do |name|
+    restores = document.fetch("jobs").fetch(name).fetch("steps").select do |step|
+      step["name"] == "Restore Rust dependency cache"
+    end
+    next false unless restores.length == 1
+    settings = restores.first.fetch("with")
+    settings["key"] == key && settings["restore-keys"].is_a?(String) &&
+      settings["restore-keys"].lines.map(&:strip) == [prefix]
+  end
+end
+
 nonblocking_fixtures = {
   "quoted job-level continue-on-error fixture" => <<~'YAML',
     jobs:
@@ -195,6 +211,22 @@ if nonblocking_quality?(File.read(validation_path), "validation workflow")
   contract_failure("quality job and its required steps may not continue on error")
 end
 document = parse_workflow(File.read(validation_path), "validation workflow")
+contract_failure("Ubuntu jobs must share the exact dependency key and bounded fallback namespace") unless \
+  shared_ubuntu_cache?(document)
+%w[unit-tests quality rocksdb].each do |name|
+  %w[missing-fallback broad-fallback isolated-key].each do |mutation|
+    fixture = Marshal.load(Marshal.dump(document))
+    settings = fixture.fetch("jobs").fetch(name).fetch("steps").find do |step|
+      step["name"] == "Restore Rust dependency cache"
+    end.fetch("with")
+    case mutation
+    when "missing-fallback" then settings.delete("restore-keys")
+    when "broad-fallback" then settings["restore-keys"] = "codevetra-rust-\n"
+    when "isolated-key" then settings["key"] += "-isolated"
+    end
+    contract_failure("#{name} #{mutation} cache regression was accepted") if shared_ubuntu_cache?(fixture)
+  end
+end
 quality, quality_steps = quality_job(document, "validation workflow")
 unit = document.fetch("jobs")["unit-tests"]
 contract_failure("ordinary tests must have a separate required job") unless unit.is_a?(Hash)
