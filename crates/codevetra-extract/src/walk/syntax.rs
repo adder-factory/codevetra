@@ -367,7 +367,7 @@ fn code_line_count(
         let comment = state.record(node, static_jsx);
         let descend = !comment
             && !is_opaque_string_literal(node.kind())
-            && (root || !is_callable_node(node.kind()));
+            && (root || !is_health_callable_node(node.kind(), language));
         root = false;
         if state.descend(&mut cursor, child_static_jsx, descend) {
             continue;
@@ -475,7 +475,7 @@ fn inspect_health_node(
     metrics: &mut SymbolHealthMetrics,
     input: HealthNodeInput<'_, '_>,
 ) -> Option<u32> {
-    if !input.root && is_callable_node(input.node.kind()) {
+    if !input.root && is_health_callable_node(input.node.kind(), input.language) {
         return None;
     }
     record_literal_health(
@@ -485,6 +485,7 @@ fn inspect_health_node(
             source: input.source,
             language: input.language,
         },
+        input.root,
     );
     let child_nesting = record_control_health(
         metrics,
@@ -513,10 +514,17 @@ fn inspect_health_node(
     Some(child_nesting)
 }
 
-fn record_literal_health(metrics: &mut SymbolHealthMetrics, input: LiteralHealthInput<'_, '_>) {
+fn record_literal_health(
+    metrics: &mut SymbolHealthMetrics,
+    input: LiteralHealthInput<'_, '_>,
+    body_root: bool,
+) {
     let node_text = text_for(input.source, input.node);
     let string_literal = is_string_literal(input.node.kind());
-    let numeric_literal = is_numeric_literal(input.node.kind());
+    // Numeric wrappers can describe the same token as their child. Charge that
+    // byte span once while retaining separate literals, including equal values.
+    let numeric_literal = is_numeric_literal(input.node.kind())
+        && (body_root || !has_same_numeric_span_parent(input.node));
     let outermost_string_literal = string_literal
         && input
             .node
@@ -538,24 +546,34 @@ fn record_literal_health(metrics: &mut SymbolHealthMetrics, input: LiteralHealth
         metrics.magic_numbers = metrics.magic_numbers.saturating_add(1);
     }
     if string_literal && contains_hardcoded_url(node_text) {
-        match classify_url_literal(input.node, input.source) {
-            UrlLiteralCategory::Request => {
-                metrics.hardcoded_urls = metrics.hardcoded_urls.saturating_add(1);
-                metrics.hardcoded_url_requests = metrics.hardcoded_url_requests.saturating_add(1);
-            }
-            UrlLiteralCategory::Configuration => {
-                metrics.hardcoded_urls = metrics.hardcoded_urls.saturating_add(1);
-                metrics.hardcoded_url_configuration =
-                    metrics.hardcoded_url_configuration.saturating_add(1);
-            }
-            UrlLiteralCategory::Presentation => {
-                metrics.hardcoded_url_presentation_abstentions = metrics
-                    .hardcoded_url_presentation_abstentions
-                    .saturating_add(1);
-            }
-            UrlLiteralCategory::Validation | UrlLiteralCategory::Data => {}
-        }
+        record_url_literal_health(metrics, classify_url_literal(input.node, input.source));
     }
+}
+
+fn record_url_literal_health(metrics: &mut SymbolHealthMetrics, category: UrlLiteralCategory) {
+    match category {
+        UrlLiteralCategory::Request => {
+            metrics.hardcoded_urls = metrics.hardcoded_urls.saturating_add(1);
+            metrics.hardcoded_url_requests = metrics.hardcoded_url_requests.saturating_add(1);
+        }
+        UrlLiteralCategory::Configuration => {
+            metrics.hardcoded_urls = metrics.hardcoded_urls.saturating_add(1);
+            metrics.hardcoded_url_configuration =
+                metrics.hardcoded_url_configuration.saturating_add(1);
+        }
+        UrlLiteralCategory::Presentation => {
+            metrics.hardcoded_url_presentation_abstentions = metrics
+                .hardcoded_url_presentation_abstentions
+                .saturating_add(1);
+        }
+        UrlLiteralCategory::Validation | UrlLiteralCategory::Data => {}
+    }
+}
+
+fn has_same_numeric_span_parent(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        is_numeric_literal(parent.kind()) && parent.byte_range() == node.byte_range()
+    })
 }
 
 fn dynamic_sql_shape(node: Node<'_>, source: &str) -> bool {
@@ -1805,6 +1823,17 @@ fn endpoint_configuration_name(raw: &str) -> bool {
 
 fn is_presentation_only_node(kind: &str) -> bool {
     matches!(kind, "jsx_text" | "jsx_attribute")
+}
+
+fn is_health_callable_node(kind: &str, language: SourceLanguage) -> bool {
+    is_callable_node(kind)
+        || matches!(
+            (language, kind),
+            (
+                SourceLanguage::PowerShell,
+                "function_statement" | "class_method_definition"
+            )
+        )
 }
 
 fn is_callable_node(kind: &str) -> bool {
@@ -3164,6 +3193,43 @@ mod tests {
     const LARGE_TEMPLATE_BYTES: usize = 2 * 1024 * 1024;
     const LARGE_CANCEL_AFTER_POLLS: usize = 20;
     const LARGE_EXPECTED_POLLS: usize = LARGE_CANCEL_AFTER_POLLS + 1;
+
+    #[test]
+    fn numeric_body_root_retains_literal_evidence() {
+        let source = "41";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&arborium_powershell::language().into())
+            .unwrap_or_else(|error| panic!("grammar: {error}"));
+        let tree = parser
+            .parse(source, None)
+            .unwrap_or_else(|| panic!("numeric tree"));
+        let literal = descendants_including_root(tree.root_node())
+            .find(|node| node.kind() == "decimal_integer_literal")
+            .unwrap_or_else(|| panic!("numeric leaf"));
+        let parent = literal
+            .parent()
+            .unwrap_or_else(|| panic!("numeric wrapper"));
+        assert!(super::is_numeric_literal(parent.kind()));
+        assert_eq!(literal.byte_range(), parent.byte_range());
+        let health = super::symbol_health_metrics(
+            super::SymbolHealthInput {
+                declaration: literal,
+                body: Some(literal),
+                symbol_kind: super::SymbolKind::Variable,
+                symbol_name: "value",
+                signature: None,
+                docstring: None,
+                language: super::SourceLanguage::PowerShell,
+                async_symbol: false,
+                source,
+            },
+            &mut || false,
+        )
+        .unwrap_or_else(|error| panic!("literal health: {error}"));
+        assert_eq!(health.magic_numbers, 1);
+        assert_eq!(health.literal_bytes, 2);
+    }
 
     #[test]
     fn flat_tree_digest_polls_cancellation_without_collecting_the_tree() {

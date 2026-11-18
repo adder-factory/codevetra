@@ -78,8 +78,7 @@ if ([string]::IsNullOrWhiteSpace($env:LIBCLANG_PATH)) {
   $env:LIBCLANG_PATH = $NativeClangDirectory
 }
 
-cargo build --locked --release --package codevetra-cli
-if ($LASTEXITCODE -ne 0) { throw 'cargo release build failed' }
+Invoke-WindowsReleaseCargo -CargoArguments @('build', '--locked', '--release', '--package', 'codevetra-cli')
 
 # Audit the exact tag-built executable before either published artifact is made.
 # Read all three common encodings because Windows toolchains can retain both

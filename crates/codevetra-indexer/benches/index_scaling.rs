@@ -29,10 +29,10 @@ use std::{
 };
 
 type BenchResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
-// V34 identity for the frozen fixture; its inputs and fingerprint stay fixed.
-// An independent wire encoder reproduced V25, V27, V30, V31, V32 and V33 before deriving V34.
+// V35 identity for the frozen fixture; its inputs and fingerprint stay fixed.
+// An independent wire encoder reproduced V25, V27, V30, V31, V32, V33 and V34 before deriving V35.
 const EXPECTED_LOGICAL_DIGEST: &str =
-    "bef936da1afdb1cd442bea9c83b988612aacc2102224f0016263555b8cbc54ee";
+    "0dc05a13c787e1face020c767343f29f2306dfd649cb3aec2bdbc9c5a9dd3f04";
 const NATIVE_WORKER_POLICY: WorkerPolicy = WorkerPolicy {
     threads: 2,
     pending_jobs: 32,

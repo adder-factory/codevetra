@@ -37,6 +37,7 @@ const DIGEST_V31_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v31";
 const DIGEST_V32_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v32";
 const DIGEST_V33_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v33";
 const DIGEST_V34_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v34";
+const DIGEST_V35_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v35";
 
 /// Each digest contract's hash domain, in [`GenerationDigestVersion::ALL`]
 /// order. The length follows `ALL`, so a new contract does not compile until
@@ -76,6 +77,7 @@ const DIGEST_DOMAINS: [&[u8]; GenerationDigestVersion::ALL.len()] = [
     DIGEST_V32_DOMAIN,
     DIGEST_V33_DOMAIN,
     DIGEST_V34_DOMAIN,
+    DIGEST_V35_DOMAIN,
 ];
 
 pub(super) fn logical_digest<Cancel>(
@@ -132,6 +134,7 @@ const fn digest_includes_numerical_sites(version: GenerationDigestVersion) -> bo
             | GenerationDigestVersion::V32
             | GenerationDigestVersion::V33
             | GenerationDigestVersion::V34
+            | GenerationDigestVersion::V35
     )
 }
 

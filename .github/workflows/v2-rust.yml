@@ -434,6 +434,11 @@ jobs:
         shell: pwsh
         run: scripts/test-windows-rust-release-paths.ps1
 
+      - name: Windows release compiler argument regression
+        if: matrix.check == 'migration'
+        shell: pwsh
+        run: scripts/test-windows-release-compiler.ps1
+
       - name: Windows physical name migration and original-lock preservation
         if: matrix.check == 'migration'
         run: cargo test --locked -p codevetra-config name_migration -- --nocapture
