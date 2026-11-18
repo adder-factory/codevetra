@@ -2,7 +2,7 @@
 
 use super::{
     NAMESPACE,
-    vectors::{active, cosine_distance, current, documents_scan, hit, read_vector, source},
+    vectors::{ScoredDocument, SourceReader, active, cosine_distance, documents_scan},
 };
 use crate::semantic::types::{
     EmbeddingModelSelector, EmbeddingModelState, RegisteredEmbeddingModel,
@@ -12,7 +12,6 @@ use crate::semantic::types::{
 use crate::{
     CanonicalSearchDocument, NativeDatabase,
     native_database::visit_state,
-    retrieval::native::retain,
     rocks::{ReadBudget, StateTransaction},
 };
 use codevetra_domain::{DocumentId, DocumentKind};
@@ -35,37 +34,33 @@ impl NativeDatabase {
     ) -> Result<SimilarSymbolsResult, Error> {
         self.require_project(&request.project_id)?;
         self.transaction(
-            Some(request.expected_generation_id.clone()),
-            0,
-            0,
+            crate::rocks::StateAccess::read_only(Some(request.expected_generation_id.clone())),
             request.statement_timeout,
             move |transaction, budget| {
-                let generation = current(transaction)?;
                 let source = resolve_source(transaction, &request, budget)?;
                 active(transaction, &source.model, budget)?;
                 let snapshot = transaction.graph_snapshot()?;
                 let graph = snapshot.graph(budget)?;
-                let mut candidates = Vec::new();
+                let mut candidates = crate::retrieval::native::RankedRows::new(
+                    usize::from(request.limit) + 1,
+                    ScoredDocument::compare,
+                );
                 let (mut documents, mut embedded) = (0_u64, 0_u64);
                 documents_scan(&graph, budget, |_, document, budget| {
                     documents += 1;
                     let id = document.document_id.clone();
                     let eligible = eligible_neighbor(&document, &source, &request);
                     let (_, digest) =
-                        source_text(transaction, &graph, &generation, document, budget)?;
-                    if let Some(vector) =
-                        read_vector(transaction, &source.model, &id, &digest, budget)?
+                        SourceReader::new(transaction, &graph).render(document, budget)?;
+                    if let Some(vector) = SourceReader::new(transaction, &graph)
+                        .model(&source.model)
+                        .read(&id, &digest, budget)?
                     {
                         embedded += 1;
                         if eligible {
                             let distance = cosine_distance(&source.vector, &vector, budget)?;
                             if 1.0 - distance >= request.minimum_score {
-                                retain(
-                                    &mut candidates,
-                                    (id, distance),
-                                    usize::from(request.limit) + 1,
-                                    |a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)),
-                                );
+                                candidates.insert(ScoredDocument { id, distance });
                             }
                         }
                     }
@@ -80,9 +75,11 @@ impl NativeDatabase {
                 candidates.truncate(usize::from(request.limit));
                 let hits = candidates
                     .into_iter()
-                    .map(|(id, distance)| {
-                        hit(&graph, &generation, &id, distance, budget)
-                            .map(|hit| SimilarSymbolHit::new(hit, (1.0 - distance).clamp(0.0, 1.0)))
+                    .map(|candidate| {
+                        let score = (1.0 - candidate.distance).clamp(0.0, 1.0);
+                        candidate
+                            .hydrate(&graph, budget)
+                            .map(|hit| SimilarSymbolHit::new(hit, score))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(SimilarSymbolsResult::new(SimilarSymbolsResultInput {
@@ -115,9 +112,7 @@ fn source_models(
 ) -> Result<Vec<RegisteredEmbeddingModel>, Error> {
     let mut models = Vec::new();
     visit_state(
-        transaction,
-        NAMESPACE,
-        b"m/",
+        &transaction.scan(NAMESPACE, b"m/"),
         budget,
         |_, model: RegisteredEmbeddingModel, _| {
             if model.state == EmbeddingModelState::Active
@@ -155,15 +150,12 @@ fn resolve_source(
             return Ok(ControlFlow::Continue(()));
         }
         let (id, language) = (document.document_id.clone(), document.language.clone());
-        let (_, digest) = source(
-            transaction,
-            &graph,
-            &request.expected_generation_id,
-            document,
-            budget,
-        )?;
+        let (_, digest) = SourceReader::new(transaction, &graph).render(document, budget)?;
         for model in &models {
-            if let Some(vector) = read_vector(transaction, &model.selector, &id, &digest, budget)? {
+            if let Some(vector) = SourceReader::new(transaction, &graph)
+                .model(&model.selector)
+                .read(&id, &digest, budget)?
+            {
                 found.push(Source {
                     model: model.selector.clone(),
                     document: id.clone(),
@@ -179,5 +171,3 @@ fn resolve_source(
     })?;
     found.pop().ok_or(Error::SourceEmbeddingUnavailable)
 }
-
-use super::vectors::source as source_text;

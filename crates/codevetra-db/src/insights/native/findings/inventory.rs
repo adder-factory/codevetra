@@ -13,6 +13,15 @@ use codevetra_domain::{EdgeKind, SourceLanguage, SymbolId, Visibility};
 use num_traits::ToPrimitive as _;
 use std::collections::{BTreeMap, BTreeSet};
 
+const RECENT_PUBLICATION_SECONDS: i64 = 30 * 86_400;
+const SYMBOLS_PER_BATCH: usize = 4096;
+const MAXIMUM_FINDING_BYTES: usize = 16 * 1_048_576;
+const MAXIMUM_REFERENCE_BYTES: usize = 8 * 1_048_576;
+const MAXIMUM_PARTIAL_CLONE_PEERS: usize = 128;
+const MAXIMUM_CLONE_SHAPE_BYTES: usize = 4096;
+const MAXIMUM_OPERATION_SITES: usize = 16 * 25;
+const MAXIMUM_SITES_PER_METRIC: u16 = 16;
+
 const FIELDS: &[&str] = &[
     "code_lines",
     "parameter_count",
@@ -58,7 +67,12 @@ pub(super) struct Document {
     pub(super) shape: Option<String>,
     pub(super) partial: Partial,
     pub(super) secrets_actionable: bool,
+    pub(super) syntax: SyntaxEvidence,
+}
+
+pub(super) struct SyntaxEvidence {
     pub(super) facade_factory: bool,
+    pub(super) flat_value_mapping: bool,
 }
 
 pub(super) struct ClonePolicy {
@@ -178,18 +192,17 @@ impl Referenced {
         transaction: &StateTransaction<'_>,
         budget: &mut ReadBudget,
     ) -> Result<Inventory, RocksError> {
-        let snapshot = transaction.graph_snapshot()?;
-        let graph = snapshot.graph(budget)?;
-        let clone_classes =
-            clones::Classes::new(transaction, &graph, &self.inputs.documents, budget)?;
+        let clone_classes = clones::Classes::new(transaction, &self.inputs.documents, budget)?;
         Ok(Inventory {
             inputs: self,
             clone_classes,
-            rows: Vec::new(),
-            bytes: 0,
-            analyzed: 0,
+            output: FindingResults {
+                rows: Vec::new(),
+                bytes: 0,
+                analyzed: 0,
+                coverage: super::coverage::CoverageAccumulator::new(),
+            },
             position: 0,
-            detector_coverage: super::coverage::CoverageAccumulator::new(),
         })
     }
 }
@@ -197,11 +210,15 @@ impl Referenced {
 pub(super) struct Inventory {
     inputs: Referenced,
     clone_classes: clones::Classes,
+    output: FindingResults,
+    position: usize,
+}
+
+struct FindingResults {
     rows: Vec<StructuralFinding>,
     bytes: usize,
     analyzed: u64,
-    position: usize,
-    detector_coverage: super::coverage::CoverageAccumulator,
+    coverage: super::coverage::CoverageAccumulator,
 }
 
 impl Inventory {
@@ -225,17 +242,8 @@ impl Inventory {
             .as_ref()
             .map(|snapshot| snapshot.graph(budget))
             .transpose()?;
-        let recent_prior = previous
-            .and_then(|previous| previous.published_at.as_ref())
-            .map(|time| time.parse::<jiff::Timestamp>().map_err(|_| corrupt()))
-            .transpose()?
-            .is_some_and(|time| {
-                time.as_second()
-                    >= jiff::Timestamp::now()
-                        .as_second()
-                        .saturating_sub(30 * 86400)
-            });
-        for handle in documents.iter().skip(self.position).take(4096) {
+        let recent_prior = recent_publication(previous)?;
+        for handle in documents.iter().skip(self.position).take(SYMBOLS_PER_BATCH) {
             self.position += 1;
             budget.checkpoint()?;
             let id = handle.symbol()?;
@@ -245,8 +253,11 @@ impl Inventory {
             if document.test
                 || matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter")
             {
-                self.detector_coverage
-                    .observe(&file, &symbol, &document, None);
+                self.output
+                    .coverage
+                    .observe(super::coverage::Subject::unscored(
+                        &file, &symbol, &document,
+                    ));
                 continue;
             }
             if document
@@ -255,7 +266,11 @@ impl Inventory {
             {
                 return Err(corrupt());
             }
-            let topology = topology(&graph, &symbol, &file, Some(documents), budget)?;
+            let topology = TopologyReader {
+                graph: &graph,
+                documents,
+            }
+            .read(&symbol, &file, budget)?;
             let potential = dynamic_external_references(references, &symbol)?;
             let external = topology
                 .external
@@ -282,37 +297,65 @@ impl Inventory {
                 prior,
                 recent_prior,
             };
-            self.detector_coverage
-                .observe(&file, &symbol, &document, Some(&base));
+            self.output
+                .coverage
+                .observe(super::coverage::Subject::scored(&base));
             validate_operation_sites(&base)?;
             let mut findings = rules::evaluate(&base)?;
             if let Some(finding) = clone_classes.finding(&base, &graph, budget)? {
                 findings.push(finding);
             }
-            for finding in findings {
-                self.detector_coverage
-                    .finding(&file.language, &finding.finding);
-                self.bytes = self
-                    .bytes
-                    .checked_add(row_bytes(&finding))
-                    .ok_or_else(workspace)?;
-                if self.bytes > 16 * 1_048_576 {
-                    return Err(workspace());
-                }
-                self.rows.push(finding);
-            }
-            self.analyzed += 1;
+            self.output.record(&file.language, findings)?;
         }
         Ok(self.position == documents.len())
     }
 
     pub(super) fn finish(self) -> ComputedInventory {
+        self.output.finish()
+    }
+}
+
+impl FindingResults {
+    fn record(
+        &mut self,
+        language: &str,
+        findings: Vec<StructuralFinding>,
+    ) -> Result<(), RocksError> {
+        for finding in findings {
+            self.coverage.finding(language, &finding.finding);
+            self.bytes = self
+                .bytes
+                .checked_add(row_bytes(&finding))
+                .ok_or_else(workspace)?;
+            if self.bytes > MAXIMUM_FINDING_BYTES {
+                return Err(workspace());
+            }
+            self.rows.push(finding);
+        }
+        self.analyzed += 1;
+        Ok(())
+    }
+
+    fn finish(self) -> ComputedInventory {
         ComputedInventory {
             rows: self.rows,
             analyzed: self.analyzed,
-            coverage: self.detector_coverage.finish(),
+            coverage: self.coverage.finish(),
         }
     }
+}
+
+fn recent_publication(previous: Option<&StoredRevision>) -> Result<bool, RocksError> {
+    Ok(previous
+        .and_then(|previous| previous.published_at.as_ref())
+        .map(|time| time.parse::<jiff::Timestamp>().map_err(|_| corrupt()))
+        .transpose()?
+        .is_some_and(|time| {
+            time.as_second()
+                >= jiff::Timestamp::now()
+                    .as_second()
+                    .saturating_sub(RECENT_PUBLICATION_SECONDS)
+        }))
 }
 
 fn language_matches_host(language: SourceLanguage, host: &str) -> bool {
@@ -331,18 +374,25 @@ fn validate_operation_sites(base: &Base<'_>) -> Result<(), RocksError> {
         let field = site.metric.field();
         let count = counts.entry(field).or_default();
         *count = count.checked_add(1).ok_or(corrupt())?;
-        if *count > 16
+        if *count > MAXIMUM_SITES_PER_METRIC
             || f64::from(*count) > base.document.health(field)
-            || site.span.start_byte() < base.symbol.start_byte
-            || site.span.end_byte() > base.symbol.end_byte
-            || site.span.start_line() < base.symbol.start_line
-            || site.span.end_line() > base.symbol.end_line
+            || !operation_site_within_symbol(site, base.symbol)
             || !unique.insert((field, site.span))
         {
             return Err(corrupt());
         }
     }
     Ok(())
+}
+
+fn operation_site_within_symbol(
+    site: &codevetra_domain::biomarkers::HealthOperationSite,
+    symbol: &SymbolInput,
+) -> bool {
+    site.span.start_byte() >= symbol.start_byte
+        && site.span.end_byte() <= symbol.end_byte
+        && site.span.start_line() >= symbol.start_line
+        && site.span.end_line() <= symbol.end_line
 }
 
 fn dynamic_external_references(
@@ -386,57 +436,54 @@ pub(super) fn parse_document(
     value: &serde_json::Value,
     test: bool,
 ) -> Result<Document, RocksError> {
+    let health_metadata = value.get("health");
     let mut health = Vec::new();
     for (index, &key) in FIELDS.iter().enumerate() {
-        let number = number(value.get("health").and_then(|health| health.get(key)))?;
-        if number != 0.0
-            || value
-                .get("health")
-                .and_then(|health| health.get(key))
-                .is_some_and(|value| !value.is_null())
-        {
+        let field = nested_field(health_metadata, key);
+        let number = number(field)?;
+        if number != 0.0 || field.is_some_and(|value| !value.is_null()) {
             health.push((u8::try_from(index).map_err(|_| corrupt())?, number));
         }
     }
     let partial = value.get("partial_clone");
-    let field = |key| partial.and_then(|partial| partial.get(key));
-    let representative = field("representative_symbol_id")
+    let representative = nested_field(partial, "representative_symbol_id")
         .and_then(serde_json::Value::as_str)
         .map(SymbolId::parse)
         .transpose()
         .map_err(|_| corrupt())?;
     let mut listed = Vec::new();
-    if let Some(values) = field("listed_peer_symbol_ids") {
+    if let Some(values) = nested_field(partial, "listed_peer_symbol_ids") {
         let values = values.as_array().ok_or(corrupt())?;
-        if values.len() > 128 {
+        if values.len() > MAXIMUM_PARTIAL_CLONE_PEERS {
             return Err(workspace());
         }
         for value in values {
             listed.push(SymbolId::parse(value.as_str().ok_or(corrupt())?).map_err(|_| corrupt())?);
         }
     }
-    let integer = |key| number(field(key))?.to_u64().ok_or(corrupt());
     let shape = value
         .get("clone_shape_digest")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
-    if shape.as_ref().is_some_and(|shape| shape.len() > 4096) {
+    if shape
+        .as_ref()
+        .is_some_and(|shape| shape.len() > MAXIMUM_CLONE_SHAPE_BYTES)
+    {
         return Err(workspace());
     }
-    let operation_sites = value
-        .get("health")
-        .and_then(|health| health.get("operation_sites"))
+    let operation_sites = nested_field(health_metadata, "operation_sites")
         .map(|sites| {
-            if sites.as_array().is_none_or(|sites| sites.len() > 16 * 25) {
+            if sites
+                .as_array()
+                .is_none_or(|sites| sites.len() > MAXIMUM_OPERATION_SITES)
+            {
                 return Err(corrupt());
             }
             serde_json::from_value(sites.clone()).map_err(|_| corrupt())
         })
         .transpose()?
         .unwrap_or_default();
-    let analyzed_language = value
-        .get("health")
-        .and_then(|health| health.get("analyzed_language"))
+    let analyzed_language = nested_field(health_metadata, "analyzed_language")
         .filter(|value| !value.is_null())
         .map(|value| serde_json::from_value(value.clone()).map_err(|_| corrupt()))
         .transpose()?;
@@ -450,28 +497,35 @@ pub(super) fn parse_document(
             enabled: boolean(value.get("duplicate_detection_enabled"), true)?,
             near_compatible: boolean(value.get("near_clone_compatible"), false)?,
         },
-        secrets_actionable: boolean(
-            value
-                .get("health")
-                .and_then(|value| value.get("secrets_actionable")),
-            false,
-        )?,
-        facade_factory: boolean(
-            value
-                .get("health")
-                .and_then(|value| value.get("facade_factory")),
-            false,
-        )?,
+        secrets_actionable: boolean(nested_field(health_metadata, "secrets_actionable"), false)?,
+        syntax: SyntaxEvidence {
+            facade_factory: boolean(nested_field(health_metadata, "facade_factory"), false)?,
+            flat_value_mapping: boolean(
+                nested_field(health_metadata, "flat_value_mapping"),
+                false,
+            )?,
+        },
         partial: Partial {
-            peers: integer("peer_count")?,
-            component: integer("component_size")?,
+            peers: integer(nested_field(partial, "peer_count"))?,
+            component: integer(nested_field(partial, "component_size"))?,
             representative,
-            maximum: number(field("maximum_overlap_ppm"))? / 1_000_000.0,
-            minimum: number(field("minimum_overlap_ppm"))? / 1_000_000.0,
+            maximum: number(nested_field(partial, "maximum_overlap_ppm"))? / 1_000_000.0,
+            minimum: number(nested_field(partial, "minimum_overlap_ppm"))? / 1_000_000.0,
             listed,
         },
     })
 }
+fn nested_field<'a>(
+    parent: Option<&'a serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    parent.and_then(|value| value.get(key))
+}
+
+fn integer(value: Option<&serde_json::Value>) -> Result<u64, RocksError> {
+    number(value)?.to_u64().ok_or(corrupt())
+}
+
 fn number(value: Option<&serde_json::Value>) -> Result<f64, RocksError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(0.0);
@@ -496,133 +550,130 @@ fn boolean(value: Option<&serde_json::Value>, default: bool) -> Result<bool, Roc
         })
 }
 
-pub(super) fn topology(
-    graph: &GraphSnapshot<'_, '_>,
-    symbol: &SymbolInput,
-    file: &FileInput,
-    documents: Option<&Documents>,
-    budget: &mut ReadBudget,
-) -> Result<Topology, RocksError> {
-    let mut output = Topology::default();
-    let contains = contained_symbols(graph, symbol, documents, budget, &mut output)?;
-    (output.outgoing, output.groups) = dependency_topology(graph, symbol, &contains, budget)?;
-    let mut parent_default = false;
-    super::super::neighbors(
-        graph,
-        &symbol.symbol_id,
-        GraphDirection::Incoming,
-        budget,
-        |link, budget| {
-            let source = graph
-                .symbol(link.source_symbol_id(), budget)?
-                .ok_or(corrupt())?;
-            if link.kind() == EdgeKind::Contains {
-                output.function_local |= matches!(
-                    source.symbol_kind.as_str(),
-                    "function" | "method" | "component"
-                );
-                parent_default |= source.export.default_export;
-            } else {
-                let count = u64::from(graph.edge(&link, budget)?.site_count);
-                output.incoming = output.incoming.checked_add(count).ok_or(corrupt())?;
-                if source.file_id != symbol.file_id {
-                    output.external += 1;
-                }
-                if source.file_id == symbol.file_id
-                    && source.symbol_id != symbol.symbol_id
-                    && source.export.exported
-                    && matches!(
-                        link.kind(),
-                        EdgeKind::Calls
-                            | EdgeKind::References
-                            | EdgeKind::TypeOf
-                            | EdgeKind::Returns
-                            | EdgeKind::Instantiates
-                            | EdgeKind::DefUse
-                    )
-                {
-                    output.exported_api = output.exported_api.checked_add(count).ok_or(corrupt())?;
-                }
-            }
-            Ok(())
-        },
-    )?;
-    output.framework = framework::convention(symbol, &file.normalized_path, parent_default)?;
-    Ok(output)
+struct TopologyReader<'input, 'snapshot, 'store> {
+    graph: &'input GraphSnapshot<'snapshot, 'store>,
+    documents: &'input Documents,
 }
 
-fn contained_symbols(
-    graph: &GraphSnapshot<'_, '_>,
-    symbol: &SymbolInput,
-    documents: Option<&Documents>,
-    budget: &mut ReadBudget,
-    output: &mut Topology,
-) -> Result<BTreeSet<SymbolId>, RocksError> {
-    let mut contains = BTreeSet::new();
-    super::super::neighbors(
-        graph,
-        &symbol.symbol_id,
-        GraphDirection::Outgoing,
-        budget,
-        |link, budget| {
-            if link.kind() == EdgeKind::Contains {
-                contains.insert(link.target_symbol_id().clone());
-                if contains.len() > 16_384 {
-                    return Err(workspace());
-                }
-                let child = graph
-                    .symbol(link.target_symbol_id(), budget)?
+impl TopologyReader<'_, '_, '_> {
+    fn read(
+        &self,
+        symbol: &SymbolInput,
+        file: &FileInput,
+        budget: &mut ReadBudget,
+    ) -> Result<Topology, RocksError> {
+        let mut output = Topology::default();
+        let contains = self.contained_symbols(symbol, budget, &mut output)?;
+        (output.outgoing, output.groups) = self.dependency_topology(symbol, &contains, budget)?;
+        let mut parent_default = false;
+        self.graph
+            .adjacency(&symbol.symbol_id, GraphDirection::Incoming)
+            .visit(budget, |link, budget| {
+                let source = self
+                    .graph
+                    .symbol(link.source_symbol_id(), budget)?
                     .ok_or(corrupt())?;
-                if matches!(child.symbol_kind.as_str(), "function" | "method")
-                    && let Some(documents) = documents
-                    && let Some(document) = documents
-                        .get(&child.symbol_id)?
-                        .filter(|document| !document.test)
-                {
-                    output.behavioral += u64::from(document.code_lines >= 5.0);
-                    output.complex += u64::from(document.cyclomatic >= 3.0);
+                if link.kind() == EdgeKind::Contains {
+                    output.function_local |= matches!(
+                        source.symbol_kind.as_str(),
+                        "function" | "method" | "component"
+                    );
+                    parent_default |= source.export.default_export;
+                } else {
+                    let count = u64::from(self.graph.edge(&link, budget)?.site_count);
+                    output.incoming = output.incoming.checked_add(count).ok_or(corrupt())?;
+                    if source.file_id != symbol.file_id {
+                        output.external += 1;
+                    }
+                    if source.file_id == symbol.file_id
+                        && source.symbol_id != symbol.symbol_id
+                        && source.export.exported
+                        && matches!(
+                            link.kind(),
+                            EdgeKind::Calls
+                                | EdgeKind::References
+                                | EdgeKind::TypeOf
+                                | EdgeKind::Returns
+                                | EdgeKind::Instantiates
+                                | EdgeKind::DefUse
+                        )
+                    {
+                        output.exported_api =
+                            output.exported_api.checked_add(count).ok_or(corrupt())?;
+                    }
                 }
-            }
-            Ok(())
-        },
-    )?;
-    Ok(contains)
+                Ok(())
+            })?;
+        output.framework = framework::convention(symbol, &file.normalized_path, parent_default)?;
+        Ok(output)
+    }
+
+    fn contained_symbols(
+        &self,
+        symbol: &SymbolInput,
+        budget: &mut ReadBudget,
+        output: &mut Topology,
+    ) -> Result<BTreeSet<SymbolId>, RocksError> {
+        let mut contains = BTreeSet::new();
+        self.graph
+            .adjacency(&symbol.symbol_id, GraphDirection::Outgoing)
+            .visit(budget, |link, budget| {
+                if link.kind() == EdgeKind::Contains {
+                    contains.insert(link.target_symbol_id().clone());
+                    if contains.len() > 16_384 {
+                        return Err(workspace());
+                    }
+                    let child = self
+                        .graph
+                        .symbol(link.target_symbol_id(), budget)?
+                        .ok_or(corrupt())?;
+                    if matches!(child.symbol_kind.as_str(), "function" | "method")
+                        && let Some(document) = self
+                            .documents
+                            .get(&child.symbol_id)?
+                            .filter(|document| !document.test)
+                    {
+                        output.behavioral += u64::from(document.code_lines >= 5.0);
+                        output.complex += u64::from(document.cyclomatic >= 3.0);
+                    }
+                }
+                Ok(())
+            })?;
+        Ok(contains)
+    }
+
+    fn dependency_topology(
+        &self,
+        symbol: &SymbolInput,
+        contains: &BTreeSet<SymbolId>,
+        budget: &mut ReadBudget,
+    ) -> Result<(u64, [u64; 5]), RocksError> {
+        let mut dependencies = BTreeSet::new();
+        let mut groups: [BTreeSet<SymbolId>; 5] = std::array::from_fn(|_| BTreeSet::new());
+        self.graph
+            .adjacency(&symbol.symbol_id, GraphDirection::Outgoing)
+            .visit(budget, |link, _| {
+                if link.kind() != EdgeKind::Contains
+                    && link.target_symbol_id() != &symbol.symbol_id
+                    && !contains.contains(link.target_symbol_id())
+                {
+                    dependencies.insert(link.target_symbol_id().clone());
+                    if let Some(index) = dependency_group(link.kind()) {
+                        groups[index].insert(link.target_symbol_id().clone());
+                    }
+                    if dependencies.len() > 16_384 {
+                        return Err(workspace());
+                    }
+                }
+                Ok(())
+            })?;
+        Ok((
+            dependencies.len() as u64,
+            groups.map(|group| group.len() as u64),
+        ))
+    }
 }
 
-fn dependency_topology(
-    graph: &GraphSnapshot<'_, '_>,
-    symbol: &SymbolInput,
-    contains: &BTreeSet<SymbolId>,
-    budget: &mut ReadBudget,
-) -> Result<(u64, [u64; 5]), RocksError> {
-    let mut dependencies = BTreeSet::new();
-    let mut groups: [BTreeSet<SymbolId>; 5] = std::array::from_fn(|_| BTreeSet::new());
-    super::super::neighbors(
-        graph,
-        &symbol.symbol_id,
-        GraphDirection::Outgoing,
-        budget,
-        |link, _| {
-            if link.kind() != EdgeKind::Contains
-                && link.target_symbol_id() != &symbol.symbol_id
-                && !contains.contains(link.target_symbol_id())
-            {
-                dependencies.insert(link.target_symbol_id().clone());
-                if let Some(index) = dependency_group(link.kind()) {
-                    groups[index].insert(link.target_symbol_id().clone());
-                }
-                if dependencies.len() > 16_384 {
-                    return Err(workspace());
-                }
-            }
-            Ok(())
-        },
-    )?;
-    Ok((
-        dependencies.len() as u64,
-        groups.map(|group| group.len() as u64),
-    ))
-}
 fn dependency_group(kind: EdgeKind) -> Option<usize> {
     match kind {
         EdgeKind::Calls => Some(0),
@@ -639,21 +690,25 @@ fn references(
     documents: &mut Documents,
     budget: &mut ReadBudget,
 ) -> Result<References, RocksError> {
-    let mut output = References::default();
-    let mut classes = Parents::default();
+    let mut collector = ReferenceCollector {
+        graph,
+        output: References::default(),
+        parents: Parents::default(),
+    };
     super::super::visit_references(graph, budget, |reference, budget| {
         if reference.target_symbol_id.is_none() {
-            record_unresolved_reference(&mut output, documents, reference)?;
+            record_unresolved_reference(&mut collector.output, documents, reference)?;
         } else if reference.reference_kind == "field_access" {
-            record_envy(graph, budget, &reference, &mut output, &mut classes)?;
+            collector.record_envy(&reference, budget)?;
         }
-        if output.bytes > 8 * 1_048_576 {
+        if collector.output.bytes > MAXIMUM_REFERENCE_BYTES {
             return Err(workspace());
         }
         Ok(())
     })?;
-    Ok(output)
+    Ok(collector.output)
 }
+
 fn record_unresolved_reference(
     output: &mut References,
     documents: &mut Documents,
@@ -720,120 +775,137 @@ struct Parents {
     values: BTreeMap<SymbolId, Vec<(SymbolId, bool)>>,
     bytes: usize,
 }
-fn parents(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    id: &SymbolId,
-    cache: &mut Parents,
-) -> Result<Vec<(SymbolId, bool)>, RocksError> {
-    if let Some(parents) = cache.values.get(id) {
-        return Ok(parents.clone());
-    }
-    let mut parents = BTreeMap::new();
-    super::super::neighbors(
-        graph,
-        id,
-        GraphDirection::Incoming,
-        budget,
-        |link, budget| {
-            if link.kind() == EdgeKind::Contains {
-                let parent = graph
-                    .symbol(link.source_symbol_id(), budget)?
-                    .ok_or(corrupt())?;
-                if matches!(
-                    parent.symbol_kind.as_str(),
-                    "class" | "struct" | "trait" | "interface"
-                ) {
-                    parents.insert(parent.symbol_id, parent.symbol_kind == "interface");
-                    if parents.len() > 32 {
-                        return Err(workspace());
+impl Parents {
+    const MAXIMUM_PARENTS: usize = 32;
+    const MAXIMUM_BYTES: usize = 8 * 1_048_576;
+    const ENTRY_BYTES: usize = 128;
+    const PARENT_BYTES: usize = 96;
+
+    fn get(
+        &mut self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+        id: &SymbolId,
+    ) -> Result<Vec<(SymbolId, bool)>, RocksError> {
+        if let Some(parents) = self.values.get(id) {
+            return Ok(parents.clone());
+        }
+        let mut parents = BTreeMap::new();
+        graph
+            .adjacency(id, GraphDirection::Incoming)
+            .visit(budget, |link, budget| {
+                if link.kind() == EdgeKind::Contains {
+                    let parent = graph
+                        .symbol(link.source_symbol_id(), budget)?
+                        .ok_or(corrupt())?;
+                    if matches!(
+                        parent.symbol_kind.as_str(),
+                        "class" | "struct" | "trait" | "interface"
+                    ) {
+                        parents.insert(parent.symbol_id, parent.symbol_kind == "interface");
+                        if parents.len() > Self::MAXIMUM_PARENTS {
+                            return Err(workspace());
+                        }
                     }
                 }
-            }
-            Ok(())
-        },
-    )?;
-    let parents = parents.into_iter().collect::<Vec<_>>();
-    cache.bytes = cache
-        .bytes
-        .checked_add(128 + parents.len() * 96)
-        .ok_or_else(workspace)?;
-    if cache.bytes > 8 * 1_048_576 {
-        return Err(workspace());
-    }
-    cache.values.insert(id.clone(), parents.clone());
-    Ok(parents)
-}
-fn record_envy(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    reference: &crate::ReferenceInput,
-    output: &mut References,
-    cache: &mut Parents,
-) -> Result<(), RocksError> {
-    let (Some(owner), Some(target)) = (&reference.owner_symbol_id, &reference.target_symbol_id)
-    else {
-        return Ok(());
-    };
-    let source = graph.symbol(owner, budget)?.ok_or(corrupt())?;
-    let field = graph.symbol(target, budget)?.ok_or(corrupt())?;
-    if source.symbol_kind != "method"
-        || !matches!(field.symbol_kind.as_str(), "field" | "property" | "method")
-    {
-        return Ok(());
-    }
-    let sources = parents(graph, budget, owner, cache)?;
-    let targets = parents(graph, budget, target, cache)?;
-    for (source, interface) in sources {
-        if interface {
-            continue;
+                Ok(())
+            })?;
+        let parents = parents.into_iter().collect::<Vec<_>>();
+        self.bytes = self
+            .bytes
+            .checked_add(Self::ENTRY_BYTES + parents.len() * Self::PARENT_BYTES)
+            .ok_or_else(workspace)?;
+        if self.bytes > Self::MAXIMUM_BYTES {
+            return Err(workspace());
         }
-        for (target_class, _) in &targets {
-            record_envy_pair(
-                output,
-                owner,
-                target,
-                &source == target_class,
-                target_class,
-                u64::from(reference.site_count),
-            )?;
-        }
+        self.values.insert(id.clone(), parents.clone());
+        Ok(parents)
     }
-    Ok(())
 }
-fn record_envy_pair(
-    output: &mut References,
-    owner: &SymbolId,
-    target: &SymbolId,
-    own: bool,
-    target_class: &SymbolId,
+
+struct ReferenceCollector<'graph, 'snapshot, 'store> {
+    graph: &'graph GraphSnapshot<'snapshot, 'store>,
+    output: References,
+    parents: Parents,
+}
+
+#[derive(Clone, Copy)]
+struct FieldAccess<'a> {
+    owner: &'a SymbolId,
+    target: &'a SymbolId,
     count: u64,
-) -> Result<(), RocksError> {
-    let owner = packed_uuid(owner.as_str())?;
-    if !output.envy.contains_key(&owner) {
-        let node = if output.envy.is_empty() { 1024 } else { 256 };
-        reserve(&mut output.bytes, node)?;
-    }
-    let envy = output.envy.entry(owner).or_default();
-    if own {
-        envy.own = envy.own.checked_add(count).ok_or(corrupt())?;
-    } else {
-        envy.foreign = envy.foreign.checked_add(count).ok_or(corrupt())?;
-        for (set, id) in [
-            (&mut envy.fields, target),
-            (&mut envy.classes, target_class),
-        ] {
-            let id = packed_uuid(id.as_str())?;
-            if !set.contains(&id) {
-                reserve(
-                    &mut output.bytes,
-                    super::packed_tree_insertion_bytes(set.len()),
-                )?;
-                set.insert(id);
+}
+
+impl ReferenceCollector<'_, '_, '_> {
+    fn record_envy(
+        &mut self,
+        reference: &crate::ReferenceInput,
+        budget: &mut ReadBudget,
+    ) -> Result<(), RocksError> {
+        let (Some(owner), Some(target)) = (&reference.owner_symbol_id, &reference.target_symbol_id)
+        else {
+            return Ok(());
+        };
+        let source = self.graph.symbol(owner, budget)?.ok_or(corrupt())?;
+        let field = self.graph.symbol(target, budget)?.ok_or(corrupt())?;
+        if source.symbol_kind != "method"
+            || !matches!(field.symbol_kind.as_str(), "field" | "property" | "method")
+        {
+            return Ok(());
+        }
+        let sources = self.parents.get(self.graph, budget, owner)?;
+        let targets = self.parents.get(self.graph, budget, target)?;
+        let site = FieldAccess {
+            owner,
+            target,
+            count: u64::from(reference.site_count),
+        };
+        for (source, interface) in sources {
+            if interface {
+                continue;
+            }
+            for (target_class, _) in &targets {
+                self.record_envy_pair(site, &source, target_class)?;
             }
         }
+        Ok(())
     }
-    Ok(())
+    fn record_envy_pair(
+        &mut self,
+        site: FieldAccess<'_>,
+        source_class: &SymbolId,
+        target_class: &SymbolId,
+    ) -> Result<(), RocksError> {
+        let owner = packed_uuid(site.owner.as_str())?;
+        if !self.output.envy.contains_key(&owner) {
+            let node = if self.output.envy.is_empty() {
+                1024
+            } else {
+                256
+            };
+            reserve(&mut self.output.bytes, node)?;
+        }
+        let envy = self.output.envy.entry(owner).or_default();
+        if source_class == target_class {
+            envy.own = envy.own.checked_add(site.count).ok_or(corrupt())?;
+        } else {
+            envy.foreign = envy.foreign.checked_add(site.count).ok_or(corrupt())?;
+            for (set, id) in [
+                (&mut envy.fields, site.target),
+                (&mut envy.classes, target_class),
+            ] {
+                let id = packed_uuid(id.as_str())?;
+                if !set.contains(&id) {
+                    reserve(
+                        &mut self.output.bytes,
+                        super::packed_tree_insertion_bytes(set.len()),
+                    )?;
+                    set.insert(id);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn coverage(
@@ -844,20 +916,16 @@ fn coverage(
     let mut rows = Vec::new();
     for (id, fraction) in crate::coverage::native::fractions(transaction, budget)? {
         let mut incoming = 0_u64;
-        super::super::neighbors(
-            graph,
-            &id,
-            GraphDirection::Incoming,
-            budget,
-            |link, budget| {
+        graph
+            .adjacency(&id, GraphDirection::Incoming)
+            .visit(budget, |link, budget| {
                 if link.kind() != EdgeKind::Contains {
                     incoming = incoming
                         .checked_add(u64::from(graph.edge(&link, budget)?.site_count))
                         .ok_or(corrupt())?;
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         rows.push((incoming, id, fraction));
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));

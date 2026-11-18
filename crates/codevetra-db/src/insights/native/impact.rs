@@ -1,6 +1,6 @@
 //! Reverse graph traversal keeps minimum distance, deterministic admission, and totals.
 
-use super::{corrupt, neighbors, workspace};
+use super::{corrupt, workspace};
 use crate::{
     GraphDirection, NativeDatabase, StorageError,
     artifacts::native::summaries::visit_documents,
@@ -8,7 +8,7 @@ use crate::{
         DEFAULT_INSIGHT_TIMEOUT, FileTestImpact, FileTestImpactQuery, FileTestImpactResult,
         StructuralCoverageRow, validate_limit,
     },
-    retrieval::native::{retain, visit_files, visit_symbols},
+    retrieval::native::{visit_files, visit_symbols},
     rocks::{GraphSnapshot, ReadBudget, RocksError},
 };
 use codevetra_domain::{DocumentKind, EdgeKind, FileId, SymbolId};
@@ -55,14 +55,15 @@ impl NativeDatabase {
             DEFAULT_INSIGHT_TIMEOUT,
             move |graph, budget| {
                 let seeds = seed_files(graph, budget, &paths)?;
-                let (reached, nodes_truncated) = walk(graph, budget, &seeds, depth, maximum)?;
+                let mut reader = ImpactReader { graph, budget };
+                let (reached, nodes_truncated) = reader.walk(&seeds, depth, maximum)?;
                 let ImpactFiles {
                     tests,
                     affected,
                     dependents,
                     barrels,
                     barrel_count,
-                } = impact_files(graph, budget, reached, pattern.as_ref(), limit)?;
+                } = reader.impact_files(reached, pattern.as_ref(), limit)?;
                 let mut matched_inputs = seeds.into_values().collect::<Vec<_>>();
                 matched_inputs.sort();
                 Ok(Some(FileTestImpactResult {
@@ -93,37 +94,35 @@ impl NativeDatabase {
         validate_limit(limit)?;
         self.current_graph(project, DEFAULT_INSIGHT_TIMEOUT, move |graph, budget| {
             let tests = test_files(graph, budget)?;
-            let mut output = Vec::new();
+            let mut output = crate::retrieval::native::RankedRows::new(
+                usize::from(limit),
+                |a: &(StructuralCoverageRow, u32), b| {
+                    b.0.direct_test_files
+                        .cmp(&a.0.direct_test_files)
+                        .then(b.0.incoming_edges.cmp(&a.0.incoming_edges))
+                        .then(a.0.path.cmp(&b.0.path))
+                        .then(a.1.cmp(&b.1))
+                        .then(a.0.symbol_id.cmp(&b.0.symbol_id))
+                },
+            );
             visit_symbols(graph, budget, |symbol, budget| {
                 if matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter") {
                     return Ok(());
                 }
-                let (incoming, test_sources) =
-                    incoming_test_sources(graph, budget, &symbol.symbol_id, &tests)?;
+                let (incoming, test_sources) = ImpactReader { graph, budget }
+                    .incoming_test_sources(&symbol.symbol_id, &tests)?;
                 let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
-                retain(
-                    &mut output,
-                    (
-                        StructuralCoverageRow {
-                            symbol_id: symbol.symbol_id.to_string(),
-                            path: file.normalized_path,
-                            qualified_name: symbol.qualified_name,
-                            symbol_kind: symbol.symbol_kind,
-                            direct_test_files: test_sources,
-                            incoming_edges: incoming,
-                        },
-                        symbol.start_line,
-                    ),
-                    usize::from(limit),
-                    |a, b| {
-                        b.0.direct_test_files
-                            .cmp(&a.0.direct_test_files)
-                            .then(b.0.incoming_edges.cmp(&a.0.incoming_edges))
-                            .then(a.0.path.cmp(&b.0.path))
-                            .then(a.1.cmp(&b.1))
-                            .then(a.0.symbol_id.cmp(&b.0.symbol_id))
+                output.insert((
+                    StructuralCoverageRow {
+                        symbol_id: symbol.symbol_id.to_string(),
+                        path: file.normalized_path,
+                        qualified_name: symbol.qualified_name,
+                        symbol_kind: symbol.symbol_kind,
+                        direct_test_files: test_sources,
+                        incoming_edges: incoming,
                     },
-                );
+                    symbol.start_line,
+                ));
                 Ok(())
             })?;
             Ok(output.into_iter().map(|(row, _)| row).collect())
@@ -166,52 +165,63 @@ fn seed_files(
     })?;
     Ok(files)
 }
-fn walk(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    seeds: &BTreeMap<FileId, String>,
-    max_depth: u8,
-    maximum: usize,
-) -> Result<(BTreeMap<SymbolId, u8>, bool), RocksError> {
-    let mut roots = BTreeSet::new();
-    visit_symbols(graph, budget, |symbol, _| {
-        if seeds.contains_key(&symbol.file_id) {
-            admit_smallest(&mut roots, symbol.symbol_id, maximum + 1);
-        }
-        Ok(())
-    })?;
-    let mut truncated = roots.len() > maximum;
-    let mut reached = roots
-        .iter()
-        .take(maximum)
-        .cloned()
-        .map(|id| (id, 0))
-        .collect::<BTreeMap<_, _>>();
-    let mut frontier = roots.into_iter().take(maximum).collect::<BTreeSet<_>>();
-    for depth in 1..=max_depth {
-        if truncated || frontier.is_empty() {
-            break;
-        }
-        let slots = maximum.saturating_sub(reached.len());
-        let mut next = BTreeSet::new();
-        for id in frontier {
-            neighbors(graph, &id, GraphDirection::Incoming, budget, |link, _| {
-                if link.kind() != EdgeKind::Contains
-                    && !reached.contains_key(link.source_symbol_id())
-                {
-                    admit_smallest(&mut next, link.source_symbol_id().clone(), slots + 1);
-                }
-                Ok(())
-            })?;
-        }
-        truncated = next.len() > slots;
-        frontier = next.into_iter().take(slots).collect();
-        for id in &frontier {
-            reached.insert(id.clone(), depth);
-        }
-    }
-    Ok((reached, truncated))
+struct ImpactReader<'a, 'view, 'store> {
+    graph: &'a GraphSnapshot<'view, 'store>,
+    budget: &'a mut ReadBudget,
 }
+impl ImpactReader<'_, '_, '_> {
+    fn walk(
+        &mut self,
+        seeds: &BTreeMap<FileId, String>,
+        max_depth: u8,
+        maximum: usize,
+    ) -> Result<(BTreeMap<SymbolId, u8>, bool), RocksError> {
+        let graph = self.graph;
+        let budget = &mut *self.budget;
+
+        let mut roots = BTreeSet::new();
+        visit_symbols(graph, budget, |symbol, _| {
+            if seeds.contains_key(&symbol.file_id) {
+                admit_smallest(&mut roots, symbol.symbol_id, maximum + 1);
+            }
+            Ok(())
+        })?;
+        let mut truncated = roots.len() > maximum;
+        let mut reached = roots
+            .iter()
+            .take(maximum)
+            .cloned()
+            .map(|id| (id, 0))
+            .collect::<BTreeMap<_, _>>();
+        let mut frontier = roots.into_iter().take(maximum).collect::<BTreeSet<_>>();
+        for depth in 1..=max_depth {
+            if truncated || frontier.is_empty() {
+                break;
+            }
+            let slots = maximum.saturating_sub(reached.len());
+            let mut next = BTreeSet::new();
+            for id in frontier {
+                graph
+                    .adjacency(&id, GraphDirection::Incoming)
+                    .visit(budget, |link, _| {
+                        if link.kind() != EdgeKind::Contains
+                            && !reached.contains_key(link.source_symbol_id())
+                        {
+                            admit_smallest(&mut next, link.source_symbol_id().clone(), slots + 1);
+                        }
+                        Ok(())
+                    })?;
+            }
+            truncated = next.len() > slots;
+            frontier = next.into_iter().take(slots).collect();
+            for id in &frontier {
+                reached.insert(id.clone(), depth);
+            }
+        }
+        Ok((reached, truncated))
+    }
+}
+
 fn admit_smallest(set: &mut BTreeSet<SymbolId>, id: SymbolId, maximum: usize) {
     set.insert(id);
     if set.len() > maximum {
@@ -259,90 +269,93 @@ struct ImpactFiles {
     barrels: Vec<String>,
     barrel_count: u64,
 }
-fn impact_files(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    reached: BTreeMap<SymbolId, u8>,
-    pattern: Option<&regex::Regex>,
-    limit: usize,
-) -> Result<ImpactFiles, RocksError> {
-    let mut files = BTreeMap::<FileId, (String, u8)>::new();
-    for (id, distance) in reached {
-        let symbol = graph.symbol(&id, budget)?.ok_or(corrupt())?;
-        let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
-        files
-            .entry(file.file_id)
-            .and_modify(|(_, old)| *old = (*old).min(distance))
-            .or_insert((file.normalized_path, distance));
-    }
-    let test_files = test_files(graph, budget)?;
-    let mut tests = Vec::new();
-    let mut affected = 0_u64;
-    let mut dependents = 0_u64;
-    let mut barrels = Vec::new();
-    let mut barrel_count = 0_u64;
-    for (id, (path, distance)) in files {
-        if distance > 0 {
-            dependents += 1;
+impl ImpactReader<'_, '_, '_> {
+    fn impact_files(
+        &mut self,
+        reached: BTreeMap<SymbolId, u8>,
+        pattern: Option<&regex::Regex>,
+        limit: usize,
+    ) -> Result<ImpactFiles, RocksError> {
+        let graph = self.graph;
+        let budget = &mut *self.budget;
+
+        let mut files = BTreeMap::<FileId, (String, u8)>::new();
+        for (id, distance) in reached {
+            let symbol = graph.symbol(&id, budget)?.ok_or(corrupt())?;
+            let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
+            files
+                .entry(file.file_id)
+                .and_modify(|(_, old)| *old = (*old).min(distance))
+                .or_insert((file.normalized_path, distance));
         }
-        if distance > 0 && barrel(&path) {
-            barrel_count += 1;
-            retain(&mut barrels, path.clone(), 100, String::cmp);
-        }
-        if pattern.map_or_else(
-            || test_files.contains(&id),
-            |pattern| pattern.is_match(&path),
-        ) {
-            affected += 1;
-            retain(
-                &mut tests,
-                FileTestImpact {
+        let test_files = test_files(graph, budget)?;
+        let mut tests =
+            crate::retrieval::native::RankedRows::new(limit, |a: &FileTestImpact, b| {
+                a.distance.cmp(&b.distance).then(a.path.cmp(&b.path))
+            });
+        let mut affected = 0_u64;
+        let mut dependents = 0_u64;
+        let mut barrels = crate::retrieval::native::RankedRows::new(100, String::cmp);
+        let mut barrel_count = 0_u64;
+        for (id, (path, distance)) in files {
+            if distance > 0 {
+                dependents += 1;
+            }
+            if distance > 0 && barrel(&path) {
+                barrel_count += 1;
+                barrels.insert(path.clone());
+            }
+            if pattern.map_or_else(
+                || test_files.contains(&id),
+                |pattern| pattern.is_match(&path),
+            ) {
+                affected += 1;
+                tests.insert(FileTestImpact {
                     path,
                     distance,
                     reason: "current_generation_dependency_graph",
-                },
-                limit,
-                |a, b| a.distance.cmp(&b.distance).then(a.path.cmp(&b.path)),
-            );
+                });
+            }
         }
+        Ok(ImpactFiles {
+            tests: tests.into_vec(),
+            affected,
+            dependents,
+            barrels: barrels.into_vec(),
+            barrel_count,
+        })
     }
-    Ok(ImpactFiles {
-        tests,
-        affected,
-        dependents,
-        barrels,
-        barrel_count,
-    })
 }
-fn incoming_test_sources(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    symbol: &SymbolId,
-    tests: &BTreeSet<FileId>,
-) -> Result<(u64, u64), RocksError> {
-    let mut incoming = BTreeSet::new();
-    let mut test_sources = BTreeSet::new();
-    neighbors(
-        graph,
-        symbol,
-        GraphDirection::Incoming,
-        budget,
-        |link, budget| {
-            if link.kind() == EdgeKind::Contains {
-                return Ok(());
-            }
-            incoming.insert(link.source_symbol_id().clone());
-            let source = graph
-                .symbol(link.source_symbol_id(), budget)?
-                .ok_or(corrupt())?;
-            if tests.contains(&source.file_id) {
-                test_sources.insert(source.file_id);
-            }
-            if incoming.len() > 131_072 || test_sources.len() > 131_072 {
-                return Err(workspace());
-            }
-            Ok(())
-        },
-    )?;
-    Ok((incoming.len() as u64, test_sources.len() as u64))
+
+impl ImpactReader<'_, '_, '_> {
+    fn incoming_test_sources(
+        &mut self,
+        symbol: &SymbolId,
+        tests: &BTreeSet<FileId>,
+    ) -> Result<(u64, u64), RocksError> {
+        let graph = self.graph;
+        let budget = &mut *self.budget;
+
+        let mut incoming = BTreeSet::new();
+        let mut test_sources = BTreeSet::new();
+        graph
+            .adjacency(symbol, GraphDirection::Incoming)
+            .visit(budget, |link, budget| {
+                if link.kind() == EdgeKind::Contains {
+                    return Ok(());
+                }
+                incoming.insert(link.source_symbol_id().clone());
+                let source = graph
+                    .symbol(link.source_symbol_id(), budget)?
+                    .ok_or(corrupt())?;
+                if tests.contains(&source.file_id) {
+                    test_sources.insert(source.file_id);
+                }
+                if incoming.len() > 131_072 || test_sources.len() > 131_072 {
+                    return Err(workspace());
+                }
+                Ok(())
+            })?;
+        Ok((incoming.len() as u64, test_sources.len() as u64))
+    }
 }

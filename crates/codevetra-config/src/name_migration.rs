@@ -7,6 +7,8 @@ use std::{
 };
 use thiserror::Error;
 
+const IGNORE_FILE_BYTES: u64 = 1024 * 1024;
+
 const CANONICAL: &str = ".codevetra";
 const LEGACY: &str = ".cartograph";
 const TOMBSTONE: &[u8] =
@@ -196,8 +198,8 @@ impl IgnoreMigration {
         let Some(meta) = metadata(&old)? else {
             return Ok(Self(None));
         };
-        let bytes = read_bounded(&old, 1024 * 1024)?;
-        if metadata(&new)?.is_some() && read_bounded(&new, 1024 * 1024)? != bytes {
+        let bytes = read_bounded(&old, IGNORE_FILE_BYTES)?;
+        if metadata(&new)?.is_some() && read_bounded(&new, IGNORE_FILE_BYTES)? != bytes {
             return Err(NameMigrationError::Conflict);
         }
         Ok(Self(Some((bytes, meta.permissions()))))
@@ -209,7 +211,7 @@ impl IgnoreMigration {
         };
         let old = root.join(".cartographignore");
         let new = root.join(".codevetraignore");
-        if read_bounded(&old, 1024 * 1024)? != bytes {
+        if read_bounded(&old, IGNORE_FILE_BYTES)? != bytes {
             return Err(NameMigrationError::Conflict);
         }
         if metadata(&new)?.is_none() {
@@ -219,7 +221,9 @@ impl IgnoreMigration {
                 Err(_) => return Err(NameMigrationError::UnsafePath),
             }
         }
-        if read_bounded(&new, 1024 * 1024)? != bytes || read_bounded(&old, 1024 * 1024)? != bytes {
+        if read_bounded(&new, IGNORE_FILE_BYTES)? != bytes
+            || read_bounded(&old, IGNORE_FILE_BYTES)? != bytes
+        {
             return Err(NameMigrationError::Conflict);
         }
         fs::remove_file(&old).map_err(|_| NameMigrationError::UnsafePath)

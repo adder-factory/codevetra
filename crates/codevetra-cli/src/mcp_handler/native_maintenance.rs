@@ -38,9 +38,11 @@ mod tests {
         let runtime = StorageRuntime::new(WorkerPolicy::default())?;
         let store = AsyncProjectStore::open(
             &runtime,
-            root.path().to_owned(),
-            ContentDigest::from_bytes([42; 32]),
-            StorePolicy::default(),
+            codevetra_db::rocks::ProjectOpening::new(
+                root.path().to_owned(),
+                ContentDigest::from_bytes([42; 32]),
+                StorePolicy::default(),
+            ),
             &StorageRequest::new(Duration::from_secs(30))?,
         )
         .await?;
@@ -58,13 +60,11 @@ mod tests {
                         let request = NativeDatabase::request_control(Duration::from_secs(30))
                             .map_err(|_| ProjectError::EmbeddingOperationFailed)?;
                         store
+                            .with_request(&request)
                             .state(
-                                None,
+                                codevetra_db::rocks::StateAccess::read_only(None),
                                 ReadBudget::new(100, 1_048_576, Duration::from_secs(30))
                                     .map_err(|_| ProjectError::EmbeddingOperationFailed)?,
-                                0,
-                                0,
-                                &request,
                                 move |_, budget| {
                                     let _entered = entered.send(());
                                     released

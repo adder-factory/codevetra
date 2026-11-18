@@ -166,6 +166,7 @@ mod contract_tests {
 
     fn fixture_helper() {}
 }
+
 ",
     );
     assert!(!symbol(&file, "production").implementation.test_symbol);
@@ -177,6 +178,83 @@ mod contract_tests {
         assert!(
             symbol(&file, qualified_name).implementation.test_symbol,
             "{qualified_name}"
+        );
+    }
+}
+
+#[test]
+fn rust_test_ownership_requires_a_real_test_or_proof_attribute() {
+    let file = extract(
+        "src/lib.rs",
+        r#"
+#[kani::proof]
+fn proof_harness() { assert_eq!(64, 64); }
+#[cfg(all(test, unix))]
+fn conditional_test() {}
+#[cfg(any(test, all(test, feature = "extra")))]
+fn alternatives_are_tests() {}
+#[cfg(not(test))]
+fn production_only() {}
+#[cfg(any(test, unix))]
+fn production_alternative() {}
+#[cfg(feature = "test")]
+fn test_named_feature() {}
+#[tokio::test_helper]
+fn similar_attribute() {}
+#[kani::proof_for_contract(other)]
+fn contract_harness() {}
+"#,
+    );
+    for name in [
+        "proof_harness",
+        "conditional_test",
+        "alternatives_are_tests",
+        "contract_harness",
+    ] {
+        assert!(symbol(&file, name).implementation.test_symbol, "{name}");
+    }
+    for name in [
+        "production_only",
+        "production_alternative",
+        "test_named_feature",
+        "similar_attribute",
+    ] {
+        assert!(!symbol(&file, name).implementation.test_symbol, "{name}");
+    }
+    assert!(file.has_inline_tests);
+}
+
+#[test]
+fn malformed_rust_cfg_cannot_hide_production_findings() {
+    for condition in [
+        ",test",
+        "all(,test)",
+        "all(test,,unix)",
+        "all[test]",
+        "all{test}",
+        "all(test, any(,unix))",
+        "all(test, unknown(unix))",
+        "all(test, not())",
+        "all(test, feature = 123)",
+    ] {
+        let source = format!("#[cfg({condition})]\nfn production() {{}}\n");
+        let file = extract("src/lib.rs", &source);
+        assert!(
+            !symbol(&file, "production").implementation.test_symbol,
+            "{condition}"
+        );
+    }
+    for condition in [
+        "test,",
+        "all(test,)",
+        "all(test, not(unix))",
+        "any(test, all(test, unix),)",
+    ] {
+        let source = format!("#[cfg({condition})]\nfn test_only() {{}}\n");
+        let file = extract("src/lib.rs", &source);
+        assert!(
+            symbol(&file, "test_only").implementation.test_symbol,
+            "{condition}"
         );
     }
 }
@@ -1965,6 +2043,231 @@ fn unresolved(left: f64, right: f64) -> (f64, f64, bool) {
     }
 }
 
+#[test]
+fn admitted_large_bodies_keep_counts_above_the_u16_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source = format!("fn repeated() {{ {} }}", "if true{37;}\n".repeat(65_536));
+    let snapshot = SourceSnapshot::from_bytes(
+        "src/repeated.rs",
+        source.as_bytes(),
+        SourceLimits::new(1024 * 1024)?,
+    )?;
+    let file = NativeExtractor::new(snapshot.language())?.extract(&snapshot)?;
+    assert!(
+        file.diagnostics.is_empty(),
+        "the admitted body must be fully analyzed"
+    );
+    let health = &symbol(&file, "repeated").health;
+    assert_eq!(health.cyclomatic, 65_537);
+    assert_eq!(health.magic_numbers, 65_536);
+    Ok(())
+}
+
+#[test]
+fn rust_flat_value_mappings_keep_raw_complexity_and_reject_computation() {
+    for value in ["1000", "data.value", "data.value as u32", "Kind::A"] {
+        let source = mapping_source("kind", value);
+        let file = extract("src/mapping.rs", &source);
+        let health = &symbol(&file, "mapping").health;
+        assert_eq!(health.cyclomatic, 21);
+        assert!(health.flat_value_mapping, "{value}");
+        if value == "1000" {
+            assert_eq!(health.magic_numbers, 20, "numeric evidence must remain");
+        }
+    }
+    for (scrutinee, value) in [
+        ("choose()", "1000"),
+        ("choose().kind", "1000"),
+        ("kind", "calculate()"),
+        ("kind", "calculate().field"),
+        ("kind", "calculate() as u32"),
+        ("kind", "if condition { 1000 } else { 2000 }"),
+        ("kind", "{ update(); 1000 }"),
+        ("kind", "generated!()"),
+    ] {
+        let file = extract("src/mapping.rs", &mapping_source(scrutinee, value));
+        assert!(
+            !symbol(&file, "mapping").health.flat_value_mapping,
+            "{scrutinee}, {value}"
+        );
+    }
+}
+
+#[test]
+fn rust_mapping_clones_preserve_pattern_domains_and_normalize_output_changes() {
+    let original = mapping_source("kind", "1000");
+    let first = original.replace("fn mapping", "fn first");
+    let copied = original
+        .replace("fn mapping", "fn copied")
+        .replace("Kind::A =>", "/* independent spelling */ Kind::A =>");
+    let domain = original
+        .replace("fn mapping", "fn domain")
+        .replace("Kind", "OtherKind");
+    let value = original
+        .replace("fn mapping", "fn value")
+        .replace("1000", "1001");
+    let source = [first, copied, domain, value].join("\n");
+    let file = extract("src/tables.rs", &source);
+    let first = symbol(&file, "first");
+    let copied = symbol(&file, "copied");
+    assert_eq!(first.clone_shape_digest, copied.clone_shape_digest);
+    assert_ne!(
+        first.clone_shape_digest,
+        symbol(&file, "domain").clone_shape_digest
+    );
+    assert_eq!(
+        first.clone_shape_digest,
+        symbol(&file, "value").clone_shape_digest
+    );
+    for name in ["first", "copied", "domain", "value"] {
+        let health = &symbol(&file, name).health;
+        assert!(health.flat_value_mapping);
+        assert_eq!(health.cyclomatic, 21);
+        assert_eq!(health.magic_numbers, 20);
+    }
+}
+
+#[test]
+fn rust_mapping_clone_discriminator_keeps_outer_callees_and_leaves_computations_normalized() {
+    let first = extract("src/first.rs", &wrapped_mapping("first_convert(MAPPING)"));
+    let other = extract("src/other.rs", &wrapped_mapping("other_convert(MAPPING)"));
+    assert_ne!(
+        symbol(&first, "mapping").clone_shape_digest,
+        symbol(&other, "mapping").clone_shape_digest
+    );
+    let first = extract("src/first.rs", &mapping_source("kind", "calculate()"));
+    let other = extract(
+        "src/other.rs",
+        &mapping_source("kind", "other_calculation()").replace("Kind", "OtherKind"),
+    );
+    assert!(!symbol(&first, "mapping").health.flat_value_mapping);
+    assert!(!symbol(&other, "mapping").health.flat_value_mapping);
+    assert_eq!(
+        symbol(&first, "mapping").clone_shape_digest,
+        symbol(&other, "mapping").clone_shape_digest
+    );
+}
+
+#[test]
+fn rust_mapping_allows_only_one_uniform_outer_call() {
+    for template in [
+        "convert(MAPPING)",
+        "f64::from(MAPPING)",
+        "crate::convert(/*data*/ MAPPING,)",
+    ] {
+        let file = extract("src/mapping.rs", &wrapped_mapping(template));
+        let health = &symbol(&file, "mapping").health;
+        assert!(health.flat_value_mapping, "{template}");
+        assert_eq!(health.cyclomatic, 21);
+        assert_eq!(health.magic_numbers, 20);
+    }
+    for template in [
+        "receiver.convert(MAPPING)",
+        "(choose())(MAPPING)",
+        "(|value| value)(MAPPING)",
+        "convert(MAPPING, extra)",
+        "convert(other, MAPPING)",
+        "outer(inner(MAPPING))",
+        "convert!(MAPPING)",
+        "convert({ MAPPING })",
+        "{ update(); convert(MAPPING) }",
+        "convert(MAPPING) + 1",
+        "convert(MAPPING, MAPPING)",
+    ] {
+        let file = extract("src/mapping.rs", &wrapped_mapping(template));
+        assert!(
+            !symbol(&file, "mapping").health.flat_value_mapping,
+            "{template}"
+        );
+    }
+    let guarded =
+        wrapped_mapping("convert(MAPPING)").replacen("Kind::A =>", "Kind::A if condition =>", 1);
+    let file = extract("src/mapping.rs", &guarded);
+    assert!(!symbol(&file, "mapping").health.flat_value_mapping);
+}
+
+fn wrapped_mapping(template: &str) -> String {
+    let source = mapping_source("kind", "1000");
+    let (prefix, body) = source
+        .split_once("{ ")
+        .unwrap_or_else(|| panic!("mapping body"));
+    let mapping = body
+        .strip_suffix(" }")
+        .unwrap_or_else(|| panic!("mapping end"));
+    format!("{prefix}{{ {} }}", template.replace("MAPPING", mapping))
+}
+
+#[test]
+fn rust_mapping_exception_rejects_guards_patterns_extra_statements_and_partial_syntax() {
+    let source = mapping_source("kind", "1000");
+    for changed in [
+        source.replacen("Kind::A =>", "Kind::A if condition =>", 1),
+        source.replacen("Kind::A =>", "Kind::A | Kind::B =>", 1),
+        source.replacen("Kind::A =>", "Kind::A { field } =>", 1),
+        source.replacen("match kind", "update(); match kind", 1),
+        source.replacen("Kind::A => 1000", "Kind::A =>", 1),
+    ] {
+        let file = extract("src/mapping.rs", &changed);
+        assert!(
+            !symbol(&file, "mapping").health.flat_value_mapping,
+            "{changed}"
+        );
+    }
+}
+
+#[test]
+fn rust_explicit_receivers_do_not_count_as_caller_parameters() {
+    for receiver in [
+        "self: &Self",
+        "self: &Arc<Self>",
+        "self: Pin<&mut Self>",
+        "mut self: Box<Self>",
+    ] {
+        let source = format!(
+            "struct Worker; impl Worker {{ fn call({receiver}, first: u32, second: u32) {{}} }}"
+        );
+        let file = extract("src/receiver.rs", &source);
+        assert_eq!(
+            symbol(&file, "Worker::call").health.parameter_count,
+            2,
+            "{receiver}"
+        );
+    }
+    let file = extract(
+        "src/receiver.rs",
+        "struct Worker; impl Worker { fn call(receiver: &Self, first: u32, second: u32) {} }",
+    );
+    assert_eq!(symbol(&file, "Worker::call").health.parameter_count, 3);
+}
+
+#[test]
+fn rust_local_named_constants_preserve_literal_bytes_without_magic_number_findings() {
+    let file = extract(
+        "src/constants.rs",
+        r"
+fn named() -> usize { const IDENTITY_BYTES: usize = 64 + 3 * 36; IDENTITY_BYTES }
+fn binding() -> usize { let identity_bytes = 64 + 3 * 36; identity_bytes }
+fn anonymous() -> usize { const { 64 + 3 * 36 } }
+fn unnamed() -> usize { const _: usize = 64 + 3 * 36; 0 }
+",
+    );
+    let named = &symbol(&file, "named").health;
+    assert_eq!(named.magic_numbers, 0);
+    assert_eq!(named.literal_bytes, 5);
+    for name in ["binding", "anonymous", "unnamed"] {
+        assert_eq!(symbol(&file, name).health.magic_numbers, 3, "{name}");
+    }
+}
+
+fn mapping_source(scrutinee: &str, value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut arms = String::new();
+    for name in 'A'..='T' {
+        assert!(writeln!(arms, "Kind::{name} => {value},").is_ok());
+    }
+    format!("fn mapping(kind: Kind, data: &Data) -> u32 {{ match {scrutinee} {{\n{arms}}} }}")
+}
+
 fn extract(path: &str, source: &str) -> ExtractedFile {
     let limits = match SourceLimits::new(SOURCE_LIMIT_BYTES) {
         Ok(limits) => limits,
@@ -1992,4 +2295,218 @@ fn symbol<'a>(
         .iter()
         .find(|symbol| symbol.qualified_name == qualified_name)
         .unwrap_or_else(|| panic!("missing polyglot symbol {qualified_name}"))
+}
+
+#[test]
+fn conditional_file_module_attribute_scans_propagate_cancellation() {
+    let source = "#[cfg(unix)] /* between */ #[cfg(feature = \"owner\")] mod transport;";
+    let limits = SourceLimits::new(SOURCE_LIMIT_BYTES)
+        .unwrap_or_else(|error| panic!("fixture limits failed: {error}"));
+    let snapshot = SourceSnapshot::from_bytes("src/lib.rs", source.as_bytes(), limits)
+        .unwrap_or_else(|error| panic!("fixture snapshot failed: {error}"));
+    let mut extractor = NativeExtractor::new(snapshot.language())
+        .unwrap_or_else(|error| panic!("fixture extractor failed: {error}"));
+    let mut polls = 0;
+    let facts = extractor
+        .extract_with_cancellation(&snapshot, || {
+            polls += 1;
+            false
+        })
+        .unwrap_or_else(|error| panic!("fixture extraction failed: {error}"));
+    assert!(
+        facts
+            .import_bindings
+            .iter()
+            .any(|binding| binding.local_name == "transport")
+    );
+    for cancel_at in 1..=polls {
+        let mut observed = 0;
+        let result = extractor.extract_with_cancellation(&snapshot, || {
+            observed += 1;
+            observed == cancel_at
+        });
+        assert!(
+            matches!(result, Err(codevetra_extract::ExtractError::Cancelled)),
+            "poll {cancel_at}"
+        );
+    }
+}
+
+#[test]
+fn explicit_file_module_attributes_preserve_raw_alias_and_cancellation() {
+    let source = "#[path = \"../shared/odd.rs\"] /* between */ mod r#type;";
+    let limits = SourceLimits::new(SOURCE_LIMIT_BYTES)
+        .unwrap_or_else(|error| panic!("fixture limits failed: {error}"));
+    let snapshot = SourceSnapshot::from_bytes("src/lib.rs", source.as_bytes(), limits)
+        .unwrap_or_else(|error| panic!("fixture snapshot failed: {error}"));
+    let mut extractor = NativeExtractor::new(snapshot.language())
+        .unwrap_or_else(|error| panic!("fixture extractor failed: {error}"));
+    let mut polls = 0;
+    let facts = extractor
+        .extract_with_cancellation(&snapshot, || {
+            polls += 1;
+            false
+        })
+        .unwrap_or_else(|error| panic!("fixture extraction failed: {error}"));
+    let binding = facts
+        .import_bindings
+        .iter()
+        .find(|binding| binding.kind == ImportBindingKind::RustFileModule)
+        .unwrap_or_else(|| panic!("missing explicit file binding"));
+    assert_eq!(binding.local_name, "r#type");
+    assert_eq!(binding.module_specifier, "../shared/odd.rs");
+    let start = usize::try_from(binding.span.start_byte())
+        .unwrap_or_else(|error| panic!("invalid start: {error}"));
+    let end = usize::try_from(binding.span.end_byte())
+        .unwrap_or_else(|error| panic!("invalid end: {error}"));
+    assert_eq!(&source[start..end], "mod r#type;");
+    assert!(facts.symbols.iter().any(|symbol| symbol.name == "./r#type"));
+    for cancel_at in 1..=polls {
+        let mut observed = 0;
+        let result = extractor.extract_with_cancellation(&snapshot, || {
+            observed += 1;
+            observed == cancel_at
+        });
+        assert!(
+            matches!(result, Err(codevetra_extract::ExtractError::Cancelled)),
+            "poll {cancel_at}"
+        );
+    }
+}
+
+#[test]
+fn explicit_file_module_attributes_reject_bounds_and_uncertain_syntax() {
+    for attributes in [
+        format!("#[path = \"{}.rs\"]", "a".repeat(1_025)),
+        format!("#[path = \"helper.rs\"] {}", "/* adjacent */".repeat(129)),
+        "#[path = \"help\\u{65}r.rs\"]".to_owned(),
+        "#[path = \"helper.rs\"] #[cfg(unix)]".to_owned(),
+        "#[path = \"helper.rs\", extra]".to_owned(),
+    ] {
+        let facts = extract("src/lib.rs", &format!("{attributes} mod helper;"));
+        assert!(
+            !facts
+                .import_bindings
+                .iter()
+                .any(|binding| binding.local_name == "helper"),
+            "{attributes}"
+        );
+    }
+}
+
+#[test]
+fn standard_expression_argument_proofs_are_bounded_and_cancellable() {
+    let source = "fn run() { assert_eq!(api::helper(), true); }";
+    let limits = SourceLimits::new(SOURCE_LIMIT_BYTES)
+        .unwrap_or_else(|error| panic!("fixture limits failed: {error}"));
+    let snapshot = SourceSnapshot::from_bytes("src/lib.rs", source.as_bytes(), limits)
+        .unwrap_or_else(|error| panic!("fixture snapshot failed: {error}"));
+    let mut extractor = NativeExtractor::new(snapshot.language())
+        .unwrap_or_else(|error| panic!("fixture extractor failed: {error}"));
+    let mut polls = 0;
+    let facts = extractor
+        .extract_with_cancellation(&snapshot, || {
+            polls += 1;
+            false
+        })
+        .unwrap_or_else(|error| panic!("fixture extraction failed: {error}"));
+    assert!(
+        facts
+            .import_bindings
+            .iter()
+            .any(|binding| binding.module_specifier == "<rust-opaque-macro>"
+                && binding.local_name == "assert_eq")
+    );
+    for cancel_at in 1..=polls {
+        let mut observed = 0;
+        let result = extractor.extract_with_cancellation(&snapshot, || {
+            observed += 1;
+            observed == cancel_at
+        });
+        assert!(
+            matches!(result, Err(codevetra_extract::ExtractError::Cancelled)),
+            "poll {cancel_at}"
+        );
+    }
+    let wide = format!(
+        "fn run() {{ assert_eq!(api::helper(), {}0); }}",
+        "1 + ".repeat(5_000)
+    );
+    let facts = extract("src/lib.rs", &wide);
+    assert!(
+        facts
+            .import_bindings
+            .iter()
+            .any(|binding| binding.module_specifier == "<rust-opaque-macro>")
+    );
+    assert!(
+        facts
+            .import_bindings
+            .iter()
+            .filter(|binding| binding.module_specifier == "<rust-opaque-macro>")
+            .all(|binding| binding.local_name == "*")
+    );
+}
+
+#[test]
+fn declared_cargo_targets_reject_duplicate_names_and_bound_the_name_index()
+-> Result<(), std::fmt::Error> {
+    use std::fmt::Write as _;
+    let mut too_many = String::new();
+    for index in 0..257 {
+        writeln!(too_many, "[[bench]]\nname = \"bench_{index}\"")?;
+    }
+    for targets in [
+        "[[bench]]\nname = \"same\"\n[[bench]]\nname = \"same\"\npath = \"elsewhere.rs\"\n"
+            .to_owned(),
+        too_many,
+    ] {
+        let source = format!("[package]\nname = \"scope\"\nversion = \"0.1.0\"\n{targets}");
+        let facts = extract("Cargo.toml", &source);
+        assert!(!facts.import_bindings.iter().any(|binding| matches!(
+            binding.local_name.as_str(),
+            "<cargo-target-root>" | "<cargo-target-convention>"
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn declared_cargo_target_scans_propagate_every_cancellation_poll() {
+    let source = "[package]\nname = \"targets\"\nversion = \"0.1.0\"\n[[bench]]\nname = \"timing\"\n[[test]]\nname = \"checks\"\npath = \"custom.rs\"\n[[example]]\nname = \"demo\"\n";
+    let limits = SourceLimits::new(SOURCE_LIMIT_BYTES)
+        .unwrap_or_else(|error| panic!("fixture limits failed: {error}"));
+    let snapshot = SourceSnapshot::from_bytes("Cargo.toml", source.as_bytes(), limits)
+        .unwrap_or_else(|error| panic!("fixture snapshot failed: {error}"));
+    let mut extractor = NativeExtractor::new(snapshot.language())
+        .unwrap_or_else(|error| panic!("fixture extractor failed: {error}"));
+    let mut polls = 0;
+    let facts = extractor
+        .extract_with_cancellation(&snapshot, || {
+            polls += 1;
+            false
+        })
+        .unwrap_or_else(|error| panic!("fixture extraction failed: {error}"));
+    assert_eq!(
+        facts
+            .import_bindings
+            .iter()
+            .filter(|binding| matches!(
+                binding.local_name.as_str(),
+                "<cargo-target-root>" | "<cargo-target-convention>"
+            ))
+            .count(),
+        3
+    );
+    for cancel_at in 1..=polls {
+        let mut observed = 0;
+        let result = extractor.extract_with_cancellation(&snapshot, || {
+            observed += 1;
+            observed == cancel_at
+        });
+        assert!(
+            matches!(result, Err(codevetra_extract::ExtractError::Cancelled)),
+            "poll {cancel_at}"
+        );
+    }
 }

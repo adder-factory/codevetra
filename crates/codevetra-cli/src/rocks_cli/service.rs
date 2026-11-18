@@ -57,6 +57,10 @@ mod macos {
         time::Duration,
     };
 
+    const MAXIMUM_REGISTRATION_BYTES: u64 = 16 * 1024;
+    const FOREIGN_PERMISSION_BITS: u32 = 0o077;
+    const PRIVATE_FILE_MODE: u32 = 0o600;
+
     struct Registration {
         root: PathBuf,
         path: PathBuf,
@@ -117,8 +121,8 @@ mod macos {
             if !metadata.is_file()
                 || metadata.file_type().is_symlink()
                 || metadata.uid() != rustix::process::geteuid().as_raw()
-                || metadata.len() > 16 * 1024
-                || metadata.mode() & 0o077 != 0
+                || metadata.len() > MAXIMUM_REGISTRATION_BYTES
+                || metadata.mode() & FOREIGN_PERMISSION_BITS != 0
             {
                 return Err("service registration is not a private owned file".to_owned());
             }
@@ -170,7 +174,7 @@ mod macos {
             let mut file = tempfile::NamedTempFile::new_in(parent)
                 .map_err(|_| "service registration write failed".to_owned())?;
             file.as_file()
-                .set_permissions(fs::Permissions::from_mode(0o600))
+                .set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
                 .map_err(|_| "service permissions failed".to_owned())?;
             file.write_all(self.document.as_bytes())
                 .and_then(|()| file.as_file().sync_all())

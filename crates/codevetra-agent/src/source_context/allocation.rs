@@ -42,6 +42,9 @@ pub struct SourceAllocationOptions {
 }
 
 impl SourceAllocationOptions {
+    const MINIMUM_BYTES: usize = 16 * 1024;
+    const MAXIMUM_BYTES: usize = 512 * 1024;
+
     /// Set a complete serialized source-allocation budget of 16–512 KiB.
     /// # Errors
     /// Rejects budgets outside the finite output range.
@@ -49,13 +52,36 @@ impl SourceAllocationOptions {
         policy: SourceSelectionPolicy,
         maximum_bytes: usize,
     ) -> Result<Self, ProjectError> {
-        if maximum_bytes < 16 * 1024 || maximum_bytes > 512 * 1024 {
+        if maximum_bytes < Self::MINIMUM_BYTES || maximum_bytes > Self::MAXIMUM_BYTES {
             return Err(ProjectError::InvalidOptions);
         }
         Ok(Self {
             policy,
             maximum_bytes,
         })
+    }
+}
+
+/// Exact generation and resolved identities allocated under one validated output policy.
+pub struct SourceAllocationRequest<'a> {
+    generation: &'a GenerationId,
+    selections: Vec<SourceSelection>,
+    options: SourceAllocationOptions,
+}
+
+impl<'a> SourceAllocationRequest<'a> {
+    /// Bind selected identities to the generation from which they were resolved.
+    #[must_use]
+    pub fn new(
+        generation: &'a GenerationId,
+        selections: Vec<SourceSelection>,
+        options: SourceAllocationOptions,
+    ) -> Self {
+        Self {
+            generation,
+            selections,
+            options,
+        }
     }
 }
 
@@ -88,11 +114,14 @@ impl ProjectRuntime {
     /// A changed generation returns `None`, never a mixture of publications.
     pub async fn allocate_source_with_cancellation(
         &self,
-        generation: &GenerationId,
-        mut selections: Vec<SourceSelection>,
-        options: SourceAllocationOptions,
+        request: SourceAllocationRequest<'_>,
         cancellation: ProjectCancellation,
     ) -> Result<Option<SourceAllocation>, ProjectError> {
+        let SourceAllocationRequest {
+            generation,
+            mut selections,
+            options,
+        } = request;
         if selections.len() > 100 {
             return Err(ProjectError::InvalidOptions);
         }
@@ -139,54 +168,55 @@ impl ProjectRuntime {
         else {
             return Ok(None);
         };
-        tokio::task::spawn_blocking(move || {
-            allocate(contexts, &priorities, options.maximum_bytes, &cancellation)
-        })
-        .await
-        .map_err(|_| ProjectError::SourceContextUnavailable)?
-        .map(Some)
+        tokio::task::spawn_blocking(move || options.allocate(contexts, &priorities, &cancellation))
+            .await
+            .map_err(|_| ProjectError::SourceContextUnavailable)?
+            .map(Some)
     }
 }
 
-fn allocate(
-    contexts: Vec<SymbolSourceContext>,
-    priorities: &BTreeSet<SymbolId>,
-    maximum_bytes: usize,
-    cancellation: &ProjectCancellation,
-) -> Result<SourceAllocation, ProjectError> {
-    let mut output = SourceAllocation {
-        windows: contexts
-            .iter()
-            .cloned()
-            .map(|mut context| {
-                context.omit_body();
-                context
-            })
-            .collect(),
-        encoded_bytes: 0,
-        maximum_bytes,
-        incomplete_priority: priorities.iter().cloned().collect(),
-        required_bodies_complete: false,
-        full_bodies: 0,
-        incomplete_bodies: 0,
-        expand: "codevetra node --symbol-id <symbol.symbol_id> --detail full; use files --format read --file <symbol.path> --byte-offset <omitted_ranges.startByte> --byte-limit 65536 for exact missing bytes; continue from excerpt.endByte",
-    };
-    account(&mut output, priorities)?;
-    if output.encoded_bytes > maximum_bytes {
-        return Err(ProjectError::SourceContextUnavailable);
-    }
-    for (index, context) in contexts.into_iter().enumerate() {
-        if cancellation.is_cancelled() {
-            return Err(ProjectError::RequestCancelled);
-        }
-        let outline = std::mem::replace(&mut output.windows[index], context);
+impl SourceAllocationOptions {
+    fn allocate(
+        self,
+        contexts: Vec<SymbolSourceContext>,
+        priorities: &BTreeSet<SymbolId>,
+        cancellation: &ProjectCancellation,
+    ) -> Result<SourceAllocation, ProjectError> {
+        let maximum_bytes = self.maximum_bytes;
+        let mut output = SourceAllocation {
+            windows: contexts
+                .iter()
+                .cloned()
+                .map(|mut context| {
+                    context.omit_body();
+                    context
+                })
+                .collect(),
+            encoded_bytes: 0,
+            maximum_bytes,
+            incomplete_priority: priorities.iter().cloned().collect(),
+            required_bodies_complete: false,
+            full_bodies: 0,
+            incomplete_bodies: 0,
+            expand: "codevetra node --symbol-id <symbol.symbol_id> --detail full; use files --format read --file <symbol.path> --byte-offset <omitted_ranges.startByte> --byte-limit 65536 for exact missing bytes; continue from excerpt.endByte",
+        };
         account(&mut output, priorities)?;
         if output.encoded_bytes > maximum_bytes {
-            output.windows[index] = outline;
-            account(&mut output, priorities)?;
+            return Err(ProjectError::SourceContextUnavailable);
         }
+        for (index, context) in contexts.into_iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(ProjectError::RequestCancelled);
+            }
+            let outline = std::mem::replace(&mut output.windows[index], context);
+            account(&mut output, priorities)?;
+            if output.encoded_bytes > maximum_bytes {
+                output.windows[index] = outline;
+                account(&mut output, priorities)?;
+            }
+        }
+        Ok(output)
     }
-    Ok(output)
 }
 
 fn account(

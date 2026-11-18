@@ -3,7 +3,7 @@
 [Documentation home](../README.md) · [Project overview](../../README.md) ·
 [Native extraction](EXTRACTION.md) · [Language matrix](../SUPPORT-MATRIX.md)
 
-Last release audit: 2026-11-16 (`v4.0.6`).
+Last release audit: 2026-11-18 (`v4.0.7`).
 
 CodeVetra v4 is a native Rust code-intelligence server for AI coding agents.
 Each project owns an embedded RocksDB 11.12.0 store. Rust implements
@@ -222,7 +222,7 @@ not prove. It never stores the source expression or literal. Static heuristic
 evidence is not relabeled as a runtime observation or formal proof;
 `codevetra_numerical`, status, and numerical review report observation and
 formal adapters as `not_configured`. Generations recorded under an older digest
-contract (anything before the current V27) remain explicitly stale until an
+contract (anything before the current V34) remain explicitly stale until an
 ordinary index republishes them; for generations older than V7, which predate
 numerical sites, that republication is also what publishes numerical evidence.
 

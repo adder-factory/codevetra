@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+const GRAPH_READ_ROWS: usize = 2_000_000;
+
 tokio::task_local! {
     static ACTIVE_REQUEST: StorageRequest;
 }
@@ -12,6 +14,7 @@ pub(crate) fn request_for(timeout: Duration) -> Result<StorageRequest, RocksErro
         .unwrap_or_else(|_| StorageRequest::new(timeout))
 }
 pub(crate) mod dataset;
+mod graph_read;
 pub(crate) mod retention;
 
 use codevetra_domain::{ContentDigest, GenerationId, ProjectId};
@@ -19,7 +22,8 @@ use codevetra_domain::{ContentDigest, GenerationId, ProjectId};
 use crate::{
     StorageError,
     rocks::{
-        AsyncProjectStore, GraphSnapshot, ReadBudget, RocksError, StateTransaction, StorageRequest,
+        AsyncProjectStore, GraphSnapshot, ReadBudget, RocksError, StateAccess, StateTransaction,
+        StorageRequest,
     },
 };
 
@@ -114,42 +118,14 @@ impl NativeDatabase {
             + Send
             + 'static,
     {
-        self.graph_with_budget(expected, timeout, 1024 * 1_048_576, read)
+        self.graph_request(expected, timeout, 1024 * 1_048_576)?
+            .read(read)
             .await
-    }
-
-    pub(crate) async fn graph_with_budget<T, F>(
-        &self,
-        expected: &GenerationId,
-        timeout: Duration,
-        maximum_bytes: usize,
-        read: F,
-    ) -> Result<T, StorageError>
-    where
-        T: Send + 'static,
-        F: FnOnce(&GraphSnapshot<'_, '_>, &mut ReadBudget) -> Result<T, RocksError>
-            + Send
-            + 'static,
-    {
-        let request = request_for(timeout).map_err(storage_error)?;
-        let budget = ReadBudget::streaming(2_000_000, maximum_bytes, 64 * 1_048_576, timeout)
-            .map_err(storage_error)?;
-        self.store
-            .read(
-                Some(expected.clone()),
-                budget,
-                &request,
-                move |snapshot, budget| read(&snapshot.graph(budget)?, budget),
-            )
-            .await
-            .map_err(storage_error)
     }
 
     pub(crate) async fn state<T, F>(
         &self,
-        expected: Option<GenerationId>,
-        write_bytes: u32,
-        write_rows: u32,
+        access: StateAccess,
         operation: F,
     ) -> Result<T, StorageError>
     where
@@ -158,14 +134,8 @@ impl NativeDatabase {
             + Send
             + 'static,
     {
-        self.state_with_timeout(
-            expected,
-            write_bytes,
-            write_rows,
-            Duration::from_secs(30),
-            operation,
-        )
-        .await
+        self.state_with_timeout(access, Duration::from_secs(30), operation)
+            .await
     }
 
     pub(crate) async fn current_graph<T, F>(
@@ -194,9 +164,7 @@ impl NativeDatabase {
 
     pub(crate) async fn state_with_timeout<T, F>(
         &self,
-        expected: Option<GenerationId>,
-        write_bytes: u32,
-        write_rows: u32,
+        access: StateAccess,
         timeout: Duration,
         operation: F,
     ) -> Result<T, StorageError>
@@ -207,15 +175,12 @@ impl NativeDatabase {
             + 'static,
     {
         let request = request_for(timeout).map_err(storage_error)?;
-        self.state_with_request(expected, write_bytes, write_rows, &request, operation)
-            .await
+        self.state_with_request(access, &request, operation).await
     }
 
     pub(crate) async fn state_with_request<T, F>(
         &self,
-        expected: Option<GenerationId>,
-        write_bytes: u32,
-        write_rows: u32,
+        access: StateAccess,
         request: &StorageRequest,
         operation: F,
     ) -> Result<T, StorageError>
@@ -227,23 +192,15 @@ impl NativeDatabase {
     {
         let timeout = request.remaining_timeout().map_err(storage_error)?;
         self.store
-            .state(
-                expected,
-                budget(timeout)?,
-                write_bytes,
-                write_rows,
-                request,
-                operation,
-            )
+            .with_request(request)
+            .state(access, budget(timeout)?, operation)
             .await
             .map_err(storage_error)
     }
 
     pub(crate) async fn transaction<T, E, F>(
         &self,
-        expected: Option<GenerationId>,
-        write_bytes: u32,
-        write_rows: u32,
+        access: StateAccess,
         timeout: Duration,
         operation: F,
     ) -> Result<T, E>
@@ -252,29 +209,22 @@ impl NativeDatabase {
         E: From<StorageError> + Send + 'static,
         F: FnOnce(&mut StateTransaction<'_>, &mut ReadBudget) -> Result<T, E> + Send + 'static,
     {
-        self.state_with_timeout(
-            expected,
-            write_bytes,
-            write_rows,
-            timeout,
-            move |transaction, budget| {
-                Ok(match operation(transaction, budget) {
-                    Ok(result) => Ok(result),
-                    Err(error) => {
-                        transaction.rollback();
-                        Err(error)
-                    }
-                })
-            },
-        )
+        self.state_with_timeout(access, timeout, move |transaction, budget| {
+            Ok(match operation(transaction, budget) {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    transaction.rollback();
+                    Err(error)
+                }
+            })
+        })
         .await
         .map_err(E::from)?
     }
 }
 
 fn budget(timeout: Duration) -> Result<ReadBudget, StorageError> {
-    ReadBudget::streaming(2_000_000, 1024 * 1_048_576, 64 * 1_048_576, timeout)
-        .map_err(storage_error)
+    ReadBudget::streaming(2_000_000, 1024 * 1_048_576, timeout).map_err(storage_error)
 }
 
 pub(crate) fn storage_error(error: RocksError) -> StorageError {
@@ -310,17 +260,13 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, 
 }
 
 pub(crate) fn visit_state<T: serde::de::DeserializeOwned>(
-    transaction: &StateTransaction<'_>,
-    namespace: crate::rocks::StateNamespace,
-    prefix: &[u8],
+    scan: &crate::rocks::StateScan<'_, '_>,
     budget: &mut ReadBudget,
     mut visit: impl FnMut(Vec<u8>, T, &mut ReadBudget) -> Result<(), RocksError>,
 ) -> Result<(), RocksError> {
     let mut cursor = None;
     loop {
-        let page = transaction.scan(
-            namespace,
-            prefix,
+        let page = scan.page(
             cursor.as_ref().map(crate::rocks::RecordKey::as_bytes),
             256,
             budget,
@@ -357,7 +303,8 @@ impl NativeDatabase {
     ) -> Result<crate::rocks::NativeStorageUsage, StorageError> {
         let request = request_for(timeout).map_err(storage_error)?;
         self.store
-            .storage_usage(&request)
+            .with_request(&request)
+            .storage_usage()
             .await
             .map_err(storage_error)
     }

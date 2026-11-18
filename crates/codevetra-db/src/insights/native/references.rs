@@ -8,11 +8,63 @@ use crate::{
         GroupedSymbolPeers, GroupedSymbolQuery, ImportInsight, IndexedFileFingerprint,
         RenameReferenceSite, validate_limit,
     },
-    retrieval::native::{retain, visit_files, visit_symbols},
+    retrieval::native::{RankedRows, visit_files, visit_symbols},
     rocks::{GraphSnapshot, ReadBudget, RocksError},
 };
 use codevetra_domain::{FileId, NormalizedPath, ProjectId, SymbolId};
 use std::collections::BTreeMap;
+
+const COMPLETE_REFERENCE_ROWS: usize = 250_000;
+const REFERENCE_WORKSPACE_BYTES: usize = 32 * 1_048_576;
+
+#[derive(Clone, Copy)]
+enum ReferenceSelection {
+    Ranked(usize),
+    Complete,
+}
+
+impl ReferenceSelection {
+    const fn limit(self) -> usize {
+        match self {
+            Self::Ranked(limit) => limit,
+            Self::Complete => COMPLETE_REFERENCE_ROWS,
+        }
+    }
+    const fn complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+struct PeerGroup {
+    key: String,
+    total: u64,
+    peers: RankedRows<
+        GroupedSymbolPeer,
+        fn(&GroupedSymbolPeer, &GroupedSymbolPeer) -> std::cmp::Ordering,
+    >,
+}
+
+impl PeerGroup {
+    fn finish(self) -> GroupedSymbolPeers {
+        GroupedSymbolPeers {
+            key: self.key,
+            total: self.total,
+            truncated: self.total > self.peers.len() as u64,
+            peers: self.peers.into_vec(),
+        }
+    }
+}
+
+fn peer_order(a: &GroupedSymbolPeer, b: &GroupedSymbolPeer) -> std::cmp::Ordering {
+    a.path
+        .cmp(&b.path)
+        .then(a.start_line.cmp(&b.start_line))
+        .then(a.symbol_id.cmp(&b.symbol_id))
+}
+
+struct PeerBudget {
+    bytes: usize,
+}
 
 impl NativeDatabase {
     /// List current import references in canonical path/span order.
@@ -24,7 +76,7 @@ impl NativeDatabase {
         limit: u16,
     ) -> Result<Vec<ImportInsight>, StorageError> {
         validate_limit(limit)?;
-        self.imports_native(project, usize::from(limit), false)
+        self.imports_native(project, ReferenceSelection::Ranked(usize::from(limit)))
             .await
     }
 
@@ -35,18 +87,20 @@ impl NativeDatabase {
         &self,
         project: &ProjectId,
     ) -> Result<Vec<ImportInsight>, StorageError> {
-        self.imports_native(project, 250_000, true).await
+        self.imports_native(project, ReferenceSelection::Complete)
+            .await
     }
 
     async fn imports_native(
         &self,
         project: &ProjectId,
-        limit: usize,
-        complete: bool,
+        selection: ReferenceSelection,
     ) -> Result<Vec<ImportInsight>, StorageError> {
         self.current_graph(project, DEFAULT_INSIGHT_TIMEOUT, move |graph, budget| {
             let anchors = file_anchors(graph, budget)?;
-            let mut output = Vec::new();
+            let mut output =
+                crate::retrieval::native::RankedRows::new(selection.limit(), import_order);
+            let mut complete = Vec::new();
             let mut bytes = 0_usize;
             visit_references(graph, budget, |reference, budget| {
                 if reference.reference_kind != "imports" {
@@ -87,17 +141,22 @@ impl NativeDatabase {
                     + row.provenance.len()
                     + row.target_path.as_ref().map_or(0, String::len)
                     + 512;
-                if complete {
+                if selection.complete() {
                     bytes = bytes.saturating_add(size);
-                    if output.len() >= limit || bytes > 32 * 1_048_576 {
+                    if complete.len() >= selection.limit() || bytes > REFERENCE_WORKSPACE_BYTES {
                         return Err(workspace());
                     }
-                    output.push(row);
+                    complete.push(row);
                 } else {
-                    retain(&mut output, row, limit, import_order);
+                    output.insert(row);
                 }
                 Ok(())
             })?;
+            let mut output = if selection.complete() {
+                complete
+            } else {
+                output.into_vec()
+            };
             output.sort_by(import_order);
             Ok(output)
         })
@@ -135,7 +194,7 @@ impl NativeDatabase {
                     bytes = bytes.saturating_add(key.0.len() + key.1.len() + key.2.len() + 192);
                 }
                 *groups.entry(key).or_default() += u64::from(reference.site_count);
-                if groups.len() > 250_000 || bytes > 32 * 1_048_576 {
+                if groups.len() > 250_000 || bytes > REFERENCE_WORKSPACE_BYTES {
                     return Err(workspace());
                 }
                 Ok(())
@@ -211,7 +270,7 @@ impl NativeDatabase {
         limit: u16,
     ) -> Result<Vec<RenameReferenceSite>, StorageError> {
         validate_limit(limit)?;
-        self.rename_native(project, id, usize::from(limit), false)
+        self.rename_native(project, id, ReferenceSelection::Ranked(usize::from(limit)))
             .await
     }
 
@@ -223,19 +282,21 @@ impl NativeDatabase {
         project: &ProjectId,
         id: &SymbolId,
     ) -> Result<Vec<RenameReferenceSite>, StorageError> {
-        self.rename_native(project, id, 250_000, true).await
+        self.rename_native(project, id, ReferenceSelection::Complete)
+            .await
     }
 
     async fn rename_native(
         &self,
         project: &ProjectId,
         id: &SymbolId,
-        limit: usize,
-        complete: bool,
+        selection: ReferenceSelection,
     ) -> Result<Vec<RenameReferenceSite>, StorageError> {
         let id = id.clone();
         self.current_graph(project, DEFAULT_INSIGHT_TIMEOUT, move |graph, budget| {
-            let mut rows = Vec::new();
+            let mut rows =
+                crate::retrieval::native::RankedRows::new(selection.limit(), rename_order);
+            let mut complete = Vec::new();
             let mut bytes = 0_usize;
             visit_references(graph, budget, |reference, budget| {
                 if reference.target_symbol_id.as_ref() != Some(&id) {
@@ -251,19 +312,24 @@ impl NativeDatabase {
                     confidence: reference.confidence,
                     provenance: reference.resolution_provenance,
                 };
-                if complete {
+                if selection.complete() {
                     bytes = bytes.saturating_add(
                         row.path.len() + row.provenance.len() + row.reference_kind.len() + 256,
                     );
-                    if rows.len() >= limit || bytes > 32 * 1_048_576 {
+                    if complete.len() >= selection.limit() || bytes > REFERENCE_WORKSPACE_BYTES {
                         return Err(workspace());
                     }
-                    rows.push(row);
+                    complete.push(row);
                 } else {
-                    retain(&mut rows, row, limit, rename_order);
+                    rows.insert(row);
                 }
                 Ok(())
             })?;
+            let mut rows = if selection.complete() {
+                complete
+            } else {
+                rows.into_vec()
+            };
             rows.sort_by(rename_order);
             Ok(rows)
         })
@@ -304,7 +370,7 @@ impl NativeDatabase {
             let mut bytes = 0_usize;
             visit_files(graph, budget, |file, _| {
                 bytes = bytes.saturating_add(file.normalized_path.len() + 192);
-                if rows.len() >= 250_000 || bytes > 32 * 1_048_576 {
+                if rows.len() >= 250_000 || bytes > REFERENCE_WORKSPACE_BYTES {
                     return Err(workspace());
                 }
                 rows.push(IndexedFileFingerprint {
@@ -343,14 +409,18 @@ impl NativeDatabase {
                 let mut groups = request
                     .groups
                     .iter()
-                    .map(|group| GroupedSymbolPeers {
+                    .map(|group| PeerGroup {
                         key: group.key.clone(),
                         total: 0,
-                        peers: Vec::new(),
-                        truncated: false,
+                        peers: RankedRows::new(usize::from(request.per_group_limit), peer_order),
                     })
                     .collect::<Vec<_>>();
-                let mut bytes = 0_usize;
+                let mut peers = PeerBudget {
+                    bytes: groups
+                        .len()
+                        .checked_mul(2 * std::mem::size_of::<usize>())
+                        .ok_or_else(workspace)?,
+                };
                 visit_symbols(graph, budget, |symbol, budget| {
                     if matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter")
                         || request.excluded_symbol_id.as_ref() == Some(&symbol.symbol_id)
@@ -366,20 +436,11 @@ impl NativeDatabase {
                         {
                             continue;
                         }
-                        retain_peer(
-                            output,
-                            &symbol,
-                            &file,
-                            usize::from(request.per_group_limit),
-                            &mut bytes,
-                        )?;
+                        peers.retain(output, &symbol, &file)?;
                     }
                     Ok(())
                 })?;
-                for group in &mut groups {
-                    group.truncated = group.total > group.peers.len() as u64;
-                }
-                Ok(groups)
+                Ok(groups.into_iter().map(PeerGroup::finish).collect())
             })
             .await?;
         Ok(output.unwrap_or(empty))
@@ -403,18 +464,16 @@ fn file_anchors(
     Ok(anchors)
 }
 
-fn retain_peer(
-    output: &mut GroupedSymbolPeers,
-    symbol: &SymbolInput,
-    file: &FileInput,
-    limit: usize,
-    bytes: &mut usize,
-) -> Result<(), RocksError> {
-    output.total += 1;
-    let before = output.peers.iter().map(peer_bytes).sum::<usize>();
-    retain(
-        &mut output.peers,
-        GroupedSymbolPeer {
+impl PeerBudget {
+    fn retain(
+        &mut self,
+        output: &mut PeerGroup,
+        symbol: &SymbolInput,
+        file: &FileInput,
+    ) -> Result<(), RocksError> {
+        output.total += 1;
+        let before = output.peers.iter().map(peer_bytes).sum::<usize>();
+        output.peers.insert(GroupedSymbolPeer {
             symbol_id: symbol.symbol_id.to_string(),
             path: file.normalized_path.clone(),
             language: file.language.clone(),
@@ -422,23 +481,17 @@ fn retain_peer(
             qualified_name: symbol.qualified_name.clone(),
             start_line: symbol.start_line,
             end_line: symbol.end_line,
-        },
-        limit,
-        |a, b| {
-            a.path
-                .cmp(&b.path)
-                .then(a.start_line.cmp(&b.start_line))
-                .then(a.symbol_id.cmp(&b.symbol_id))
-        },
-    );
-    *bytes = bytes
-        .checked_sub(before)
-        .and_then(|bytes| bytes.checked_add(output.peers.iter().map(peer_bytes).sum::<usize>()))
-        .ok_or_else(workspace)?;
-    if *bytes > 32 * 1_048_576 {
-        return Err(workspace());
+        });
+        self.bytes = self
+            .bytes
+            .checked_sub(before)
+            .and_then(|bytes| bytes.checked_add(output.peers.iter().map(peer_bytes).sum::<usize>()))
+            .ok_or_else(workspace)?;
+        if self.bytes > REFERENCE_WORKSPACE_BYTES {
+            return Err(workspace());
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn peer_bytes(peer: &GroupedSymbolPeer) -> usize {

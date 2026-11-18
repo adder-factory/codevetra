@@ -36,6 +36,37 @@ struct QueueState {
     finalizer: Option<Job>,
 }
 
+/// One job's byte reservation, writer admission and maximum releasable input.
+#[derive(Clone, Copy)]
+pub(super) struct JobCapacity {
+    reservation: u32,
+    mutation: bool,
+    maximum_reclamation: u32,
+}
+
+impl JobCapacity {
+    pub(super) const fn new(reservation: u32, mutation: bool) -> Self {
+        Self {
+            reservation,
+            mutation,
+            maximum_reclamation: 0,
+        }
+    }
+
+    pub(super) const fn read(reservation: u32) -> Self {
+        Self::new(reservation, false)
+    }
+
+    pub(super) const fn write(reservation: u32) -> Self {
+        Self::new(reservation, true)
+    }
+
+    pub(super) const fn reclaiming(mut self, maximum_reclamation: u32) -> Self {
+        self.maximum_reclamation = maximum_reclamation;
+        self
+    }
+}
+
 struct Admission {
     _slot: OwnedSemaphorePermit,
     bytes: OwnedSemaphorePermit,
@@ -90,14 +121,7 @@ impl StoragePool {
         policy: WorkerPolicy,
         finalize: impl FnOnce() + Send + 'static,
     ) -> Result<Self> {
-        if !(2..=16).contains(&policy.threads)
-            || !(u16::from(policy.threads)..=1_024).contains(&policy.pending_jobs)
-            || !(1_048_576..=512 * 1_048_576).contains(&policy.pending_bytes)
-        {
-            return Err(RocksError::Limit {
-                resource: "worker_policy",
-            });
-        }
+        let policy = policy.validate()?;
         let pool = Self {
             queue: Arc::new(Queue::default()),
             workers: Mutex::new(Vec::new()),
@@ -132,32 +156,32 @@ impl StoragePool {
     pub(super) async fn run<T, F>(
         &self,
         request: &StorageRequest,
-        reservation: u32,
-        mutation: bool,
+        capacity: JobCapacity,
         operation: F,
     ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(StorageRequest) -> Result<T> + Send + 'static,
     {
-        self.run_reclaiming(request, reservation, mutation, 0, move |control, _| {
-            operation(control)
-        })
-        .await
+        self.run_reclaiming(request, capacity, move |control, _| operation(control))
+            .await
     }
 
     pub(super) async fn run_reclaiming<T, F>(
         &self,
         request: &StorageRequest,
-        reservation: u32,
-        mutation: bool,
-        maximum_reclamation: u32,
+        capacity: JobCapacity,
         operation: F,
     ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(StorageRequest, &mut ByteReclamation<'_>) -> Result<T> + Send + 'static,
     {
+        let JobCapacity {
+            reservation,
+            mutation,
+            maximum_reclamation,
+        } = capacity;
         if maximum_reclamation > reservation {
             return Err(crate::rocks::operation("worker_reclamation"));
         }

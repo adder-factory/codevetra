@@ -14,7 +14,7 @@ use super::super::engine::PointReaders;
 use super::super::{Collection, ReadBudget, RecordKey, Result, RevisionSnapshot, RocksError};
 use super::{
     DOCUMENT, FILE, GraphInfo, INCOMING, MANIFEST, NUMERICAL, OUTGOING, REFERENCE, SYMBOL, codec,
-    ingest::EdgeProperties,
+    ingest::EdgeProperties, names,
 };
 
 /// Opaque cursor tied to one revision, vertex, direction, and packed block.
@@ -106,7 +106,7 @@ impl<'store> RevisionSnapshot<'store> {
     }
 }
 
-impl GraphSnapshot<'_, '_> {
+impl<'view, 'store> GraphSnapshot<'view, 'store> {
     /// Exact generation pinned by this immutable view.
     #[must_use]
     pub fn generation_id(&self) -> &GenerationId {
@@ -123,7 +123,8 @@ impl GraphSnapshot<'_, '_> {
         limit: u16,
         budget: &mut ReadBudget,
     ) -> Result<(Vec<FileInput>, Option<RecordKey>)> {
-        self.table_records(Collection::Graph, FILE, after, limit, budget)
+        self.table(Collection::Graph, FILE)
+            .page(after, limit, budget)
     }
 
     /// Read a finite canonical symbol page from this revision.
@@ -136,54 +137,17 @@ impl GraphSnapshot<'_, '_> {
         limit: u16,
         budget: &mut ReadBudget,
     ) -> Result<(Vec<SymbolInput>, Option<RecordKey>)> {
-        self.table_records(Collection::Graph, SYMBOL, after, limit, budget)
+        self.table(Collection::Graph, SYMBOL)
+            .page(after, limit, budget)
     }
 
-    /// Page exact simple or qualified names, matching Unicode lowercase keys.
-    /// Callers retain their original case-sensitive or qualified predicates and
-    /// result ordering. Inspect `info().name_index_version` before using this
-    /// optional index; zero requires the existing symbol scan.
-    /// # Errors
-    /// Rejects unavailable indexes, invalid names, cursors, corrupt postings,
-    /// changed/missing symbols, and exhausted read budgets.
-    pub fn symbols_by_name(
-        &self,
-        name: &str,
-        after: Option<&RecordKey>,
-        limit: u16,
-        budget: &mut ReadBudget,
-    ) -> Result<(Vec<SymbolInput>, Option<RecordKey>)> {
-        use super::names;
-        if self.info.name_index_version != 1 || name.is_empty() || name.len() > 4096 {
-            return Err(RocksError::InvalidInput {
-                field: "name_index",
-            });
-        }
-        let mut prefix = names::PREFIX.to_vec();
-        prefix.extend_from_slice(&names::hash(name));
-        let page = self
-            .snapshot
-            .scan_prefix(Collection::Graph, &prefix, after, limit, budget)?;
-        let expected = name.to_lowercase();
-        let mut rows = Vec::new();
-        for (key, marker) in page.rows {
-            if marker != [1] {
-                return Err(codec::corrupt());
-            }
-            let raw = key
-                .as_bytes()
-                .strip_prefix(prefix.as_slice())
-                .ok_or_else(codec::corrupt)?;
-            let id = codec::symbol(raw)?;
-            let symbol = self.symbol(&id, budget)?.ok_or_else(codec::corrupt)?;
-            // Hash collisions cannot admit an unrelated declaration.
-            if symbol.qualified_name.to_lowercase() == expected
-                || names::simple(&symbol.qualified_name).to_lowercase() == expected
-            {
-                rows.push(symbol);
-            }
-        }
-        Ok((rows, page.next_after))
+    /// Bind this lookup to one immutable graph and its query identity.
+    #[must_use]
+    pub fn symbols_by_name<'query>(
+        &'query self,
+        name: &'query str,
+    ) -> NamedSymbols<'query, 'view, 'store> {
+        NamedSymbols { graph: self, name }
     }
 
     /// Read a finite canonical document page for bounded native retrieval.
@@ -196,7 +160,8 @@ impl GraphSnapshot<'_, '_> {
         limit: u16,
         budget: &mut ReadBudget,
     ) -> Result<(Vec<CanonicalSearchDocument>, Option<RecordKey>)> {
-        self.table_records(Collection::Search, DOCUMENT, after, limit, budget)
+        self.table(Collection::Search, DOCUMENT)
+            .page(after, limit, budget)
     }
 
     pub(crate) fn document_cursor(id: &DocumentId) -> Result<RecordKey> {
@@ -213,35 +178,17 @@ impl GraphSnapshot<'_, '_> {
         limit: u16,
         budget: &mut ReadBudget,
     ) -> Result<(Vec<ReferenceInput>, Option<RecordKey>)> {
-        self.table_records(Collection::Graph, REFERENCE, after, limit, budget)
+        self.table(Collection::Graph, REFERENCE)
+            .page(after, limit, budget)
     }
 
-    /// Page references with exact continuation keys, optionally restricted to one file.
-    /// # Errors
-    /// Rejects malformed file identities, cursors, decoding and read-budget failures.
-    pub(crate) fn reference_sites(
-        &self,
-        file: Option<&FileId>,
-        after: Option<&RecordKey>,
-        limit: u16,
-        budget: &mut ReadBudget,
-    ) -> Result<ReferenceSitePage> {
-        let mut prefix = REFERENCE.to_vec();
-        if let Some(file) = file {
-            prefix.extend_from_slice(&codec::uuid(file.as_str())?);
-        }
-        let page = self
-            .snapshot
-            .scan_prefix(Collection::Graph, &prefix, after, limit, budget)?;
-        let rows = page
-            .rows
-            .into_iter()
-            .map(|(key, bytes)| Ok((key, codec::decode(&bytes)?)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(ReferenceSitePage {
-            rows,
-            next: page.next_after,
-        })
+    /// Bind this lookup to one immutable graph and its query identity.
+    #[must_use]
+    pub(crate) fn reference_sites<'query>(
+        &'query self,
+        file: Option<&'query FileId>,
+    ) -> ReferenceSites<'query, 'view, 'store> {
+        ReferenceSites { graph: self, file }
     }
 
     /// Read a finite canonical numerical-site page from this revision.
@@ -253,26 +200,8 @@ impl GraphSnapshot<'_, '_> {
         limit: u16,
         budget: &mut ReadBudget,
     ) -> Result<(Vec<NumericalSiteInput>, Option<RecordKey>)> {
-        self.table_records(Collection::Graph, NUMERICAL, after, limit, budget)
-    }
-
-    fn table_records<T: DeserializeOwned>(
-        &self,
-        collection: Collection,
-        prefix: &[u8],
-        after: Option<&RecordKey>,
-        limit: u16,
-        budget: &mut ReadBudget,
-    ) -> Result<(Vec<T>, Option<RecordKey>)> {
-        let page = self
-            .snapshot
-            .scan_prefix(collection, prefix, after, limit, budget)?;
-        let rows = page
-            .rows
-            .into_iter()
-            .map(|(_, bytes)| codec::decode(&bytes))
-            .collect::<Result<Vec<_>>>()?;
-        Ok((rows, page.next_after))
+        self.table(Collection::Graph, NUMERICAL)
+            .page(after, limit, budget)
     }
 
     /// Exact row counts and physical graph format for the pinned revision.
@@ -286,7 +215,8 @@ impl GraphSnapshot<'_, '_> {
     /// # Errors
     /// Returns read-budget, decoding, or storage failures.
     pub fn file(&self, id: &FileId, budget: &mut ReadBudget) -> Result<Option<FileInput>> {
-        self.record(Collection::Graph, FILE, &codec::uuid(id.as_str())?, budget)
+        self.table(Collection::Graph, FILE)
+            .get(&codec::uuid(id.as_str())?, budget)
     }
 
     /// Read one canonical declaration without traversing its relationships.
@@ -294,12 +224,8 @@ impl GraphSnapshot<'_, '_> {
     /// # Errors
     /// Returns read-budget, decoding, or storage failures.
     pub fn symbol(&self, id: &SymbolId, budget: &mut ReadBudget) -> Result<Option<SymbolInput>> {
-        self.record(
-            Collection::Graph,
-            SYMBOL,
-            &codec::uuid(id.as_str())?,
-            budget,
-        )
+        self.table(Collection::Graph, SYMBOL)
+            .get(&codec::uuid(id.as_str())?, budget)
     }
 
     /// Read one static numerical evidence record.
@@ -311,12 +237,8 @@ impl GraphSnapshot<'_, '_> {
         id: &NumericalSiteId,
         budget: &mut ReadBudget,
     ) -> Result<Option<NumericalSiteInput>> {
-        self.record(
-            Collection::Graph,
-            NUMERICAL,
-            &codec::uuid(id.as_str())?,
-            budget,
-        )
+        self.table(Collection::Graph, NUMERICAL)
+            .get(&codec::uuid(id.as_str())?, budget)
     }
 
     /// Read a canonical durable search document; this does not imply BM25 readiness.
@@ -328,40 +250,92 @@ impl GraphSnapshot<'_, '_> {
         id: &DocumentId,
         budget: &mut ReadBudget,
     ) -> Result<Option<CanonicalSearchDocument>> {
-        self.record(
-            Collection::Search,
-            DOCUMENT,
-            &codec::uuid(id.as_str())?,
-            budget,
-        )
+        self.table(Collection::Search, DOCUMENT)
+            .get(&codec::uuid(id.as_str())?, budget)
     }
 
-    /// Read a bounded file-reference page with the native logical-key cursor.
+    /// Bind this lookup to one immutable graph and its query identity.
+    #[must_use]
+    pub fn references<'query>(
+        &'query self,
+        id: &'query FileId,
+    ) -> FileReferences<'query, 'view, 'store> {
+        FileReferences { graph: self, id }
+    }
+
+    /// Bind topology reads to one snapshot, vertex and direction.
+    #[must_use]
+    pub fn adjacency<'query>(
+        &'query self,
+        node: &'query SymbolId,
+        direction: GraphDirection,
+    ) -> GraphAdjacency<'query, 'store> {
+        GraphAdjacency {
+            snapshot: self.snapshot,
+            node,
+            incoming: matches!(direction, GraphDirection::Incoming),
+        }
+    }
+
+    /// Hydrate confidence, provenance, and site multiplicity for one topology link.
     ///
     /// # Errors
-    /// Returns cursor, read-budget, decoding, or storage failures.
-    pub fn references(
-        &self,
-        id: &FileId,
-        after: Option<&RecordKey>,
-        limit: u16,
-        budget: &mut ReadBudget,
-    ) -> Result<(Vec<ReferenceInput>, Option<RecordKey>)> {
-        let prefix = codec::key(REFERENCE, &codec::uuid(id.as_str())?)?;
-        let page = self.snapshot.scan_prefix(
-            Collection::Graph,
-            prefix.as_bytes(),
-            after,
-            limit,
-            budget,
-        )?;
-        let mut rows = Vec::with_capacity(page.rows.len());
-        for (_, bytes) in page.rows {
-            rows.push(codec::decode(&bytes)?);
+    /// Rejects links from another revision or mismatching/missing properties.
+    pub fn edge(&self, link: &GraphLink, budget: &mut ReadBudget) -> Result<EdgeInput> {
+        if link.project != *self.snapshot.project_identity()
+            || link.generation != self.snapshot.revision().generation_id
+        {
+            return Err(RocksError::GenerationChanged);
         }
-        Ok((rows, page.next_after))
+        let key = codec::edge_key(&link.source, &link.target, &link.entry)?;
+        let bytes = self
+            .point_readers
+            .get(Collection::Graph, &key, budget)?
+            .ok_or_else(codec::corrupt)?;
+        let properties: EdgeProperties = codec::decode(&bytes)?;
+        // The inclusive range also rejects NaN and either infinity.
+        if !(0.0..=1.0).contains(&properties.confidence)
+            || !(1..=100_000_000).contains(&properties.site_count)
+            || properties.provenance.len() > 256
+            || blake3::hash(properties.provenance.as_bytes())
+                .as_bytes()
+                .as_slice()
+                != &link.entry[codec::ID_BYTES + 1..]
+        {
+            return Err(codec::corrupt());
+        }
+        Ok(EdgeInput {
+            source_symbol_id: link.source.clone(),
+            target_symbol_id: link.target.clone(),
+            kind: link.kind,
+            confidence: properties.confidence,
+            provenance: properties.provenance,
+            site_count: properties.site_count,
+        })
     }
 
+    fn table<'query>(
+        &'query self,
+        collection: Collection,
+        prefix: &'query [u8],
+    ) -> GraphTable<'query, 'view, 'store> {
+        GraphTable {
+            snapshot: self.snapshot,
+            readers: &self.point_readers,
+            collection,
+            prefix,
+        }
+    }
+}
+
+/// Borrowed adjacency view with fixed project, generation, vertex and direction.
+pub struct GraphAdjacency<'view, 'store> {
+    snapshot: &'view RevisionSnapshot<'store>,
+    node: &'view SymbolId,
+    incoming: bool,
+}
+
+impl GraphAdjacency<'_, '_> {
     /// Traverse compact adjacency without loading confidence/provenance properties.
     ///
     /// Each block contains at most 128 binary relationships. Large vertices
@@ -370,10 +344,8 @@ impl GraphSnapshot<'_, '_> {
     ///
     /// # Errors
     /// Rejects foreign/stale cursors, malformed blocks, or exhausted read bounds.
-    pub fn neighbors(
+    pub fn page(
         &self,
-        node: &SymbolId,
-        direction: GraphDirection,
         after: Option<&GraphCursor>,
         limit: u16,
         budget: &mut ReadBudget,
@@ -383,7 +355,8 @@ impl GraphSnapshot<'_, '_> {
                 resource: "graph_neighbors",
             });
         }
-        let incoming = matches!(direction, GraphDirection::Incoming);
+        let incoming = self.incoming;
+        let node = self.node;
         if after.is_some_and(|cursor| {
             cursor.project != *self.snapshot.project_identity()
                 || cursor.generation != self.snapshot.revision().generation_id
@@ -409,55 +382,23 @@ impl GraphSnapshot<'_, '_> {
         .read(budget)
     }
 
-    /// Hydrate confidence, provenance, and site multiplicity for one topology link.
-    ///
-    /// # Errors
-    /// Rejects links from another revision or mismatching/missing properties.
-    pub fn edge(&self, link: &GraphLink, budget: &mut ReadBudget) -> Result<EdgeInput> {
-        if link.project != *self.snapshot.project_identity()
-            || link.generation != self.snapshot.revision().generation_id
-        {
-            return Err(RocksError::GenerationChanged);
-        }
-        let key = codec::edge_key(&link.source, &link.target, &link.entry)?;
-        let bytes = self
-            .point_readers
-            .get(Collection::Graph, &key, budget)?
-            .ok_or_else(codec::corrupt)?;
-        let properties: EdgeProperties = codec::decode(&bytes)?;
-        if !properties.confidence.is_finite()
-            || !(0.0..=1.0).contains(&properties.confidence)
-            || properties.site_count == 0
-            || properties.site_count > 100_000_000
-            || properties.provenance.len() > 256
-            || blake3::hash(properties.provenance.as_bytes())
-                .as_bytes()
-                .as_slice()
-                != &link.entry[codec::ID_BYTES + 1..]
-        {
-            return Err(codec::corrupt());
-        }
-        Ok(EdgeInput {
-            source_symbol_id: link.source.clone(),
-            target_symbol_id: link.target.clone(),
-            kind: link.kind,
-            confidence: properties.confidence,
-            provenance: properties.provenance,
-            site_count: properties.site_count,
-        })
-    }
-
-    fn record<T: DeserializeOwned>(
+    pub(crate) fn visit(
         &self,
-        collection: Collection,
-        prefix: &[u8],
-        suffix: &[u8],
         budget: &mut ReadBudget,
-    ) -> Result<Option<T>> {
-        self.point_readers
-            .get(collection, &codec::key(prefix, suffix)?, budget)?
-            .map(|bytes| codec::decode(&bytes))
-            .transpose()
+        mut visit: impl FnMut(GraphLink, &mut ReadBudget) -> Result<()>,
+    ) -> Result<()> {
+        let mut cursor = None;
+        loop {
+            let page = self.page(cursor.as_ref(), 256, budget)?;
+            for link in page.links {
+                budget.checkpoint()?;
+                visit(link, budget)?;
+            }
+            cursor = page.next;
+            if cursor.is_none() {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -475,23 +416,24 @@ struct Neighborhood<'view, 'store> {
 impl Neighborhood<'_, '_> {
     fn read(mut self, budget: &mut ReadBudget) -> Result<GraphNeighborPage> {
         while let Some((key, bytes)) = self.next_block(budget)? {
-            let entries = validate_block(&key, self.prefix.as_bytes(), &bytes)?;
+            let block = validate_block(&key, self.prefix.as_bytes(), &bytes)?;
             let offset = self
                 .cursor
                 .as_ref()
                 .filter(|cursor| cursor.block == key)
                 .map_or(0, |cursor| cursor.offset);
-            if offset > entries.len() / codec::ENTRY_BYTES {
+            if offset > block.entries.len() {
                 return Err(codec::corrupt());
             }
-            self.append(&key, entries, offset, budget)?;
+            self.append(&block, offset, budget)?;
             if self.links.len() == self.limit {
                 return Ok(GraphNeighborPage {
                     links: self.links,
                     next: self.cursor,
                 });
             }
-            self.cursor = Some(self.cursor_at(key, entries.len() / codec::ENTRY_BYTES));
+            let next_offset = block.entries.len();
+            self.cursor = Some(self.cursor_at(key, next_offset));
         }
         Ok(GraphNeighborPage {
             links: self.links,
@@ -511,13 +453,10 @@ impl Neighborhood<'_, '_> {
         }
         let mut after = self.cursor.as_ref().map(|cursor| cursor.block.clone());
         loop {
-            let page = self.snapshot.scan_prefix(
-                Collection::Graph,
-                self.prefix.as_bytes(),
-                after.as_ref(),
-                1,
-                budget,
-            )?;
+            let page = self
+                .snapshot
+                .scan_prefix(Collection::Graph, self.prefix.as_bytes())
+                .page(after.as_ref(), 1, budget)?;
             if let Some(row) = page.rows.into_iter().next() {
                 return Ok(Some(row));
             }
@@ -530,27 +469,25 @@ impl Neighborhood<'_, '_> {
 
     fn append(
         &mut self,
-        key: &RecordKey,
-        entries: &[u8],
+        block: &AdjacencyBlock<'_>,
         offset: usize,
         budget: &mut ReadBudget,
     ) -> Result<()> {
+        // One 64-byte project digest and three 36-byte textual graph IDs.
+        const LINK_IDENTITY_BYTES: usize = 64 + 3 * 36;
         let initial_length = self.links.len();
-        for entry in entries
-            .as_chunks::<{ codec::ENTRY_BYTES }>()
-            .0
-            .iter()
-            .skip(offset)
-        {
-            budget.charge(size_of::<GraphLink>() + 64 + 3 * 36)?;
+        for entry in block.entries.iter().skip(offset) {
+            budget.charge(size_of::<GraphLink>() + LINK_IDENTITY_BYTES)?;
             self.links.push(self.link(*entry)?);
             if self.links.len() == self.limit {
                 break;
             }
         }
         if self.links.len() > initial_length {
-            self.cursor =
-                Some(self.cursor_at(key.clone(), offset + self.links.len() - initial_length));
+            self.cursor = Some(self.cursor_at(
+                block.key.clone(),
+                offset + self.links.len() - initial_length,
+            ));
         }
         Ok(())
     }
@@ -585,32 +522,27 @@ impl Neighborhood<'_, '_> {
     }
 }
 
-fn validate_block<'a>(key: &RecordKey, prefix: &[u8], bytes: &'a [u8]) -> Result<&'a [u8]> {
-    let payload = bytes
-        .strip_prefix(codec::BLOCK_HEADER)
-        .ok_or_else(codec::corrupt)?;
-    let depth_bytes: [u8; 2] = payload
-        .get(..2)
-        .ok_or_else(codec::corrupt)?
-        .try_into()
-        .map_err(|_| codec::corrupt())?;
-    let depth = usize::from(u16::from_be_bytes(depth_bytes));
-    let entries = payload.get(2..).ok_or_else(codec::corrupt)?;
+struct AdjacencyBlock<'a> {
+    key: &'a RecordKey,
+    entries: &'a [[u8; codec::ENTRY_BYTES]],
+}
+
+fn validate_block<'a>(
+    key: &'a RecordKey,
+    prefix: &[u8],
+    bytes: &'a [u8],
+) -> Result<AdjacencyBlock<'a>> {
+    let (depth, entries) = block_payload(bytes)?;
     let suffix = key
         .as_bytes()
         .strip_prefix(prefix)
         .ok_or_else(codec::corrupt)?;
-    if entries.is_empty()
-        || entries.len() % codec::ENTRY_BYTES != 0
-        || entries.len() / codec::ENTRY_BYTES > codec::BLOCK_CAPACITY
-        || depth > codec::ENTRY_BYTES * 8
-        || (depth == 0 && !suffix.is_empty())
-        || (depth > 0 && suffix.len() != codec::ENTRY_BYTES)
-    {
+    let suffix_bytes = if depth == 0 { 0 } else { codec::ENTRY_BYTES };
+    if suffix.len() != suffix_bytes {
         return Err(codec::corrupt());
     }
     let mut previous = None;
-    for entry in entries.as_chunks::<{ codec::ENTRY_BYTES }>().0 {
+    for entry in entries {
         if (depth > 0 && codec::radix_prefix(entry, depth)?.as_slice() != suffix)
             || previous.is_some_and(|previous| previous >= entry)
         {
@@ -619,5 +551,244 @@ fn validate_block<'a>(key: &RecordKey, prefix: &[u8], bytes: &'a [u8]) -> Result
         codec::kind(entry[codec::ID_BYTES])?;
         previous = Some(entry);
     }
-    Ok(entries)
+    Ok(AdjacencyBlock { key, entries })
+}
+
+/// Decode the block framing before interpreting entries or a partition key.
+fn block_payload(bytes: &[u8]) -> Result<(usize, &[[u8; codec::ENTRY_BYTES]])> {
+    let payload = bytes
+        .strip_prefix(codec::BLOCK_HEADER)
+        .ok_or_else(codec::corrupt)?;
+    let (depth, entries) = payload
+        .split_at_checked(size_of::<u16>())
+        .ok_or_else(codec::corrupt)?;
+    let depth = usize::from(u16::from_be_bytes(
+        depth.try_into().map_err(|_| codec::corrupt())?,
+    ));
+    let (entries, remainder) = entries.as_chunks::<{ codec::ENTRY_BYTES }>();
+    if !remainder.is_empty()
+        || !(1..=codec::BLOCK_CAPACITY).contains(&entries.len())
+        || depth > codec::ENTRY_BYTES * u8::BITS as usize
+    {
+        return Err(codec::corrupt());
+    }
+    Ok((depth, entries))
+}
+
+struct GraphTable<'query, 'view, 'store> {
+    snapshot: &'view RevisionSnapshot<'store>,
+    readers: &'query PointReaders<'view, 'store>,
+    collection: Collection,
+    prefix: &'query [u8],
+}
+
+impl GraphTable<'_, '_, '_> {
+    fn page<T: DeserializeOwned>(
+        &self,
+        after: Option<&RecordKey>,
+        limit: u16,
+        budget: &mut ReadBudget,
+    ) -> Result<(Vec<T>, Option<RecordKey>)> {
+        let page = self
+            .snapshot
+            .scan_prefix(self.collection, self.prefix)
+            .page(after, limit, budget)?;
+        let rows = page
+            .rows
+            .into_iter()
+            .map(|(_, bytes)| codec::decode(&bytes))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((rows, page.next_after))
+    }
+
+    fn get<T: DeserializeOwned>(
+        &self,
+        suffix: &[u8],
+        budget: &mut ReadBudget,
+    ) -> Result<Option<T>> {
+        self.readers
+            .get(self.collection, &codec::key(self.prefix, suffix)?, budget)?
+            .map(|bytes| codec::decode(&bytes))
+            .transpose()
+    }
+}
+
+/// A graph lookup whose query identity remains fixed across pages.
+pub struct NamedSymbols<'query, 'view, 'store> {
+    graph: &'query GraphSnapshot<'view, 'store>,
+    name: &'query str,
+}
+
+impl NamedSymbols<'_, '_, '_> {
+    /// Page exact simple or qualified names, matching Unicode lowercase keys.
+    /// Callers retain their original case-sensitive or qualified predicates and
+    /// result ordering. Inspect `info().name_index_version` before using this
+    /// optional index; zero requires the existing symbol scan.
+    /// # Errors
+    /// Rejects unavailable indexes, invalid names, cursors, corrupt postings,
+    /// changed/missing symbols, and exhausted read budgets.
+    pub fn page(
+        &self,
+        after: Option<&RecordKey>,
+        limit: u16,
+        budget: &mut ReadBudget,
+    ) -> Result<(Vec<SymbolInput>, Option<RecordKey>)> {
+        let name = self.name;
+
+        if self.graph.info.name_index_version != 1 || name.is_empty() || name.len() > 4096 {
+            return Err(RocksError::InvalidInput {
+                field: "name_index",
+            });
+        }
+        let mut prefix = names::PREFIX.to_vec();
+        prefix.extend_from_slice(&names::hash(name));
+        let page = self
+            .graph
+            .snapshot
+            .scan_prefix(Collection::Graph, &prefix)
+            .page(after, limit, budget)?;
+        let expected = name.to_lowercase();
+        let mut rows = Vec::new();
+        for (key, marker) in page.rows {
+            if marker != [1] {
+                return Err(codec::corrupt());
+            }
+            let raw = key
+                .as_bytes()
+                .strip_prefix(prefix.as_slice())
+                .ok_or_else(codec::corrupt)?;
+            let id = codec::symbol(raw)?;
+            let symbol = self.graph.symbol(&id, budget)?.ok_or_else(codec::corrupt)?;
+            // Hash collisions cannot admit an unrelated declaration.
+            if symbol.qualified_name.to_lowercase() == expected
+                || names::simple(&symbol.qualified_name).to_lowercase() == expected
+            {
+                rows.push(symbol);
+            }
+        }
+        Ok((rows, page.next_after))
+    }
+}
+
+/// A graph lookup whose query identity remains fixed across pages.
+pub(crate) struct ReferenceSites<'query, 'view, 'store> {
+    graph: &'query GraphSnapshot<'view, 'store>,
+    file: Option<&'query FileId>,
+}
+
+impl ReferenceSites<'_, '_, '_> {
+    /// Page references with exact continuation keys, optionally restricted to one file.
+    /// # Errors
+    /// Rejects malformed file identities, cursors, decoding and read-budget failures.
+    pub(crate) fn page(
+        &self,
+        after: Option<&RecordKey>,
+        limit: u16,
+        budget: &mut ReadBudget,
+    ) -> Result<ReferenceSitePage> {
+        let file = self.file;
+
+        let mut prefix = REFERENCE.to_vec();
+        if let Some(file) = file {
+            prefix.extend_from_slice(&codec::uuid(file.as_str())?);
+        }
+        let page = self
+            .graph
+            .snapshot
+            .scan_prefix(Collection::Graph, &prefix)
+            .page(after, limit, budget)?;
+        let rows = page
+            .rows
+            .into_iter()
+            .map(|(key, bytes)| Ok((key, codec::decode(&bytes)?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ReferenceSitePage {
+            rows,
+            next: page.next_after,
+        })
+    }
+}
+
+/// A graph lookup whose query identity remains fixed across pages.
+pub struct FileReferences<'query, 'view, 'store> {
+    graph: &'query GraphSnapshot<'view, 'store>,
+    id: &'query FileId,
+}
+
+impl FileReferences<'_, '_, '_> {
+    /// Read a bounded file-reference page with the native logical-key cursor.
+    ///
+    /// # Errors
+    /// Returns cursor, read-budget, decoding, or storage failures.
+    pub fn page(
+        &self,
+        after: Option<&RecordKey>,
+        limit: u16,
+        budget: &mut ReadBudget,
+    ) -> Result<(Vec<ReferenceInput>, Option<RecordKey>)> {
+        let id = self.id;
+
+        let prefix = codec::key(REFERENCE, &codec::uuid(id.as_str())?)?;
+        let page = self
+            .graph
+            .snapshot
+            .scan_prefix(Collection::Graph, prefix.as_bytes())
+            .page(after, limit, budget)?;
+        let mut rows = Vec::with_capacity(page.rows.len());
+        for (_, bytes) in page.rows {
+            rows.push(codec::decode(&bytes)?);
+        }
+        Ok((rows, page.next_after))
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    fn block(depth: u16, entries: &[[u8; 49]]) -> Vec<u8> {
+        let mut bytes = b"CGA1".to_vec();
+        bytes.extend_from_slice(&depth.to_be_bytes());
+        bytes.extend_from_slice(entries.as_flattened());
+        bytes
+    }
+
+    #[test]
+    fn adjacency_geometry_preserves_capacity_and_radix_boundaries() -> Result<()> {
+        let prefix = b"cg1/o/fixture";
+        let root = RecordKey::new(prefix.to_vec())?;
+        let entries: Vec<[u8; 49]> = (1..=129)
+            .map(|index| {
+                let mut entry = [0; 49];
+                entry[0] = index;
+                entry
+            })
+            .collect();
+        assert!(validate_block(&root, prefix, &block(0, &[])).is_err());
+        assert_eq!(
+            validate_block(&root, prefix, &block(0, &entries[..128]))?
+                .entries
+                .as_flattened()
+                .len(),
+            128 * 49
+        );
+        assert!(validate_block(&root, prefix, &block(0, &entries)).is_err());
+        assert!(validate_block(&root, b"foreign", &block(0, &entries[..1])).is_err());
+        let leaf = RecordKey::new([prefix.as_slice(), &entries[0]].concat())?;
+        assert!(validate_block(&leaf, prefix, &block(0, &entries[..1])).is_err());
+        assert!(validate_block(&root, prefix, &block(392, &entries[..1])).is_err());
+        assert!(validate_block(&leaf, prefix, &block(392, &entries[..1])).is_ok());
+        assert!(validate_block(&leaf, prefix, &block(393, &entries[..1])).is_err());
+        assert!(validate_block(&leaf, prefix, &block(392, &entries[1..2])).is_err());
+        assert!(validate_block(&root, prefix, &block(0, &[entries[0], entries[0]])).is_err());
+        assert!(validate_block(&root, prefix, &block(0, &[entries[1], entries[0]])).is_err());
+        let mut invalid_kind = entries[0];
+        invalid_kind[16] = 255;
+        assert!(validate_block(&root, prefix, &block(0, &[invalid_kind])).is_err());
+        let bytes = block(0, &entries[..1]);
+        for end in 0..bytes.len() {
+            assert!(validate_block(&root, prefix, &bytes[..end]).is_err());
+        }
+        Ok(())
+    }
 }

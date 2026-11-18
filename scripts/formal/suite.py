@@ -41,6 +41,15 @@ def inventory(root, manifest):
     return total
 
 
+def verus_counts(manifest):
+    contracts = sum(bool(fn.get('ensures')) for module in manifest['modules'] for fn in module['functions'])
+    if not contracts:
+        raise SystemExit('Empty Verus suite')
+    # Verus reports each executable constant initializer as a separate proof.
+    initializers = sum(len(module.get('constants', [])) for module in manifest['modules'])
+    return contracts, initializers
+
+
 def run_recorded(command):
     # Stream diagnostics so the outer deadline/OOM cannot discard the log.
     # Keep only its bounded tail for checking completion summaries.
@@ -93,9 +102,12 @@ def main():
     root = Path('/work')
     manifest = json.loads((root / 'verification/contracts.json').read_text())
     total = inventory(root, manifest)
-    action = sys.argv[1] if len(sys.argv) > 1 else 'verify'
+    (root / 'verification/kani/production_types.inc').write_text(
+        binding.generate_kani_types(root, manifest))
+    arguments = sys.argv[1:]
+    action = arguments[0] if arguments else 'verify'
     if action == 'kani':
-        source, harness, solver = sys.argv[2:5]
+        source, harness, solver, *options = arguments[1:]
         if solver not in ('cadical', 'kissat'):
             raise SystemExit('Kani requires a reviewed SAT solver; CBMC 6.11 SMT rounding is incorrect')
         if not any(item['source'] == source and harness in item['required'] + list(item['experimental'])
@@ -103,18 +115,17 @@ def main():
             raise SystemExit('Harness is absent from the reviewed inventory')
         command = ['kani', source, '--harness', harness, '--exact', '--jobs', '1',
                    '--output-format', 'regular', '--solver', solver]
-        if sys.argv[5:] == ['--counterexample']:
+        if options == ['--counterexample']:
             command += ['-Z', 'concrete-playback', '--concrete-playback', 'print']
-        elif sys.argv[5:]:
+        elif options:
             raise SystemExit('Unknown diagnostic option')
         checked(command,
                 r'Complete - 1 successfully verified harnesses, 0 failures, 1 total\.')
         return
     generated = root / 'contracts.rs'
     generated.write_text(binding.generate(root, manifest))
-    count = sum(bool(fn.get('ensures')) for module in manifest['modules'] for fn in module['functions'])
-    if not count:
-        raise SystemExit('Empty Verus suite')
+    contracts, initializers = verus_counts(manifest)
+    count = contracts + initializers
     checked(['verus', '--no-cheating', str(generated)], rf'verification results:: {count} verified, 0 errors\b')
     if action == 'verus':
         return
@@ -130,7 +141,7 @@ def main():
         for name, reason in suite['experimental'].items():
             print(f'UNPROVEN experiment {name}: {reason}', flush=True)
     negative_controls(root, manifest, count)
-    print(f'Required suite passed: {total} Kani harnesses, {count} Verus contracts.', flush=True)
+    print(f'Required suite passed: {total} Kani harnesses, {contracts} Verus contracts, {initializers} constant initializers.', flush=True)
 
 
 if __name__ == '__main__':

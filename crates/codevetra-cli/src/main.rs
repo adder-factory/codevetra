@@ -2923,11 +2923,15 @@ async fn run_owner_index(
     interrupts.request_started();
     let context = codevetra_mcp::ToolCallContext::local(Duration::from_secs(300));
     let call=codevetra_mcp::ToolCall {name:"codevetra_admin".to_owned(),arguments:serde_json::json!({"action":"index","workers":workers.unwrap_or(16),"force":force,"exclude":exclude,"preserveCurrentExcludes":preserve_current_excludes,"singlePublication":supervised,"refreshHistory":!supervised,"enrich":false,"baseOnly":true}).as_object().cloned().ok_or_else(||"native index request is malformed".to_owned())?};
-    let operation = rocks_cli::remote_job::run(&project_path, call, context.clone(), |progress| {
-        if supervised {
-            eprintln!("{}", serde_json::json!({"progress":progress}));
-        }
-    });
+    let operation = rocks_cli::remote_job::RemoteJobs::new(&project_path).run(
+        call,
+        context.clone(),
+        |progress| {
+            if supervised {
+                eprintln!("{}", serde_json::json!({"progress":progress}));
+            }
+        },
+    );
     tokio::pin!(operation);
     let result = tokio::select! {
         biased;
@@ -3046,8 +3050,7 @@ async fn run_owner_sync_if_dirty(
     let interrupts = InterruptForwarding::install(cancellation.clone(), !quiet);
     interrupts.request_started();
     let context = codevetra_mcp::ToolCallContext::local(Duration::from_secs(300));
-    let operation = rocks_cli::remote_job::run(
-        project_path,
+    let operation = rocks_cli::remote_job::RemoteJobs::new(project_path).run(
         codevetra_mcp::ToolCall {
             name: "codevetra_admin".to_owned(),
             arguments,
@@ -3850,59 +3853,11 @@ async fn build_doctor_report_with_settings(
             apply_llm_doctor_fix(&project_path, &mut fixes_applied, &mut checks).await;
         }
     }
-    let arguments = Map::from_iter([
-        ("action".to_owned(), Value::from("doctor")),
-        (
-            "skipProjectChecks".to_owned(),
-            Value::Bool(input.skip_project_checks),
-        ),
-    ]);
-    let observation =
-        generated_cli::run_direct_result("codevetra_admin", project_path.clone(), arguments).await;
-    let mut project_index = if input.skip_project_checks {
-        ProjectIndexObservation::not_checked()
-    } else {
-        ProjectIndexObservation::unavailable()
-    };
-    let mut semantic = if input.skip_project_checks {
-        SemanticRetrievalReadinessState::NotChecked
-    } else {
-        SemanticRetrievalReadinessState::Unavailable
-    };
-    if input.skip_project_checks {
-        semantic = semantic_readiness_without_probe(
-            EmbeddingConfigurationState::NotChecked,
-            project_index,
-        )
-        .unwrap_or(SemanticRetrievalReadinessState::Unavailable);
-    }
-    let database = match observation {
-        Ok(result) if !result.is_error() => {
-            let value: Value = serde_json::from_str(
-                result
-                    .primary_text()
-                    .ok_or_else(|| "native doctor returned no report".to_owned())?,
-            )
-            .map_err(|_| "native doctor report is malformed".to_owned())?;
-            checks.push(doctor_pass(
-                "database-native",
-                "RocksDB format, project identity and owned worker access passed.",
-            ));
-            if !input.skip_project_checks {
-                (project_index, semantic) = observe_native_doctor_project(&value, &mut checks)?;
-            }
-            Some(value["capabilities"].clone())
-        }
-        _ => {
-            checks.push(doctor_fail(
-                "database-native",
-                "Native project storage could not be opened or read.",
-                "Inspect the owning CodeVetra process and project state, then retry doctor."
-                    .to_owned(),
-            ));
-            None
-        }
-    };
+    let NativeDoctorObservation {
+        database,
+        project_index,
+        semantic,
+    } = probe_native_doctor(&project_path, input.skip_project_checks, &mut checks).await?;
     if !input.skip_project_checks {
         check_llm_configuration(&project_path, &mut checks).await;
     }
@@ -3930,6 +3885,78 @@ async fn build_doctor_report_with_settings(
         fixes_applied,
         checks,
         database,
+    })
+}
+
+struct NativeDoctorObservation {
+    database: Option<Value>,
+    project_index: ProjectIndexObservation,
+    semantic: SemanticRetrievalReadinessState,
+}
+
+async fn probe_native_doctor(
+    project_path: &Path,
+    skip_project_checks: bool,
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<NativeDoctorObservation, String> {
+    let arguments = Map::from_iter([
+        ("action".to_owned(), Value::from("doctor")),
+        (
+            "skipProjectChecks".to_owned(),
+            Value::Bool(skip_project_checks),
+        ),
+    ]);
+    let observation =
+        generated_cli::run_direct_result("codevetra_admin", project_path.to_path_buf(), arguments)
+            .await;
+    let mut project_index = if skip_project_checks {
+        ProjectIndexObservation::not_checked()
+    } else {
+        ProjectIndexObservation::unavailable()
+    };
+    let mut semantic = if skip_project_checks {
+        SemanticRetrievalReadinessState::NotChecked
+    } else {
+        SemanticRetrievalReadinessState::Unavailable
+    };
+    if skip_project_checks {
+        semantic = semantic_readiness_without_probe(
+            EmbeddingConfigurationState::NotChecked,
+            project_index,
+        )
+        .unwrap_or(SemanticRetrievalReadinessState::Unavailable);
+    }
+    let database = match observation {
+        Ok(result) if !result.is_error() => {
+            let value: Value = serde_json::from_str(
+                result
+                    .primary_text()
+                    .ok_or_else(|| "native doctor returned no report".to_owned())?,
+            )
+            .map_err(|_| "native doctor report is malformed".to_owned())?;
+            checks.push(doctor_pass(
+                "database-native",
+                "RocksDB format, project identity and owned worker access passed.",
+            ));
+            if !skip_project_checks {
+                (project_index, semantic) = observe_native_doctor_project(&value, checks)?;
+            }
+            Some(value["capabilities"].clone())
+        }
+        _ => {
+            checks.push(doctor_fail(
+                "database-native",
+                "Native project storage could not be opened or read.",
+                "Inspect the owning CodeVetra process and project state, then retry doctor."
+                    .to_owned(),
+            ));
+            None
+        }
+    };
+    Ok(NativeDoctorObservation {
+        database,
+        project_index,
+        semantic,
     })
 }
 

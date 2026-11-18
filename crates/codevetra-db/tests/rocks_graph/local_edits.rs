@@ -5,17 +5,16 @@ fn sparse(
     facts: CanonicalGenerationFacts,
     replacements: GenerationFacts,
 ) -> TestResult<GraphPublicationInput> {
-    Ok(GraphPublicationInput::replace_files(
+    Ok(codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(2),
             source_revision: digest(8),
             base: GraphBase::Current(generation(1)),
         },
-        facts,
-        replacements,
         GraphPolicy::default(),
         &request()?,
-    )?)
+    )
+    .replace_files(facts, replacements)?)
 }
 
 fn reference() -> ReferenceInput {
@@ -76,26 +75,16 @@ fn sparse_publication_matches_cold_digest_and_keeps_pinned_topology_and_rows() -
     for graph in [&old, &current] {
         assert_eq!(
             graph
-                .neighbors(
-                    &symbol(1),
-                    GraphDirection::Outgoing,
-                    None,
-                    10,
-                    &mut budget()?
-                )?
+                .adjacency(&symbol(1), GraphDirection::Outgoing)
+                .page(None, 10, &mut budget()?)?
                 .links
                 .len(),
             1
         );
         assert_eq!(
             graph
-                .neighbors(
-                    &symbol(2),
-                    GraphDirection::Incoming,
-                    None,
-                    10,
-                    &mut budget()?
-                )?
+                .adjacency(&symbol(2), GraphDirection::Incoming)
+                .page(None, 10, &mut budget()?)?
                 .links
                 .len(),
             1
@@ -163,24 +152,22 @@ fn sparse_replacements_observe_cancellation_and_input_bounds() -> TestResult {
         source_revision: digest(8),
         base: GraphBase::Current(generation(1)),
     };
-    let cancelled = GraphPublicationInput::replace_files(
+    let cancelled = codevetra_db::rocks::GraphPreparation::new(
         identity.clone(),
-        facts(3, Vec::new())?,
-        raw_facts(3, Vec::new()),
         GraphPolicy::default(),
         &request,
-    );
+    )
+    .replace_files(facts(3, Vec::new())?, raw_facts(3, Vec::new()));
     assert!(matches!(cancelled, Err(RocksError::Cancelled)));
-    let constrained = GraphPublicationInput::replace_files(
+    let constrained = codevetra_db::rocks::GraphPreparation::new(
         identity,
-        facts(3, Vec::new())?,
-        raw_facts(3, Vec::new()),
         GraphPolicy {
             maximum_input_bytes: 32,
             ..GraphPolicy::default()
         },
         &super::request()?,
-    );
+    )
+    .replace_files(facts(3, Vec::new())?, raw_facts(3, Vec::new()));
     assert!(matches!(constrained, Err(RocksError::Limit { .. })));
     Ok(())
 }
@@ -189,20 +176,19 @@ fn sparse_replacements_observe_cancellation_and_input_bounds() -> TestResult {
 fn replacement_size_is_remeasured_after_the_old_immutable_proof_is_invalidated() -> TestResult {
     let mut replacement = raw_facts(3, Vec::new());
     replacement.symbols[0].signature = "x".repeat(50_000);
-    let input = GraphPublicationInput::replace_files(
+    let input = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(2),
             source_revision: digest(8),
             base: GraphBase::Current(generation(1)),
         },
-        facts(3, Vec::new())?,
-        replacement,
         GraphPolicy {
             maximum_input_bytes: 32 * 1024,
             ..GraphPolicy::default()
         },
         &request()?,
-    );
+    )
+    .replace_files(facts(3, Vec::new())?, replacement);
     assert!(matches!(input, Err(RocksError::Limit { .. })));
     Ok(())
 }
@@ -215,20 +201,19 @@ fn sparse_old_and_new_encoded_rows_share_one_workspace_allowance() -> TestResult
     }
     let mut replacement = old.clone();
     replacement.files[0].content_hash = digest(9);
-    let result = GraphPublicationInput::replace_files(
+    let result = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(2),
             source_revision: digest(8),
             base: GraphBase::Current(generation(1)),
         },
-        canonical(old)?,
-        replacement,
         GraphPolicy {
             maximum_working_bytes: 1_048_576,
             ..GraphPolicy::default()
         },
         &request()?,
-    );
+    )
+    .replace_files(canonical(old)?, replacement);
     assert!(matches!(result, Err(RocksError::Limit { .. })));
     Ok(())
 }

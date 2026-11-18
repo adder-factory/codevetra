@@ -12,49 +12,56 @@ fn names_are_indexed_in_the_same_snapshot_and_survive_sparse_publication() -> Te
     let graph = pinned.graph(&mut budget()?)?;
     assert_eq!(graph.info().name_index_version, 1);
     let mut tight = ReadBudget::new(64, 32 * 1024, Duration::from_secs(5))?;
-    let (first, cursor) = graph.symbols_by_name("ÄLPHA", None, 1, &mut tight)?;
-    let (second, _) = graph.symbols_by_name("älpha", cursor.as_ref(), 4, &mut tight)?;
+    let (first, cursor) = graph.symbols_by_name("ÄLPHA").page(None, 1, &mut tight)?;
+    let (second, _) = graph
+        .symbols_by_name("älpha")
+        .page(cursor.as_ref(), 4, &mut tight)?;
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
     assert_ne!(first[0].symbol_id, second[0].symbol_id);
     assert_eq!(
         graph
-            .symbols_by_name("MODULE::ÄLPHA", None, 4, &mut tight)?
+            .symbols_by_name("MODULE::ÄLPHA")
+            .page(None, 4, &mut tight)?
             .0
             .len(),
         1
     );
     assert_eq!(
-        graph.symbols_by_name("not_found", None, 4, &mut tight)?.0,
+        graph
+            .symbols_by_name("not_found")
+            .page(None, 4, &mut tight)?
+            .0,
         []
     );
     let mut local = raw.clone();
     local.files[0].content_hash = digest(4);
     local.symbols[0].signature = "updated signature".into();
-    let patch = GraphPublicationInput::replace_files(
+    let patch = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(2),
             source_revision: digest(8),
             base: GraphBase::Current(generation(1)),
         },
-        canonical(raw.clone())?,
-        local,
         GraphPolicy::default(),
         &request()?,
-    )?;
+    )
+    .replace_files(canonical(raw.clone())?, local)?;
     store.publish_graph(patch, &request()?)?;
     let updated = store.current_snapshot(None)?;
     let updated = updated.graph(&mut budget()?)?;
     assert_eq!(
         updated
-            .symbols_by_name("module::älpha", None, 4, &mut budget()?)?
+            .symbols_by_name("module::älpha")
+            .page(None, 4, &mut budget()?)?
             .0[0]
             .signature,
         "updated signature"
     );
     assert_eq!(
         graph
-            .symbols_by_name("module::älpha", None, 4, &mut budget()?)?
+            .symbols_by_name("module::älpha")
+            .page(None, 4, &mut budget()?)?
             .0[0]
             .signature,
         "fn function()"
@@ -65,20 +72,23 @@ fn names_are_indexed_in_the_same_snapshot_and_survive_sparse_publication() -> Te
     let newest = newest.graph(&mut budget()?)?;
     assert_eq!(
         newest
-            .symbols_by_name("module::älpha", None, 4, &mut budget()?)?
+            .symbols_by_name("module::älpha")
+            .page(None, 4, &mut budget()?)?
             .0,
         []
     );
     assert_eq!(
         newest
-            .symbols_by_name("Renamed", None, 4, &mut budget()?)?
+            .symbols_by_name("Renamed")
+            .page(None, 4, &mut budget()?)?
             .0
             .len(),
         1
     );
     assert_eq!(
         graph
-            .symbols_by_name("älpha", None, 4, &mut budget()?)?
+            .symbols_by_name("älpha")
+            .page(None, 4, &mut budget()?)?
             .0
             .len(),
         2
@@ -90,26 +100,27 @@ fn names_are_indexed_in_the_same_snapshot_and_survive_sparse_publication() -> Te
 fn optional_name_postings_never_expand_the_admitted_workspace() -> TestResult {
     let root = tempfile::tempdir()?;
     let store = ProjectStore::open(root.path(), &digest(1), StorePolicy::default())?;
-    let input = GraphPublicationInput::new(
+    let input = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(1),
             source_revision: digest(8),
             base: GraphBase::Empty,
         },
-        facts(12_000, Vec::new())?,
         GraphPolicy {
             maximum_working_bytes: 1_048_576,
             ..GraphPolicy::default()
         },
         &request()?,
-    )?;
+    )
+    .resident(facts(12_000, Vec::new())?)?;
     store.publish_graph(input, &request()?)?;
     let current = store.current_snapshot(None)?;
     let graph = current.graph(&mut budget()?)?;
     assert_eq!(graph.info().name_index_version, 0);
     assert!(
         graph
-            .symbols_by_name("function_1", None, 4, &mut budget()?)
+            .symbols_by_name("function_1")
+            .page(None, 4, &mut budget()?)
             .is_err()
     );
     assert_eq!(graph.symbols(None, 10, &mut budget()?)?.0.len(), 10);

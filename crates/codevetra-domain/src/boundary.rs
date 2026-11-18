@@ -1,6 +1,13 @@
 //! Typed metadata for framework boundary landmarks in the immutable symbol graph.
 use serde::Serialize;
 
+const BOUNDARY_FIELD_COUNT: usize = 6;
+const SCOPE_HEX_LENGTH: usize = 32;
+const MAXIMUM_OPERATION_BYTES: usize = 32;
+const MAXIMUM_ADAPTER_BYTES: usize = 64;
+const MAXIMUM_DESTINATION_BYTES: usize = 512;
+const MAXIMUM_RESOLUTION_BYTES: usize = 64;
+
 /// A syntax or convention-backed boundary site; connecting edges carry confidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,7 +39,7 @@ impl BoundarySite {
                 !ordinal.is_empty() && ordinal.bytes().all(|byte| byte.is_ascii_digit())
             })
             .map_or(encoded, |(base, _)| base);
-        let mut parts = encoded.splitn(6, "::");
+        let mut parts = encoded.splitn(BOUNDARY_FIELD_COUNT, "::");
         let channel = parts.next()?;
         let role = parts.next()?;
         let scope = parts.next()?;
@@ -43,11 +50,13 @@ impl BoundarySite {
             channel,
             "http" | "queue" | "event" | "observer" | "navigation"
         ) || !matches!(role, "source" | "registration" | "unknown" | "external")
-            || scope.len() != 32
-            || !scope.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || operation.len() > 32
-            || adapter.len() > 64
-            || destination.len() > 512
+        {
+            return None;
+        }
+        if !valid_scope(scope)
+            || operation.len() > MAXIMUM_OPERATION_BYTES
+            || adapter.len() > MAXIMUM_ADAPTER_BYTES
+            || destination.len() > MAXIMUM_DESTINATION_BYTES
         {
             return None;
         }
@@ -66,7 +75,7 @@ impl BoundarySite {
     #[must_use]
     pub fn with_resolution_signature(mut self, signature: &str) -> Self {
         if let Some(state) = signature.strip_prefix("boundary-state:").filter(|state| {
-            state.len() <= 64
+            state.len() <= MAXIMUM_RESOLUTION_BYTES
                 && state
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
@@ -87,6 +96,10 @@ impl BoundarySite {
             _ => None,
         }
     }
+}
+
+fn valid_scope(scope: &str) -> bool {
+    scope.len() == SCOPE_HEX_LENGTH && scope.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Explicit coverage, independent of whether a query happens to return boundary edges.

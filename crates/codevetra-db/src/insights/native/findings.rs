@@ -22,7 +22,6 @@ use crate::{
         dataset::{self, CommitGuard, Manifest},
         encode,
     },
-    retrieval::native::retain,
     rocks::{
         ReadBudget, RevisionState, RocksError, StateNamespace, StateTransaction, StoredRevision,
     },
@@ -77,12 +76,16 @@ impl NativeDatabase {
         timeout: Duration,
     ) -> Result<StructuralFindingRefresh, StorageError> {
         let current = self
-            .state_with_timeout(None, 0, 0, timeout, |transaction, budget| {
-                let Some(fingerprint) = fingerprint(transaction, budget)? else {
-                    return Ok(None);
-                };
-                Ok(Some(cached(transaction, budget, &fingerprint)?.is_some()))
-            })
+            .state_with_timeout(
+                crate::rocks::StateAccess::read_only(None),
+                timeout,
+                |transaction, budget| {
+                    let Some(fingerprint) = fingerprint(transaction, budget)? else {
+                        return Ok(None);
+                    };
+                    Ok(Some(cached(transaction, budget, &fingerprint)?.is_some()))
+                },
+            )
             .await?;
         match current {
             None => return Ok(StructuralFindingRefresh::NoCurrentGeneration),
@@ -96,13 +99,15 @@ impl NativeDatabase {
             fingerprint: prepared.fingerprint.digest,
             stats: prepared.stats,
         };
-        self.replace_dataset_guarded(
-            NAMESPACE,
-            NAME,
-            Some(prepared.fingerprint.generation),
-            &run,
+        self.replace_dataset(
+            crate::native_database::dataset::DatasetReplacement {
+                namespace: NAMESPACE,
+                name: NAME.to_owned(),
+                expected: Some(prepared.fingerprint.generation),
+                metadata: &run,
+                guard: prepared.fingerprint.guard,
+            },
             prepared.rows.into_iter(),
-            prepared.fingerprint.guard,
         )
         .await?;
         Ok(StructuralFindingRefresh::Recomputed)
@@ -116,12 +121,15 @@ impl NativeDatabase {
         project: &ProjectId,
     ) -> Result<Option<StructuralFindingStats>, StorageError> {
         self.require_project(project)?;
-        self.state(None, 0, 0, |transaction, budget| {
-            let Some(fingerprint) = fingerprint(transaction, budget)? else {
-                return Ok(None);
-            };
-            cached(transaction, budget, &fingerprint).map(|run| run.map(|(_, run)| run.stats))
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            |transaction, budget| {
+                let Some(fingerprint) = fingerprint(transaction, budget)? else {
+                    return Ok(None);
+                };
+                cached(transaction, budget, &fingerprint).map(|run| run.map(|(_, run)| run.stats))
+            },
+        )
         .await
     }
 
@@ -184,19 +192,23 @@ impl NativeDatabase {
         self.require_project(project)?;
         validate_limit(request.limit)?;
         let request = request.clone();
-        self.state(None, 0, 0, move |transaction, budget| {
-            let mut output = Vec::new();
-            visit_current(transaction, budget, |row, _| {
-                if matches(&row, &request)? {
-                    retain(&mut output, row, usize::from(request.limit), order);
-                }
-                if output.iter().map(row_bytes).sum::<usize>() > 32 * 1_048_576 {
-                    return Err(workspace());
-                }
-                Ok(())
-            })?;
-            Ok(output)
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let mut output =
+                    crate::retrieval::native::RankedRows::new(usize::from(request.limit), order);
+                visit_current(transaction, budget, |row, _| {
+                    if matches(&row, &request)? {
+                        output.insert(row);
+                    }
+                    if output.iter().map(row_bytes).sum::<usize>() > 32 * 1_048_576 {
+                        return Err(workspace());
+                    }
+                    Ok(())
+                })?;
+                Ok(output.into_vec())
+            },
+        )
         .await
     }
 
@@ -211,14 +223,17 @@ impl NativeDatabase {
         self.require_project(project)?;
         validate_limit(request.limit)?;
         let request = request.clone();
-        self.state(None, 0, 0, move |transaction, budget| {
-            let mut count = 0_u64;
-            visit_current(transaction, budget, |row, _| {
-                count += u64::from(matches(&row, &request)?);
-                Ok(())
-            })?;
-            Ok(count)
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let mut count = 0_u64;
+                visit_current(transaction, budget, |row, _| {
+                    count += u64::from(matches(&row, &request)?);
+                    Ok(())
+                })?;
+                Ok(count)
+            },
+        )
         .await
     }
 
@@ -232,48 +247,60 @@ impl NativeDatabase {
     ) -> Result<StructuralFindingGroup, StorageError> {
         self.require_project(project)?;
         let request = request.clone();
-        self.state(None, 0, 0, move |transaction, budget| {
-            let mut counts = request
-                .findings
-                .iter()
-                .map(|name| (name.clone(), 0_u64))
-                .collect::<BTreeMap<_, _>>();
-            let mut groups = BTreeMap::<String, Vec<StructuralFinding>>::new();
-            let mut bytes = 0_usize;
-            let computation = visit_current(transaction, budget, |row, _| {
-                if let Some(count) = counts.get_mut(&row.finding)
-                    && rank(&row.severity)? >= request.minimum_severity.rank()
-                    && (!request.exclude_fixtures || !framework::fixture(&row.path)?)
-                    && request.path_prefix.as_ref().is_none_or(|prefix| {
-                        row.path == *prefix
-                            || row
-                                .path
-                                .strip_prefix(prefix)
-                                .is_some_and(|suffix| suffix.starts_with('/'))
-                    })
-                {
-                    *count += 1;
-                    let rows = groups.entry(row.finding.clone()).or_default();
-                    let before = rows.iter().map(row_bytes).sum::<usize>();
-                    retain(rows, row, usize::from(request.per_finding_limit), order);
-                    bytes = bytes
-                        .checked_sub(before)
-                        .and_then(|bytes| {
-                            bytes.checked_add(rows.iter().map(row_bytes).sum::<usize>())
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let mut counts = request
+                    .findings
+                    .iter()
+                    .map(|name| (name.clone(), 0_u64))
+                    .collect::<BTreeMap<_, _>>();
+                let mut groups = BTreeMap::new();
+                let mut bytes = request
+                    .findings
+                    .len()
+                    .checked_mul(2 * std::mem::size_of::<usize>())
+                    .ok_or_else(workspace)?;
+                let computation = visit_current(transaction, budget, |row, _| {
+                    if let Some(count) = counts.get_mut(&row.finding)
+                        && rank(&row.severity)? >= request.minimum_severity.rank()
+                        && (!request.exclude_fixtures || !framework::fixture(&row.path)?)
+                        && request.path_prefix.as_ref().is_none_or(|prefix| {
+                            row.path == *prefix
+                                || row
+                                    .path
+                                    .strip_prefix(prefix)
+                                    .is_some_and(|suffix| suffix.starts_with('/'))
                         })
-                        .ok_or_else(workspace)?;
-                    if bytes > 32 * 1_048_576 {
-                        return Err(workspace());
+                    {
+                        *count += 1;
+                        let rows = groups.entry(row.finding.clone()).or_insert_with(|| {
+                            crate::retrieval::native::RankedRows::new(
+                                usize::from(request.per_finding_limit),
+                                order,
+                            )
+                        });
+                        let before = rows.iter().map(row_bytes).sum::<usize>();
+                        rows.insert(row);
+                        bytes = bytes
+                            .checked_sub(before)
+                            .and_then(|bytes| {
+                                bytes.checked_add(rows.iter().map(row_bytes).sum::<usize>())
+                            })
+                            .ok_or_else(workspace)?;
+                        if bytes > 32 * 1_048_576 {
+                            return Err(workspace());
+                        }
                     }
-                }
-                Ok(())
-            })?;
-            Ok(StructuralFindingGroup {
-                findings: groups.into_values().flatten().collect(),
-                counts,
-                computation,
-            })
-        })
+                    Ok(())
+                })?;
+                Ok(StructuralFindingGroup {
+                    findings: groups.into_values().flatten().collect(),
+                    counts,
+                    computation,
+                })
+            },
+        )
         .await
     }
 }
@@ -344,7 +371,10 @@ fn cached(
     budget: &mut ReadBudget,
     fingerprint: &Fingerprint,
 ) -> Result<Option<(Manifest, Run)>, RocksError> {
-    let Some(manifest) = dataset::manifest(transaction, NAMESPACE, NAME, budget)? else {
+    let Some(manifest) = dataset::Reader::new(transaction, NAMESPACE)
+        .at(NAME)
+        .manifest(budget)?
+    else {
         return Ok(None);
     };
     if manifest.generation.as_ref() != Some(&fingerprint.generation) {
@@ -385,13 +415,9 @@ fn visit_current(
     let Some((manifest, run)) = cached(transaction, budget, &fingerprint)? else {
         return Ok(None);
     };
-    dataset::visit(
-        transaction,
-        NAMESPACE,
-        NAME,
-        &manifest,
-        budget,
-        |row: StructuralFinding, budget| {
+    dataset::Reader::new(transaction, NAMESPACE)
+        .at(NAME)
+        .visit(&manifest, budget, |row: StructuralFinding, budget| {
             if !row.metric.is_finite()
                 || !row.degree_centrality.is_finite()
                 || !(0.0..=1.0).contains(&row.degree_centrality)
@@ -402,8 +428,7 @@ fn visit_current(
             }
             rank(&row.severity)?;
             visit(row, budget)
-        },
-    )?;
+        })?;
     Ok(Some(StructuralFindingComputation {
         generation_id: fingerprint.generation,
         input_fingerprint: fingerprint.digest,

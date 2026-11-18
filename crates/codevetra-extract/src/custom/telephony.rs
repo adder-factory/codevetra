@@ -1,8 +1,8 @@
 //! Bounded, literal-safe telephony configuration scanners. Includes are graph
 //! evidence only; scanners never read another file or evaluate directives.
-use codevetra_domain::{FileParseStatus, SourceLanguage, SymbolId, SymbolKind};
+use codevetra_domain::{FileParseStatus, SourceLanguage, SymbolKind};
 
-use super::{CustomBuilder, CustomSymbolInput, SymbolOptions, specifier_may_carry_credential};
+use super::{CustomBuilder, CustomSymbolInput, specifier_may_carry_credential};
 use crate::ExtractError;
 
 mod freeswitch;
@@ -31,22 +31,6 @@ fn safe_name(name: &str) -> bool {
         && !specifier_may_carry_credential(name)
 }
 
-fn symbol(
-    builder: &mut CustomBuilder<'_, '_>,
-    (kind, name, qualified): (SymbolKind, &str, String),
-    (start, end): (usize, usize),
-    parent: Option<SymbolId>,
-) -> Result<SymbolId, ExtractError> {
-    builder.add_symbol(
-        CustomSymbolInput::new(kind, name, qualified)
-            .at(start, end)
-            .with_options(SymbolOptions {
-                parent,
-                ..SymbolOptions::default()
-            }),
-    )
-}
-
 fn rtpengine(builder: &mut CustomBuilder<'_, '_>) -> Result<FileParseStatus, ExtractError> {
     let mut section: Option<usize> = None;
     let mut complete = true;
@@ -61,7 +45,7 @@ fn rtpengine(builder: &mut CustomBuilder<'_, '_>) -> Result<FileParseStatus, Ext
             section = rtpengine_section(builder, (offset, line), text)?;
             complete &= section.is_some();
         } else {
-            complete &= rtpengine_option(builder, section, (offset, line), text)?;
+            complete &= rtpengine_option(builder, section, (offset, line))?;
         }
     }
     close_section(builder, section, builder.source().len())?;
@@ -99,11 +83,10 @@ fn rtpengine_section(
         return Ok(None);
     }
     let position = builder.symbols.len();
-    symbol(
-        builder,
-        (SymbolKind::Namespace, name, format!("rtpengine::{name}")),
-        (offset, offset + line.len()),
-        None,
+    builder.add_symbol(
+        CustomSymbolInput::new(SymbolKind::Namespace, name, format!("rtpengine::{name}"))
+            .at(offset, offset + line.len())
+            .with_parent(None),
     )?;
     Ok(Some(position))
 }
@@ -112,9 +95,8 @@ fn rtpengine_option(
     builder: &mut CustomBuilder<'_, '_>,
     section: Option<usize>,
     (offset, line): (usize, &str),
-    text: &str,
 ) -> Result<bool, ExtractError> {
-    let Some((key, _)) = text.split_once('=') else {
+    let Some((key, _)) = line.trim().split_once('=') else {
         return Ok(false);
     };
     let key = key.trim();
@@ -127,11 +109,10 @@ fn rtpengine_option(
     let parent = &builder.symbols[position];
     let qualified = format!("{}::{key}", parent.qualified_name);
     let id = parent.id.clone();
-    symbol(
-        builder,
-        (SymbolKind::Property, key, qualified),
-        (offset, offset + line.len()),
-        Some(id),
+    builder.add_symbol(
+        CustomSymbolInput::new(SymbolKind::Property, key, qualified)
+            .at(offset, offset + line.len())
+            .with_parent(Some(id)),
     )?;
     Ok(true)
 }

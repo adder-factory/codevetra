@@ -18,6 +18,29 @@ pub(super) struct HashScan<'a> {
     pub(super) retain_native: bool,
 }
 
+const HASH_WORKERS: usize = 4;
+const HASH_CHANNEL_CAPACITY: usize = 8;
+const PARALLEL_MINIMUM_FILES: usize = 32;
+const PARALLEL_MAXIMUM_FILE_BYTES: usize = 8 * 1_048_576;
+
+pub(super) struct CaptureSink<'a> {
+    pub(super) paths: &'a BTreeSet<NormalizedPath>,
+    pub(super) captures: &'a mut super::SourceCaptures,
+}
+
+impl CaptureSink<'_> {
+    fn capture(
+        &mut self,
+        file: &DiscoveredSource,
+        snapshot: &codevetra_extract::SourceSnapshot,
+    ) -> Result<(), ProjectError> {
+        if self.paths.contains(file.path()) {
+            self.captures.insert(file.path(), snapshot)?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct Observation {
     pub(super) path: NormalizedPath,
     pub(super) hash: ContentDigest,
@@ -41,96 +64,139 @@ pub(super) fn retry_complete_scan<T>(
     Err(ProjectError::SourceScanFailed)
 }
 
-pub(super) fn read_sources<Cancel>(
-    mut scan: HashScan<'_>,
-    cancelled: &mut Cancel,
-    capture_paths: &BTreeSet<NormalizedPath>,
-    captures: &mut super::SourceCaptures,
-    mut observe: impl FnMut(Observation) -> Result<(), ProjectError>,
-) -> Result<(), ProjectError>
-where
-    Cancel: FnMut() -> bool + Send,
-{
-    let parallel = capture_paths.is_empty()
-        && scan.files.len() >= 32
-        && scan
-            .files
-            .iter()
-            .all(|file| file.byte_size() <= 8 * 1_048_576);
-    if parallel {
-        scan.limits = super::source_limits_with_max(scan.maximum_bytes.min(8 * 1_048_576))?;
-        return read_hashes(&scan, cancelled, observe);
-    }
-    for file in scan.files {
-        if let Some(observation) = read_one(&scan, file, &mut *cancelled, |snapshot| {
-            if capture_paths.contains(file.path()) {
-                captures.insert(file.path(), snapshot)?;
-            }
-            Ok(())
-        })? {
-            observe(observation)?;
+impl HashScan<'_> {
+    pub(super) fn read_sources<Cancel>(
+        mut self,
+        cancelled: &mut Cancel,
+        mut capture: CaptureSink<'_>,
+        mut observe: impl FnMut(Observation) -> Result<(), ProjectError>,
+    ) -> Result<(), ProjectError>
+    where
+        Cancel: FnMut() -> bool + Send,
+    {
+        let parallel = capture.paths.is_empty()
+            && self.files.len() >= PARALLEL_MINIMUM_FILES
+            && self
+                .files
+                .iter()
+                .all(|file| file.byte_size() <= PARALLEL_MAXIMUM_FILE_BYTES as u64);
+        if parallel {
+            self.limits =
+                super::source_limits_with_max(self.maximum_bytes.min(PARALLEL_MAXIMUM_FILE_BYTES))?;
+            return self.read_hashes(cancelled, observe);
         }
+        for file in self.files {
+            if let Some(observation) = self.read_one(file, &mut *cancelled, |snapshot| {
+                capture.capture(file, snapshot)
+            })? {
+                observe(observation)?;
+            }
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-fn read_hashes<Cancel>(
-    scan: &HashScan<'_>,
-    cancelled: &mut Cancel,
-    observe: impl FnMut(Observation) -> Result<(), ProjectError>,
-) -> Result<(), ProjectError>
-where
-    Cancel: FnMut() -> bool + Send,
-{
-    // Four source buffers retain at most 32 MiB. Each producer can retain only
-    // eight compact observations; strided reduction preserves manifest order.
-    let cancellation = Mutex::new(cancelled);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        let mut receivers = Vec::new();
-        for worker in 0..4 {
-            let (sender, receiver) = mpsc::sync_channel(8);
-            receivers.push(receiver);
-            let cancellation = &cancellation;
-            if let Ok(handle) = std::thread::Builder::new()
-                .name("codevetra-source-hash".into())
-                .spawn_scoped(scope, move || {
-                    hash_files(scan, worker, cancellation, &sender);
-                })
-            {
-                handles.push(handle);
-            } else {
-                drop(receivers);
-                join_hash_workers(handles)?;
-                return Err(ProjectError::SourceScanFailed);
+    fn read_hashes<Cancel>(
+        &self,
+        cancelled: &mut Cancel,
+        observe: impl FnMut(Observation) -> Result<(), ProjectError>,
+    ) -> Result<(), ProjectError>
+    where
+        Cancel: FnMut() -> bool + Send,
+    {
+        // Four source buffers retain at most 32 MiB. Each producer can retain only
+        // eight compact observations; strided reduction preserves manifest order.
+        let cancellation = Mutex::new(cancelled);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut receivers = Vec::new();
+            for worker in 0..HASH_WORKERS {
+                let (sender, receiver) = mpsc::sync_channel(HASH_CHANNEL_CAPACITY);
+                receivers.push(receiver);
+                let cancellation = &cancellation;
+                if let Ok(handle) = std::thread::Builder::new()
+                    .name("codevetra-source-hash".into())
+                    .spawn_scoped(scope, move || {
+                        self.hash_files(worker, cancellation, &sender);
+                    })
+                {
+                    handles.push(handle);
+                } else {
+                    drop(receivers);
+                    join_hash_workers(handles)?;
+                    return Err(ProjectError::SourceScanFailed);
+                }
+            }
+            let result = observe_hashes(&receivers, self.files.len(), observe);
+            drop(receivers);
+            join_hash_workers(handles)?;
+            result
+        })
+    }
+
+    fn hash_files<Cancel>(
+        &self,
+        worker: usize,
+        cancellation: &Mutex<&mut Cancel>,
+        sender: &mpsc::SyncSender<HashResult>,
+    ) where
+        Cancel: FnMut() -> bool + Send,
+    {
+        for file in self.files.iter().skip(worker).step_by(HASH_WORKERS) {
+            let stopped = || cancellation.lock().map_or(true, |mut check| check());
+            let value = self.read_one(file, stopped, |_| Ok(()));
+            let failed = value.is_err();
+            if sender.send(value).is_err() || failed {
+                break;
             }
         }
-        let result = observe_hashes(&receivers, scan.files.len(), observe);
-        drop(receivers);
-        join_hash_workers(handles)?;
-        result
-    })
+    }
+
+    fn read_one(
+        &self,
+        file: &DiscoveredSource,
+        mut cancelled: impl FnMut() -> bool,
+        mut capture: impl FnMut(&codevetra_extract::SourceSnapshot) -> Result<(), ProjectError>,
+    ) -> Result<Option<Observation>, ProjectError> {
+        if cancelled() {
+            return Err(ProjectError::SourceScanFailed);
+        }
+        if file.byte_size() > self.maximum_bytes as u64 {
+            return Ok(Some(Observation {
+                path: file.path().clone(),
+                hash: oversized_source_digest(file),
+                bytes: 0,
+                admitted: false,
+                v1: SourceLanguage::is_v1_candidate_path(file.path().as_str()),
+                native: None,
+            }));
+        }
+        let snapshot = match self.root.read_with_cancellation(
+            file.path(),
+            SourceReadOptions::new(self.limits, &mut cancelled),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(SourceReadError::UnsupportedLanguage) => return Ok(None),
+            Err(_) => return Err(ProjectError::SourceScanFailed),
+        };
+        capture(&snapshot)?;
+        Ok(Some(Observation {
+            path: file.path().clone(),
+            hash: snapshot.content_hash().clone(),
+            bytes: snapshot.byte_size(),
+            admitted: true,
+            v1: SourceLanguage::for_v1_normalized_path_with_source(
+                file.path().as_str(),
+                snapshot.source(),
+            )
+            .is_some(),
+            native: self
+                .retain_native
+                .then(|| codevetra_indexer::NativeObservedFile::from_snapshot(&snapshot)),
+        }))
+    }
 }
 
 type HashResult = Result<Option<Observation>, ProjectError>;
-
-fn hash_files<Cancel>(
-    scan: &HashScan<'_>,
-    worker: usize,
-    cancellation: &Mutex<&mut Cancel>,
-    sender: &mpsc::SyncSender<HashResult>,
-) where
-    Cancel: FnMut() -> bool + Send,
-{
-    for file in scan.files.iter().skip(worker).step_by(4) {
-        let stopped = || cancellation.lock().map_or(true, |mut check| check());
-        let value = read_one(scan, file, stopped, |_| Ok(()));
-        let failed = value.is_err();
-        if sender.send(value).is_err() || failed {
-            break;
-        }
-    }
-}
 
 fn observe_hashes(
     receivers: &[mpsc::Receiver<HashResult>],
@@ -138,7 +204,7 @@ fn observe_hashes(
     mut observe: impl FnMut(Observation) -> Result<(), ProjectError>,
 ) -> Result<(), ProjectError> {
     for index in 0..files {
-        if let Some(observation) = receivers[index % 4]
+        if let Some(observation) = receivers[index % HASH_WORKERS]
             .recv()
             .map_err(|_| ProjectError::SourceScanFailed)??
         {
@@ -160,50 +226,6 @@ fn join_hash_workers(
     } else {
         Err(ProjectError::SourceScanFailed)
     }
-}
-
-fn read_one(
-    scan: &HashScan<'_>,
-    file: &DiscoveredSource,
-    mut cancelled: impl FnMut() -> bool,
-    mut capture: impl FnMut(&codevetra_extract::SourceSnapshot) -> Result<(), ProjectError>,
-) -> Result<Option<Observation>, ProjectError> {
-    if cancelled() {
-        return Err(ProjectError::SourceScanFailed);
-    }
-    if file.byte_size() > scan.maximum_bytes as u64 {
-        return Ok(Some(Observation {
-            path: file.path().clone(),
-            hash: oversized_source_digest(file),
-            bytes: 0,
-            admitted: false,
-            v1: SourceLanguage::is_v1_candidate_path(file.path().as_str()),
-            native: None,
-        }));
-    }
-    let snapshot = match scan.root.read_with_cancellation(
-        file.path(),
-        SourceReadOptions::new(scan.limits, &mut cancelled),
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(SourceReadError::UnsupportedLanguage) => return Ok(None),
-        Err(_) => return Err(ProjectError::SourceScanFailed),
-    };
-    capture(&snapshot)?;
-    Ok(Some(Observation {
-        path: file.path().clone(),
-        hash: snapshot.content_hash().clone(),
-        bytes: snapshot.byte_size(),
-        admitted: true,
-        v1: SourceLanguage::for_v1_normalized_path_with_source(
-            file.path().as_str(),
-            snapshot.source(),
-        )
-        .is_some(),
-        native: scan
-            .retain_native
-            .then(|| codevetra_indexer::NativeObservedFile::from_snapshot(&snapshot)),
-    }))
 }
 
 #[cfg(test)]
@@ -262,17 +284,19 @@ mod tests {
                     .map_err(|_| ProjectError::SourceScanFailed)?;
             }
             let mut paths = Vec::new();
-            super::read_sources(
-                super::HashScan {
-                    root: &source_root,
-                    files: &files,
-                    limits: source_limits_with_max(DEFAULT_MAX_SOURCE_BYTES)?,
-                    maximum_bytes: DEFAULT_MAX_SOURCE_BYTES,
-                    retain_native: false,
-                },
+            super::HashScan {
+                root: &source_root,
+                files: &files,
+                limits: source_limits_with_max(DEFAULT_MAX_SOURCE_BYTES)?,
+                maximum_bytes: DEFAULT_MAX_SOURCE_BYTES,
+                retain_native: false,
+            }
+            .read_sources(
                 &mut || false,
-                &BTreeSet::new(),
-                &mut SourceCaptures::default(),
+                super::CaptureSink {
+                    paths: &BTreeSet::new(),
+                    captures: &mut SourceCaptures::default(),
+                },
                 |observation| {
                     paths.push(observation.path);
                     Ok(())
@@ -321,17 +345,19 @@ mod tests {
                 .discover(discovery_limits()?)
                 .map_err(|_| ProjectError::SourceScanFailed)?;
             let mut captures = SourceCaptures::default();
-            super::read_sources(
-                super::HashScan {
-                    root: &source_root,
-                    files: &files,
-                    limits: source_limits_with_max(DEFAULT_MAX_SOURCE_BYTES)?,
-                    maximum_bytes: DEFAULT_MAX_SOURCE_BYTES,
-                    retain_native: false,
-                },
+            super::HashScan {
+                root: &source_root,
+                files: &files,
+                limits: source_limits_with_max(DEFAULT_MAX_SOURCE_BYTES)?,
+                maximum_bytes: DEFAULT_MAX_SOURCE_BYTES,
+                retain_native: false,
+            }
+            .read_sources(
                 &mut || false,
-                &BTreeSet::from([captured_path.clone()]),
-                &mut captures,
+                super::CaptureSink {
+                    paths: &BTreeSet::from([captured_path.clone()]),
+                    captures: &mut captures,
+                },
                 |observation| {
                     if attempts == 1 && observation.path == captured_path {
                         std::fs::write(root.path().join("a.rs"), "pub fn new_value() {}\n")

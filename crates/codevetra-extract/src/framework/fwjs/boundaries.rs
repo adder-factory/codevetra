@@ -28,7 +28,8 @@ struct Receiver {
     lexical_end: usize,
     observer_dispatch_proven: bool,
 }
-struct State {
+struct State<'index> {
+    lexical: &'index lexical::Index,
     names: BTreeMap<String, usize>,
     imports: BTreeMap<String, Option<(String, String)>>,
     receivers: BTreeMap<String, Receiver>,
@@ -84,6 +85,7 @@ fn scan_inner(
     lexical: &lexical::Index,
 ) -> Result<(), ExtractError> {
     let mut state = State {
+        lexical,
         names: BTreeMap::new(),
         imports: BTreeMap::new(),
         receivers: BTreeMap::new(),
@@ -131,42 +133,38 @@ fn scan_inner(
         channels::prove_observer(builder, node, &mut state);
         Ok(())
     })?;
-    next::registrations(builder, &mut state, lexical)?;
-    react_router::scan(builder, root, &mut state, lexical)?;
+    next::registrations(builder, &mut state)?;
+    react_router::scan(builder, root, &mut state)?;
     walk(builder, root, |builder, node| {
         if node.kind() == "call_expression" {
-            channels::call(builder, node, &mut state, lexical)?;
-            next::call(builder, node, &mut state, lexical)?;
+            channels::call(builder, node, &mut state)?;
+            next::call(builder, node, &mut state)?;
         } else if matches!(
             node.kind(),
             "jsx_opening_element" | "jsx_self_closing_element"
         ) {
-            next::markup(builder, node, &mut state, lexical)?;
+            next::markup(builder, node, &mut state)?;
         }
         Ok(())
     })
 }
 
-fn imported(
-    _builder: &FrameworkBuilder<'_, '_>,
-    state: &State,
-    local: &str,
-    modules: &[&str],
-    exports: &[&str],
-) -> bool {
-    if state.names.get(local).copied().unwrap_or(0) != 0 {
-        return false;
+impl State<'_> {
+    fn imported(&self, local: &str, modules: &[&str], exports: &[&str]) -> bool {
+        if self.names.get(local).copied().unwrap_or(0) != 0 {
+            return false;
+        }
+        let Some(Some((module, export))) = self.imports.get(local) else {
+            return false;
+        };
+        modules.contains(&module.as_str()) && exports.contains(&export.as_str())
     }
-    let Some(Some((module, export))) = state.imports.get(local) else {
-        return false;
-    };
-    modules.contains(&module.as_str()) && exports.contains(&export.as_str())
 }
 
 fn collect_receiver(
     builder: &mut FrameworkBuilder<'_, '_>,
     node: Node<'_>,
-    state: &mut State,
+    state: &mut State<'_>,
 ) -> Result<(), ExtractError> {
     if node.kind() != "variable_declarator"
         || !node
@@ -225,26 +223,18 @@ fn collect_receiver(
 fn receiver_kind(
     builder: &FrameworkBuilder<'_, '_>,
     value: Node<'_>,
-    state: &State,
+    state: &State<'_>,
 ) -> Option<ReceiverKind> {
     if value.kind() == "new_expression" {
         let constructor = value.child_by_field_name("constructor")?;
         let constructor = text(builder, constructor);
-        if imported(
-            builder,
-            state,
+        if state.imported(
             constructor,
             &["events", "node:events"],
             &["EventEmitter", "default"],
         ) {
             Some(ReceiverKind::Event)
-        } else if imported(
-            builder,
-            state,
-            constructor,
-            &["bull"],
-            &["default", "Queue"],
-        ) {
+        } else if state.imported(constructor, &["bull"], &["default", "Queue"]) {
             Some(ReceiverKind::Queue)
         } else if constructor == "Set"
             && !state.names.contains_key("Set")
@@ -293,67 +283,67 @@ fn member<'a>(builder: &'a FrameworkBuilder<'_, '_>, call: Node<'_>) -> Option<(
     (object.kind() == "identifier" && property.kind() == "property_identifier")
         .then(|| (text(builder, object), text(builder, property)))
 }
-fn add(
-    builder: &mut FrameworkBuilder<'_, '_>,
-    state: &mut State,
-    lexical: &lexical::Index,
-    site: Site<'_, '_>,
-) -> Result<(), ExtractError> {
-    let target = site
-        .target
-        .filter(|node| site.role == "registration" && node.kind() == "identifier");
-    let binding = match target {
-        Some(node) => lexical.resolution(builder, node)?,
-        None => None,
-    };
-    let target_name = target.map(|node| text(builder, node).to_owned());
-    add_resolved(
-        builder,
-        state,
-        site,
-        target
-            .zip(binding.as_ref())
-            .zip(target_name.as_deref())
-            .map(|((node, binding), name)| {
-                (
-                    name,
-                    binding.resolution_name.as_deref(),
-                    node.start_byte(),
-                    node.end_byte(),
-                )
-            }),
-    )
-}
+impl State<'_> {
+    fn add(
+        &mut self,
+        builder: &mut FrameworkBuilder<'_, '_>,
+        site: Site<'_, '_>,
+    ) -> Result<(), ExtractError> {
+        let target = site
+            .target
+            .filter(|node| site.role == "registration" && node.kind() == "identifier");
+        let binding = match target {
+            Some(node) => self.lexical.resolution(builder, node)?,
+            None => None,
+        };
+        let target_name = target.map(|node| text(builder, node).to_owned());
+        self.add_resolved(
+            builder,
+            site,
+            target
+                .zip(binding.as_ref())
+                .zip(target_name.as_deref())
+                .map(|((node, binding), name)| {
+                    (
+                        name,
+                        binding.resolution_name.as_deref(),
+                        node.start_byte(),
+                        node.end_byte(),
+                    )
+                }),
+        )
+    }
 
-fn add_resolved(
-    builder: &mut FrameworkBuilder<'_, '_>,
-    state: &mut State,
-    mut site: Site<'_, '_>,
-    target: Option<(&str, Option<&str>, usize, usize)>,
-) -> Result<(), ExtractError> {
-    if site.destination.len() > 512 || site.destination.contains(['\n', '\r', '#']) {
-        site.role = "unknown";
-        site.destination = "<unsupported-literal>";
+    fn add_resolved(
+        &mut self,
+        builder: &mut FrameworkBuilder<'_, '_>,
+        mut site: Site<'_, '_>,
+        target: Option<(&str, Option<&str>, usize, usize)>,
+    ) -> Result<(), ExtractError> {
+        if site.destination.len() > 512 || site.destination.contains(['\n', '\r', '#']) {
+            site.role = "unknown";
+            site.destination = "<unsupported-literal>";
+        }
+        if self.sites >= 512 {
+            return Err(ExtractError::OutputLimit);
+        }
+        let identity = format!(
+            "boundary-v1::{}::{}::{}::{}::{}::{}",
+            site.channel, site.role, site.scope, site.operation, site.adapter, site.destination
+        );
+        builder.add_contained_landmark(LandmarkInput {
+            kind: SymbolKind::Resource,
+            name: site.destination.to_owned(),
+            identity,
+            start: site.start,
+            end: site.end,
+            body_search_text: format!(
+                "{} {} {} boundary {} {}; possible static relationship, not runtime execution",
+                site.adapter, site.channel, site.operation, site.role, site.destination
+            ),
+            target,
+        })?;
+        self.sites += 1;
+        Ok(())
     }
-    if state.sites >= 512 {
-        return Err(ExtractError::OutputLimit);
-    }
-    let identity = format!(
-        "boundary-v1::{}::{}::{}::{}::{}::{}",
-        site.channel, site.role, site.scope, site.operation, site.adapter, site.destination
-    );
-    builder.add_contained_landmark(LandmarkInput {
-        kind: SymbolKind::Resource,
-        name: site.destination.to_owned(),
-        identity,
-        start: site.start,
-        end: site.end,
-        body_search_text: format!(
-            "{} {} {} boundary {} {}; possible static relationship, not runtime execution",
-            site.adapter, site.channel, site.operation, site.role, site.destination
-        ),
-        target,
-    })?;
-    state.sites += 1;
-    Ok(())
 }

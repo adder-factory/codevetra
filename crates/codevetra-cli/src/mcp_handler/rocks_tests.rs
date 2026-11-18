@@ -706,12 +706,14 @@ async fn source_allocation_accounts_for_json_escaping_and_reports_missing_requir
     for (limit, complete) in [(16 * 1024, false), (256 * 1024, true)] {
         let allocation = runtime
             .allocate_source_with_cancellation(
-                generation.generation_id(),
-                vec![SourceSelection {
-                    symbol_id: id.clone(),
-                    prioritized: true,
-                }],
-                SourceAllocationOptions::new(SourceSelectionPolicy::Full, limit)?,
+                codevetra_agent::SourceAllocationRequest::new(
+                    generation.generation_id(),
+                    vec![SourceSelection {
+                        symbol_id: id.clone(),
+                        prioritized: true,
+                    }],
+                    SourceAllocationOptions::new(SourceSelectionPolicy::Full, limit)?,
+                ),
                 ProjectCancellation::new(),
             )
             .await?

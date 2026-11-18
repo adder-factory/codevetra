@@ -5,9 +5,10 @@ use super::{
     validate_generation_facts,
 };
 
-// V27 adds health analyzer metadata and its domain; restored graph facts are unchanged.
+// V34 changes only the domain for this unchanged frozen corpus.
+// Independent encoding reproduces the V33 pin before deriving the V34 pin.
 const PREVIOUS_GENERIC_DIGEST: &str =
-    "47a44af932806c641b741c2bd6c4dd80a83117a0fba0ea04bd700ced6e1e75d4";
+    "9190bc1af72e0ad8650a94699888bcca5e25e99e0467072ba1f81fba89a2e7a0";
 
 pub(super) fn unordered_copy(facts: &CanonicalGenerationFacts) -> GenerationFacts {
     GenerationFacts {

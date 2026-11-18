@@ -9,7 +9,6 @@ use super::{
 use crate::{
     NativeDatabase, StorageError,
     native_database::dataset,
-    retrieval::native::retain,
     rocks::{ReadBudget, RocksError, StateNamespace, StateTransaction},
 };
 use codevetra_domain::{GenerationId, ProjectId, SymbolId};
@@ -28,9 +27,10 @@ impl NativeDatabase {
         generation: &GenerationId,
     ) -> Result<(), Error> {
         self.require_project(project)?;
-        self.state(Some(generation.clone()), 4096, 1, |transaction, _| {
-            transaction.delete(NAMESPACE, b"dataset/h/issues")
-        })
+        self.state(
+            crate::rocks::StateAccess::write(Some(generation.clone()), 4096, 1),
+            |transaction, _| transaction.delete(NAMESPACE, b"dataset/h/issues"),
+        )
         .await
         .map_err(Error::from)
     }
@@ -87,10 +87,13 @@ impl NativeDatabase {
             truncated: request.metadata.truncated,
         };
         self.replace_dataset(
-            NAMESPACE,
-            NAME,
-            Some(request.generation_id),
-            &report,
+            crate::native_database::dataset::DatasetReplacement {
+                namespace: NAMESPACE,
+                name: NAME.to_owned(),
+                expected: Some(request.generation_id),
+                metadata: &report,
+                guard: crate::native_database::dataset::CommitGuard::default(),
+            },
             rows.into_iter(),
         )
         .await?;
@@ -109,30 +112,29 @@ impl NativeDatabase {
             return Err(Error::InvalidInput);
         }
         let (id, limit) = (request.symbol_id.clone(), usize::from(request.limit));
-        self.state(None, 0, 0, move |transaction, budget| {
-            let mut rows = Vec::new();
-            visit(transaction, budget, |row, _| {
-                if row.symbol_id == id {
-                    retain(
-                        &mut rows,
-                        SymbolIssueRecord {
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let mut rows =
+                    crate::retrieval::native::RankedRows::new(limit, |a: &SymbolIssueRecord, b| {
+                        a.issue_number
+                            .cmp(&b.issue_number)
+                            .then(a.commit_sha.cmp(&b.commit_sha))
+                            .then(a.kind.cmp(&b.kind))
+                    });
+                visit(transaction, budget, |row, _| {
+                    if row.symbol_id == id {
+                        rows.insert(SymbolIssueRecord {
                             issue_number: row.issue_number,
                             commit_sha: row.commit_sha,
                             kind: row.kind,
-                        },
-                        limit,
-                        |a, b| {
-                            a.issue_number
-                                .cmp(&b.issue_number)
-                                .then(a.commit_sha.cmp(&b.commit_sha))
-                                .then(a.kind.cmp(&b.kind))
-                        },
-                    );
-                }
-                Ok(())
-            })?;
-            Ok(rows)
-        })
+                        });
+                    }
+                    Ok(())
+                })?;
+                Ok(rows.into_vec())
+            },
+        )
         .await
         .map_err(Error::from)
     }
@@ -145,14 +147,17 @@ impl NativeDatabase {
         project: &ProjectId,
     ) -> Result<u64, Error> {
         self.require_project(project)?;
-        self.state(None, 0, 0, |transaction, budget| {
-            let mut count = 0_u64;
-            visit(transaction, budget, |_, _| {
-                count += 1;
-                Ok(())
-            })?;
-            Ok(count)
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            |transaction, budget| {
+                let mut count = 0_u64;
+                visit(transaction, budget, |_, _| {
+                    count += 1;
+                    Ok(())
+                })?;
+                Ok(count)
+            },
+        )
         .await
         .map_err(Error::from)
     }
@@ -173,43 +178,42 @@ impl NativeDatabase {
             u64::from(request.minimum_shared),
             usize::from(request.limit),
         );
-        self.state(None, 0, 0, move |transaction, budget| {
-            if transaction.current()?.is_none() {
-                return Ok(Vec::new());
-            }
-            let shared = shared_commits(modified_commits(transaction, budget)?, &anchor)?;
-            let snapshot = transaction.graph_snapshot()?;
-            let graph = snapshot.graph(budget)?;
-            let mut output = Vec::new();
-            for (id, commits) in shared {
-                if (commits.len() as u64) < minimum {
-                    continue;
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                if transaction.current()?.is_none() {
+                    return Ok(Vec::new());
                 }
-                let Some(symbol) = graph.symbol(&id, budget)? else {
-                    continue;
-                };
-                let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
-                retain(
-                    &mut output,
-                    SymbolIssuePeer {
-                        symbol_id: id,
-                        path: file.normalized_path,
-                        qualified_name: symbol.qualified_name,
-                        co_occurrences: commits.len() as u64,
-                        shared_commits: commits.into_iter().take(5).collect(),
-                    },
-                    maximum,
-                    |a, b| {
+                let shared = shared_commits(modified_commits(transaction, budget)?, &anchor)?;
+                let snapshot = transaction.graph_snapshot()?;
+                let graph = snapshot.graph(budget)?;
+                let mut output =
+                    crate::retrieval::native::RankedRows::new(maximum, |a: &SymbolIssuePeer, b| {
                         b.co_occurrences
                             .cmp(&a.co_occurrences)
                             .then(a.path.cmp(&b.path))
                             .then(a.qualified_name.cmp(&b.qualified_name))
                             .then(a.symbol_id.cmp(&b.symbol_id))
-                    },
-                );
-            }
-            Ok(output)
-        })
+                    });
+                for (id, commits) in shared {
+                    if (commits.len() as u64) < minimum {
+                        continue;
+                    }
+                    let Some(symbol) = graph.symbol(&id, budget)? else {
+                        continue;
+                    };
+                    let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
+                    output.insert(SymbolIssuePeer {
+                        symbol_id: id,
+                        path: file.normalized_path,
+                        qualified_name: symbol.qualified_name,
+                        co_occurrences: commits.len() as u64,
+                        shared_commits: commits.into_iter().take(5).collect(),
+                    });
+                }
+                Ok(output.into_vec())
+            },
+        )
         .await
         .map_err(Error::from)
     }
@@ -230,77 +234,82 @@ impl NativeDatabase {
             request.excluded_symbol_id.clone(),
             usize::from(request.per_commit_limit),
         );
-        self.state(None, 0, 0, move |transaction, budget| {
-            let mut requested = commits
-                .iter()
-                .cloned()
-                .map(|commit| (commit, BTreeSet::new()))
-                .collect::<BTreeMap<_, BTreeSet<SymbolId>>>();
-            visit(transaction, budget, |row, _| {
-                if row.kind == Kind::Modified
-                    && row.symbol_id != excluded
-                    && let Some(ids) = requested.get_mut(&row.commit_sha)
-                {
-                    ids.insert(row.symbol_id);
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let mut requested = commits
+                    .iter()
+                    .cloned()
+                    .map(|commit| (commit, BTreeSet::new()))
+                    .collect::<BTreeMap<_, BTreeSet<SymbolId>>>();
+                visit(transaction, budget, |row, _| {
+                    if row.kind == Kind::Modified
+                        && row.symbol_id != excluded
+                        && let Some(ids) = requested.get_mut(&row.commit_sha)
+                    {
+                        ids.insert(row.symbol_id);
+                    }
+                    if requested.values().map(BTreeSet::len).sum::<usize>() > 131_072 {
+                        return Err(limit());
+                    }
+                    Ok(())
+                })?;
+                if transaction.current()?.is_none() {
+                    return Ok(commits
+                        .into_iter()
+                        .map(|commit_sha| SymbolIssueCommitPeers {
+                            commit_sha,
+                            total: 0,
+                            peers: Vec::new(),
+                            truncated: false,
+                        })
+                        .collect());
                 }
-                if requested.values().map(BTreeSet::len).sum::<usize>() > 131_072 {
-                    return Err(limit());
-                }
-                Ok(())
-            })?;
-            if transaction.current()?.is_none() {
-                return Ok(commits
-                    .into_iter()
-                    .map(|commit_sha| SymbolIssueCommitPeers {
-                        commit_sha,
-                        total: 0,
-                        peers: Vec::new(),
-                        truncated: false,
-                    })
-                    .collect());
-            }
-            let snapshot = transaction.graph_snapshot()?;
-            let graph = snapshot.graph(budget)?;
-            let mut output = Vec::new();
-            for commit in commits {
-                let mut peers = Vec::new();
-                let mut total = 0_u64;
-                for id in requested.remove(&commit).unwrap_or_default() {
-                    let Some(symbol) = graph.symbol(&id, budget)? else {
-                        continue;
-                    };
-                    let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
-                    total += 1;
-                    retain(
-                        &mut peers,
-                        SymbolIssueCommitPeer {
-                            symbol_id: id,
-                            path: file.normalized_path,
-                            qualified_name: symbol.qualified_name,
-                            symbol_kind: symbol.symbol_kind,
-                        },
+                let snapshot = transaction.graph_snapshot()?;
+                let graph = snapshot.graph(budget)?;
+                let mut output = Vec::new();
+                for commit in commits {
+                    let mut peers = crate::retrieval::native::RankedRows::new(
                         maximum,
-                        |a, b| {
+                        |a: &SymbolIssueCommitPeer, b| {
                             a.path
                                 .cmp(&b.path)
                                 .then(a.qualified_name.cmp(&b.qualified_name))
                                 .then(a.symbol_id.cmp(&b.symbol_id))
                         },
                     );
+                    let mut total = 0_u64;
+                    for id in requested.remove(&commit).unwrap_or_default() {
+                        let Some(symbol) = graph.symbol(&id, budget)? else {
+                            continue;
+                        };
+                        let file = graph.file(&symbol.file_id, budget)?.ok_or(corrupt())?;
+                        total += 1;
+                        peers.insert(SymbolIssueCommitPeer {
+                            symbol_id: id,
+                            path: file.normalized_path,
+                            qualified_name: symbol.qualified_name,
+                            symbol_kind: symbol.symbol_kind,
+                        });
+                    }
+                    output.push(SymbolIssueCommitPeers {
+                        commit_sha: commit,
+                        total,
+                        truncated: total > peers.len() as u64,
+                        peers: peers.into_vec(),
+                    });
                 }
-                output.push(SymbolIssueCommitPeers {
-                    commit_sha: commit,
-                    total,
-                    truncated: total > peers.len() as u64,
-                    peers,
-                });
-            }
-            Ok(output)
-        })
+                Ok(output)
+            },
+        )
         .await
         .map_err(Error::from)
     }
 }
+
+const MAXIMUM_SHARED_COMMIT_SYMBOLS: usize = 50;
+const SHARED_COMMIT_ENTRY_BYTES: usize = 160;
+const MAXIMUM_SHARED_COMMIT_BYTES: usize = 32 * 1_048_576;
 
 fn shared_commits(
     commits: BTreeMap<String, BTreeSet<SymbolId>>,
@@ -309,7 +318,7 @@ fn shared_commits(
     let mut shared = BTreeMap::<SymbolId, BTreeSet<String>>::new();
     let mut bytes = 0_usize;
     for (commit, symbols) in commits {
-        if symbols.len() > 50 || !symbols.contains(anchor) {
+        if symbols.len() > MAXIMUM_SHARED_COMMIT_SYMBOLS || !symbols.contains(anchor) {
             continue;
         }
         for id in symbols {
@@ -317,9 +326,9 @@ fn shared_commits(
                 continue;
             }
             if shared.entry(id).or_default().insert(commit.clone()) {
-                bytes = bytes.saturating_add(commit.len() + 160);
+                bytes = bytes.saturating_add(commit.len() + SHARED_COMMIT_ENTRY_BYTES);
             }
-            if bytes > 32 * 1_048_576 {
+            if bytes > MAXIMUM_SHARED_COMMIT_BYTES {
                 return Err(limit());
             }
         }
@@ -335,16 +344,16 @@ fn visit(
     let current = transaction
         .current()?
         .map(|revision| revision.generation_id);
-    let Some(manifest) = dataset::manifest(transaction, NAMESPACE, NAME, budget)? else {
+    let Some(manifest) = dataset::Reader::new(transaction, NAMESPACE)
+        .at(NAME)
+        .manifest(budget)?
+    else {
         return Ok(());
     };
     if current.is_none() || manifest.generation != current {
         return Ok(());
     }
-    dataset::visit(
-        transaction,
-        NAMESPACE,
-        NAME,
+    dataset::Reader::new(transaction, NAMESPACE).at(NAME).visit(
         &manifest,
         budget,
         |row: Row, budget| {
@@ -368,7 +377,7 @@ fn modified_commits(
         {
             bytes = bytes.saturating_add(row.commit_sha.len() + 160);
         }
-        if bytes > 32 * 1_048_576 {
+        if bytes > MAXIMUM_SHARED_COMMIT_BYTES {
             return Err(limit());
         }
         Ok(())

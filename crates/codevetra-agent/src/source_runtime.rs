@@ -65,13 +65,15 @@ impl ProjectRuntime {
     pub(super) async fn scan_source_batch(
         &self,
         capture_paths: BTreeSet<NormalizedPath>,
-        additional_excludes: &[String],
-        maximum_file_bytes: Option<usize>,
+        admission: Option<&codevetra_db::GenerationSourceAdmission>,
         cancellation: ProjectCancellation,
     ) -> Result<SourceRevision, ProjectError> {
         if capture_paths.len() > source_context::MAXIMUM_CONTEXT_BATCH {
             return Err(ProjectError::InvalidOptions);
         }
+        let additional_excludes = admission.map_or(&[][..], |value| value.run_excludes());
+        let maximum_file_bytes =
+            admission.and_then(codevetra_db::GenerationSourceAdmission::maximum_file_bytes);
         let source_policy = project_source_policy_with_excludes(&self.root, additional_excludes)?;
         let max_source_bytes = source_policy
             .maximum_file_bytes
@@ -103,13 +105,9 @@ impl ProjectRuntime {
         let current = snapshot
             .as_ref()
             .and_then(|project| project.current.as_ref());
-        let run_excludes =
-            current.map_or(&[][..], |current| current.source_admission.run_excludes());
-        let ceiling = current.and_then(|current| current.source_admission.maximum_file_bytes());
         self.scan_source_batch(
             capture_path.into_iter().collect(),
-            run_excludes,
-            ceiling,
+            current.map(|current| &current.source_admission),
             cancellation,
         )
         .await

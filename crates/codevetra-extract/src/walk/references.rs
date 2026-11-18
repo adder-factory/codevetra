@@ -1256,7 +1256,9 @@ fn push_resolved_reference(
         return Ok(());
     }
     let pending = PendingReference {
-        owner: builder.execution_reference_owner(pending.owner.as_ref(), pending.kind),
+        owner: builder
+            .javascript
+            .execution_reference_owner(pending.owner.as_ref(), pending.kind),
         ..pending
     };
     super::current_class_calls::capture(builder, &pending)?;

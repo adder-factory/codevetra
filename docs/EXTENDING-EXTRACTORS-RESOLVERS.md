@@ -304,6 +304,23 @@ The key contract, correction policy and current disposition counts are in the
 Generation freshness includes the native generation-digest contract, so a
 change to the facts an existing language publishes needs a new contract;
 otherwise an unchanged checkout keeps reporting fresh with the old facts. The
+V34 contract proves qualified paths in bounded standard expression-macro arguments
+and explicit named Cargo benchmark/test/example target roots. Macro scope and
+shadowing, diagnostic arguments, duplicate target names, and ambiguous conventional
+paths remain fenced. The
+V33 contract adds exact top-level literal Rust `#[path]` file modules, scoped visibility,
+and physical child-loading directories. Missing files do not use suffix/name fallback;
+conflicting loading contexts, mixed attributes, nested path attributes, and raw
+module heads remain unresolved. Standalone parent proofs do not invent Cargo roots. The
+V32 contract retains conventional Rust module bindings through bounded, valid cfg-only
+attributes without evaluating configuration activation. Mixed/path-rewriting attributes
+and ambiguous declarations abstain. The V31 contract retains full-width raw health counts and admits one uniform outer
+call around a flat Rust value mapping under source-rule contract v4. It also retains mapping arm-pattern syntax
+and the uniform outer callee in near-clone shapes while normalizing output values
+and declaration names. The
+V30 contract corrects Rust qualified-path method namespaces and local
+named-constant health evidence. The V29 contract corrects explicit Rust receiver metrics. The V28 contract fences exact Rust test/proof ownership and flat value-mapping
+evidence. V27 added analyzer-language and operation-local safety facts. The
 V26 contract fences callable initializer reference ownership and the updated
 Ada grammar, retaining V25 FreeSWITCH XML, Kamailio and rtpengine configuration
 facts and V24 shared test-path classification. Native

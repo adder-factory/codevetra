@@ -10,6 +10,8 @@ use toml_edit::{Document, Item, Value};
 const MAXIMUM_MANIFEST_BYTES: usize = 256 * 1_024;
 const MAXIMUM_BINDING_BYTES: usize = 1_024;
 const PARSE_BYTES_PER_SOURCE_BYTE: u64 = 64;
+const MAXIMUM_DECLARED_TARGETS: usize = 256;
+const TARGET_NAME_INDEX_BYTES: u64 = 64;
 
 pub(super) fn extract(builder: &mut FrameworkBuilder<'_, '_>) -> Result<(), ExtractError> {
     let snapshot = builder.snapshot;
@@ -134,6 +136,13 @@ fn target_roots(
             .unwrap_or("src/lib.rs");
         target_binding(builder, ("<cargo-target-root>", path), span)?;
     }
+    for (kind, directory) in [
+        ("bench", "benches"),
+        ("test", "tests"),
+        ("example", "examples"),
+    ] {
+        declared_targets(builder, (document, kind, directory), span)?;
+    }
     let Some(binaries) = document.get("bin").and_then(Item::as_array_of_tables) else {
         return Ok(());
     };
@@ -152,6 +161,53 @@ fn target_roots(
             ] {
                 target_binding(builder, ("<cargo-target-root>", &path), span)?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn declared_targets(
+    builder: &mut FrameworkBuilder<'_, '_>,
+    (document, kind, directory): (&Document<&str>, &str, &str),
+    span: SourceSpan,
+) -> Result<(), ExtractError> {
+    let Some(targets) = document.get(kind).and_then(Item::as_array_of_tables) else {
+        return Ok(());
+    };
+    if targets.len() > MAXIMUM_DECLARED_TARGETS {
+        return Ok(());
+    }
+    builder.bridge.reserve_working_bytes(
+        u64::try_from(targets.len())
+            .map_err(|_| ExtractError::OutputLimit)?
+            .saturating_mul(TARGET_NAME_INDEX_BYTES),
+    )?;
+    let mut names = std::collections::HashSet::new();
+    names
+        .try_reserve(targets.len())
+        .map_err(|_| ExtractError::OutputLimit)?;
+    for target in targets {
+        builder.bridge.check_cancelled()?;
+        let Some(name) = target
+            .get("name")
+            .and_then(Item::as_str)
+            .filter(|name| crate_name(name))
+        else {
+            return Ok(());
+        };
+        if !names.insert(name) {
+            return Ok(());
+        }
+    }
+    for target in targets {
+        builder.bridge.check_cancelled()?;
+        if let Some(path) = target.get("path") {
+            if let Some(path) = path.as_str() {
+                target_binding(builder, ("<cargo-target-root>", path), span)?;
+            }
+        } else if let Some(name) = target.get("name").and_then(Item::as_str) {
+            let stem = format!("{directory}/{name}");
+            target_binding(builder, ("<cargo-target-convention>", &stem), span)?;
         }
     }
     Ok(())

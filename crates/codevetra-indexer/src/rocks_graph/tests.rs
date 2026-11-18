@@ -3,8 +3,8 @@ use std::{error::Error, fs, time::Duration};
 use codevetra_db::{
     GraphDirection,
     rocks::{
-        AsyncProjectStore, GraphBase, ReadBudget, RevisionSnapshot, StorageRuntime, StorePolicy,
-        WorkerPolicy,
+        AsyncProjectStore, GraphBase, GraphPolicy, GraphRevision, ReadBudget, RevisionSnapshot,
+        StorageRequest, StorageRuntime, StorePolicy, WorkerPolicy,
     },
 };
 use codevetra_domain::{ContentDigest, EdgeKind, GenerationId};
@@ -64,9 +64,11 @@ async fn native_cross_file_edit_replaces_both_directions_and_keeps_unresolved_re
     let runtime = StorageRuntime::new(WorkerPolicy::default())?;
     let store = AsyncProjectStore::open(
         &runtime,
-        storage_root.path().to_path_buf(),
-        ContentDigest::from_bytes([1; 32]),
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            storage_root.path().to_path_buf(),
+            ContentDigest::from_bytes([1; 32]),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
@@ -95,9 +97,7 @@ async fn native_cross_file_edit_replaces_both_directions_and_keeps_unresolved_re
         let (input, _) = build_native_rocks_graph(
             &runner,
             NativeGenerationBuild::new(SourceRoot::open(source.path())?, config()?),
-            identity,
-            GraphPolicy::default(),
-            &request()?,
+            GraphPreparation::new(identity, GraphPolicy::default(), &request()?),
         )
         .await?;
         drop(cancellation);
@@ -105,16 +105,26 @@ async fn native_cross_file_edit_replaces_both_directions_and_keeps_unresolved_re
             .close_abort_and_reap_retained(Instant::now() + Duration::from_secs(10))
             .await;
         assert!(reaped.all_joined && !reaped.worker_failed && !reaped.unobserved_results);
-        let published = store.publish_graph(input, &request()?).await?;
+        let published = {
+            let request_bound_input = input;
+            store
+                .with_request(&request()?)
+                .publish_graph(request_bound_input)
+                .await
+        }?;
         previous = Some(published.revision.generation_id.clone());
-        store
-            .read(
-                previous.clone(),
-                budget()?,
-                &request()?,
-                move |snapshot, budget| verify_native_graph(snapshot, budget, sequence),
-            )
-            .await?;
+        {
+            let request_bound_expected = previous.clone();
+            let request_bound_budget = budget()?;
+            store
+                .with_request(&request()?)
+                .read(
+                    request_bound_expected,
+                    request_bound_budget,
+                    move |snapshot, budget| verify_native_graph(snapshot, budget, sequence),
+                )
+                .await
+        }?;
     }
     runtime.shutdown(&request()?).await?;
     Ok(())
@@ -127,13 +137,9 @@ fn verify_native_graph(
 ) -> Result<(), RocksError> {
     let graph = snapshot.graph(budget)?;
     // Identify actual native declarations through their canonical symbol keys.
-    let page = snapshot.scan_prefix(
-        codevetra_db::rocks::Collection::Graph,
-        b"cg1/s/",
-        None,
-        100,
-        budget,
-    )?;
+    let page = snapshot
+        .scan_prefix(codevetra_db::rocks::Collection::Graph, b"cg1/s/")
+        .page(None, 100, budget)?;
     let symbols: Vec<codevetra_db::SymbolInput> = page
         .rows
         .into_iter()
@@ -150,13 +156,8 @@ fn verify_native_graph(
             field: "probe_caller",
         })?;
     let calls = graph
-        .neighbors(
-            &caller.symbol_id,
-            GraphDirection::Outgoing,
-            None,
-            100,
-            budget,
-        )?
+        .adjacency(&caller.symbol_id, GraphDirection::Outgoing)
+        .page(None, 100, budget)?
         .links
         .into_iter()
         .filter(|edge| edge.kind() == EdgeKind::Calls)
@@ -168,7 +169,7 @@ fn verify_native_graph(
                 .iter()
                 .any(|symbol| symbol.qualified_name.ends_with("target"))
         );
-        let references = graph.references(&caller.file_id, None, 100, budget)?.0;
+        let references = graph.references(&caller.file_id).page(None, 100, budget)?.0;
         assert!(
             references
                 .iter()
@@ -178,7 +179,9 @@ fn verify_native_graph(
     } else {
         assert_eq!(calls.len(), 1);
         let target = calls[0].target_symbol_id();
-        let reverse = graph.neighbors(target, GraphDirection::Incoming, None, 100, budget)?;
+        let reverse = graph
+            .adjacency(target, GraphDirection::Incoming)
+            .page(None, 100, budget)?;
         assert!(
             reverse
                 .links

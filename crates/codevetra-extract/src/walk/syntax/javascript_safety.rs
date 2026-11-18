@@ -18,38 +18,47 @@ fn needs_scope(node: Node<'_>, source: &str) -> bool {
         || outer_dynamic_sql(node, source)
 }
 
-#[derive(Default)]
-pub(super) enum Analysis<'tree> {
-    #[default]
+enum ScopeState<'tree, 'source> {
     Pending,
-    Ready(Scope<'tree>),
+    Ready(Scope<'tree, 'source>),
     Unavailable,
 }
 
-impl<'tree> Analysis<'tree> {
+pub(super) struct Analysis<'tree, 'source> {
+    input: super::HealthWalkInput<'tree, 'source>,
+    state: ScopeState<'tree, 'source>,
+}
+
+impl<'tree, 'source> Analysis<'tree, 'source> {
+    pub(super) fn new(input: super::HealthWalkInput<'tree, 'source>) -> Self {
+        Self {
+            input,
+            state: ScopeState::Pending,
+        }
+    }
+
     pub(super) fn record(
         &mut self,
         metrics: &mut SymbolHealthMetrics,
         node: Node<'tree>,
-        input: &super::HealthWalkInput<'tree, '_>,
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<(), ExtractError> {
-        if matches!(self, Self::Unavailable) || !needs_scope(node, input.source) {
+        if matches!(self.state, ScopeState::Unavailable) || !needs_scope(node, self.input.source) {
             return Ok(());
         }
         let result = (|| {
-            if matches!(self, Self::Pending) {
-                *self = Self::Ready(Scope::new(input.body, input.source, cancelled)?);
+            if matches!(self.state, ScopeState::Pending) {
+                self.state = ScopeState::Ready(Scope::new(self.input, cancelled)?);
             }
-            if let Self::Ready(scope) = self {
-                scope.record(metrics, node, input.body, input.source, input.async_symbol)?;
+            if let ScopeState::Ready(scope) = &self.state {
+                scope.record(metrics, node)?;
             }
             Ok(())
         })();
         if result == Err(ExtractError::OutputLimit) {
             // Scope bounds are optional detector bounds, not extraction limits.
             // Drop any prefix so neither coverage nor findings imply a full scan.
-            *self = Self::Unavailable;
+            self.state = ScopeState::Unavailable;
             metrics.analyzed_language = None;
             metrics.operation_sites = crate::HealthOperationSites::default();
             metrics.unsafe_json_parse = 0;
@@ -73,22 +82,24 @@ struct Binding<'tree> {
     declaration: Node<'tree>,
 }
 
-pub(super) struct Scope<'tree> {
+struct Scope<'tree, 'source> {
+    input: super::HealthWalkInput<'tree, 'source>,
     bindings: Vec<Binding<'tree>>,
 }
 
-impl<'tree> Scope<'tree> {
-    pub(super) fn new(
-        body: Node<'tree>,
-        source: &str,
+impl<'tree, 'source> Scope<'tree, 'source> {
+    fn new(
+        input: super::HealthWalkInput<'tree, 'source>,
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Self, ExtractError> {
+        let body = input.body;
         validate_ancestry(body)?;
         let mut scope = Self {
+            input,
             bindings: Vec::new(),
         };
         let mut work = vec![(body, true)];
-        scope.collect_enclosing_bindings(body, source, &mut work)?;
+        scope.collect_enclosing_bindings(&mut work)?;
         let mut visited = 0_usize;
         while let Some((node, descend)) = work.pop() {
             visited += 1;
@@ -98,7 +109,7 @@ impl<'tree> Scope<'tree> {
             if visited.is_multiple_of(256) && cancelled() {
                 return Err(ExtractError::Cancelled);
             }
-            scope.declaration(node, source)?;
+            scope.declaration(node)?;
             if is_callable_node(node.kind()) {
                 continue;
             }
@@ -121,14 +132,12 @@ impl<'tree> Scope<'tree> {
 
     fn collect_enclosing_bindings(
         &mut self,
-        body: Node<'tree>,
-        source: &str,
         work: &mut Vec<(Node<'tree>, bool)>,
     ) -> Result<(), ExtractError> {
-        let mut ancestor = body.parent();
+        let mut ancestor = self.input.body.parent();
         while let Some(node) = ancestor {
             if let Some(parameters) = node.child_by_field_name("parameters") {
-                self.pattern(parameters, node, node, source)?;
+                self.pattern(parameters, node, node)?;
             }
             if matches!(node.kind(), "program" | "statement_block") {
                 work.extend(named_children(node).map(|child| (child, false)));
@@ -138,7 +147,7 @@ impl<'tree> Scope<'tree> {
         Ok(())
     }
 
-    fn declaration(&mut self, node: Node<'tree>, source: &str) -> Result<(), ExtractError> {
+    fn declaration(&mut self, node: Node<'tree>) -> Result<(), ExtractError> {
         validate_ancestry(node)?;
         let pattern = match node.kind() {
             "variable_declarator" | "function_declaration" | "class_declaration" => {
@@ -168,7 +177,7 @@ impl<'tree> Scope<'tree> {
                     || (function_scoped && is_callable_node(parent.kind()))
                     || (!function_scoped && parent.kind() == "statement_block")
                 {
-                    return self.pattern(pattern, parent, node, source);
+                    return self.pattern(pattern, parent, node);
                 }
                 scope = parent.parent();
             }
@@ -181,7 +190,6 @@ impl<'tree> Scope<'tree> {
         pattern: Node<'tree>,
         scope: Node<'tree>,
         declaration: Node<'tree>,
-        source: &str,
     ) -> Result<(), ExtractError> {
         let mut pending = vec![pattern];
         let mut visited = 0;
@@ -198,7 +206,7 @@ impl<'tree> Scope<'tree> {
                     return Err(ExtractError::OutputLimit);
                 }
                 self.bindings.push(Binding {
-                    name: text_for(source, node).to_owned(),
+                    name: text_for(self.input.source, node).to_owned(),
                     scope,
                     declaration,
                 });
@@ -221,14 +229,12 @@ impl<'tree> Scope<'tree> {
             .min_by_key(|binding| binding.scope.byte_range().len())
     }
 
-    pub(super) fn record(
+    fn record(
         &self,
         metrics: &mut SymbolHealthMetrics,
         node: Node<'tree>,
-        body: Node<'tree>,
-        source: &str,
-        async_symbol: bool,
     ) -> Result<(), ExtractError> {
+        let source = self.input.source;
         validate_ancestry(node)?;
         if outer_dynamic_sql(node, source) {
             add(metrics, Metric::SqlStringConcatenation, node)?;
@@ -251,11 +257,11 @@ impl<'tree> Scope<'tree> {
             let Some(function) = node.child_by_field_name("function") else {
                 return Ok(());
             };
-            self.record_call(metrics, node, function, source, async_symbol)?;
+            self.record_call(metrics, node, function)?;
         }
         if is_env_value(node, source)
             && self.binding("process", node).is_none()
-            && !self.validated_env(node, body, source)
+            && !self.validated_env(node)
         {
             add(metrics, Metric::UnvalidatedEnv, node)?;
         }
@@ -267,16 +273,15 @@ impl<'tree> Scope<'tree> {
         metrics: &mut SymbolHealthMetrics,
         node: Node<'tree>,
         function: Node<'tree>,
-        source: &str,
-        async_symbol: bool,
     ) -> Result<(), ExtractError> {
+        let source = self.input.source;
         if member(function, source) == Some(("Math", "random"))
             && self.binding("Math", node).is_none()
             && security_context(node, source)
         {
             add(metrics, Metric::InsecureRandom, node)?;
         }
-        self.record_named_calls(metrics, node, function, source, async_symbol)?;
+        self.record_named_calls(metrics, node, function)?;
         if member(function, source) == Some(("JSON", "parse"))
             && self.binding("JSON", node).is_none()
             && !inside_caught_try(node)
@@ -292,7 +297,7 @@ impl<'tree> Scope<'tree> {
                     method,
                     "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
                 )
-                && self.imported_from("axios", node, source, "axios")
+                && self.imported_from("axios", node, "axios")
         });
         if (fetch || axios) && !request_has_guard(node, source, axios) {
             add(metrics, Metric::HttpWithoutTimeout, node)?;
@@ -305,9 +310,8 @@ impl<'tree> Scope<'tree> {
         metrics: &mut SymbolHealthMetrics,
         node: Node<'tree>,
         function: Node<'tree>,
-        source: &str,
-        async_symbol: bool,
     ) -> Result<(), ExtractError> {
+        let source = self.input.source;
         let name = (function.kind() == "identifier").then(|| text_for(source, function));
         if name == Some("eval") && self.binding("eval", node).is_none() {
             add(metrics, Metric::DynamicEval, node)?;
@@ -318,7 +322,7 @@ impl<'tree> Scope<'tree> {
         {
             add(metrics, Metric::DebugLogs, node)?;
         }
-        if async_symbol
+        if self.input.async_symbol
             && name.is_some_and(|name| {
                 matches!(
                     name,
@@ -328,19 +332,17 @@ impl<'tree> Scope<'tree> {
                         | "execSync"
                         | "execFileSync"
                         | "spawnSync"
-                ) && (self.binding(name, node).is_none()
-                    || self.imported_from(name, node, source, "node:fs")
-                    || self.imported_from(name, node, source, "fs")
-                    || self.imported_from(name, node, source, "node:child_process")
-                    || self.imported_from(name, node, source, "child_process"))
+                ) && self.global_or_imported(
+                    name,
+                    node,
+                    &["node:fs", "fs", "node:child_process", "child_process"],
+                )
             })
         {
             add(metrics, Metric::SyncIoInAsync, node)?;
         }
         if name == Some("createHash")
-            && (self.binding("createHash", node).is_none()
-                || self.imported_from("createHash", node, source, "crypto")
-                || self.imported_from("createHash", node, source, "node:crypto"))
+            && self.global_or_imported("createHash", node, &["crypto", "node:crypto"])
             && node
                 .child_by_field_name("arguments")
                 .and_then(|args| named_children(args).next())
@@ -357,7 +359,14 @@ impl<'tree> Scope<'tree> {
         Ok(())
     }
 
-    fn imported_from(&self, name: &str, at: Node<'_>, source: &str, module: &str) -> bool {
+    fn global_or_imported(&self, name: &str, at: Node<'_>, modules: &[&str]) -> bool {
+        self.binding(name, at).is_none()
+            || modules
+                .iter()
+                .any(|module| self.imported_from(name, at, module))
+    }
+
+    fn imported_from(&self, name: &str, at: Node<'_>, module: &str) -> bool {
         let Some(binding) = self.binding(name, at) else {
             return false;
         };
@@ -365,7 +374,7 @@ impl<'tree> Scope<'tree> {
         while let Some(current) = node {
             if current.kind() == "import_statement" {
                 return current.child_by_field_name("source").is_some_and(|value| {
-                    text_for(source, value).trim_matches(['\'', '"']) == module
+                    text_for(self.input.source, value).trim_matches(['\'', '"']) == module
                 });
             }
             if matches!(current.kind(), "program" | "statement_block") {
@@ -376,11 +385,15 @@ impl<'tree> Scope<'tree> {
         false
     }
 
-    fn validated_env(&self, node: Node<'tree>, body: Node<'tree>, source: &str) -> bool {
+    fn validated_env(&self, node: Node<'tree>) -> bool {
+        let source = self.input.source;
         let Some(arguments) = node.parent().filter(|parent| parent.kind() == "arguments") else {
             return false;
         };
-        let Some(call) = arguments.parent().filter(|parent| contains(body, *parent)) else {
+        let Some(call) = arguments
+            .parent()
+            .filter(|parent| contains(self.input.body, *parent))
+        else {
             return false;
         };
         let Some(function) = call.child_by_field_name("function") else {
@@ -394,10 +407,11 @@ impl<'tree> Scope<'tree> {
         }
         function
             .child_by_field_name("object")
-            .is_some_and(|schema| self.zod_schema(schema, call, source, 0))
+            .is_some_and(|schema| self.zod_schema(schema, call, 0))
     }
 
-    fn zod_schema(&self, schema: Node<'tree>, at: Node<'tree>, source: &str, depth: u8) -> bool {
+    fn zod_schema(&self, schema: Node<'tree>, at: Node<'tree>, depth: u8) -> bool {
+        let source = self.input.source;
         if depth >= 8 {
             return false;
         }
@@ -411,7 +425,7 @@ impl<'tree> Scope<'tree> {
                     }) && binding
                         .declaration
                         .child_by_field_name("value")
-                        .is_some_and(|value| self.zod_schema(value, at, source, depth + 1))
+                        .is_some_and(|value| self.zod_schema(value, at, depth + 1))
                 });
         }
         let Some(function) = schema.child_by_field_name("function") else {
@@ -423,7 +437,7 @@ impl<'tree> Scope<'tree> {
                     method,
                     "string" | "number" | "boolean" | "object" | "enum" | "array" | "literal"
                 )
-                && self.imported_from("z", at, source, "zod");
+                && self.imported_from("z", at, "zod");
         }
         false
     }

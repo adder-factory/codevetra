@@ -8,7 +8,7 @@ use super::{
 use crate::{
     NativeDatabase, StorageError,
     native_database::dataset,
-    retrieval::native::{retain, visit_files},
+    retrieval::native::visit_files,
     rocks::{ReadBudget, RocksError, StateNamespace, StateTransaction},
 };
 use codevetra_domain::ProjectId;
@@ -55,10 +55,13 @@ impl NativeDatabase {
             parameters: request.parameters,
         };
         self.replace_dataset(
-            NAMESPACE,
-            NAME,
-            None,
-            &metadata,
+            crate::native_database::dataset::DatasetReplacement {
+                namespace: NAMESPACE,
+                name: NAME.to_owned(),
+                expected: None,
+                metadata: &metadata,
+                guard: crate::native_database::dataset::CommitGuard::default(),
+            },
             request
                 .files
                 .into_iter()
@@ -82,22 +85,28 @@ impl NativeDatabase {
         let head = reuse.head_commit.to_owned();
         let parameters = reuse.parameters;
         let shallow = reuse.shallow_history;
-        self.state(None, 0, 0, move |transaction, budget| {
-            let Some(manifest) = dataset::manifest(transaction, NAMESPACE, NAME, budget)? else {
-                return Ok(None);
-            };
-            let metadata: Metadata =
-                serde_json::from_value(manifest.metadata).map_err(|_| corrupt())?;
-            if metadata.report.head_commit != head
-                || metadata.report.shallow_history != shallow
-                || metadata.parameters != Some(parameters)
-            {
-                return Ok(None);
-            }
-            let mut report = metadata.report;
-            report.reused = true;
-            Ok(Some(report))
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let Some(manifest) = dataset::Reader::new(transaction, NAMESPACE)
+                    .at(NAME)
+                    .manifest(budget)?
+                else {
+                    return Ok(None);
+                };
+                let metadata: Metadata =
+                    serde_json::from_value(manifest.metadata).map_err(|_| corrupt())?;
+                if metadata.report.head_commit != head
+                    || metadata.report.shallow_history != shallow
+                    || metadata.parameters != Some(parameters)
+                {
+                    return Ok(None);
+                }
+                let mut report = metadata.report;
+                report.reused = true;
+                Ok(Some(report))
+            },
+        )
         .await
     }
 
@@ -121,46 +130,53 @@ impl NativeDatabase {
         let path = request.path.cloned();
         let minimum = request.minimum_commits;
         let limit = request.limit;
-        self.state(None, 0, 0, move |transaction, budget| {
-            let Some(manifest) = dataset::manifest(transaction, NAMESPACE, NAME, budget)? else {
-                return Ok(Vec::new());
-            };
-            let metadata: Metadata =
-                serde_json::from_value(manifest.metadata.clone()).map_err(|_| corrupt())?;
-            let live = live_paths(transaction, budget)?;
-            let mut output = Vec::new();
-            dataset::visit::<HistoryRow>(
-                transaction,
-                NAMESPACE,
-                NAME,
-                &manifest,
-                budget,
-                |row, _| {
-                    let HistoryRow::File(fact) = row else {
-                        return Ok(());
-                    };
-                    validate_fact(&fact)?;
-                    if !live.contains(fact.path.as_str())
-                        || path.as_ref().is_some_and(|path| path != &fact.path)
-                        || fact.commit_count < u64::from(minimum)
-                    {
-                        return Ok(());
-                    }
-                    let timestamp = fact
-                        .last_touched_at
-                        .map(|seconds| {
-                            i64::try_from(seconds)
-                                .map_err(|_| corrupt())
-                                .and_then(|seconds| {
-                                    jiff::Timestamp::from_second(seconds)
-                                        .map(|timestamp| timestamp.to_string())
-                                        .map_err(|_| corrupt())
-                                })
-                        })
-                        .transpose()?;
-                    retain(
-                        &mut output,
-                        FileHistoryRecord {
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let Some(manifest) = dataset::Reader::new(transaction, NAMESPACE)
+                    .at(NAME)
+                    .manifest(budget)?
+                else {
+                    return Ok(Vec::new());
+                };
+                let metadata: Metadata =
+                    serde_json::from_value(manifest.metadata.clone()).map_err(|_| corrupt())?;
+                let live = live_paths(transaction, budget)?;
+                let mut output = crate::retrieval::native::RankedRows::new(
+                    usize::from(limit),
+                    |a: &FileHistoryRecord, b| {
+                        b.commit_count
+                            .cmp(&a.commit_count)
+                            .then_with(|| b.last_touched_at.cmp(&a.last_touched_at))
+                            .then(a.path.cmp(&b.path))
+                    },
+                );
+                dataset::Reader::new(transaction, NAMESPACE)
+                    .at(NAME)
+                    .visit::<HistoryRow>(&manifest, budget, |row, _| {
+                        let HistoryRow::File(fact) = row else {
+                            return Ok(());
+                        };
+                        validate_fact(&fact)?;
+                        if !live.contains(fact.path.as_str())
+                            || path.as_ref().is_some_and(|path| path != &fact.path)
+                            || fact.commit_count < u64::from(minimum)
+                        {
+                            return Ok(());
+                        }
+                        let timestamp = fact
+                            .last_touched_at
+                            .map(|seconds| {
+                                i64::try_from(seconds)
+                                    .map_err(|_| corrupt())
+                                    .and_then(|seconds| {
+                                        jiff::Timestamp::from_second(seconds)
+                                            .map(|timestamp| timestamp.to_string())
+                                            .map_err(|_| corrupt())
+                                    })
+                            })
+                            .transpose()?;
+                        output.insert(FileHistoryRecord {
                             path: fact.path.as_str().to_owned(),
                             head_commit: metadata.report.head_commit.clone(),
                             commit_count: fact.commit_count,
@@ -169,20 +185,12 @@ impl NativeDatabase {
                             deletions: fact.deletions,
                             last_touched_at: timestamp,
                             shallow_history: metadata.report.shallow_history,
-                        },
-                        usize::from(limit),
-                        |a, b| {
-                            b.commit_count
-                                .cmp(&a.commit_count)
-                                .then_with(|| b.last_touched_at.cmp(&a.last_touched_at))
-                                .then(a.path.cmp(&b.path))
-                        },
-                    );
-                    Ok(())
-                },
-            )?;
-            Ok(output)
-        })
+                        });
+                        Ok(())
+                    })?;
+                Ok(output.into_vec())
+            },
+        )
         .await
     }
 
@@ -196,67 +204,74 @@ impl NativeDatabase {
         self.require_project(request.project_id)?;
         validate_query_limit(request.limit)?;
         let (path, minimum, limit) = (request.path.clone(), request.minimum_commits, request.limit);
-        self.state(None, 0, 0, move |transaction, budget| {
-            let Some(manifest) = dataset::manifest(transaction, NAMESPACE, NAME, budget)? else {
-                return Ok(Vec::new());
-            };
-            let live = live_paths(transaction, budget)?;
-            let counts = file_counts(transaction, budget, &manifest)?;
-            let Some(anchor) = counts.get(path.as_str()) else {
-                return Ok(Vec::new());
-            };
-            let mut output = Vec::new();
-            dataset::visit::<HistoryRow>(
-                transaction,
-                NAMESPACE,
-                NAME,
-                &manifest,
-                budget,
-                |row, _| {
-                    let HistoryRow::Cochange(fact) = row else {
-                        return Ok(());
-                    };
-                    let partner = if fact.path_a == path {
-                        &fact.path_b
-                    } else if fact.path_b == path {
-                        &fact.path_a
-                    } else {
-                        return Ok(());
-                    };
-                    if !live.contains(partner.as_str()) || fact.commit_count < u64::from(minimum) {
-                        return Ok(());
-                    }
-                    let Some(partner_count) = counts.get(partner.as_str()) else {
-                        return Ok(());
-                    };
-                    let shared = fact.commit_count.to_f32().ok_or(corrupt())?;
-                    if !fact.confidence.is_finite()
-                        || !(0.0..=1.0).contains(&fact.confidence)
-                        || fact.commit_count > *anchor
-                        || fact.commit_count > *partner_count
-                    {
-                        return Err(corrupt());
-                    }
-                    let record = FileCochangeRecord {
-                        path: partner.as_str().to_owned(),
-                        shared_commits: fact.commit_count,
-                        jaccard: fact.confidence,
-                        anchor_ratio: shared / (*anchor).max(1).to_f32().ok_or(corrupt())?,
-                        partner_ratio: shared / (*partner_count).max(1).to_f32().ok_or(corrupt())?,
-                        anchor_commits: *anchor,
-                        partner_commits: *partner_count,
-                    };
-                    retain(&mut output, record, usize::from(limit), |a, b| {
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let Some(manifest) = dataset::Reader::new(transaction, NAMESPACE)
+                    .at(NAME)
+                    .manifest(budget)?
+                else {
+                    return Ok(Vec::new());
+                };
+                let live = live_paths(transaction, budget)?;
+                let counts = file_counts(transaction, budget, &manifest)?;
+                let Some(anchor) = counts.get(path.as_str()) else {
+                    return Ok(Vec::new());
+                };
+                let mut output = crate::retrieval::native::RankedRows::new(
+                    usize::from(limit),
+                    |a: &FileCochangeRecord, b| {
                         b.shared_commits
                             .cmp(&a.shared_commits)
                             .then(b.jaccard.total_cmp(&a.jaccard))
                             .then(a.path.cmp(&b.path))
-                    });
-                    Ok(())
-                },
-            )?;
-            Ok(output)
-        })
+                    },
+                );
+                dataset::Reader::new(transaction, NAMESPACE)
+                    .at(NAME)
+                    .visit::<HistoryRow>(&manifest, budget, |row, _| {
+                        let HistoryRow::Cochange(fact) = row else {
+                            return Ok(());
+                        };
+                        let partner = if fact.path_a == path {
+                            &fact.path_b
+                        } else if fact.path_b == path {
+                            &fact.path_a
+                        } else {
+                            return Ok(());
+                        };
+                        if !live.contains(partner.as_str())
+                            || fact.commit_count < u64::from(minimum)
+                        {
+                            return Ok(());
+                        }
+                        let Some(partner_count) = counts.get(partner.as_str()) else {
+                            return Ok(());
+                        };
+                        let shared = fact.commit_count.to_f32().ok_or(corrupt())?;
+                        if !fact.confidence.is_finite()
+                            || !(0.0..=1.0).contains(&fact.confidence)
+                            || fact.commit_count > *anchor
+                            || fact.commit_count > *partner_count
+                        {
+                            return Err(corrupt());
+                        }
+                        let record = FileCochangeRecord {
+                            path: partner.as_str().to_owned(),
+                            shared_commits: fact.commit_count,
+                            jaccard: fact.confidence,
+                            anchor_ratio: shared / (*anchor).max(1).to_f32().ok_or(corrupt())?,
+                            partner_ratio: shared
+                                / (*partner_count).max(1).to_f32().ok_or(corrupt())?,
+                            anchor_commits: *anchor,
+                            partner_commits: *partner_count,
+                        };
+                        output.insert(record);
+                        Ok(())
+                    })?;
+                Ok(output.into_vec())
+            },
+        )
         .await
     }
 }
@@ -292,19 +307,21 @@ fn file_counts(
 ) -> Result<BTreeMap<String, u64>, RocksError> {
     let mut counts = BTreeMap::new();
     let mut bytes = 0_usize;
-    dataset::visit::<HistoryRow>(transaction, NAMESPACE, NAME, manifest, budget, |row, _| {
-        if let HistoryRow::File(fact) = row {
-            validate_fact(&fact)?;
-            bytes = bytes.saturating_add(fact.path.as_str().len() + 128);
-            if bytes > 24 * 1_048_576 {
-                return Err(RocksError::Limit {
-                    resource: "history_file_workspace",
-                });
+    dataset::Reader::new(transaction, NAMESPACE)
+        .at(NAME)
+        .visit::<HistoryRow>(manifest, budget, |row, _| {
+            if let HistoryRow::File(fact) = row {
+                validate_fact(&fact)?;
+                bytes = bytes.saturating_add(fact.path.as_str().len() + 128);
+                if bytes > 24 * 1_048_576 {
+                    return Err(RocksError::Limit {
+                        resource: "history_file_workspace",
+                    });
+                }
+                counts.insert(fact.path.as_str().to_owned(), fact.commit_count);
             }
-            counts.insert(fact.path.as_str().to_owned(), fact.commit_count);
-        }
-        Ok(())
-    })?;
+            Ok(())
+        })?;
     Ok(counts)
 }
 
@@ -322,25 +339,30 @@ pub(crate) fn visit_metrics(
     budget: &mut ReadBudget,
     mut visitor: impl FnMut(&str, super::FileHistoryMetrics) -> Result<(), RocksError>,
 ) -> Result<(), RocksError> {
-    let Some(manifest) = dataset::manifest(transaction, NAMESPACE, NAME, budget)? else {
+    let Some(manifest) = dataset::Reader::new(transaction, NAMESPACE)
+        .at(NAME)
+        .manifest(budget)?
+    else {
         return Ok(());
     };
-    dataset::visit::<HistoryRow>(transaction, NAMESPACE, NAME, &manifest, budget, |row, _| {
-        if let HistoryRow::File(fact) = row {
-            validate_fact(&fact)?;
-            visitor(
-                fact.path.as_str(),
-                super::FileHistoryMetrics {
-                    commit_count: fact.commit_count,
-                    author_count: fact.author_count,
-                    insertions: fact.insertions,
-                    deletions: fact.deletions,
-                    last_touched_at: fact.last_touched_at,
-                },
-            )?;
-        }
-        Ok(())
-    })
+    dataset::Reader::new(transaction, NAMESPACE)
+        .at(NAME)
+        .visit::<HistoryRow>(&manifest, budget, |row, _| {
+            if let HistoryRow::File(fact) = row {
+                validate_fact(&fact)?;
+                visitor(
+                    fact.path.as_str(),
+                    super::FileHistoryMetrics {
+                        commit_count: fact.commit_count,
+                        author_count: fact.author_count,
+                        insertions: fact.insertions,
+                        deletions: fact.deletions,
+                        last_touched_at: fact.last_touched_at,
+                    },
+                )?;
+            }
+            Ok(())
+        })
 }
 
 fn corrupt() -> RocksError {

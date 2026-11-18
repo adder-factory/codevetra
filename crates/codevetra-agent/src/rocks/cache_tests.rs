@@ -112,6 +112,18 @@ async fn increasing_configured_file_limit_invalidates_the_graph_and_explicit_ove
         .await?;
     assert!(inherited.unchanged);
     assert_eq!(inherited.revision.maximum_file_bytes, Some(1024));
+    let reset = runtime
+        .index(
+            RocksIndexOptions {
+                additional_excludes: Some(Vec::new()),
+                ..RocksIndexOptions::default()
+            },
+            &request,
+        )
+        .await?;
+    assert!(!reset.unchanged);
+    assert_eq!(reset.revision.maximum_file_bytes, None);
+    assert_eq!(reset.counts.symbols, second.counts.symbols);
     runtime.shutdown().await?;
     Ok(())
 }

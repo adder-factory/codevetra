@@ -314,6 +314,14 @@ const CASES: [(&str, fn()); 8] = [
     ),
 ];
 
+// A fixed schedule budget keeps cases comparable and replayable. Assertions
+// below use the same requested run count, not a second independently edited number.
+const SCHEDULES_PER_CASE: usize = 1000;
+const MAXIMUM_STEPS: usize = 10_000;
+const MAXIMUM_REPLAY_BYTES: usize = 4096;
+const SEED_BASE: u64 = 0x405_2026;
+const PCT_DEPTH: usize = 3;
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let selected = match args.as_slice() {
@@ -327,13 +335,14 @@ fn main() {
         _ => panic!("expected optional case and replay schedule"),
     };
     let mut config = Config::default();
-    config.max_steps = MaxSteps::FailAfter(10_000);
+    config.max_steps = MaxSteps::FailAfter(MAXIMUM_STEPS);
     config.max_time = None;
     for (name, case) in &selected {
         println!("SHUTTLE_CASE {name}");
         if let [_, schedule] = args.as_slice() {
             assert!(
-                schedule.len() <= 4096 && schedule.bytes().all(|byte| byte.is_ascii_hexdigit())
+                schedule.len() <= MAXIMUM_REPLAY_BYTES
+                    && schedule.bytes().all(|byte| byte.is_ascii_hexdigit())
             );
             let count =
                 Runner::new(ReplayScheduler::new_from_encoded(schedule), config.clone()).run(*case);
@@ -345,13 +354,19 @@ fn main() {
             .iter()
             .position(|(candidate, _)| candidate == name)
             .unwrap();
-        let seed = 0x405_2026 + u64::try_from(index).unwrap();
-        let random =
-            Runner::new(RandomScheduler::new_from_seed(seed, 1000), config.clone()).run(*case);
-        assert_eq!(random, 1000, "incomplete random run");
-        let pct =
-            Runner::new(PctScheduler::new_from_seed(seed, 3, 1000), config.clone()).run(*case);
-        assert_eq!(pct, 1000, "incomplete PCT run");
+        let seed = SEED_BASE + u64::try_from(index).unwrap();
+        let random = Runner::new(
+            RandomScheduler::new_from_seed(seed, SCHEDULES_PER_CASE),
+            config.clone(),
+        )
+        .run(*case);
+        assert_eq!(random, SCHEDULES_PER_CASE, "incomplete random run");
+        let pct = Runner::new(
+            PctScheduler::new_from_seed(seed, PCT_DEPTH, SCHEDULES_PER_CASE),
+            config.clone(),
+        )
+        .run(*case);
+        assert_eq!(pct, SCHEDULES_PER_CASE, "incomplete PCT run");
         println!("SHUTTLE_PASSED {name} random={random} pct={pct} seed={seed}");
     }
 }

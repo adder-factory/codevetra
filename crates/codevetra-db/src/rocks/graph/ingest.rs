@@ -1,3 +1,4 @@
+use crate::rocks::RetentionPolicy;
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
@@ -5,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub(super) mod adjacency;
 mod file_changes;
 mod lexical_index;
-pub(super) use file_changes::FileChanges;
+pub(super) use file_changes::{FileChanges, RowCollector};
 
 use crate::{
     CanonicalSearchDocument, EdgeInput, FileInput, NumericalSiteInput, ReferenceInput, SymbolInput,
@@ -20,6 +21,13 @@ use super::{
     OUTGOING, ProjectStore, REFERENCE, Result, RocksError, SYMBOL, StorageRequest, check_workspace,
     codec, count,
 };
+
+const PUBLICATION_READ_ROWS: usize = 100_000;
+const PUBLICATION_READ_BYTES: usize = 64 * 1_048_576;
+const PUBLICATION_TIMEOUT: super::Duration = super::Duration::from_secs(300);
+const STAGING_KEY_COPIES: usize = 3;
+const STAGING_ROW_OVERHEAD_BYTES: usize = 128;
+const STAGING_METADATA_ALLOWANCE_BYTES: usize = 4096;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct EdgeProperties {
@@ -112,51 +120,62 @@ impl Row<'_> {
     }
 }
 
-pub(super) fn publish(
-    store: &ProjectStore,
-    mut input: GraphPublicationInput,
-    request: &StorageRequest,
-    mut reclaim: impl FnMut(usize) -> Result<()>,
-) -> std::result::Result<GraphPublication, GraphPublicationError> {
-    request.check()?;
-    let previous = match store.current_snapshot(None) {
-        Ok(snapshot) => Some(snapshot),
-        Err(RocksError::GenerationUnavailable) => None,
-        Err(error) => return Err(error.into()),
-    };
-    check_base(&input.identity.base, previous.as_ref())?;
-    if let Some(previous) = &previous {
-        previous.graph(&mut read_budget(request)?)?;
+impl GraphPublicationInput {
+    fn seal_metadata(
+        &self,
+        digest: codevetra_domain::ContentDigest,
+        version: codevetra_domain::GenerationDigestVersion,
+    ) -> crate::rocks::engine::RevisionSeal {
+        crate::rocks::engine::RevisionSeal::new(digest, version)
+            .with_source_admission(self.run_excludes.clone(), self.maximum_file_bytes)
     }
-    let writer = store.begin_revision(
-        input.identity.generation_id.clone(),
-        input.identity.source_revision.clone(),
-        super::Duration::from_secs(300),
-    )?;
-    let result = prepare_and_publish(
-        store,
-        &writer,
-        &mut input,
-        previous.as_ref(),
-        request,
-        &mut reclaim,
-    );
-    drop(input);
-    match result {
-        Ok((revision, report)) => {
-            // Release our old native snapshot before collecting retired rows.
-            drop(previous);
-            let retention = match store.prune(2, 4, 10_000, &mut read_budget(request)?) {
-                Ok(report) => GraphRetention::Completed(report),
-                Err(error) => GraphRetention::Deferred(error),
-            };
-            Ok(GraphPublication {
-                revision,
-                report,
-                retention,
-            })
+
+    pub(super) fn publish(
+        mut self,
+        store: &ProjectStore,
+        request: &StorageRequest,
+        mut reclaim: impl FnMut(usize) -> Result<()>,
+    ) -> std::result::Result<GraphPublication, GraphPublicationError> {
+        request.check()?;
+        let previous = match store.current_snapshot(None) {
+            Ok(snapshot) => Some(snapshot),
+            Err(RocksError::GenerationUnavailable) => None,
+            Err(error) => return Err(error.into()),
+        };
+        check_base(&self.identity.base, previous.as_ref())?;
+        if let Some(previous) = &previous {
+            previous.graph(&mut read_budget(request)?)?;
         }
-        Err(primary) => Err(failed_publication(store, &writer, primary)),
+        let writer = store.begin_revision(
+            self.identity.generation_id.clone(),
+            self.identity.source_revision.clone(),
+            PUBLICATION_TIMEOUT,
+        )?;
+        let publication = Publication {
+            store,
+            writer: &writer,
+            previous: previous.as_ref(),
+            request,
+        };
+        let result = publication.prepare_and_publish(&mut self, &mut reclaim);
+        drop(self);
+        match result {
+            Ok((revision, report)) => {
+                // Release our old native snapshot before collecting retired rows.
+                drop(previous);
+                let retention =
+                    match store.prune(RetentionPolicy::AUTOMATIC, &mut read_budget(request)?) {
+                        Ok(report) => GraphRetention::Completed(report),
+                        Err(error) => GraphRetention::Deferred(error),
+                    };
+                Ok(GraphPublication {
+                    revision,
+                    report,
+                    retention,
+                })
+            }
+            Err(primary) => Err(failed_publication(store, &writer, primary)),
+        }
     }
 }
 
@@ -183,104 +202,101 @@ fn check_base(base: &GraphBase, previous: Option<&RevisionSnapshot<'_>>) -> Resu
     }
 }
 
-fn prepare_and_publish(
-    store: &ProjectStore,
-    writer: &RevisionWriter,
-    input: &mut GraphPublicationInput,
-    previous: Option<&RevisionSnapshot<'_>>,
-    request: &StorageRequest,
-    reclaim: &mut impl FnMut(usize) -> Result<()>,
-) -> Result<(super::StoredRevision, GraphWriteReport)> {
-    // A writer may have published between taking the old view and reserving.
-    let current = match store.current_snapshot(None) {
-        Ok(snapshot) => Some(snapshot),
-        Err(RocksError::GenerationUnavailable) => None,
-        Err(error) => return Err(error),
-    };
-    check_base(&input.identity.base, current.as_ref())?;
-    drop(current);
-    let lexical = lexical_index::statistics(previous, request)?;
-    let changes = input.changes.take().filter(|_| lexical.is_some());
-    let sparse = changes.is_some();
-    let mut delta = Delta {
-        store,
-        writer,
-        previous,
-        request,
-        policy: input.policy,
-        pending: Vec::new(),
-        pending_bytes: 0,
-        report: GraphWriteReport::default(),
-        lexical_bootstrap: lexical.is_none(),
-        lexical_statistics: lexical.unwrap_or_default(),
-        lexical_working_bytes: input.policy.maximum_working_bytes,
-    };
-    let info = input.info()?;
-    let digest_version = match &input.payload {
-        super::GraphPayload::Resident(facts) => facts.digest_version(),
-        super::GraphPayload::Packed(graph) => graph.digest_version,
-    };
-    if let Some(changes) = changes {
-        delta.lexical_working_bytes = delta
-            .policy
-            .maximum_working_bytes
-            .checked_sub(usize::try_from(changes.retained_bytes()?).map_err(|_| super::limit())?)
-            .ok_or_else(super::limit)?;
-        changes.apply(&mut delta)?;
-        drop(changes);
-        delta.lexical_working_bytes = delta.policy.maximum_working_bytes;
-    } else {
-        match &mut input.payload {
-            super::GraphPayload::Resident(facts) => {
-                replace_tables(&mut delta, facts)?;
-                replace_adjacency(&mut delta, facts.edges(), false)?;
-                replace_adjacency(&mut delta, facts.edges(), true)?;
-            }
-            super::GraphPayload::Packed(graph) => graph.replay(
-                |collection, prefix, rows| {
-                    let mut old = PreviousRows::new(previous, collection, prefix, request);
-                    rows.visit(request, |key, value| delta.row(&mut old, key, value))?;
-                    delta.finish_rows(&mut old)
-                },
-                request,
-                reclaim,
-            )?,
+#[derive(Clone, Copy)]
+struct Publication<'a, 'store> {
+    store: &'a ProjectStore,
+    writer: &'a RevisionWriter,
+    previous: Option<&'a RevisionSnapshot<'store>>,
+    request: &'a StorageRequest,
+}
+
+impl<'a, 'store> Publication<'a, 'store> {
+    fn prepare_and_publish(
+        self,
+        input: &mut GraphPublicationInput,
+        reclaim: &mut impl FnMut(usize) -> Result<()>,
+    ) -> Result<(super::StoredRevision, GraphWriteReport)> {
+        let Self {
+            store,
+            writer,
+            previous,
+            request,
+        } = self;
+        // A writer may have published between taking the old view and reserving.
+        let current = match store.current_snapshot(None) {
+            Ok(snapshot) => Some(snapshot),
+            Err(RocksError::GenerationUnavailable) => None,
+            Err(error) => return Err(error),
+        };
+        check_base(&input.identity.base, current.as_ref())?;
+        drop(current);
+        let lexical = lexical_index::statistics(previous, request)?;
+        let changes = input.changes.take().filter(|_| lexical.is_some());
+        let sparse = changes.is_some();
+        let mut delta = Delta {
+            publication: self,
+            policy: input.policy,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            report: GraphWriteReport::default(),
+            lexical_bootstrap: lexical.is_none(),
+            lexical_statistics: lexical.unwrap_or_default(),
+            lexical_working_bytes: input.policy.maximum_working_bytes,
+        };
+        let info = input.info()?;
+        let digest_version = match &input.payload {
+            super::GraphPayload::Resident(facts) => facts.digest_version(),
+            super::GraphPayload::Packed(graph) => graph.digest_version,
+        };
+        if let Some(changes) = changes {
+            delta.apply_changes(changes)?;
+        } else {
+            delta.apply_payload(&mut input.payload, reclaim)?;
         }
-        if let super::GraphPayload::Packed(graph) = &input.payload {
-            delta.report.adjacency_blocks = graph.adjacency_blocks;
-            delta.report.maximum_degree = graph.maximum_degree;
+        let name_index_version = info.name_index_version;
+        let previous_name_version = previous
+            .map(|snapshot| {
+                snapshot
+                    .graph(&mut read_budget(request)?)
+                    .map(|graph| graph.info().name_index_version)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        if (!sparse || previous_name_version != name_index_version)
+            && let super::GraphPayload::Resident(facts) = &input.payload
+        {
+            replace_names(&mut delta, facts, name_index_version != 0)?;
+        }
+        delta.finish_lexical(info.documents)?;
+        let mut old = self.previous_rows(Collection::Graph, MANIFEST);
+        delta.row(&mut old, codec::key(MANIFEST, &[])?, codec::encode(&info)?)?;
+        delta.finish_rows(&mut old)?;
+        delta.flush()?;
+        request.check()?;
+        writer.seal(
+            store,
+            input.seal_metadata(info.content_digest, digest_version),
+        )?;
+        request.check()?;
+        let revision = store.publish(writer)?;
+        Ok((revision, delta.report))
+    }
+
+    fn previous_rows(
+        &self,
+        collection: Collection,
+        prefix: &'static [u8],
+    ) -> PreviousRows<'a, 'store> {
+        PreviousRows {
+            snapshot: self.previous,
+            collection,
+            prefix,
+            rows: VecDeque::new(),
+            after: None,
+            done: self.previous.is_none(),
+            request: self.request,
         }
     }
-    let name_index_version = info.name_index_version;
-    let previous_name_version = previous
-        .map(|snapshot| {
-            snapshot
-                .graph(&mut read_budget(request)?)
-                .map(|graph| graph.info().name_index_version)
-        })
-        .transpose()?
-        .unwrap_or(0);
-    if (!sparse || previous_name_version != name_index_version)
-        && let super::GraphPayload::Resident(facts) = &input.payload
-    {
-        replace_names(&mut delta, facts, name_index_version != 0)?;
-    }
-    delta.finish_lexical(info.documents)?;
-    let mut old = PreviousRows::new(previous, Collection::Graph, MANIFEST, request);
-    delta.row(&mut old, codec::key(MANIFEST, &[])?, codec::encode(&info)?)?;
-    delta.finish_rows(&mut old)?;
-    delta.flush()?;
-    request.check()?;
-    store.seal_with_admission(
-        writer,
-        info.content_digest,
-        digest_version,
-        input.run_excludes.clone(),
-        input.maximum_file_bytes,
-    )?;
-    request.check()?;
-    let revision = store.publish(writer)?;
-    Ok((revision, delta.report))
 }
 
 fn replace_names(
@@ -300,7 +316,7 @@ fn replace_names(
         keys.try_reserve_exact(count).map_err(|_| super::limit())?;
         check_workspace::<[u8; names::SUFFIX_BYTES]>(keys.capacity(), 0, delta.policy)?;
         for symbol in facts.symbols() {
-            delta.request.check()?;
+            delta.publication.request.check()?;
             keys.push(names::suffix(
                 &symbol.qualified_name,
                 symbol.symbol_id.as_str(),
@@ -313,14 +329,11 @@ fn replace_names(
         keys.sort_unstable();
         keys.dedup();
     }
-    let mut previous = PreviousRows::new(
-        delta.previous,
-        Collection::Graph,
-        names::PREFIX,
-        delta.request,
-    );
+    let mut previous = delta
+        .publication
+        .previous_rows(Collection::Graph, names::PREFIX);
     for key in keys {
-        delta.request.check()?;
+        delta.publication.request.check()?;
         delta.row(&mut previous, codec::key(names::PREFIX, &key)?, vec![1])?;
     }
     delta.finish_rows(&mut previous)
@@ -331,22 +344,19 @@ fn replace_tables(
     facts: &crate::CanonicalGenerationFacts,
 ) -> Result<()> {
     let tables = [
-        (Collection::Graph, FILE, facts.files().len()),
-        (Collection::Graph, SYMBOL, facts.symbols().len()),
-        (Collection::Graph, EDGE, facts.edges().len()),
-        (Collection::Graph, REFERENCE, facts.references().len()),
-        (Collection::Graph, NUMERICAL, facts.numerical_sites().len()),
-        (Collection::Search, DOCUMENT, facts.documents().len()),
+        (Collection::Graph, FILE),
+        (Collection::Graph, SYMBOL),
+        (Collection::Graph, EDGE),
+        (Collection::Graph, REFERENCE),
+        (Collection::Graph, NUMERICAL),
+        (Collection::Search, DOCUMENT),
     ];
-    for (collection, prefix, length) in tables {
-        delta.request.check()?;
-        let mut old = PreviousRows::new(delta.previous, collection, prefix, delta.request);
-        visit_table_rows(
-            facts,
-            prefix,
-            length,
+    for (collection, prefix) in tables {
+        delta.publication.request.check()?;
+        let mut old = delta.publication.previous_rows(collection, prefix);
+        CanonicalTable::new(facts, prefix)?.visit(
             delta.policy,
-            delta.request,
+            delta.publication.request,
             |key, row, workspace| {
                 delta.lexical_working_bytes = delta
                     .policy
@@ -378,12 +388,7 @@ pub(super) fn validate_workspace(
         u32::try_from(length).map_err(|_| super::limit())?;
     }
     for prefix in [EDGE, REFERENCE] {
-        let length = if prefix == EDGE {
-            facts.edges().len()
-        } else {
-            facts.references().len()
-        };
-        for group in table_groups(facts, prefix, length, || request.check()) {
+        for group in CanonicalTable::new(facts, prefix)?.groups(|| request.check()) {
             let group = group?;
             check_workspace::<TableOrder>(group.len(), 0, policy)?;
         }
@@ -394,158 +399,175 @@ pub(super) fn validate_workspace(
 // UUID text order is identical to its canonical binary key order. Only hashes
 // and the stored edge-kind discriminant need sorting, and their preceding UUID
 // fields already partition canonical rows into contiguous groups.
-fn table_groups<'a>(
+
+/// One canonical table with a source-derived row bound and a fixed key prefix.
+#[derive(Clone, Copy)]
+pub(super) struct CanonicalTable<'a> {
     facts: &'a crate::CanonicalGenerationFacts,
     prefix: &'a [u8],
     length: usize,
-    mut check: impl FnMut() -> Result<()> + 'a,
-) -> impl Iterator<Item = Result<std::ops::Range<usize>>> + 'a {
-    let mut offset = 0;
-    std::iter::from_fn(move || {
-        if offset == length {
-            return None;
-        }
-        if let Err(error) = check() {
-            offset = length;
-            return Some(Err(error));
-        }
-        let start = offset;
-        offset += 1;
-        while offset < length
-            && match prefix {
-                REFERENCE => {
-                    facts.references()[start].file_id == facts.references()[offset].file_id
-                }
-                EDGE => {
-                    let left = &facts.edges()[start];
-                    let right = &facts.edges()[offset];
-                    left.source_symbol_id == right.source_symbol_id
-                        && left.target_symbol_id == right.target_symbol_id
-                }
-                _ => false,
+}
+
+impl<'a> CanonicalTable<'a> {
+    pub(super) fn new(
+        facts: &'a crate::CanonicalGenerationFacts,
+        prefix: &'a [u8],
+    ) -> Result<Self> {
+        let length = match prefix {
+            FILE => facts.files().len(),
+            SYMBOL => facts.symbols().len(),
+            EDGE => facts.edges().len(),
+            REFERENCE => facts.references().len(),
+            NUMERICAL => facts.numerical_sites().len(),
+            DOCUMENT => facts.documents().len(),
+            _ => return Err(codec::corrupt()),
+        };
+        Ok(Self {
+            facts,
+            prefix,
+            length,
+        })
+    }
+
+    fn row(&self, index: usize) -> Result<(RecordKey, Row<'a>)> {
+        let row = row_at(self.facts, self.prefix, index)?;
+        Ok((row.key()?, row))
+    }
+    fn groups<'scan>(
+        self,
+        mut check: impl FnMut() -> Result<()> + 'scan,
+    ) -> impl Iterator<Item = Result<std::ops::Range<usize>>> + 'scan
+    where
+        'a: 'scan,
+    {
+        let Self {
+            facts,
+            prefix,
+            length,
+        } = self;
+        let mut offset = 0;
+        std::iter::from_fn(move || {
+            if offset == length {
+                return None;
             }
-        {
             if let Err(error) = check() {
                 offset = length;
                 return Some(Err(error));
             }
+            let start = offset;
             offset += 1;
+            while offset < length
+                && match prefix {
+                    REFERENCE => {
+                        facts.references()[start].file_id == facts.references()[offset].file_id
+                    }
+                    EDGE => {
+                        let left = &facts.edges()[start];
+                        let right = &facts.edges()[offset];
+                        left.source_symbol_id == right.source_symbol_id
+                            && left.target_symbol_id == right.target_symbol_id
+                    }
+                    _ => false,
+                }
+            {
+                if let Err(error) = check() {
+                    offset = length;
+                    return Some(Err(error));
+                }
+                offset += 1;
+            }
+            Some(Ok(start..offset))
+        })
+    }
+    pub(super) fn visit(
+        &self,
+        policy: super::GraphPolicy,
+        request: &StorageRequest,
+        mut visit: impl FnMut(RecordKey, Row<'a>, usize) -> Result<()>,
+    ) -> Result<()> {
+        let Self {
+            facts,
+            prefix,
+            length,
+        } = *self;
+        if prefix != EDGE && prefix != REFERENCE {
+            for index in 0..length {
+                request.check()?;
+                let (key, row) = self.row(index)?;
+                visit(key, row, 0)?;
+            }
+            return Ok(());
         }
-        Some(Ok(start..offset))
-    })
+        for group in self.groups(|| request.check()) {
+            let group = group?;
+            request.check()?;
+            check_workspace::<TableOrder>(group.len(), 0, policy)?;
+            let mut rows = Vec::new();
+            rows.try_reserve_exact(group.len())
+                .map_err(|_| super::limit())?;
+            let workspace = rows
+                .capacity()
+                .checked_mul(size_of::<TableOrder>())
+                .ok_or_else(super::limit)?;
+            if workspace > policy.maximum_working_bytes {
+                return Err(super::limit());
+            }
+            for index in group {
+                request.check()?;
+                let (key, _) = self.row(index)?;
+                rows.push(TableOrder::new(&key, prefix, index)?);
+            }
+            rows.sort_unstable_by(|left, right| left.bytes().cmp(right.bytes()));
+            request.check()?;
+            for ordered in rows {
+                let index = usize::try_from(ordered.index).map_err(|_| super::limit())?;
+                visit(
+                    codec::key(prefix, ordered.bytes())?,
+                    row_at(facts, prefix, index)?,
+                    workspace,
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
-pub(super) fn visit_table_rows<'a>(
-    facts: &'a crate::CanonicalGenerationFacts,
-    prefix: &[u8],
-    length: usize,
-    policy: super::GraphPolicy,
-    request: &StorageRequest,
-    mut visit: impl FnMut(RecordKey, Row<'a>, usize) -> Result<()>,
-) -> Result<()> {
-    if prefix != EDGE && prefix != REFERENCE {
-        for index in 0..length {
-            request.check()?;
-            let (key, row) = table_row(facts, prefix, index)?;
-            visit(key, row, 0)?;
-        }
-        return Ok(());
-    }
-    for group in table_groups(facts, prefix, length, || request.check()) {
-        let group = group?;
-        request.check()?;
-        check_workspace::<TableOrder>(group.len(), 0, policy)?;
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(group.len())
-            .map_err(|_| super::limit())?;
-        let workspace = rows
-            .capacity()
-            .checked_mul(size_of::<TableOrder>())
-            .ok_or_else(super::limit)?;
-        if workspace > policy.maximum_working_bytes {
-            return Err(super::limit());
-        }
-        for index in group {
-            request.check()?;
-            let (key, _) = table_row(facts, prefix, index)?;
-            rows.push(TableOrder::new(&key, prefix, index)?);
-        }
-        rows.sort_unstable_by(|left, right| left.bytes().cmp(right.bytes()));
-        request.check()?;
-        for ordered in rows {
-            let index = usize::try_from(ordered.index).map_err(|_| super::limit())?;
-            visit(
-                codec::key(prefix, ordered.bytes())?,
-                row_at(facts, prefix, index)?,
-                workspace,
-            )?;
+impl Row<'_> {
+    fn key(self) -> Result<RecordKey> {
+        match self {
+            Self::File(row) => uuid_key(FILE, row.file_id.as_str()),
+            Self::Symbol(row) => uuid_key(SYMBOL, row.symbol_id.as_str()),
+            Self::Edge(row) => edge_key(row),
+            Self::Reference(row) => reference_key(row),
+            Self::Numerical(row) => uuid_key(NUMERICAL, row.site_id.as_str()),
+            Self::Document(row) => uuid_key(DOCUMENT, row.document_id.as_str()),
         }
     }
-    Ok(())
 }
 
-fn table_row<'a>(
-    facts: &'a crate::CanonicalGenerationFacts,
-    prefix: &[u8],
-    index: usize,
-) -> Result<(RecordKey, Row<'a>)> {
-    match prefix {
-        FILE => {
-            let row = &facts.files()[index];
-            Ok((
-                codec::key(FILE, &codec::uuid(row.file_id.as_str())?)?,
-                Row::File(row),
-            ))
-        }
-        SYMBOL => {
-            let row = &facts.symbols()[index];
-            Ok((
-                codec::key(SYMBOL, &codec::uuid(row.symbol_id.as_str())?)?,
-                Row::Symbol(row),
-            ))
-        }
-        EDGE => {
-            let row = &facts.edges()[index];
-            let entry = codec::entry(&row.target_symbol_id, row.kind, &row.provenance)?;
-            Ok((
-                codec::edge_key(&row.source_symbol_id, &row.target_symbol_id, &entry)?,
-                Row::Edge(row),
-            ))
-        }
-        REFERENCE => {
-            let row = &facts.references()[index];
-            let mut suffix = codec::uuid(row.file_id.as_str())?.to_vec();
-            suffix.extend_from_slice(blake3::hash(&codec::encode(row)?).as_bytes());
-            Ok((codec::key(REFERENCE, &suffix)?, Row::Reference(row)))
-        }
-        NUMERICAL => {
-            let row = &facts.numerical_sites()[index];
-            Ok((
-                codec::key(NUMERICAL, &codec::uuid(row.site_id.as_str())?)?,
-                Row::Numerical(row),
-            ))
-        }
-        DOCUMENT => {
-            let row = &facts.documents()[index];
-            Ok((
-                codec::key(DOCUMENT, &codec::uuid(row.document_id.as_str())?)?,
-                Row::Document(row),
-            ))
-        }
-        _ => Err(codec::corrupt()),
-    }
+fn uuid_key(prefix: &[u8], id: &str) -> Result<RecordKey> {
+    codec::key(prefix, &codec::uuid(id)?)
+}
+
+fn edge_key(row: &EdgeInput) -> Result<RecordKey> {
+    let entry = codec::entry(&row.target_symbol_id, row.kind, &row.provenance)?;
+    codec::edge_key(&row.source_symbol_id, &row.target_symbol_id, &entry)
+}
+
+fn reference_key(row: &ReferenceInput) -> Result<RecordKey> {
+    let mut suffix = codec::uuid(row.file_id.as_str())?.to_vec();
+    suffix.extend_from_slice(blake3::hash(&codec::encode(row)?).as_bytes());
+    codec::key(REFERENCE, &suffix)
 }
 
 fn replace_adjacency(delta: &mut Delta<'_, '_>, edges: &[EdgeInput], incoming: bool) -> Result<()> {
     let prefix = if incoming { INCOMING } else { OUTGOING };
-    let mut old = PreviousRows::new(delta.previous, Collection::Graph, prefix, delta.request);
-    let report = adjacency::visit(
-        edges,
-        incoming,
-        delta.policy,
-        delta.request,
-        |key, value| delta.row(&mut old, key, value),
-    )?;
+    let mut old = delta.publication.previous_rows(Collection::Graph, prefix);
+    let policy = delta.policy;
+    let report = adjacency::AdjacencyWriter::new(delta.publication.request, |key, value| {
+        delta.row(&mut old, key, value)
+    })
+    .visit(edges, incoming, policy)?;
     delta.report.adjacency_blocks = delta
         .report
         .adjacency_blocks
@@ -556,10 +578,7 @@ fn replace_adjacency(delta: &mut Delta<'_, '_>, edges: &[EdgeInput], incoming: b
 }
 
 struct Delta<'a, 'store> {
-    store: &'a ProjectStore,
-    writer: &'a RevisionWriter,
-    previous: Option<&'a RevisionSnapshot<'store>>,
-    request: &'a StorageRequest,
+    publication: Publication<'a, 'store>,
     policy: super::GraphPolicy,
     pending: Vec<RecordChange>,
     pending_bytes: usize,
@@ -570,13 +589,53 @@ struct Delta<'a, 'store> {
 }
 
 impl Delta<'_, '_> {
+    fn apply_changes(&mut self, changes: FileChanges) -> Result<()> {
+        self.lexical_working_bytes = self
+            .policy
+            .maximum_working_bytes
+            .checked_sub(usize::try_from(changes.retained_bytes()?).map_err(|_| super::limit())?)
+            .ok_or_else(super::limit)?;
+        changes.apply(self)?;
+        drop(changes);
+        self.lexical_working_bytes = self.policy.maximum_working_bytes;
+        Ok(())
+    }
+    fn apply_payload(
+        &mut self,
+        payload: &mut super::GraphPayload,
+        reclaim: &mut impl FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        let request = self.publication.request;
+        match payload {
+            super::GraphPayload::Resident(facts) => {
+                replace_tables(self, facts)?;
+                replace_adjacency(self, facts.edges(), false)?;
+                replace_adjacency(self, facts.edges(), true)?;
+            }
+            super::GraphPayload::Packed(graph) => graph.replay(
+                |collection, prefix, rows| {
+                    let mut old = self.publication.previous_rows(collection, prefix);
+                    rows.visit(request, |key, value| self.row(&mut old, key, value))?;
+                    self.finish_rows(&mut old)
+                },
+                request,
+                reclaim,
+            )?,
+        }
+        if let super::GraphPayload::Packed(graph) = payload {
+            self.report.adjacency_blocks = graph.adjacency_blocks;
+            self.report.maximum_degree = graph.maximum_degree;
+        }
+        Ok(())
+    }
+
     fn row(
         &mut self,
         old: &mut PreviousRows<'_, '_>,
         key: RecordKey,
         value: Vec<u8>,
     ) -> Result<()> {
-        self.request.check()?;
+        self.publication.request.check()?;
         self.report.candidate_records += 1;
         while old.peek()?.is_some_and(|row| row.0 < key) {
             let (old_key, _) = old.pop()?.ok_or_else(codec::corrupt)?;
@@ -625,16 +684,17 @@ impl Delta<'_, '_> {
         let bytes = key
             .as_bytes()
             .len()
-            .saturating_mul(3)
+            .saturating_mul(STAGING_KEY_COPIES)
             .saturating_add(value.as_ref().map_or(0, Vec::len))
-            .saturating_add(128);
-        let store_policy = self.store.batch_policy();
+            .saturating_add(STAGING_ROW_OVERHEAD_BYTES);
+        let store_policy = self.publication.store.batch_policy();
         // Native validation reserves this fixed metadata allowance. Retain it
         // when the store's byte ceiling is tighter than the graph's ceiling.
-        let maximum_bytes = self
-            .policy
-            .maximum_batch_bytes
-            .min(store_policy.maximum_batch_bytes.saturating_sub(4_096));
+        let maximum_bytes = self.policy.maximum_batch_bytes.min(
+            store_policy
+                .maximum_batch_bytes
+                .saturating_sub(STAGING_METADATA_ALLOWANCE_BYTES),
+        );
         if bytes > maximum_bytes {
             return Err(RocksError::Limit {
                 resource: "graph_batch_bytes",
@@ -658,10 +718,13 @@ impl Delta<'_, '_> {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.request.check()?;
+        self.publication.request.check()?;
         if !self.pending.is_empty() {
-            self.store
-                .stage_controlled(self.writer, &self.pending, Some(self.request))?;
+            self.publication.store.stage_controlled(
+                self.publication.writer,
+                &self.pending,
+                Some(self.publication.request),
+            )?;
             self.pending.clear();
             self.pending_bytes = 0;
         }
@@ -679,33 +742,14 @@ struct PreviousRows<'a, 'store> {
     request: &'a StorageRequest,
 }
 
-impl<'a, 'store> PreviousRows<'a, 'store> {
-    fn new(
-        snapshot: Option<&'a RevisionSnapshot<'store>>,
-        collection: Collection,
-        prefix: &'static [u8],
-        request: &'a StorageRequest,
-    ) -> Self {
-        Self {
-            snapshot,
-            collection,
-            prefix,
-            rows: VecDeque::new(),
-            after: None,
-            done: snapshot.is_none(),
-            request,
-        }
-    }
-
+impl PreviousRows<'_, '_> {
     fn fill(&mut self) -> Result<()> {
         self.request.check()?;
         while self.rows.is_empty()
             && !self.done
             && let Some(snapshot) = self.snapshot
         {
-            let page = snapshot.scan_prefix(
-                self.collection,
-                self.prefix,
+            let page = snapshot.scan_prefix(self.collection, self.prefix).page(
                 self.after.as_ref(),
                 256,
                 &mut read_budget(self.request)?,
@@ -728,10 +772,12 @@ impl<'a, 'store> PreviousRows<'a, 'store> {
 }
 
 fn read_budget(request: &StorageRequest) -> Result<ReadBudget> {
-    Ok(
-        ReadBudget::new(100_000, 64 * 1_048_576, super::Duration::from_secs(300))?
-            .with_control(request.clone()),
-    )
+    Ok(ReadBudget::new(
+        PUBLICATION_READ_ROWS,
+        PUBLICATION_READ_BYTES,
+        PUBLICATION_TIMEOUT,
+    )?
+    .with_control(request.clone()))
 }
 
 #[cfg(test)]

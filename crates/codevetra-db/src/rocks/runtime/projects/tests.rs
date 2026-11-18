@@ -1,5 +1,6 @@
 use std::{sync::mpsc, time::Duration};
 
+use super::super::JobCapacity;
 use super::*;
 use crate::rocks::{AsyncProjectStore, ReadBudget, StorageRuntime, WorkerPolicy};
 use codevetra_domain::{GenerationDigestVersion, GenerationId};
@@ -28,19 +29,12 @@ async fn hold_open(
     let root = root.to_path_buf();
     let control = request()?;
     let task = tokio::spawn(async move {
-        pool.run(&control, 64 * 1_024, true, move |control| {
+        pool.run(&control, JobCapacity::write(64 * 1_024), move |control| {
             projects.open_with(
-                &root,
-                identity(8),
-                StorePolicy::default(),
+                ProjectOpening::new(root, identity(8), StorePolicy::default()),
                 &control,
-                |root, identity, policy, control| {
-                    let store = ProjectStore::open_controlled(
-                        root,
-                        identity,
-                        policy,
-                        Some(control.clone()),
-                    )?;
+                |opening, control| {
+                    let store = opening.open(Some(control.clone()))?;
                     let _entered = entered.send(());
                     released
                         .recv_timeout(Duration::from_secs(10))
@@ -66,46 +60,65 @@ async fn suspended_and_waiting_project_opens_leave_existing_readers_responsive()
     })?;
     let current = AsyncProjectStore::open(
         &runtime,
-        current_root.path().to_path_buf(),
-        identity(7),
-        StorePolicy::default(),
+        crate::rocks::ProjectOpening::new(
+            current_root.path().to_path_buf(),
+            identity(7),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
-    let writer = current
-        .begin_revision(
-            GenerationId::from_uuid_v8([1; 16]),
-            identity(1),
-            Duration::from_secs(30),
-            &request()?,
-        )
-        .await?;
-    current
-        .seal(
-            &writer,
-            identity(2),
-            GenerationDigestVersion::V23,
-            &request()?,
-        )
-        .await?;
-    current.publish(&writer, &request()?).await?;
+    let writer = {
+        let request_bound_generation = GenerationId::from_uuid_v8([1; 16]);
+        let request_bound_source_revision = identity(1);
+        let request_bound_lease = Duration::from_secs(30);
+        current
+            .with_request(&request()?)
+            .begin_revision(
+                request_bound_generation,
+                request_bound_source_revision,
+                request_bound_lease,
+            )
+            .await
+    }?;
+    {
+        let request_bound_writer = &writer;
+        let request_bound_content_digest = identity(2);
+        let request_bound_digest_version = GenerationDigestVersion::V23;
+        current
+            .with_request(&request()?)
+            .seal(
+                request_bound_writer,
+                request_bound_content_digest,
+                request_bound_digest_version,
+            )
+            .await
+    }?;
+    {
+        let request_bound_writer = &writer;
+        current
+            .with_request(&request()?)
+            .publish(request_bound_writer)
+            .await
+    }?;
     let (release, opening) = hold_open(&runtime, opening_root.path()).await?;
     let waiting_request = request()?;
     let mut waiting = Box::pin(AsyncProjectStore::open(
         &runtime,
-        waiting_root.path().to_path_buf(),
-        identity(9),
-        StorePolicy::default(),
+        crate::rocks::ProjectOpening::new(
+            waiting_root.path().to_path_buf(),
+            identity(9),
+            StorePolicy::default(),
+        ),
         &waiting_request,
     ));
     assert!(futures_util::poll!(waiting.as_mut()).is_pending());
     let read_request = request()?;
     let read = tokio::time::timeout(
         Duration::from_secs(2),
-        current.read(
+        current.with_request(&read_request).read(
             None,
             ReadBudget::new(1, 1_024, Duration::from_secs(5))?,
-            &read_request,
             |snapshot, _| Ok(snapshot.revision().sequence),
         ),
     )

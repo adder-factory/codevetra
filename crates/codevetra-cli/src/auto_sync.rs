@@ -651,9 +651,8 @@ async fn run_auto_sync(input: AutoSyncTask) {
     let state = input.state.clone();
     // Both futures belong to this single supervised task. Completing or
     // cancelling either drops the other; no maintenance work is detached.
-    let maintenance = run_retention(
+    let maintenance = input.state.clone().run_retention(
         input.runtime.clone(),
-        input.state.clone(),
         input.cancellation.clone(),
         input.startup_reconciliation_enabled,
     );
@@ -664,37 +663,41 @@ async fn run_auto_sync(input: AutoSyncTask) {
     state.active.store(false, Ordering::Release);
 }
 
-async fn run_retention(
-    runtime: Arc<dyn SyncProject>,
-    state: Arc<AutoSyncState>,
-    mut cancellation: watch::Receiver<bool>,
-    startup_reconciliation_enabled: bool,
-) {
-    let mut delay = if startup_reconciliation_enabled {
-        STARTUP_RECONCILIATION_DELAY
-    } else {
-        RECONCILIATION_INTERVAL
-    };
-    loop {
-        tokio::select! {
-            biased;
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() { break; }
+impl AutoSyncState {
+    async fn run_retention(
+        self: Arc<Self>,
+        runtime: Arc<dyn SyncProject>,
+        mut cancellation: watch::Receiver<bool>,
+        startup_reconciliation_enabled: bool,
+    ) {
+        let mut delay = if startup_reconciliation_enabled {
+            STARTUP_RECONCILIATION_DELAY
+        } else {
+            RECONCILIATION_INTERVAL
+        };
+        loop {
+            tokio::select! {
+                biased;
+                changed = cancellation.changed() => {
+                    if changed.is_err() || *cancellation.borrow() { break; }
+                }
+                () = tokio::time::sleep(delay) => {},
             }
-            () = tokio::time::sleep(delay) => {},
+            if self.retention_attempt_allowed(unix_millis()) {
+                self.record_retention_outcome(
+                    runtime.clone().sync_retention().await,
+                    unix_millis(),
+                );
+            }
+            // Recheck at most every 30 seconds so a successful index can shorten
+            // maintenance backoff, while honoring the exact next-admission time.
+            delay = Duration::from_millis(
+                self.next_retention_at
+                    .load(Ordering::Acquire)
+                    .saturating_sub(unix_millis()),
+            )
+            .min(RECONCILIATION_INTERVAL);
         }
-        if state.retention_attempt_allowed(unix_millis()) {
-            state.record_retention_outcome(runtime.clone().sync_retention().await, unix_millis());
-        }
-        // Recheck at most every 30 seconds so a successful index can shorten
-        // maintenance backoff, while honoring the exact next-admission time.
-        delay = Duration::from_millis(
-            state
-                .next_retention_at
-                .load(Ordering::Acquire)
-                .saturating_sub(unix_millis()),
-        )
-        .min(RECONCILIATION_INTERVAL);
     }
 }
 

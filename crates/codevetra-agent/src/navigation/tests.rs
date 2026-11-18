@@ -606,9 +606,14 @@ async fn large_native_allocations_preserve_provider_seed_bounds_and_report_trunc
         .collect();
     let allocation = runtime
         .allocate_source_with_cancellation(
-            generation,
-            selections,
-            crate::SourceAllocationOptions::new(crate::SourceSelectionPolicy::Full, 512 * 1024)?,
+            crate::SourceAllocationRequest::new(
+                generation,
+                selections,
+                crate::SourceAllocationOptions::new(
+                    crate::SourceSelectionPolicy::Full,
+                    512 * 1024,
+                )?,
+            ),
             ProjectCancellation::new(),
         )
         .await?

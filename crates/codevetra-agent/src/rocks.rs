@@ -8,7 +8,7 @@ use std::{
 };
 
 use codevetra_db::rocks::{
-    AsyncProjectStore, GraphBase, GraphInfo, GraphPolicy, GraphPublicationError,
+    AsyncProjectStore, GraphBase, GraphInfo, GraphPolicy, GraphPreparation, GraphPublicationError,
     GraphPublicationInput, GraphRetention, GraphRevision, GraphWriteReport, PruneReport,
     ReadBudget, RocksError, StorageRequest, StorageRuntime, StorePolicy, StoredRevision,
     WorkerPolicy,
@@ -29,9 +29,18 @@ use crate::{
     run_source_worker, select_worker_count, source_revision_with_options,
 };
 
+const CURRENT_GRAPH_READ_ROWS: usize = 8;
+const CURRENT_GRAPH_READ_BYTES: usize = 1_048_576;
+const CURRENT_GRAPH_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+mod admission;
 #[cfg(test)]
 mod cache_tests;
+use admission::SourceAdmission;
 mod incremental;
+mod index;
+mod maintenance;
+use maintenance::Maintenance;
 mod operations;
 mod query;
 pub use query::{RocksQuery, RocksQueryResult};
@@ -81,7 +90,7 @@ impl RocksIndexOptions {
     fn source_admission(
         &self,
         inherited: Option<&StoredRevision>,
-    ) -> Result<(Vec<String>, Option<usize>), RocksProjectError> {
+    ) -> Result<SourceAdmission, RocksProjectError> {
         if self
             .workers
             .is_some_and(|workers| !(1..=16).contains(&workers))
@@ -97,7 +106,7 @@ impl RocksIndexOptions {
             self.maximum_file_bytes
                 .or_else(|| inherited.and_then(|revision| revision.maximum_file_bytes))
         };
-        Ok((excludes, ceiling))
+        Ok(SourceAdmission { excludes, ceiling })
     }
 }
 
@@ -193,17 +202,6 @@ impl RocksMaintenanceReport {
     }
 }
 
-struct IndexCompletion {
-    native: Option<NativePipelineReport>,
-    workers: u16,
-    incremental_files: u16,
-    cache_contract: ContentDigest,
-    publication: codevetra_db::rocks::GraphPublication,
-    counts: GraphInfo,
-    profile: IndexProfile,
-    started: std::time::Instant,
-}
-
 struct PreparedGraph {
     input: GraphPublicationInput,
     native: Option<NativePipelineReport>,
@@ -218,8 +216,7 @@ struct GraphBuild<'a> {
     base: GraphBase,
     request: &'a StorageRequest,
     progress: &'a NativeBuildProgress,
-    excludes: &'a [String],
-    ceiling: Option<usize>,
+    admission: &'a SourceAdmission,
     publication_policy: GraphPolicy,
 }
 
@@ -329,9 +326,11 @@ impl RocksProjectRuntime {
         })?;
         let store = AsyncProjectStore::open(
             &storage,
-            root.clone(),
-            identity.clone(),
-            StorePolicy::default(),
+            codevetra_db::rocks::ProjectOpening::new(
+                root.clone(),
+                identity.clone(),
+                StorePolicy::default(),
+            ),
             request,
         )
         .await?;
@@ -376,10 +375,8 @@ impl RocksProjectRuntime {
         retain_overlay: bool,
     ) -> Result<(SourceRevision, ProjectSourcePolicy), RocksProjectError> {
         let current = self.current(request).await?;
-        let (excludes, ceiling) = current.map_or((Vec::new(), None), |(revision, _)| {
-            (revision.run_excludes, revision.maximum_file_bytes)
-        });
-        self.scan_with_admission(request, retain_overlay, excludes, ceiling)
+        let admission = SourceAdmission::inherited(current.map(|(revision, _)| revision));
+        self.scan_with_admission(request, retain_overlay, admission)
             .await
     }
 
@@ -387,8 +384,7 @@ impl RocksProjectRuntime {
         &self,
         request: &StorageRequest,
         retain_overlay: bool,
-        excludes: Vec<String>,
-        ceiling: Option<usize>,
+        admission: SourceAdmission,
     ) -> Result<(SourceRevision, ProjectSourcePolicy), RocksProjectError> {
         request.check()?;
         let permit = tokio::select! {
@@ -409,17 +405,7 @@ impl RocksProjectRuntime {
             if let Some(pause) = pause {
                 pause.wait()?;
             }
-            let mut policy = project_source_policy_with_excludes(&root, &excludes)?;
-            if let Some(ceiling) = ceiling {
-                if !(1..=32 * 1_048_576).contains(&ceiling) {
-                    return Err(ProjectError::InvalidOptions);
-                }
-                policy.maximum_file_bytes = Some(
-                    policy
-                        .maximum_file_bytes
-                        .map_or(ceiling, |configured| configured.min(ceiling)),
-                );
-            }
+            let policy = admission.policy(&root)?;
             let source = crate::source_scan::retry_complete_scan(|| {
                 if control.check().is_err() {
                     return Err(ProjectError::RequestCancelled);
@@ -449,10 +435,14 @@ impl RocksProjectRuntime {
     ) -> Result<Option<(StoredRevision, GraphInfo)>, RocksProjectError> {
         let result = self
             .store
+            .with_request(request)
             .read(
                 None,
-                ReadBudget::new(8, 1_048_576, Duration::from_secs(30))?,
-                request,
+                ReadBudget::new(
+                    CURRENT_GRAPH_READ_ROWS,
+                    CURRENT_GRAPH_READ_BYTES,
+                    CURRENT_GRAPH_READ_TIMEOUT,
+                )?,
                 |snapshot, budget| {
                     Ok((
                         snapshot.revision().clone(),
@@ -505,150 +495,9 @@ impl RocksProjectRuntime {
             .indexing
             .try_lock()
             .map_err(|_| RocksError::WriterBusy)?;
-        let started = std::time::Instant::now();
-        let current = self.current(request).await?;
-        let inherited = current.as_ref().map(|(revision, _)| revision);
-        let (excludes, ceiling) = options.source_admission(inherited)?;
-        let (source, policy) = self
-            .scan_with_admission(request, true, excludes.clone(), ceiling)
-            .await?;
-        let cache_contract =
-            codevetra_indexer::native_parse_cache_contract_digest(policy.index.maximum_ast_depth);
-        let preparation_millis = monotonic_millis(started.elapsed());
-        let progress = options.progress.clone().unwrap_or_default();
-        if !options.force
-            && let Some(current) = current.as_ref().filter(|(revision, _)| {
-                revision.source_revision == source.digest
-                    && revision.digest_version == Some(GenerationDigestVersion::CURRENT)
-                    && revision.run_excludes == excludes
-                    && revision.maximum_file_bytes == ceiling
-            })
-        {
-            return self
-                .unchanged_report(
-                    current,
-                    cache_contract,
-                    preparation_millis,
-                    started,
-                    request,
-                )
-                .await;
-        }
-        let base = current.as_ref().map_or(GraphBase::Empty, |(revision, _)| {
-            GraphBase::Current(revision.generation_id.clone())
-        });
-        let pipeline_started = std::time::Instant::now();
-        let index_policy = policy.index;
-        let scip_overlay = source.scip_overlay.is_some();
-        let observed_source = source.native_manifest.is_some();
-        let PreparedGraph {
-            input,
-            native,
-            workers,
-            incremental_files,
-        } = self
-            .prepare_graph(
-                &mut warm,
-                GraphBuild {
-                    source,
-                    policy,
-                    options: &options,
-                    base,
-                    request,
-                    progress: &progress,
-                    excludes: &excludes,
-                    ceiling,
-                    publication_policy: graph_publication_policy(),
-                },
-            )
-            .await?;
-        let counts = input.info()?;
-        let retained_facts = input.shared_facts();
-        if incremental_files > 0 {
-            progress.publishing_incremental().await?;
-        } else {
-            progress.publishing().await?;
-        }
-        let publication = self.store.publish_graph(input, request).await?;
-        *warm = retained_facts.map(|facts| incremental::WarmGraph {
-            generation: publication.revision.generation_id.clone(),
-            policy: index_policy,
-            scip_overlay,
-            facts,
-        });
-        progress.finish(true, false).await;
-        let pipeline_millis = monotonic_millis(pipeline_started.elapsed());
-        let pipeline_stages = progress.status().await.stage_timings().to_vec();
-        self.complete_index(
-            IndexCompletion {
-                native,
-                workers,
-                incremental_files,
-                cache_contract,
-                publication,
-                counts,
-                started,
-                profile: IndexProfile {
-                    preparation_millis,
-                    source_manifest_reused: observed_source && incremental_files == 0,
-                    pipeline_millis,
-                    pipeline_stages,
-                    ..IndexProfile::default()
-                },
-            },
-            request,
-        )
-        .await
-    }
-
-    async fn complete_index(
-        &self,
-        completed: IndexCompletion,
-        request: &StorageRequest,
-    ) -> Result<RocksIndexReport, RocksProjectError> {
-        let IndexCompletion {
-            native,
-            workers,
-            incremental_files,
-            cache_contract,
-            publication,
-            counts,
-            started,
-            mut profile,
-        } = completed;
-        let (retention_progress, retention_error) = retention_outcome(&publication.retention);
-        let (
-            parse_cache_retention,
-            parse_cache_retention_error,
-            auxiliary_retention,
-            auxiliary_retention_error,
-        ) = self.maintain_auxiliary(&cache_contract, request).await;
-        let (fresh, source_verification_error) = self
-            .verify_publication(&publication.revision.generation_id, request)
-            .await;
-        let parse_cache = native.as_ref().map(NativePipelineReport::parse_cache);
-        profile.total_millis = monotonic_millis(started.elapsed());
-        Ok(RocksIndexReport {
-            native: native.map(Into::into),
-            workers,
-            parse_cache_contract_digest: cache_contract,
-            profile,
-            parse_cache,
-            parse_cache_retention,
-            parse_cache_retention_error,
-            auxiliary_retention,
-            auxiliary_retention_error,
-            unchanged: false,
-            incremental_files,
-            revision: publication.revision,
-            counts,
-            writes: publication.report,
-            fresh,
-            retention_completed: Some(retention_progress.is_some_and(|report| report.complete)),
-            retention_progress,
-            retention_error,
-            source_verification_error,
-        })
+        index::IndexRun::new(self, request)
+            .execute(options, &mut warm)
+            .await
     }
 
     async fn verify_publication(
@@ -669,117 +518,14 @@ impl RocksProjectRuntime {
         }
     }
 
-    async fn unchanged_report(
-        &self,
-        current: &(StoredRevision, GraphInfo),
-        cache_contract: ContentDigest,
-        preparation_millis: u64,
-        started: std::time::Instant,
-        request: &StorageRequest,
-    ) -> Result<RocksIndexReport, RocksProjectError> {
-        let (revision, counts) = current;
-        let (retention_progress, retention_error) = self.maintain(request).await;
-        let (
-            parse_cache_retention,
-            parse_cache_retention_error,
-            auxiliary_retention,
-            auxiliary_retention_error,
-        ) = self.maintain_auxiliary(&cache_contract, request).await;
-        let fresh = self.status_inner(request).await?.fresh;
-        Ok(RocksIndexReport {
-            native: None,
-            workers: 0,
-            parse_cache_contract_digest: cache_contract,
-            profile: IndexProfile {
-                preparation_millis,
-                total_millis: monotonic_millis(started.elapsed()),
-                ..IndexProfile::default()
-            },
-            parse_cache: None,
-            parse_cache_retention,
-            parse_cache_retention_error,
-            auxiliary_retention,
-            auxiliary_retention_error,
-            unchanged: true,
-            incremental_files: 0,
-            revision: revision.clone(),
-            counts: counts.clone(),
-            writes: GraphWriteReport::default(),
-            fresh,
-            retention_completed: Some(retention_progress.is_some_and(|report| report.complete)),
-            retention_progress,
-            retention_error,
-            source_verification_error: None,
-        })
-    }
-
-    async fn maintain(&self, request: &StorageRequest) -> (Option<PruneReport>, Option<String>) {
-        let result = async {
-            self.store
-                .prune(
-                    2,
-                    4,
-                    10_000,
-                    ReadBudget::new(20_000, 64 * 1_048_576, Duration::from_secs(30))?,
-                    request,
-                )
-                .await
-        }
-        .await;
-        retention_outcome(&match result {
-            Ok(report) => GraphRetention::Completed(report),
-            Err(error) => GraphRetention::Deferred(error),
-        })
-    }
-
-    async fn maintain_auxiliary(
-        &self,
-        contract: &ContentDigest,
-        request: &StorageRequest,
-    ) -> (
-        Option<codevetra_db::NativeParseCacheRetentionReport>,
-        Option<String>,
-        Option<codevetra_db::NativeAuxiliaryPruneReport>,
-        Option<String>,
-    ) {
-        let cache = self
-            .database
-            .prune_native_parse_cache_with_request(
-                self.database.project_id(),
-                contract,
-                codevetra_db::NativeParseCacheRetentionPolicy::automatic(),
-                request,
-            )
-            .await;
-        let auxiliary = self
-            .database
-            .prune_auxiliary_snapshots_with_request(request)
-            .await;
-        let (cache, cache_error) = match cache {
-            Ok(report) => (Some(report), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        let (auxiliary, auxiliary_error) = match auxiliary {
-            Ok(report) => (Some(report), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        (cache, cache_error, auxiliary, auxiliary_error)
-    }
-
     async fn prepare_graph(
         &self,
         warm: &mut Option<incremental::WarmGraph>,
         build: GraphBuild<'_>,
     ) -> Result<PreparedGraph, RocksProjectError> {
         if let Some((input, files)) = self.try_local_graph(warm, &build).await? {
-            self.verify_graph_source(
-                &input,
-                &build.source,
-                build.excludes,
-                build.ceiling,
-                build.request,
-            )
-            .await?;
+            self.verify_graph_source(&input, &build.source, build.request)
+                .await?;
             return Ok(PreparedGraph {
                 input,
                 native: None,
@@ -810,8 +556,7 @@ impl RocksProjectRuntime {
             base,
             request,
             progress,
-            excludes,
-            ceiling,
+            admission,
             publication_policy,
         } = input;
         let workers = select_worker_count(
@@ -853,15 +598,12 @@ impl RocksProjectRuntime {
         };
         let (input, report) = build_native_rocks_graph_observed(
             build,
-            identity,
-            publication_policy,
-            request,
+            GraphPreparation::new(identity, publication_policy, request),
             progress,
         )
         .await?;
-        let input = input.with_source_admission(excludes.to_vec(), ceiling)?;
-        self.verify_graph_source(&input, &source, excludes, ceiling, request)
-            .await?;
+        let input = admission.attach(input)?;
+        self.verify_graph_source(&input, &source, request).await?;
         Ok((input, report, workers))
     }
 
@@ -869,8 +611,6 @@ impl RocksProjectRuntime {
         &self,
         input: &GraphPublicationInput,
         source: &SourceRevision,
-        excludes: &[String],
-        ceiling: Option<usize>,
         request: &StorageRequest,
     ) -> Result<(), RocksProjectError> {
         // Check the bytes actually parsed, not only pre/post filesystem scans.
@@ -895,7 +635,7 @@ impl RocksProjectRuntime {
             return Err(RocksProjectError::SourceChanged);
         }
         if self
-            .scan_with_admission(request, false, excludes.to_vec(), ceiling)
+            .scan_with_admission(request, false, SourceAdmission::attached(input))
             .await?
             .0
             .digest
@@ -956,11 +696,11 @@ mod tests {
         // 10,000-version batch, while preserving the complete current graph.
         let writer = runtime
             .store
+            .with_request(&control)
             .begin_revision(
                 new_generation_id(),
                 indexed.revision.source_revision.clone(),
                 Duration::from_secs(30),
-                &control,
             )
             .await?;
         for batch in 0_u32..12 {
@@ -973,9 +713,13 @@ mod tests {
                     ))
                 })
                 .collect::<Result<Vec<_>, RocksError>>()?;
-            runtime.store.stage(&writer, changes, &control).await?;
+            runtime
+                .store
+                .with_request(&control)
+                .stage(&writer, changes)
+                .await?;
         }
-        runtime.store.fail(&writer, &control).await?;
+        runtime.store.with_request(&control).fail(&writer).await?;
         let first = runtime
             .index(RocksIndexOptions::default(), &control)
             .await?;

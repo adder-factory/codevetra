@@ -352,17 +352,31 @@ pub enum GenerationDigestVersion {
     V26 = 26,
     /// Operation-local safety facts, scoped application boundaries and receiver resolution.
     V27 = 27,
+    /// Conservative Rust test/proof ownership and flat value-mapping evidence.
+    V28 = 28,
+    /// Explicit Rust receiver parameters stay outside caller argument counts.
+    V29 = 29,
+    /// Rust qualified-path method namespaces and local named-constant health evidence.
+    V30 = 30,
+    /// Full-width health counts, uniform-call mappings, and mapping-pattern clone identity.
+    V31 = 31,
+    /// Bounded cfg-only conventional Rust module bindings across build configurations.
+    V32 = 32,
+    /// Exact Rust path-attribute modules, loading directories, and scoped visibility.
+    V33 = 33,
+    /// Proven qualified macro arguments and explicit Cargo benchmark/test/example roots.
+    V34 = 34,
 }
 
 impl GenerationDigestVersion {
     /// Current digest contract emitted by this CodeVetra v2 binary.
-    pub const CURRENT: Self = Self::V27;
+    pub const CURRENT: Self = Self::V34;
 
     /// Every admitted contract version in ascending order.
     ///
     /// A new version is added here and nowhere else; validation walks this list
     /// rather than repeating one guarded arm per version.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 34] = [
         Self::V1,
         Self::V2,
         Self::V3,
@@ -390,6 +404,13 @@ impl GenerationDigestVersion {
         Self::V25,
         Self::V26,
         Self::V27,
+        Self::V28,
+        Self::V29,
+        Self::V30,
+        Self::V31,
+        Self::V32,
+        Self::V33,
+        Self::V34,
     ];
 
     /// Stable PostgreSQL `smallint` representation.
@@ -745,7 +766,14 @@ mod tests {
     const DIGEST_V25_DATABASE_VALUE: i16 = 25;
     const DIGEST_V26_DATABASE_VALUE: i16 = 26;
     const DIGEST_V27_DATABASE_VALUE: i16 = 27;
-    const UNKNOWN_DIGEST_DATABASE_VALUE: i16 = 28;
+    const DIGEST_V28_DATABASE_VALUE: i16 = 28;
+    const DIGEST_V29_DATABASE_VALUE: i16 = 29;
+    const DIGEST_V30_DATABASE_VALUE: i16 = 30;
+    const DIGEST_V31_DATABASE_VALUE: i16 = 31;
+    const DIGEST_V32_DATABASE_VALUE: i16 = 32;
+    const DIGEST_V33_DATABASE_VALUE: i16 = 33;
+    const DIGEST_V34_DATABASE_VALUE: i16 = 34;
+    const UNKNOWN_DIGEST_DATABASE_VALUE: i16 = 35;
 
     #[test]
     fn branded_ids_canonicalize_and_validate_deserialized_values() {
@@ -811,6 +839,13 @@ mod tests {
             (DIGEST_V25_DATABASE_VALUE, GenerationDigestVersion::V25),
             (DIGEST_V26_DATABASE_VALUE, GenerationDigestVersion::V26),
             (DIGEST_V27_DATABASE_VALUE, GenerationDigestVersion::V27),
+            (DIGEST_V28_DATABASE_VALUE, GenerationDigestVersion::V28),
+            (DIGEST_V29_DATABASE_VALUE, GenerationDigestVersion::V29),
+            (DIGEST_V30_DATABASE_VALUE, GenerationDigestVersion::V30),
+            (DIGEST_V31_DATABASE_VALUE, GenerationDigestVersion::V31),
+            (DIGEST_V32_DATABASE_VALUE, GenerationDigestVersion::V32),
+            (DIGEST_V33_DATABASE_VALUE, GenerationDigestVersion::V33),
+            (DIGEST_V34_DATABASE_VALUE, GenerationDigestVersion::V34),
         ];
         for (value, version) in versions {
             assert_eq!(version.database_value(), value);
@@ -821,7 +856,7 @@ mod tests {
         }
         assert_eq!(
             GenerationDigestVersion::CURRENT.database_value(),
-            DIGEST_V27_DATABASE_VALUE
+            DIGEST_V34_DATABASE_VALUE
         );
         assert!(
             GenerationDigestVersion::from_database_value(UNKNOWN_DIGEST_DATABASE_VALUE).is_err()

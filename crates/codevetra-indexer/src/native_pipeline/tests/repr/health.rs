@@ -1,9 +1,9 @@
 use super::super::*;
 use std::collections::{HashMap, HashSet};
 
-const MAX_CYCLOMATIC_EXCLUSIVE: u16 = 15;
+const MAX_CYCLOMATIC_EXCLUSIVE: u32 = 15;
 const MAX_FUNCTION_LINES_EXCLUSIVE: u32 = 100;
-const MAX_PARAMETER_COUNT: u16 = 3;
+const MAX_PARAMETER_COUNT: u32 = 3;
 const MAX_DISTINCT_CALLS_EXCLUSIVE: usize = 25;
 
 #[test]

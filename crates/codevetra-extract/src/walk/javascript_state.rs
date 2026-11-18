@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use codevetra_domain::SymbolId;
+use codevetra_domain::{ReferenceKind, SymbolId};
 
 use super::{
     javascript_owners::OwnerIndex, javascript_scopes::LexicalScopes,
@@ -28,4 +28,33 @@ pub(super) struct JavaScriptState<'source> {
     /// inside it (a non-callable variable declarator, a type alias), so a type
     /// consumer in its value is not recorded a second time.
     pub(super) whole_type_owners: BTreeSet<SymbolId>,
+}
+
+impl JavaScriptState<'_> {
+    pub(super) fn initializer_execution_owner(&self, owner: Option<&SymbolId>) -> Option<SymbolId> {
+        let owner = owner?;
+        Some(
+            self.initializer_reference_owners
+                .iter()
+                .rev()
+                .find_map(|(binding, execution)| (binding == owner).then_some(execution))
+                .unwrap_or(owner)
+                .clone(),
+        )
+    }
+
+    pub(super) fn execution_reference_owner(
+        &self,
+        owner: Option<&SymbolId>,
+        kind: ReferenceKind,
+    ) -> Option<SymbolId> {
+        if matches!(
+            kind,
+            ReferenceKind::Calls | ReferenceKind::Instantiates | ReferenceKind::Imports
+        ) {
+            self.initializer_execution_owner(owner)
+        } else {
+            owner.cloned()
+        }
+    }
 }

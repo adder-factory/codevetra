@@ -2,6 +2,11 @@
 
 use std::{cmp::Ordering, collections::BTreeSet};
 
+mod ranked;
+pub(crate) use ranked::RankedRows;
+
+use codevetra_domain::FileId;
+
 use super::{
     CurrentEntryPointPage, CurrentEntryPointsLookup, CurrentFileLookup, CurrentFileRecord,
     CurrentFileSymbolsLookup, CurrentFilesLookup, CurrentGenerationRecord, CurrentGraphEdge,
@@ -13,16 +18,19 @@ use super::{
 };
 use crate::{
     FileInput, NativeDatabase, SymbolInput,
-    rocks::{GraphLink, GraphSnapshot, ReadBudget, RocksError},
+    rocks::{GraphLink, GraphSnapshot, ReadBudget, RecordKey, RocksError},
 };
 
 type NativeResult<T> = Result<T, RocksError>;
+type RecordPage<T> = NativeResult<(Vec<T>, Option<RecordKey>)>;
+const SCAN_PAGE_ROWS: u16 = 256;
 
 struct GraphEdgeFilter {
     direction: GraphDirection,
     include_tests: bool,
     kinds: Vec<codevetra_domain::EdgeKind>,
     minimum_confidence: f32,
+    limit: usize,
 }
 
 impl NativeDatabase {
@@ -49,12 +57,10 @@ impl NativeDatabase {
         let request = crate::native_database::request_for(timeout)
             .map_err(crate::native_database::storage_error)?;
         self.store
+            .with_request(&request)
             .state(
-                None,
+                crate::rocks::StateAccess::read_only(None),
                 ReadBudget::new(8, 4096, timeout).map_err(crate::native_database::storage_error)?,
-                0,
-                0,
-                &request,
                 |transaction, _| {
                     Ok(transaction
                         .current()?
@@ -136,19 +142,20 @@ impl NativeDatabase {
             request.expected_generation_id,
             timeout,
             move |graph, budget| {
-                let mut rows = Vec::new();
+                let mut rows =
+                    crate::retrieval::native::RankedRows::new(limit, |a: &CurrentFileRecord, b| {
+                        a.path.cmp(&b.path).then(a.file_id.cmp(&b.file_id))
+                    });
                 visit_files(graph, budget, |file, _| {
                     if directory.as_ref().is_none_or(|directory| {
                         in_directory(&file.normalized_path, directory.as_str())
                     }) && language.is_none_or(|language| language.as_str() == file.language)
                     {
-                        retain(&mut rows, file_record(&generation, file)?, limit, |a, b| {
-                            a.path.cmp(&b.path).then(a.file_id.cmp(&b.file_id))
-                        });
+                        rows.insert(file_record(&generation, file)?);
                     }
                     Ok(())
                 })?;
-                Ok(rows)
+                Ok(rows.into_vec())
             },
         )
         .await
@@ -176,14 +183,11 @@ impl NativeDatabase {
         self.require_project(request.project_id)?;
         validate_limit(request.limit, MAX_LOOKUP_LIMIT)?;
         let text = validate_exact_text(request.text, "name")?.to_owned();
-        self.select_symbols(
+        let selection = SymbolSelection::Name(text);
+        self.graph(
             request.expected_generation_id,
-            request.limit,
             timeout,
-            Some(text.clone()),
-            move |symbol, _, _| {
-                Ok(symbol.qualified_name == text || simple_name(&symbol.qualified_name) == text)
-            },
+            move |graph, budget| selection.collect(graph, budget, request.limit),
         )
         .await
     }
@@ -209,13 +213,11 @@ impl NativeDatabase {
     ) -> Result<Vec<CurrentSymbolRecord>, StorageError> {
         self.require_project(request.project_id)?;
         validate_limit(request.limit, MAX_LOOKUP_LIMIT)?;
-        let file = request.file_id.clone();
-        self.select_symbols(
+        let selection = SymbolSelection::File(request.file_id.clone());
+        self.graph(
             request.expected_generation_id,
-            request.limit,
             timeout,
-            None,
-            move |symbol, _, _| Ok(symbol.file_id == file),
+            move |graph, budget| selection.collect(graph, budget, request.limit),
         )
         .await
     }
@@ -242,20 +244,15 @@ impl NativeDatabase {
         self.require_project(request.project_id)?;
         validate_limit(request.limit, MAX_LOOKUP_LIMIT)?;
         super::validate_source_range(request.start_line, request.end_line)?;
-        let (path, start, end) = (request.path.clone(), request.start_line, request.end_line);
-        self.select_symbols(
+        let selection = SymbolSelection::Range {
+            path: request.path.clone(),
+            start: request.start_line,
+            end: request.end_line,
+        };
+        self.graph(
             request.expected_generation_id,
-            request.limit,
             timeout,
-            None,
-            move |symbol, graph, budget| {
-                if symbol.start_line > end || symbol.end_line < start {
-                    return Ok(false);
-                }
-                Ok(graph
-                    .file(&symbol.file_id, budget)?
-                    .is_some_and(|file| file.normalized_path == path.as_str()))
-            },
+            move |graph, budget| selection.collect(graph, budget, request.limit),
         )
         .await
     }
@@ -282,7 +279,6 @@ impl NativeDatabase {
         self.require_project(request.project_id)?;
         validate_symbol_set(request.symbol_ids)?;
         let ids = request.symbol_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let generation = request.expected_generation_id.clone();
         self.graph(
             request.expected_generation_id,
             timeout,
@@ -290,45 +286,13 @@ impl NativeDatabase {
                 let mut rows = Vec::new();
                 for id in ids {
                     if let Some(symbol) = graph.symbol(&id, budget)? {
-                        rows.push(symbol_record(&generation, symbol, graph, budget)?);
+                        rows.push(symbol_record(symbol, graph, budget)?);
                     }
                 }
                 rows.sort_by(symbol_order);
                 Ok(rows)
             },
         )
-        .await
-    }
-
-    async fn select_symbols<F>(
-        &self,
-        generation: &GenerationId,
-        limit: u16,
-        timeout: Duration,
-        name: Option<String>,
-        predicate: F,
-    ) -> Result<Vec<CurrentSymbolRecord>, StorageError>
-    where
-        F: Fn(&SymbolInput, &GraphSnapshot<'_, '_>, &mut ReadBudget) -> NativeResult<bool>
-            + Send
-            + 'static,
-    {
-        let expected = generation.clone();
-        self.graph(generation, timeout, move |graph, budget| {
-            let mut rows = Vec::new();
-            visit_symbols_named(graph, budget, name.as_deref(), |symbol, budget| {
-                if predicate(&symbol, graph, budget)? {
-                    retain(
-                        &mut rows,
-                        symbol_record(&expected, symbol, graph, budget)?,
-                        usize::from(limit),
-                        symbol_order,
-                    );
-                }
-                Ok(())
-            })?;
-            Ok(rows)
-        })
         .await
     }
 
@@ -361,7 +325,16 @@ impl NativeDatabase {
             timeout,
             move |graph, budget| {
                 let mut cursor = None;
-                let mut rows = Vec::new();
+                let mut rows = crate::retrieval::native::RankedRows::new(
+                    limit,
+                    |a: &CurrentReferenceRecord, b| {
+                        a.path
+                            .cmp(&b.path)
+                            .then(a.start_byte.cmp(&b.start_byte))
+                            .then(a.end_byte.cmp(&b.end_byte))
+                            .then(a.provenance.cmp(&b.provenance))
+                    },
+                );
                 let mut ordinal = 0_u64;
                 loop {
                     let (references, next) =
@@ -391,20 +364,14 @@ impl NativeDatabase {
                             site_count: reference.site_count,
                             span_precision: reference.span_precision,
                         };
-                        retain(&mut rows, row, limit, |a, b| {
-                            a.path
-                                .cmp(&b.path)
-                                .then(a.start_byte.cmp(&b.start_byte))
-                                .then(a.end_byte.cmp(&b.end_byte))
-                                .then(a.provenance.cmp(&b.provenance))
-                        });
+                        rows.insert(row);
                     }
                     cursor = next;
                     if cursor.is_none() {
                         break;
                     }
                 }
-                Ok(rows)
+                Ok(rows.into_vec())
             },
         )
         .await
@@ -431,7 +398,6 @@ impl NativeDatabase {
     ) -> Result<CurrentEntryPointPage, StorageError> {
         self.require_project(request.project_id)?;
         validate_limit(request.limit, MAX_ENTRY_POINT_LIMIT)?;
-        let generation = request.expected_generation_id.clone();
         let (bucket, limit) = (request.bucket, usize::from(request.limit));
         self.graph(
             request.expected_generation_id,
@@ -442,7 +408,8 @@ impl NativeDatabase {
                 } else {
                     BTreeSet::new()
                 };
-                let mut symbols = Vec::new();
+                let filter = EntryPointFilter { bucket, mcp };
+                let mut symbols = crate::retrieval::native::RankedRows::new(limit, symbol_order);
                 let mut total = 0_u64;
                 visit_symbols(graph, budget, |symbol, budget| {
                     let file = graph
@@ -451,22 +418,23 @@ impl NativeDatabase {
                     if test_path(&file.normalized_path) {
                         return Ok(());
                     }
-                    if entry_point_matches(graph, budget, bucket, &symbol, &file, &mcp)? {
-                        total = total.checked_add(1).ok_or(RocksError::Format)?;
-                        retain(
-                            &mut symbols,
-                            symbol_record(&generation, symbol, graph, budget)?,
-                            limit,
-                            symbol_order,
-                        );
+                    if !filter.matches(&symbol, &file) {
+                        return Ok(());
                     }
+                    if bucket == EntryPointBucket::PublicExports
+                        && has_consumer(graph, &symbol.symbol_id, budget)?
+                    {
+                        return Ok(());
+                    }
+                    total = total.checked_add(1).ok_or(RocksError::Format)?;
+                    symbols.insert(symbol_record(symbol, graph, budget)?);
                     Ok(())
                 })?;
                 Ok(CurrentEntryPointPage {
                     bucket,
                     total,
                     truncated: total > symbols.len() as u64,
-                    symbols,
+                    symbols: symbols.into_vec(),
                 })
             },
         )
@@ -504,26 +472,28 @@ impl NativeDatabase {
             return Err(super::invalid("edge_kinds"));
         }
         let frontier = request.frontier.iter().cloned().collect::<BTreeSet<_>>();
-        let generation = request.expected_generation_id.clone();
         let filter = GraphEdgeFilter {
             direction: request.direction,
             include_tests: request.include_test_targets,
             kinds: request.edge_kinds.to_vec(),
             minimum_confidence: request.minimum_confidence,
+            limit: usize::from(request.limit),
         };
         let limit = usize::from(request.limit);
         self.graph(
             request.expected_generation_id,
             timeout,
             move |graph, budget| {
-                let mut ranked = Vec::new();
+                let mut ranked = crate::retrieval::native::RankedRows::new(
+                    limit,
+                    |a: &(usize, CurrentGraphEdge), b| {
+                        a.0.cmp(&b.0).then_with(|| edge_order(&a.1, &b.1))
+                    },
+                );
                 for origin in frontier {
-                    let edges =
-                        graph_edges_from(graph, budget, &generation, &origin, &filter, limit)?;
+                    let edges = filter.edges_from(graph, budget, &origin)?;
                     for (rank, edge) in edges.into_iter().enumerate() {
-                        retain(&mut ranked, (rank, edge), limit, |a, b| {
-                            a.0.cmp(&b.0).then_with(|| edge_order(&a.1, &b.1))
-                        });
+                        ranked.insert((rank, edge));
                     }
                 }
                 Ok(ranked.into_iter().map(|(_, edge)| edge).collect())
@@ -533,23 +503,55 @@ impl NativeDatabase {
     }
 }
 
-fn entry_point_matches(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
+struct EntryPointFilter {
     bucket: EntryPointBucket,
-    symbol: &SymbolInput,
-    file: &FileInput,
-    mcp: &BTreeSet<SymbolId>,
-) -> NativeResult<bool> {
-    let name = simple_name(&symbol.qualified_name);
-    let cli = file.normalized_path.split('/').any(|part| {
+    mcp: BTreeSet<SymbolId>,
+}
+
+impl EntryPointFilter {
+    fn matches(&self, symbol: &SymbolInput, file: &FileInput) -> bool {
+        let name = simple_name(&symbol.qualified_name);
+        match self.bucket {
+            EntryPointBucket::Routes | EntryPointBucket::CliCommands => {
+                symbol.symbol_kind == "route"
+                    && name.to_ascii_lowercase().starts_with("cmd ")
+                        == (self.bucket == EntryPointBucket::CliCommands)
+            }
+            EntryPointBucket::McpTools => {
+                symbol.export.exported
+                    && symbol.symbol_kind == "constant"
+                    && is_mcp_tool_name(name)
+                    && self.mcp.contains(&symbol.symbol_id)
+            }
+            EntryPointBucket::CliFiles | EntryPointBucket::PublicExports => {
+                symbol.export.exported
+                    && exportable_kind(&symbol.symbol_kind)
+                    && cli_path(&file.normalized_path)
+                        == (self.bucket == EntryPointBucket::CliFiles)
+            }
+        }
+    }
+}
+
+fn is_mcp_tool_name(name: &str) -> bool {
+    name.ends_with("_TOOL")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn cli_path(path: &str) -> bool {
+    path.split('/').any(|part| {
         matches!(
             part.to_ascii_lowercase().as_str(),
             "bin" | "cli" | "command" | "commands"
         )
-    });
-    let exportable = matches!(
-        symbol.symbol_kind.as_str(),
+    })
+}
+
+fn exportable_kind(kind: &str) -> bool {
+    matches!(
+        kind,
         "function"
             | "method"
             | "class"
@@ -564,93 +566,69 @@ fn entry_point_matches(
             | "namespace"
             | "component"
             | "resource"
-    );
-    Ok(match bucket {
-        EntryPointBucket::Routes => {
-            symbol.symbol_kind == "route" && !name.to_ascii_lowercase().starts_with("cmd ")
-        }
-        EntryPointBucket::CliCommands => {
-            symbol.symbol_kind == "route" && name.to_ascii_lowercase().starts_with("cmd ")
-        }
-        EntryPointBucket::McpTools => {
-            symbol.export.exported
-                && symbol.symbol_kind == "constant"
-                && name.ends_with("_TOOL")
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-                && mcp.contains(&symbol.symbol_id)
-        }
-        EntryPointBucket::CliFiles => symbol.export.exported && exportable && cli,
-        EntryPointBucket::PublicExports => {
-            symbol.export.exported
-                && exportable
-                && !cli
-                && !has_consumer(graph, &symbol.symbol_id, budget)?
-        }
-    })
+    )
 }
 
-fn graph_edges_from(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    generation: &GenerationId,
-    origin: &SymbolId,
-    filter: &GraphEdgeFilter,
-    limit: usize,
-) -> NativeResult<Vec<CurrentGraphEdge>> {
-    let mut cursor = None;
-    let mut edges = Vec::new();
-    loop {
-        let page = graph.neighbors(origin, filter.direction, cursor.as_ref(), 256, budget)?;
-        for link in page.links {
-            if !filter.include_tests && test_target(graph, budget, &link, filter.direction)? {
-                continue;
-            }
-            let edge = graph.edge(&link, budget)?;
-            if edge.confidence < filter.minimum_confidence
-                || (!filter.kinds.is_empty() && !filter.kinds.contains(&edge.kind))
-            {
-                continue;
-            }
-            retain(
-                &mut edges,
-                CurrentGraphEdge {
-                    generation_id: generation.clone(),
+impl GraphEdgeFilter {
+    fn edges_from(
+        &self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+        origin: &SymbolId,
+    ) -> NativeResult<Vec<CurrentGraphEdge>> {
+        let mut cursor = None;
+        let mut edges = crate::retrieval::native::RankedRows::new(self.limit, edge_order);
+        loop {
+            let page =
+                graph
+                    .adjacency(origin, self.direction)
+                    .page(cursor.as_ref(), 256, budget)?;
+            for link in page.links {
+                if !self.include_tests && self.test_target(graph, budget, &link)? {
+                    continue;
+                }
+                let edge = graph.edge(&link, budget)?;
+                if edge.confidence < self.minimum_confidence
+                    || (!self.kinds.is_empty() && !self.kinds.contains(&edge.kind))
+                {
+                    continue;
+                }
+                edges.insert(CurrentGraphEdge {
+                    generation_id: graph.generation_id().clone(),
                     source_symbol_id: edge.source_symbol_id,
                     target_symbol_id: edge.target_symbol_id,
                     edge_kind: edge.kind.as_str().to_owned(),
                     confidence: edge.confidence,
                     provenance: edge.provenance,
                     site_count: edge.site_count,
-                },
-                limit,
-                edge_order,
-            );
-        }
-        cursor = page.next;
-        if cursor.is_none() {
-            return Ok(edges);
+                });
+            }
+            cursor = page.next;
+            if cursor.is_none() {
+                return Ok(edges.into_vec());
+            }
         }
     }
 }
 
-fn test_target(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    link: &GraphLink,
-    direction: GraphDirection,
-) -> NativeResult<bool> {
-    let adjacent = match direction {
-        GraphDirection::Outgoing => link.target_symbol_id(),
-        GraphDirection::Incoming => link.source_symbol_id(),
-    };
-    let Some(symbol) = graph.symbol(adjacent, budget)? else {
-        return Ok(false);
-    };
-    Ok(graph
-        .file(&symbol.file_id, budget)?
-        .is_some_and(|file| test_path(&file.normalized_path)))
+impl GraphEdgeFilter {
+    fn test_target(
+        &self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+        link: &GraphLink,
+    ) -> NativeResult<bool> {
+        let adjacent = match self.direction {
+            GraphDirection::Outgoing => link.target_symbol_id(),
+            GraphDirection::Incoming => link.source_symbol_id(),
+        };
+        let Some(symbol) = graph.symbol(adjacent, budget)? else {
+            return Ok(false);
+        };
+        Ok(graph
+            .file(&symbol.file_id, budget)?
+            .is_some_and(|file| test_path(&file.normalized_path)))
+    }
 }
 
 fn edge_order(a: &CurrentGraphEdge, b: &CurrentGraphEdge) -> Ordering {
@@ -663,19 +641,6 @@ fn edge_order(a: &CurrentGraphEdge, b: &CurrentGraphEdge) -> Ordering {
         .then(a.target_symbol_id.cmp(&b.target_symbol_id))
 }
 
-pub(crate) fn retain<T>(
-    rows: &mut Vec<T>,
-    row: T,
-    limit: usize,
-    order: impl Fn(&T, &T) -> Ordering,
-) {
-    let position = rows.partition_point(|existing| order(existing, &row) != Ordering::Greater);
-    if position < limit {
-        rows.insert(position, row);
-        rows.truncate(limit);
-    }
-}
-
 fn symbol_order(a: &CurrentSymbolRecord, b: &CurrentSymbolRecord) -> Ordering {
     a.path
         .cmp(&b.path)
@@ -686,52 +651,59 @@ fn symbol_order(a: &CurrentSymbolRecord, b: &CurrentSymbolRecord) -> Ordering {
 pub(crate) fn visit_files(
     graph: &GraphSnapshot<'_, '_>,
     budget: &mut ReadBudget,
-    mut visit: impl FnMut(FileInput, &mut ReadBudget) -> NativeResult<()>,
+    visit: impl FnMut(FileInput, &mut ReadBudget) -> NativeResult<()>,
 ) -> NativeResult<()> {
-    let mut cursor = None;
-    loop {
-        let (rows, next) = graph.files(cursor.as_ref(), 256, budget)?;
-        for row in rows {
-            visit(row, budget)?;
-        }
-        cursor = next;
-        if cursor.is_none() {
-            return Ok(());
-        }
-    }
+    visit_pages(
+        budget,
+        |after, budget| graph.files(after, SCAN_PAGE_ROWS, budget),
+        visit,
+    )
 }
 
-pub(crate) fn visit_symbols_named(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    name: Option<&str>,
-    mut visit: impl FnMut(SymbolInput, &mut ReadBudget) -> NativeResult<()>,
-) -> NativeResult<()> {
-    let Some(name) = name.filter(|name| !name.is_empty() && graph.info().name_index_version == 1)
-    else {
-        return visit_symbols(graph, budget, visit);
-    };
-    let mut cursor = None;
-    loop {
-        let (rows, next) = graph.symbols_by_name(name, cursor.as_ref(), 256, budget)?;
-        for row in rows {
-            visit(row, budget)?;
-        }
-        cursor = next;
-        if cursor.is_none() {
-            return Ok(());
-        }
+impl GraphSnapshot<'_, '_> {
+    pub(crate) fn visit_symbols_named(
+        &self,
+        budget: &mut ReadBudget,
+        name: Option<&str>,
+        visit: impl FnMut(SymbolInput, &mut ReadBudget) -> NativeResult<()>,
+    ) -> NativeResult<()> {
+        let Some(name) =
+            name.filter(|name| !name.is_empty() && self.info().name_index_version == 1)
+        else {
+            return visit_symbols(self, budget, visit);
+        };
+        visit_pages(
+            budget,
+            |after, budget| {
+                self.symbols_by_name(name)
+                    .page(after, SCAN_PAGE_ROWS, budget)
+            },
+            visit,
+        )
     }
 }
 
 pub(crate) fn visit_symbols(
     graph: &GraphSnapshot<'_, '_>,
     budget: &mut ReadBudget,
-    mut visit: impl FnMut(SymbolInput, &mut ReadBudget) -> NativeResult<()>,
+    visit: impl FnMut(SymbolInput, &mut ReadBudget) -> NativeResult<()>,
+) -> NativeResult<()> {
+    visit_pages(
+        budget,
+        |after, budget| graph.symbols(after, SCAN_PAGE_ROWS, budget),
+        visit,
+    )
+}
+
+/// Preserve one read budget across page loading and nested visitor reads.
+fn visit_pages<T>(
+    budget: &mut ReadBudget,
+    mut page: impl FnMut(Option<&RecordKey>, &mut ReadBudget) -> RecordPage<T>,
+    mut visit: impl FnMut(T, &mut ReadBudget) -> NativeResult<()>,
 ) -> NativeResult<()> {
     let mut cursor = None;
     loop {
-        let (rows, next) = graph.symbols(cursor.as_ref(), 256, budget)?;
+        let (rows, next) = page(cursor.as_ref(), budget)?;
         for row in rows {
             visit(row, budget)?;
         }
@@ -756,7 +728,6 @@ pub(super) fn file_record(
 }
 
 pub(crate) fn symbol_record(
-    generation: &GenerationId,
     symbol: SymbolInput,
     graph: &GraphSnapshot<'_, '_>,
     budget: &mut ReadBudget,
@@ -773,7 +744,7 @@ pub(crate) fn symbol_record(
             .flatten(),
         start_byte: symbol.start_byte,
         end_byte: symbol.end_byte,
-        generation_id: generation.clone(),
+        generation_id: graph.generation_id().clone(),
         symbol_id: symbol.symbol_id,
         file_id: symbol.file_id,
         path: NormalizedPath::parse(&file.normalized_path).map_err(|_| RocksError::Format)?,
@@ -850,13 +821,10 @@ fn has_consumer(
 ) -> NativeResult<bool> {
     let mut cursor = None;
     loop {
-        let page = graph.neighbors(
-            symbol,
-            GraphDirection::Incoming,
-            cursor.as_ref(),
-            256,
-            budget,
-        )?;
+        let page =
+            graph
+                .adjacency(symbol, GraphDirection::Incoming)
+                .page(cursor.as_ref(), 256, budget)?;
         if page.links.iter().any(|link| {
             matches!(
                 link.kind(),
@@ -897,5 +865,61 @@ fn mcp_documents(
         if cursor.is_none() {
             return Ok(found);
         }
+    }
+}
+
+// Each predicate owns the optional name-index optimization that is sound for it.
+// Callers cannot narrow a file/range scan with an unrelated name hint.
+enum SymbolSelection {
+    Name(String),
+    File(FileId),
+    Range {
+        path: NormalizedPath,
+        start: u32,
+        end: u32,
+    },
+}
+
+impl SymbolSelection {
+    fn matches(
+        &self,
+        symbol: &SymbolInput,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+    ) -> NativeResult<bool> {
+        match self {
+            Self::Name(text) => {
+                Ok(symbol.qualified_name == *text || simple_name(&symbol.qualified_name) == text)
+            }
+            Self::File(file) => Ok(symbol.file_id == *file),
+            Self::Range { path, start, end } => {
+                if symbol.start_line > *end || symbol.end_line < *start {
+                    return Ok(false);
+                }
+                Ok(graph
+                    .file(&symbol.file_id, budget)?
+                    .is_some_and(|file| file.normalized_path == path.as_str()))
+            }
+        }
+    }
+
+    fn collect(
+        &self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+        limit: u16,
+    ) -> NativeResult<Vec<CurrentSymbolRecord>> {
+        let name = match self {
+            Self::Name(text) => Some(text.as_str()),
+            Self::File(_) | Self::Range { .. } => None,
+        };
+        let mut rows = crate::retrieval::native::RankedRows::new(usize::from(limit), symbol_order);
+        graph.visit_symbols_named(budget, name, |symbol, budget| {
+            if self.matches(&symbol, graph, budget)? {
+                rows.insert(symbol_record(symbol, graph, budget)?);
+            }
+            Ok(())
+        })?;
+        Ok(rows.into_vec())
     }
 }

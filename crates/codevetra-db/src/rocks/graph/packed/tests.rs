@@ -221,7 +221,8 @@ fn corrupted_publication_keeps_current_releases_writer_and_allows_reopen_retry()
     let first = identity(1, GraphBase::Empty);
     let generation = first.generation_id.clone();
     store.publish_graph(
-        GraphPublicationInput::new(first, canonical()?, GraphPolicy::default(), &request()?)?,
+        crate::rocks::GraphPreparation::new(first, GraphPolicy::default(), &request()?)
+            .resident(canonical()?)?,
         &request()?,
     )?;
     let mut packed = PackedGraph::build(canonical()?, GraphPolicy::default(), &request()?)?;
@@ -259,16 +260,15 @@ fn corrupted_publication_keeps_current_releases_writer_and_allows_reopen_retry()
     );
     drop(store);
     let store = ProjectStore::open(root.path(), &project, StorePolicy::default())?;
-    let replacement = GraphPublicationInput::prepare(
+    let replacement = crate::rocks::GraphPreparation::new(
         identity(3, GraphBase::Current(generation)),
-        canonical()?,
         GraphPolicy {
             maximum_input_bytes: 64 * 1_024,
             ..GraphPolicy::default()
         },
-        256 * 1_048_576,
         &request()?,
-    )?;
+    )
+    .prepare(canonical()?, 256 * 1_048_576)?;
     assert!(replacement.shared_facts().is_none());
     let next = replacement.identity.generation_id.clone();
     store.publish_graph(replacement, &request()?)?;
@@ -326,24 +326,15 @@ fn preparation_peak_and_final_source_admission_stay_bounded() -> TestResult {
         ..GraphPolicy::default()
     };
     assert!(matches!(
-        GraphPublicationInput::prepare(
-            identity(1, GraphBase::Empty),
-            canonical()?,
-            policy,
-            1_048_576,
-            &request()?
-        ),
+        crate::rocks::GraphPreparation::new(identity(1, GraphBase::Empty), policy, &request()?)
+            .prepare(canonical()?, 1_048_576),
         Err(RocksError::Limit {
             resource: "graph_preparation_bytes"
         })
     ));
-    let input = GraphPublicationInput::prepare(
-        identity(1, GraphBase::Empty),
-        canonical()?,
-        policy,
-        256 * 1_048_576,
-        &request()?,
-    )?;
+    let input =
+        crate::rocks::GraphPreparation::new(identity(1, GraphBase::Empty), policy, &request()?)
+            .prepare(canonical()?, 256 * 1_048_576)?;
     assert!(input.retained_input_bytes() <= policy.maximum_input_bytes);
     let mut pattern = String::with_capacity(64 * 1_024);
     pattern.push_str("evidence/**");

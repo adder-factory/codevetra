@@ -82,7 +82,10 @@ fn canonical_auxiliary_records_roundtrip_and_are_removed_on_replacement() -> Tes
         Some(numerical.clone())
     );
     assert_eq!(
-        graph.references(&file.file_id, None, 10, &mut budget()?)?.0,
+        graph
+            .references(&file.file_id)
+            .page(None, 10, &mut budget()?)?
+            .0,
         vec![reference]
     );
     assert_eq!(
@@ -100,7 +103,10 @@ fn canonical_auxiliary_records_roundtrip_and_are_removed_on_replacement() -> Tes
             .is_none()
     );
     assert_eq!(
-        graph.references(&file.file_id, None, 10, &mut budget()?)?.0,
+        graph
+            .references(&file.file_id)
+            .page(None, 10, &mut budget()?)?
+            .0,
         [] as [ReferenceInput; 0]
     );
     assert!(graph.document(&document_id, &mut budget()?)?.is_none());
@@ -118,19 +124,19 @@ fn partial_staging_failure_is_invisible_releases_writer_and_survives_reopen() ->
     let mut oversized = auxiliary_facts();
     oversized.symbols = raw_facts(600, Vec::new()).symbols;
     oversized.documents[0].code = "x".repeat(1_048_576);
-    let failing = GraphPublicationInput::new(
+    let failing = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(2),
             source_revision: digest(9),
             base: GraphBase::Current(generation(1)),
         },
-        canonical(oversized)?,
         GraphPolicy {
             maximum_batch_bytes: 1_048_576,
             ..GraphPolicy::default()
         },
         &request()?,
-    )?;
+    )
+    .resident(canonical(oversized)?)?;
     assert!(matches!(
         store
             .publish_graph(failing, &request()?)
@@ -145,29 +151,24 @@ fn partial_staging_failure_is_invisible_releases_writer_and_survives_reopen() ->
     );
     drop(store);
     let store = ProjectStore::open(root.path(), &digest(1), StorePolicy::default())?;
-    let retry = GraphPublicationInput::new(
+    let retry = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(3),
             source_revision: digest(9),
             base: GraphBase::Current(generation(1)),
         },
-        facts(2, Vec::new())?,
         GraphPolicy::default(),
         &request()?,
-    )?;
+    )
+    .resident(facts(2, Vec::new())?)?;
     store.publish_graph(retry, &request()?)?;
     let snapshot = store.current_snapshot(None)?;
     let graph = snapshot.graph(&mut budget()?)?;
     assert_eq!(graph.info().symbols, 2);
     assert!(
         graph
-            .neighbors(
-                &symbol(2),
-                GraphDirection::Incoming,
-                None,
-                10,
-                &mut budget()?
-            )?
+            .adjacency(&symbol(2), GraphDirection::Incoming)
+            .page(None, 10, &mut budget()?)?
             .links
             .is_empty()
     );
@@ -193,13 +194,8 @@ fn automatic_retention_preserves_pinned_readers_without_resurrecting_deleted_edg
     ));
     assert_eq!(
         old.graph(&mut budget()?)?
-            .neighbors(
-                &symbol(1),
-                GraphDirection::Outgoing,
-                None,
-                10,
-                &mut budget()?
-            )?
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(None, 10, &mut budget()?)?
             .links
             .len(),
         1
@@ -208,13 +204,8 @@ fn automatic_retention_preserves_pinned_readers_without_resurrecting_deleted_edg
     assert!(
         current
             .graph(&mut budget()?)?
-            .neighbors(
-                &symbol(1),
-                GraphDirection::Outgoing,
-                None,
-                10,
-                &mut budget()?
-            )?
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(None, 10, &mut budget()?)?
             .links
             .is_empty()
     );
@@ -233,36 +224,32 @@ fn cancelled_inputs_and_resource_bounds_leave_no_writer_or_partial_revision() ->
         base: GraphBase::Empty,
     };
     assert!(matches!(
-        GraphPublicationInput::new(
-            identity(),
-            facts(2, Vec::new())?,
-            GraphPolicy::default(),
-            &cancelled
-        ),
+        codevetra_db::rocks::GraphPreparation::new(identity(), GraphPolicy::default(), &cancelled)
+            .resident(facts(2, Vec::new())?),
         Err(RocksError::Cancelled)
     ));
     assert!(
-        GraphPublicationInput::new(
+        codevetra_db::rocks::GraphPreparation::new(
             identity(),
-            facts(2, Vec::new())?,
             GraphPolicy {
                 maximum_input_bytes: 1,
                 ..GraphPolicy::default()
             },
             &request()?
         )
+        .resident(facts(2, Vec::new())?)
         .is_err()
     );
     assert!(
-        GraphPublicationInput::new(
+        codevetra_db::rocks::GraphPreparation::new(
             identity(),
-            facts(2, Vec::new())?,
             GraphPolicy {
                 maximum_working_bytes: 0,
                 ..GraphPolicy::default()
             },
             &request()?
         )
+        .resident(facts(2, Vec::new())?)
         .is_err()
     );
     assert!(matches!(
@@ -306,19 +293,19 @@ fn reference_sort_workspace_is_bounded_by_one_file_instead_of_the_complete_table
     }
     let facts = canonical(raw)?;
     let expected_digest = facts.digest().clone();
-    let input = GraphPublicationInput::new(
+    let input = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(1),
             source_revision: digest(9),
             base: GraphBase::Empty,
         },
-        facts,
         GraphPolicy {
             maximum_working_bytes: 1_048_576,
             ..GraphPolicy::default()
         },
         &request()?,
-    )?;
+    )
+    .resident(facts)?;
     let root = tempfile::tempdir()?;
     let store = ProjectStore::open(root.path(), &digest(1), StorePolicy::default())?;
     let published = store.publish_graph(input, &request()?)?;
@@ -328,7 +315,7 @@ fn reference_sort_workspace_is_bounded_by_one_file_instead_of_the_complete_table
     assert_eq!(graph.info().references, 28_000);
     for file_number in 1..=4_u8 {
         let file_id = FileId::from_uuid_v8([file_number; 16]);
-        let (rows, _) = graph.references(&file_id, None, 10, &mut budget()?)?;
+        let (rows, _) = graph.references(&file_id).page(None, 10, &mut budget()?)?;
         assert_eq!(rows.len(), 10);
         assert!(rows.iter().all(|row| row.file_id == file_id));
     }
@@ -342,19 +329,19 @@ fn adjacency_sort_uses_bounded_indices_for_a_large_hub() -> TestResult {
         .collect();
     let facts = facts(20_000, edges)?;
     let expected_digest = facts.digest().clone();
-    let input = GraphPublicationInput::new(
+    let input = codevetra_db::rocks::GraphPreparation::new(
         GraphRevision {
             generation_id: generation(1),
             source_revision: digest(9),
             base: GraphBase::Empty,
         },
-        facts,
         GraphPolicy {
             maximum_working_bytes: 1_048_576,
             ..GraphPolicy::default()
         },
         &request()?,
-    )?;
+    )
+    .resident(facts)?;
     let root = tempfile::tempdir()?;
     let store = ProjectStore::open(root.path(), &digest(1), StorePolicy::default())?;
     let published = store.publish_graph(input, &request()?)?;
@@ -364,13 +351,9 @@ fn adjacency_sort_uses_bounded_indices_for_a_large_hub() -> TestResult {
     let graph = snapshot.graph(&mut budget()?)?;
     assert_eq!(graph.info().edges, 19_999);
     for target in [2, 10_000, 20_000] {
-        let incoming = graph.neighbors(
-            &symbol(target),
-            GraphDirection::Incoming,
-            None,
-            10,
-            &mut budget()?,
-        )?;
+        let incoming = graph
+            .adjacency(&symbol(target), GraphDirection::Incoming)
+            .page(None, 10, &mut budget()?)?;
         assert_eq!(incoming.links.len(), 1);
         assert_eq!(incoming.links[0].source_symbol_id(), &symbol(1));
     }
@@ -409,26 +392,19 @@ fn compact_publication_preserves_all_native_records_and_rows_larger_than_a_block
         ..GraphPolicy::default()
     };
     assert!(matches!(
-        GraphPublicationInput::new(
-            identity(),
-            canonical(raw.clone())?,
-            compact_policy,
-            &request()?
-        ),
+        codevetra_db::rocks::GraphPreparation::new(identity(), compact_policy, &request()?)
+            .resident(canonical(raw.clone())?),
         Err(RocksError::Limit {
             resource: "graph_input_bytes"
         })
     ));
-    let packed = GraphPublicationInput::prepare(
-        identity(),
-        canonical(raw)?,
-        compact_policy,
-        256 * 1_048_576,
-        &request()?,
-    )?;
+    let packed =
+        codevetra_db::rocks::GraphPreparation::new(identity(), compact_policy, &request()?)
+            .prepare(canonical(raw)?, 256 * 1_048_576)?;
     assert!(packed.shared_facts().is_none());
     let resident =
-        GraphPublicationInput::new(identity(), expected, GraphPolicy::default(), &request()?)?;
+        codevetra_db::rocks::GraphPreparation::new(identity(), GraphPolicy::default(), &request()?)
+            .resident(expected)?;
     let resident_root = tempfile::tempdir()?;
     let packed_root = tempfile::tempdir()?;
     let resident_store =
@@ -447,8 +423,11 @@ fn compact_publication_preserves_all_native_records_and_rows_larger_than_a_block
             let mut after = None;
             let mut rows = Vec::new();
             loop {
-                let page =
-                    snapshot.scan_prefix(collection, b"", after.as_ref(), 256, &mut budget()?)?;
+                let page = snapshot.scan_prefix(collection, b"").page(
+                    after.as_ref(),
+                    256,
+                    &mut budget()?,
+                )?;
                 rows.extend(page.rows);
                 after = page.next_after;
                 if after.is_none() {
@@ -474,7 +453,9 @@ fn all_native_rows(snapshot: &codevetra_db::rocks::RevisionSnapshot<'_>) -> Test
         let mut rows = Vec::new();
         loop {
             let page =
-                snapshot.scan_prefix(collection, b"", after.as_ref(), 256, &mut budget()?)?;
+                snapshot
+                    .scan_prefix(collection, b"")
+                    .page(after.as_ref(), 256, &mut budget()?)?;
             rows.extend(page.rows);
             after = page.next_after;
             if after.is_none() {
@@ -516,24 +497,23 @@ fn compact_replacements_preserve_pinned_readers_deletions_and_reopened_records()
                 GraphBase::Current(generation(sequence - 1))
             },
         };
-        let packed = GraphPublicationInput::prepare(
+        let packed = codevetra_db::rocks::GraphPreparation::new(
             identity(),
-            canonical(raw.clone())?,
             GraphPolicy {
                 maximum_input_bytes: 64 * 1_024,
                 ..GraphPolicy::default()
             },
-            256 * 1_048_576,
             &request()?,
-        )?;
+        )
+        .prepare(canonical(raw.clone())?, 256 * 1_048_576)?;
         assert!(packed.shared_facts().is_none());
         resident.publish_graph(
-            GraphPublicationInput::new(
+            codevetra_db::rocks::GraphPreparation::new(
                 identity(),
-                canonical(raw)?,
                 GraphPolicy::default(),
                 &request()?,
-            )?,
+            )
+            .resident(canonical(raw)?)?,
             &request()?,
         )?;
         compact.publish_graph(packed, &request()?)?;

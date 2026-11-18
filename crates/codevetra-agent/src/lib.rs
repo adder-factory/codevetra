@@ -149,9 +149,9 @@ pub use scip_interchange::{
 };
 pub use source_context::{
     FileSourceContext, FileSourceExcerpt, FileSourceOptions, FileSourceRequest, OmittedSourceRange,
-    SourceAllocation, SourceAllocationOptions, SourceContextOptions, SourceContextRequest,
-    SourceDetail, SourceExcerpt, SourceRepresentation, SourceSelection, SourceSelectionPolicy,
-    SymbolSourceContext,
+    SourceAllocation, SourceAllocationOptions, SourceAllocationRequest, SourceContextOptions,
+    SourceContextRequest, SourceDetail, SourceExcerpt, SourceRepresentation, SourceSelection,
+    SourceSelectionPolicy, SymbolSourceContext,
 };
 pub use source_search::{
     SourceSearchError, SourceSearchHit, SourceSearchOptions, SourceSearchReport,
@@ -1214,17 +1214,19 @@ where
     let mut source_bytes = 0_u64;
     let mut native_manifest =
         retain_scip_overlay.then(|| codevetra_indexer::NativeObservedManifest::new(exclusions));
-    source_scan::read_sources(
-        source_scan::HashScan {
-            root: &source_root,
-            files: &files,
-            limits: source_limits,
-            maximum_bytes: max_source_bytes,
-            retain_native: retain_scip_overlay,
-        },
+    source_scan::HashScan {
+        root: &source_root,
+        files: &files,
+        limits: source_limits,
+        maximum_bytes: max_source_bytes,
+        retain_native: retain_scip_overlay,
+    }
+    .read_sources(
         &mut cancelled,
-        capture_paths,
-        &mut captures,
+        source_scan::CaptureSink {
+            paths: capture_paths,
+            captures: &mut captures,
+        },
         |observed| {
             if let Some(file) = observed.native {
                 if native_manifest

@@ -49,96 +49,16 @@ impl JevClient {
         let started = Instant::now();
         tokio::time::timeout(
             self.settings.timeout,
-            self.decide_timed(state, questions, started),
+            DecisionRequest {
+                client: self,
+                questions,
+                started,
+                attempts: AtomicU32::new(0),
+            }
+            .decide_timed(state),
         )
         .await
         .map_err(|_| JevError::EndpointUnavailable)?
-    }
-
-    async fn decide_timed(
-        &self,
-        state: &Value,
-        questions: &BTreeMap<String, JevQuestion>,
-        started: Instant,
-    ) -> Result<JevDecision, JevError> {
-        let body = encode_request(state, questions)?;
-        let current = self
-            .settings
-            .credential
-            .current()
-            .await
-            .map_err(JevError::CredentialUnavailable)?;
-        let access = self
-            .cache_key(&body, current.as_ref())
-            .map_or(Access::Bypass, |key| {
-                DecisionCache::shared().access(key, Instant::now())
-            });
-        let (owner, outcome) = match access {
-            Access::Hit(response) => {
-                return self.cached(&response, questions, started, DecisionCacheOutcome::Hit);
-            }
-            Access::Wait(waiter) => {
-                let response = waiter.wait().await?;
-                return self.cached(
-                    &response,
-                    questions,
-                    started,
-                    DecisionCacheOutcome::Coalesced,
-                );
-            }
-            Access::Lead(owner) => (Some(owner), DecisionCacheOutcome::Miss),
-            Access::Bypass => (None, DecisionCacheOutcome::Bypassed),
-        };
-        let attempts = AtomicU32::new(0);
-        let response = self.request(body, current, started, &attempts).await;
-        let result = response.and_then(|response| {
-            decode_response(&response, questions).map(|decision| (response, decision))
-        });
-        let attempts = attempts.load(Ordering::Relaxed);
-        if let Some(owner) = owner {
-            // A renewed credential has a different cache identity; never store
-            // its response under the rejected credential's key.
-            owner.finish(
-                result
-                    .as_ref()
-                    .map(|(body, _)| body.clone())
-                    .map_err(Clone::clone),
-                attempts == 1,
-            );
-        }
-        let (_, mut decision) = result?;
-        self.account(&mut decision, started, outcome, attempts);
-        Ok(decision)
-    }
-
-    fn cached(
-        &self,
-        response: &[u8],
-        questions: &BTreeMap<String, JevQuestion>,
-        started: Instant,
-        outcome: DecisionCacheOutcome,
-    ) -> Result<JevDecision, JevError> {
-        let mut decision = decode_response(response, questions)?;
-        decision.usage = None;
-        self.account(&mut decision, started, outcome, 0);
-        Ok(decision)
-    }
-
-    fn account(
-        &self,
-        decision: &mut JevDecision,
-        started: Instant,
-        cache: DecisionCacheOutcome,
-        attempts: u32,
-    ) {
-        decision.metrics = Some(DecisionRequestMetrics {
-            cache,
-            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            provider_requests: attempts,
-            input_tokens: decision.usage.and_then(|usage| usage.input_tokens),
-            output_tokens: decision.usage.and_then(|usage| usage.output_tokens),
-            background: matches!(self.priority, RequestPriority::Background),
-        });
     }
 
     fn cache_key(&self, body: &[u8], current: Option<&SecretString>) -> Option<[u8; 32]> {
@@ -156,27 +76,106 @@ impl JevClient {
         }
         Some(*digest.finalize().as_bytes())
     }
+}
+
+/// A decision's original clock, questions and attempt counter span cache and HTTP work.
+struct DecisionRequest<'a> {
+    client: &'a JevClient,
+    questions: &'a BTreeMap<String, JevQuestion>,
+    started: Instant,
+    attempts: AtomicU32,
+}
+
+impl DecisionRequest<'_> {
+    async fn decide_timed(&self, state: &Value) -> Result<JevDecision, JevError> {
+        let body = encode_request(state, self.questions)?;
+        let current = self
+            .client
+            .settings
+            .credential
+            .current()
+            .await
+            .map_err(JevError::CredentialUnavailable)?;
+        let access = self
+            .client
+            .cache_key(&body, current.as_ref())
+            .map_or(Access::Bypass, |key| {
+                DecisionCache::shared().access(key, Instant::now())
+            });
+        let (owner, outcome) = match access {
+            Access::Hit(response) => {
+                return self.cached(&response, DecisionCacheOutcome::Hit);
+            }
+            Access::Wait(waiter) => {
+                let response = waiter.wait().await?;
+                return self.cached(&response, DecisionCacheOutcome::Coalesced);
+            }
+            Access::Lead(owner) => (Some(owner), DecisionCacheOutcome::Miss),
+            Access::Bypass => (None, DecisionCacheOutcome::Bypassed),
+        };
+        let response = self.request(body, current).await;
+        let result = response.and_then(|response| {
+            decode_response(&response, self.questions).map(|decision| (response, decision))
+        });
+        let attempts = self.attempts.load(Ordering::Relaxed);
+        if let Some(owner) = owner {
+            // A renewed credential has a different cache identity; never store
+            // its response under the rejected credential's key.
+            owner.finish(
+                result
+                    .as_ref()
+                    .map(|(body, _)| body.clone())
+                    .map_err(Clone::clone),
+                attempts == 1,
+            );
+        }
+        let (_, mut decision) = result?;
+        self.account(&mut decision, outcome, attempts);
+        Ok(decision)
+    }
+
+    fn cached(
+        &self,
+        response: &[u8],
+        outcome: DecisionCacheOutcome,
+    ) -> Result<JevDecision, JevError> {
+        let mut decision = decode_response(response, self.questions)?;
+        decision.usage = None;
+        self.account(&mut decision, outcome, 0);
+        Ok(decision)
+    }
+
+    fn account(&self, decision: &mut JevDecision, cache: DecisionCacheOutcome, attempts: u32) {
+        decision.metrics = Some(DecisionRequestMetrics {
+            cache,
+            elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            provider_requests: attempts,
+            input_tokens: decision.usage.and_then(|usage| usage.input_tokens),
+            output_tokens: decision.usage.and_then(|usage| usage.output_tokens),
+            background: matches!(self.client.priority, RequestPriority::Background),
+        });
+    }
 
     async fn request(
         &self,
         body: Vec<u8>,
         current: Option<SecretString>,
-        started: Instant,
-        attempts: &AtomicU32,
     ) -> Result<Arc<[u8]>, JevError> {
         let remaining = self
+            .client
             .settings
             .timeout
-            .checked_sub(started.elapsed())
+            .checked_sub(self.started.elapsed())
             .filter(|remaining| !remaining.is_zero())
             .ok_or(JevError::EndpointUnavailable)?;
         let admission = self
+            .client
             .transport
-            .admit(self.priority, remaining)
+            .admit(self.client.priority, remaining)
             .await
             .map_err(|()| JevError::EndpointUnavailable)?;
         let response = send_credentialed(CredentialedRequest {
-            credential: &self.settings.credential,
+            credential: &self.client.settings.credential,
             current,
             build: |key: Option<&SecretString>| {
                 let authorization = key
@@ -185,11 +184,12 @@ impl JevClient {
                 let remaining = admission
                     .remaining()
                     .map_err(|()| JevError::EndpointUnavailable)?;
-                attempts.fetch_add(1, Ordering::Relaxed);
+                self.attempts.fetch_add(1, Ordering::Relaxed);
                 Ok(self
+                    .client
                     .transport
                     .client
-                    .post(self.settings.endpoint.clone())
+                    .post(self.client.settings.endpoint.clone())
                     .timeout(remaining)
                     .header(header::AUTHORIZATION, authorization)
                     .header(header::CONTENT_TYPE, "application/json")

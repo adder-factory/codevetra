@@ -338,9 +338,7 @@ fn symbol_heap_bytes(symbol: &ExtractedSymbol) -> u64 {
                 symbol.docstring.as_ref().map_or(0, String::capacity),
             ))
         })
-        .and_then(|bytes| {
-            bytes.checked_add(usize_to_u64(symbol.health.operation_sites.retained_bytes()))
-        })
+        .and_then(|bytes| bytes.checked_add(usize_to_u64(symbol.health.retained_bytes())))
         .and_then(|bytes| bytes.checked_add(usize_to_u64(symbol.body_search_text.capacity())))
         .and_then(|bytes| bytes.checked_add(usize_to_u64(symbol.structural_digest.as_str().len())))
         .and_then(|bytes| bytes.checked_add(usize_to_u64(symbol.clone_shape_digest.as_str().len())))

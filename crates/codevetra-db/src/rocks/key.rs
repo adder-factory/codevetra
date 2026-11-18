@@ -10,7 +10,7 @@ pub(super) fn successor(bytes: Vec<u8>) -> Option<Vec<u8>> {
     encoding::successor(bytes)
 }
 
-const MAXIMUM_KEY_BYTES: usize = 4_096;
+use encoding::MAXIMUM_KEY_BYTES;
 
 /// Versioned record namespaces with independent `RocksDB` compaction policies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

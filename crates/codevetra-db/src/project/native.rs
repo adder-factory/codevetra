@@ -25,34 +25,37 @@ impl NativeDatabase {
             return Ok(None);
         }
         let project = self.project_id.clone();
-        self.state(None, 0, 0, move |transaction, budget| {
-            let current = transaction
-                .current()?
-                .map(|revision| {
-                    let snapshot = transaction.graph_snapshot()?;
-                    let graph = snapshot.graph(budget)?;
-                    Ok::<_, RocksError>(ProjectCurrentGeneration {
-                        generation_id: revision.generation_id,
-                        sequence: i64::try_from(revision.sequence).map_err(|_| corrupt())?,
-                        source_revision: revision.source_revision.to_string(),
-                        content_digest: revision.content_digest.ok_or(corrupt())?,
-                        digest_version: revision.digest_version.ok_or(corrupt())?,
-                        counts: counts(graph.info())?,
-                        source_admission: GenerationSourceAdmission {
-                            run_exclude_patterns: u16::try_from(revision.run_excludes.len())
-                                .map_err(|_| corrupt())?,
-                            run_excludes: revision.run_excludes,
-                            maximum_file_bytes: revision.maximum_file_bytes,
-                        },
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let current = transaction
+                    .current()?
+                    .map(|revision| {
+                        let snapshot = transaction.graph_snapshot()?;
+                        let graph = snapshot.graph(budget)?;
+                        Ok::<_, RocksError>(ProjectCurrentGeneration {
+                            generation_id: revision.generation_id,
+                            sequence: i64::try_from(revision.sequence).map_err(|_| corrupt())?,
+                            source_revision: revision.source_revision.to_string(),
+                            content_digest: revision.content_digest.ok_or(corrupt())?,
+                            digest_version: revision.digest_version.ok_or(corrupt())?,
+                            counts: counts(graph.info())?,
+                            source_admission: GenerationSourceAdmission {
+                                run_exclude_patterns: u16::try_from(revision.run_excludes.len())
+                                    .map_err(|_| corrupt())?,
+                                run_excludes: revision.run_excludes,
+                                maximum_file_bytes: revision.maximum_file_bytes,
+                            },
+                        })
                     })
-                })
-                .transpose()?;
-            Ok(Some(ProjectSnapshot {
-                project_id: project,
-                current,
-                generation_storage: summary(transaction, budget)?,
-            }))
-        })
+                    .transpose()?;
+                Ok(Some(ProjectSnapshot {
+                    project_id: project,
+                    current,
+                    generation_storage: summary(transaction, budget)?,
+                }))
+            },
+        )
         .await
     }
 
@@ -68,9 +71,11 @@ impl NativeDatabase {
         if root != self.root_identity {
             return Ok(false);
         }
-        self.state_with_timeout(None, 0, 0, timeout, |transaction, _| {
-            Ok(transaction.current()?.is_some())
-        })
+        self.state_with_timeout(
+            crate::rocks::StateAccess::read_only(None),
+            timeout,
+            |transaction, _| Ok(transaction.current()?.is_some()),
+        )
         .await
     }
 
@@ -82,11 +87,12 @@ impl NativeDatabase {
         project: &ProjectId,
     ) -> Result<GenerationStorageSummary, StorageError> {
         self.require_project(project)?;
-        self.state(None, 0, 0, summary).await
+        self.state(crate::rocks::StateAccess::read_only(None), summary)
+            .await
     }
 }
 
-pub(crate) fn revisions(
+fn revisions(
     transaction: &StateTransaction<'_>,
     budget: &mut ReadBudget,
 ) -> Result<Vec<StoredRevision>, RocksError> {

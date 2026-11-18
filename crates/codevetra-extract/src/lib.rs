@@ -33,6 +33,7 @@ mod salesforce_bundle;
 mod snapshot;
 mod source_lines;
 mod static_trace;
+mod symbol_health;
 mod tags;
 mod test_names;
 mod walk;
@@ -48,6 +49,7 @@ pub use discovery_policy::{
 };
 pub use grammars::NativeGrammar;
 pub use language::{ExtractionStrategy, LanguageSpec};
+pub use symbol_health::SymbolHealth;
 mod operation_sites;
 pub use operation_sites::HealthOperationSites;
 

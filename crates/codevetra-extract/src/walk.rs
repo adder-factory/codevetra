@@ -70,6 +70,7 @@ mod require_aliases;
 mod rescript_family;
 mod ruby_family;
 mod rust_macro;
+mod rust_test_attributes;
 mod schema;
 mod script_support;
 mod shader_family;
@@ -358,8 +359,7 @@ fn has_inline_tests(
         if node.kind() != "attribute_item" || !rust_attribute_precedes_function(node) {
             continue;
         }
-        let compact = compact_rust_attribute(builder.context.source(), node)?;
-        if rust_attribute_marks_test(&compact) {
+        if rust_test_attributes::marks_test(node, builder.context.source())? {
             return Ok(true);
         }
     }
@@ -380,16 +380,6 @@ fn compact_rust_attribute(source: &str, node: Node<'_>) -> Result<String, Extrac
             .filter(|character| !character.is_whitespace()),
     );
     Ok(compact)
-}
-
-fn rust_attribute_marks_test(compact: &str) -> bool {
-    matches!(compact, "#[test]" | "#[rstest]")
-        || compact.starts_with("#[tokio::test")
-        || compact.starts_with("#[async_std::test")
-        || compact.starts_with("#[actix_rt::test")
-        || compact.starts_with("#[test_case")
-        || compact.starts_with("#[rstest(")
-        || compact.starts_with("#[cfg(") && compact.contains("test")
 }
 
 fn rust_symbol_is_test_owned(
@@ -421,7 +411,7 @@ fn rust_symbol_is_test_owned(
             if attribute.kind() != "attribute_item" {
                 break;
             }
-            if rust_attribute_marks_test(&compact_rust_attribute(source, attribute)?) {
+            if rust_test_attributes::marks_test(attribute, source)? {
                 return Ok(true);
             }
             sibling = attribute.prev_named_sibling();
@@ -1349,7 +1339,9 @@ fn visit_javascript_binding_value(
     // initializer execute in the enclosing callable, including `this.#m()`.
     let execution_owner =
         if input.callable.is_none() && initializer_runs_in_callable(builder, input.value)? {
-            builder.initializer_execution_owner(builder.owners.last())
+            builder
+                .javascript
+                .initializer_execution_owner(builder.owners.last())
         } else {
             None
         };
@@ -1666,8 +1658,15 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
             self.context.source,
             self.context.cancelled,
         )?;
-        let clone_shape_digest =
-            syntax::clone_shape_digest(pending.structural_node, self.context.cancelled)?;
+        let clone_shape_digest = if health.flat_value_mapping {
+            syntax::mapping_clone_digest(
+                pending.structural_node,
+                self.context.source,
+                self.context.cancelled,
+            )?
+        } else {
+            syntax::clone_shape_digest(pending.structural_node, self.context.cancelled)?
+        };
         let clone_token_profile = matches!(
             pending.kind,
             SymbolKind::Function | SymbolKind::Method | SymbolKind::Component
@@ -1694,7 +1693,7 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
             docstring,
             body_search_text: body_search.text,
             body_search_truncated: body_search.truncated,
-            health,
+            health: health.into(),
             implementation: SymbolImplementationFlags {
                 declaration_only: pending.declaration_only,
                 test_symbol: rust_symbol_is_test_owned(
@@ -1728,37 +1727,11 @@ impl<'source, 'cancel> ExtractionBuilder<'source, 'cancel> {
         })
     }
 
-    fn initializer_execution_owner(&self, owner: Option<&SymbolId>) -> Option<SymbolId> {
-        let owner = owner?;
-        Some(
-            self.javascript
-                .initializer_reference_owners
-                .iter()
-                .rev()
-                .find_map(|(binding, execution)| (binding == owner).then_some(execution))
-                .unwrap_or(owner)
-                .clone(),
-        )
-    }
-
-    fn execution_reference_owner(
-        &self,
-        owner: Option<&SymbolId>,
-        kind: ReferenceKind,
-    ) -> Option<SymbolId> {
-        if matches!(
-            kind,
-            ReferenceKind::Calls | ReferenceKind::Instantiates | ReferenceKind::Imports
-        ) {
-            self.initializer_execution_owner(owner)
-        } else {
-            owner.cloned()
-        }
-    }
-
     fn emit_reference(&mut self, reference: ExtractedReference) -> Result<(), ExtractError> {
         let reference = ExtractedReference {
-            owner: self.execution_reference_owner(reference.owner.as_ref(), reference.kind),
+            owner: self
+                .javascript
+                .execution_reference_owner(reference.owner.as_ref(), reference.kind),
             name: self.bound_canonical_name(
                 reference.name,
                 crate::bounded_name::MAX_CANONICAL_REFERENCE_NAME_BYTES,

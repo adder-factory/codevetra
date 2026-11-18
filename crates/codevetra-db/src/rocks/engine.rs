@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     path::Path,
     sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::{Duration, Instant},
@@ -24,11 +23,28 @@ const ACTIVE_KEY: &[u8] = b"active";
 pub(super) const MAXIMUM_RECORD_BYTES: usize = 32 * 1_048_576;
 const META: &str = "default";
 
+// Process and on-disk resource budgets. Keep the write-buffer settings separate
+// from StorePolicy's shared cache/memtable admission limits.
+const BACKGROUND_JOBS: i32 = 2;
+const OPEN_FILE_LIMIT: i32 = 256;
+const WAL_SIZE_LIMIT: u64 = 64 * 1_048_576;
+const SYNC_INTERVAL_BYTES: u64 = 1_048_576;
+const RETAINED_LOG_FILES: usize = 2;
+const LOG_SIZE_LIMIT: usize = 1_048_576;
+const MANIFEST_SIZE_LIMIT: usize = 4 * 1_048_576;
+const FAMILY_WRITE_BUFFER_BYTES: usize = 8 * 1_048_576;
+const FAMILY_WRITE_BUFFERS: i32 = 3;
+const BLOOM_BITS_PER_KEY: f64 = 10.0;
+
 mod lifecycle;
+mod writer;
+pub(in crate::rocks) use writer::RevisionSeal;
 mod lookup;
+mod opening;
 mod ownership;
 pub(in crate::rocks) use lookup::PointReaders;
-use lookup::{read_record, read_record_from};
+use lookup::PublishedRead;
+pub use opening::ProjectOpening;
 mod usage;
 pub use usage::NativeStorageUsage;
 mod retention;
@@ -38,8 +54,8 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use retention::PruneReport;
-pub use state::{StateNamespace, StateTransaction};
+pub use retention::{PruneReport, RetentionPolicy};
+pub use state::{StateNamespace, StateScan, StateTransaction};
 
 /// Durable generation state. Only published revisions can answer graph reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,8 +115,7 @@ pub struct StoredRevision {
 #[derive(Clone)]
 pub struct RevisionWriter {
     generation_id: GenerationId,
-    sequence: u64,
-    fence: [u8; 32],
+    identity: WriterIdentity,
 }
 
 impl RevisionWriter {
@@ -113,14 +128,34 @@ impl RevisionWriter {
     /// Monotonic reservation sequence.
     #[must_use]
     pub const fn sequence(&self) -> u64 {
-        self.sequence
+        self.identity.sequence
     }
 }
 
-struct ActiveWriter {
+/// Reservation sequence and unpredictable nonce form one indivisible writer authority.
+#[derive(Clone, Copy)]
+struct WriterIdentity {
     sequence: u64,
     fence: [u8; 32],
+}
+
+struct ActiveWriter {
+    identity: WriterIdentity,
     expires_at: Instant,
+}
+
+/// The retention frontier and whether this logical key already has its older anchor.
+#[derive(Default, Serialize, Deserialize)]
+struct VersionAnchor {
+    floor: u64,
+    kept_anchor: bool,
+}
+
+/// One generation-selection pass keeps its retirement floor and allowance together.
+struct RetentionSelection {
+    previous_floor: u64,
+    retained: u8,
+    keep: u8,
 }
 
 struct Inner {
@@ -237,8 +272,10 @@ impl ProjectStore {
         // Repeated failed publications must not accumulate an unbounded
         // terminal backlog. The exact owner drains one small independent
         // maintenance batch even when its original request was cancelled.
-        let mut budget = ReadBudget::new(20_000, 64 * 1_048_576, Duration::from_secs(2))?;
-        cleanup.prune(2, 4, 10_000, &mut budget).map(|_| ())
+        let mut budget = RetentionPolicy::read_budget(Duration::from_secs(2))?;
+        cleanup
+            .prune(RetentionPolicy::AUTOMATIC, &mut budget)
+            .map(|_| ())
     }
 
     /// Open this project's private `.codevetra/data` database.
@@ -254,80 +291,7 @@ impl ProjectStore {
         project_identity: &ContentDigest,
         policy: StorePolicy,
     ) -> Result<Self> {
-        Self::open_controlled(project_root, project_identity, policy, None)
-    }
-
-    pub(in crate::rocks) fn open_controlled(
-        project_root: &Path,
-        project_identity: &ContentDigest,
-        policy: StorePolicy,
-        control: Option<super::StorageRequest>,
-    ) -> Result<Self> {
-        if let Some(control) = &control {
-            control.check()?;
-        }
-        let policy = policy.validate()?;
-        let root = project_root
-            .canonicalize()
-            .map_err(|_| RocksError::Directory)?;
-        if !root.is_dir() {
-            return Err(RocksError::Directory);
-        }
-        #[cfg(windows)]
-        let admission = {
-            let wait = std::time::Duration::from_secs(2);
-            let wait = control.as_ref().map_or(Ok(wait), |request| {
-                request
-                    .remaining_timeout()
-                    .map(|remaining| remaining.min(wait))
-            })?;
-            codevetra_config::StateAdmission::acquire_until(
-                &root,
-                std::time::Instant::now() + wait,
-            )?
-        };
-        if let Some(control) = &control {
-            control.check()?;
-        }
-        let state = codevetra_config::prepare_project_state(&root)?;
-        private_directory(&state)?;
-        let primary = ownership::lock_primary(&state)?;
-        #[cfg(windows)]
-        drop(admission);
-        let directory = state.join("data");
-        // RocksDB appends slash-separated filenames. Win32 verbatim paths do
-        // not normalize those slashes, so use the equivalent ordinary path
-        // only when it preserves the exact Windows filename semantics.
-        #[cfg(windows)]
-        let directory = dunce::simplified(&directory).to_path_buf();
-        private_directory(&directory)?;
-        // Refuse foreign storage before RocksDB can recover a WAL, create a
-        // column family, or write its options/log files.
-        ownership::admit(&directory, project_identity)?;
-        ownership::validate_native(&directory, project_identity)?;
-        if let Some(control) = &control {
-            control.check()?;
-        }
-        let (options, families) = database_options(policy);
-        let database = DB::open_cf_descriptors(&options, &directory, families)
-            .map_err(|_| operation("open"))?;
-        let store = Self {
-            inner: Arc::new(Inner {
-                database,
-                _primary: primary,
-                identity: project_identity.clone(),
-                mutation: RwLock::new(()),
-                stripes: std::array::from_fn(|_| Mutex::new(())),
-                writer: Mutex::new(None),
-                policy,
-            }),
-            control,
-        };
-        store.initialize(project_identity)?;
-        Ok(Self {
-            control: None,
-            ..store
-        })
+        ProjectOpening::new(project_root.to_owned(), project_identity.clone(), policy).open(None)
     }
 
     pub(in crate::rocks) fn with_control(&self, control: super::StorageRequest) -> Self {
@@ -365,11 +329,7 @@ impl ProjectStore {
         }
         let mut batch = WriteBatch::default();
         if let Some(abandoned) = active.as_ref() {
-            let mut revision = self.revision(abandoned.sequence)?;
-            revision.state = RevisionState::Failed;
-            put_revision(&mut batch, &self.meta()?, &revision)?;
-            batch.delete_cf(&self.meta()?, staging::byte_count_key(abandoned.sequence));
-            self.clear_claims(&mut batch, abandoned.sequence)?;
+            abandoned.abandon(self, &mut batch)?;
         }
         if self.get_meta(&identity_key(&generation_id))?.is_some() {
             return Err(RocksError::ReplayConflict);
@@ -394,24 +354,19 @@ impl ProjectStore {
             maximum_file_bytes: None,
         };
         let meta = self.meta()?;
-        put_revision(&mut batch, &meta, &revision)?;
-        batch.put_cf(&meta, identity_key(&generation_id), sequence.to_be_bytes());
-        batch.put_cf(&meta, LAST_SEQUENCE_KEY, sequence.to_be_bytes());
-        batch.put_cf(&meta, ACTIVE_KEY, sequence.to_be_bytes());
-        batch.put_cf(&meta, version_count_key(sequence), 0_u64.to_be_bytes());
+        revision.write_reservation(&mut batch, &meta)?;
         let mut fence = [0; 32];
         getrandom::fill(&mut fence).map_err(|_| operation("writer_identity"))?;
         self.write(&batch)?;
         let expires_at = lease_deadline(lease_duration)?;
+        let identity = WriterIdentity { sequence, fence };
         *active = Some(ActiveWriter {
-            sequence,
-            fence,
+            identity,
             expires_at,
         });
         Ok(RevisionWriter {
             generation_id,
-            sequence,
-            fence,
+            identity,
         })
     }
 
@@ -420,17 +375,7 @@ impl ProjectStore {
     /// # Errors
     /// Returns a fence, policy, or synchronization failure.
     pub fn heartbeat(&self, writer: &RevisionWriter, duration: Duration) -> Result<()> {
-        validate_lease_duration(duration)?;
-        let mut active = self.lock_writer()?;
-        self.check_control()?;
-        validate_fence(active.as_ref(), writer)?;
-        // Calculate renewal after lock acquisition: waiting for another
-        // lifecycle operation must not consume the newly granted lease.
-        let deadline = lease_deadline(duration)?;
-        if let Some(active) = active.as_mut() {
-            active.expires_at = deadline;
-        }
-        Ok(())
+        writer.heartbeat(self, duration)
     }
 
     /// Seal a completely validated logical generation supplied by the indexer.
@@ -447,36 +392,7 @@ impl ProjectStore {
         content_digest: ContentDigest,
         digest_version: GenerationDigestVersion,
     ) -> Result<StoredRevision> {
-        self.seal_with_admission(writer, content_digest, digest_version, Vec::new(), None)
-    }
-
-    pub(super) fn seal_with_admission(
-        &self,
-        writer: &RevisionWriter,
-        content_digest: ContentDigest,
-        digest_version: GenerationDigestVersion,
-        run_excludes: Vec<String>,
-        maximum_file_bytes: Option<usize>,
-    ) -> Result<StoredRevision> {
-        let _serial = self.lock_mutation()?;
-        let active = self.lock_writer()?;
-        validate_fence(active.as_ref(), writer)?;
-        let mut revision = self.revision(writer.sequence)?;
-        if revision.state != RevisionState::Staging {
-            return Err(RocksError::Transition);
-        }
-        revision.content_digest = Some(content_digest);
-        revision.digest_version = Some(digest_version);
-        revision.run_excludes = run_excludes;
-        revision.maximum_file_bytes = maximum_file_bytes;
-        revision.state = RevisionState::Ready;
-        let mut batch = WriteBatch::default();
-        put_revision(&mut batch, &self.meta()?, &revision)?;
-        batch.delete_cf(&self.meta()?, staging::byte_count_key(writer.sequence));
-        self.clear_claims(&mut batch, writer.sequence)?;
-        validate_fence(active.as_ref(), writer)?;
-        self.write(&batch)?;
-        Ok(revision)
+        writer.seal(self, RevisionSeal::new(content_digest, digest_version))
     }
 
     /// Atomically publish the sealed graph and all its secondary indexes.
@@ -488,38 +404,7 @@ impl ProjectStore {
     /// # Errors
     /// Returns a fence, lifecycle, base-generation, or storage failure.
     pub fn publish(&self, writer: &RevisionWriter) -> Result<StoredRevision> {
-        let _serial = self.lock_mutation()?;
-        let mut active = self.lock_writer()?;
-        validate_fence(active.as_ref(), writer)?;
-        let mut revision = self.revision(writer.sequence)?;
-        if revision.state != RevisionState::Ready {
-            return Err(RocksError::Transition);
-        }
-        if !lifecycle::same_base(self.optional_sequence(CURRENT_KEY)?, revision.base_sequence) {
-            return Err(RocksError::GenerationChanged);
-        }
-        let meta = self.meta()?;
-        let mut batch = WriteBatch::default();
-        if let Some(previous) = revision.base_sequence {
-            let mut previous = self.revision(previous)?;
-            if previous.state != RevisionState::Current {
-                return Err(RocksError::Corrupt {
-                    field: "current_revision",
-                });
-            }
-            previous.state = RevisionState::Superseded;
-            put_revision(&mut batch, &meta, &previous)?;
-        }
-        revision.state = RevisionState::Current;
-        revision.published_at = Some(jiff::Timestamp::now().to_string());
-        put_revision(&mut batch, &meta, &revision)?;
-        batch.put_cf(&meta, published_key(writer.sequence), []);
-        batch.put_cf(&meta, CURRENT_KEY, writer.sequence.to_be_bytes());
-        batch.delete_cf(&meta, ACTIVE_KEY);
-        validate_fence(active.as_ref(), writer)?;
-        self.write(&batch)?;
-        *active = None;
-        Ok(revision)
+        writer.publish(self)
     }
 
     /// Terminalize owned staging/ready work. Published generations are immutable.
@@ -529,35 +414,7 @@ impl ProjectStore {
     /// # Errors
     /// Returns a fence, lifecycle, or storage failure.
     pub fn fail(&self, writer: &RevisionWriter) -> Result<()> {
-        let _serial = self.lock_mutation()?;
-        let mut active = self.lock_writer()?;
-        if !active.as_ref().is_some_and(|active| {
-            lifecycle::owns_writer(
-                active.sequence,
-                &active.fence,
-                writer.sequence,
-                &writer.fence,
-            )
-        }) {
-            return Err(RocksError::FenceLost);
-        }
-        let mut revision = self.revision(writer.sequence)?;
-        if !matches!(
-            revision.state,
-            RevisionState::Staging | RevisionState::Ready
-        ) {
-            return Err(RocksError::Transition);
-        }
-        revision.state = RevisionState::Failed;
-        let meta = self.meta()?;
-        let mut batch = WriteBatch::default();
-        put_revision(&mut batch, &meta, &revision)?;
-        batch.delete_cf(&meta, ACTIVE_KEY);
-        batch.delete_cf(&meta, staging::byte_count_key(writer.sequence));
-        self.clear_claims(&mut batch, writer.sequence)?;
-        self.write(&batch)?;
-        *active = None;
-        Ok(())
+        writer.fail(self)
     }
 
     /// Capture a consistent current generation, optionally requiring its ID.
@@ -644,93 +501,8 @@ impl ProjectStore {
         ownership::stamp_checkpoint(destination, &self.inner.identity)
     }
 
-    fn initialize(&self, identity: &ContentDigest) -> Result<()> {
-        let format = self.get_meta(FORMAT_KEY)?;
-        let mut batch = WriteBatch::default();
-        let meta = self.meta()?;
-        if let Some(format) = format {
-            if format != FORMAT_VERSION {
-                return Err(RocksError::Format);
-            }
-            if self.get_meta(PROJECT_KEY)?.as_deref() != Some(identity.as_str().as_bytes()) {
-                return Err(RocksError::ProjectMismatch);
-            }
-        } else {
-            // A marker alone never permits adoption of unknown native rows.
-            for name in family_names() {
-                let family = self
-                    .inner
-                    .database
-                    .cf_handle(name)
-                    .ok_or(RocksError::Format)?;
-                if self
-                    .inner
-                    .database
-                    .iterator_cf(&family, IteratorMode::Start)
-                    .next()
-                    .is_some()
-                {
-                    return Err(RocksError::Format);
-                }
-            }
-            batch.put_cf(&meta, FORMAT_KEY, FORMAT_VERSION);
-            batch.put_cf(&meta, PROJECT_KEY, identity.as_str());
-        }
-        if let Some(sequence) = self.optional_sequence(ACTIVE_KEY)? {
-            let mut revision = self.revision(sequence)?;
-            if !matches!(
-                revision.state,
-                RevisionState::Staging | RevisionState::Ready
-            ) {
-                return Err(RocksError::Corrupt {
-                    field: "active_revision",
-                });
-            }
-            revision.state = RevisionState::Failed;
-            put_revision(&mut batch, &meta, &revision)?;
-            batch.delete_cf(&meta, ACTIVE_KEY);
-            batch.delete_cf(&meta, staging::byte_count_key(sequence));
-            self.clear_claims(&mut batch, sequence)?;
-        }
-        self.write(&batch)
-    }
-
     pub(in crate::rocks) fn batch_policy(&self) -> StorePolicy {
         self.inner.policy
-    }
-
-    fn validate_changes(&self, changes: &[RecordChange]) -> Result<()> {
-        if changes.len() > self.inner.policy.maximum_batch_rows {
-            return Err(RocksError::Limit {
-                resource: "batch_rows",
-            });
-        }
-        let mut bytes = 4_096_usize;
-        let mut keys = BTreeSet::new();
-        for change in changes {
-            let value_bytes = change.value.as_ref().map_or(0, Vec::len);
-            if value_bytes > MAXIMUM_RECORD_BYTES {
-                return Err(RocksError::Limit {
-                    resource: "record_bytes",
-                });
-            }
-            bytes = bytes
-                .checked_add(change.key.prefix().len())
-                .and_then(|sum| sum.checked_add(value_bytes))
-                .and_then(|sum| sum.checked_add(32))
-                .ok_or(RocksError::Limit {
-                    resource: "batch_bytes",
-                })?;
-            if bytes > self.inner.policy.maximum_batch_bytes {
-                return Err(RocksError::Limit {
-                    resource: "batch_bytes",
-                });
-            }
-            if !keys.insert((change.collection, &change.key)) {
-                return Err(RocksError::ReplayConflict);
-            }
-        }
-        Ok(())
     }
 
     fn family(&self, collection: Collection) -> Result<Arc<BoundColumnFamily<'_>>> {
@@ -806,7 +578,7 @@ impl ProjectStore {
     }
 }
 
-impl RevisionSnapshot<'_> {
+impl<'store> RevisionSnapshot<'store> {
     /// Immutable generation metadata captured with this read view.
     #[must_use]
     pub const fn revision(&self) -> &StoredRevision {
@@ -823,108 +595,23 @@ impl RevisionSnapshot<'_> {
         key: &RecordKey,
         budget: &mut ReadBudget,
     ) -> Result<Option<Vec<u8>>> {
-        read_record(
-            &self.snapshot,
-            &self.store.family(collection)?,
-            &self.store.meta()?,
-            self.revision.sequence,
-            key,
-            budget,
-        )
-    }
-
-    /// Read a bounded logical-key page in ascending byte order.
-    ///
-    /// `after` is exclusive and must belong to the supplied prefix. Tombstones
-    /// and unpublished revisions never appear. Pages stop at four MiB or the
-    /// logical-key limit, including invisible keys; one indivisible record may
-    /// exceed the page byte target. Continue with `next_after` even when a page
-    /// is empty. A key's version chain is never split across pages.
-    ///
-    /// # Errors
-    /// Returns an input-bound, read-budget, corrupt-value, or storage error.
-    pub fn scan_prefix(
-        &self,
-        collection: Collection,
-        prefix: &[u8],
-        after: Option<&RecordKey>,
-        limit: u16,
-        budget: &mut ReadBudget,
-    ) -> Result<RecordPage> {
-        validate_scan_request(prefix, after, limit)?;
-        let encoded_prefix = key::escape(prefix);
-        let start = after.map_or_else(
-            || Some(encoded_prefix.clone()),
-            |after| key::successor(after.prefix()),
-        );
-        let Some(start) = start else {
-            return Ok(RecordPage {
-                rows: Vec::new(),
-                next_after: None,
-            });
-        };
         let family = self.store.family(collection)?;
         let meta = self.store.meta()?;
-        let mut rows = Vec::new();
-        let mut bytes = 0_usize;
-        let mut keys = ScanKeys {
-            limit,
-            examined: 0,
-            previous: None,
-        };
-        let mut iterator = self
-            .snapshot
-            .raw_iterator_cf_opt(&family, scan_read_options(&encoded_prefix));
-        budget.checkpoint()?;
-        iterator.seek(start);
-        while let Some((encoded_key, value)) = iterator.item() {
-            budget.charge(encoded_key.len().saturating_add(value.len()))?;
-            if !encoded_key.starts_with(&encoded_prefix) {
-                break;
-            }
-            let (logical_key, sequence) = key::decode(encoded_key)?;
-            if keys.at_boundary(&logical_key) {
-                return Ok(RecordPage {
-                    rows,
-                    next_after: keys.previous,
-                });
-            }
-            if sequence > self.revision.sequence {
-                budget.checkpoint()?;
-                iterator.seek(logical_key.at_sequence(self.revision.sequence));
-                continue;
-            }
-            if !is_published(&self.snapshot, &meta, sequence)? {
-                budget.checkpoint()?;
-                iterator.next();
-                continue;
-            }
-            if let Some(value) = decode_value(value)? {
-                bytes = bytes
-                    .saturating_add(logical_key.as_bytes().len())
-                    .saturating_add(value.len());
-                rows.push((logical_key.clone(), value.to_vec()));
-                if rows.len() == usize::from(limit) || bytes >= 4 * 1_048_576 {
-                    return Ok(RecordPage {
-                        rows,
-                        next_after: Some(logical_key),
-                    });
-                }
-            }
-            // A published value or tombstone shadows every older version.
-            // Advance past this exact terminated key, retaining binary child
-            // keys that share its raw logical-byte prefix.
-            let Some(next) = key::successor(logical_key.prefix()) else {
-                break;
-            };
-            budget.checkpoint()?;
-            iterator.seek(next);
+        PublishedRead::new(&self.snapshot, &meta, self.revision.sequence).read(&family, key, budget)
+    }
+
+    /// Bind a logical-key prefix to this immutable revision and collection.
+    #[must_use]
+    pub fn scan_prefix<'query>(
+        &'query self,
+        collection: Collection,
+        prefix: &'query [u8],
+    ) -> PrefixScan<'query, 'store> {
+        PrefixScan {
+            snapshot: self,
+            collection,
+            prefix,
         }
-        iterator.status().map_err(|_| operation("scan_records"))?;
-        Ok(RecordPage {
-            rows,
-            next_after: None,
-        })
     }
 }
 
@@ -1040,6 +727,27 @@ fn snapshot_revision(
     Ok(revision)
 }
 
+impl StoredRevision {
+    /// Encode the reservation's identity, active pointer, and empty row count
+    /// from the same metadata record into its caller's existing atomic batch.
+    fn write_reservation(
+        &self,
+        batch: &mut WriteBatch,
+        meta: &Arc<BoundColumnFamily<'_>>,
+    ) -> Result<()> {
+        put_revision(batch, meta, self)?;
+        batch.put_cf(
+            meta,
+            identity_key(&self.generation_id),
+            self.sequence.to_be_bytes(),
+        );
+        batch.put_cf(meta, LAST_SEQUENCE_KEY, self.sequence.to_be_bytes());
+        batch.put_cf(meta, ACTIVE_KEY, self.sequence.to_be_bytes());
+        batch.put_cf(meta, version_count_key(self.sequence), 0_u64.to_be_bytes());
+        Ok(())
+    }
+}
+
 fn put_revision(
     batch: &mut WriteBatch,
     meta: &Arc<BoundColumnFamily<'_>>,
@@ -1063,12 +771,7 @@ fn put_revision(
 fn validate_fence(active: Option<&ActiveWriter>, writer: &RevisionWriter) -> Result<()> {
     if active.is_some_and(|active| {
         lifecycle::can_mutate_writer(
-            lifecycle::owns_writer(
-                active.sequence,
-                &active.fence,
-                writer.sequence,
-                &writer.fence,
-            ),
+            lifecycle::owns_writer(&active.identity, &writer.identity),
             active.expires_at > Instant::now(),
         )
     }) {
@@ -1136,14 +839,14 @@ fn database_options(policy: StorePolicy) -> (Options, Vec<ColumnFamilyDescriptor
     options.set_allow_concurrent_memtable_write(true);
     // Unordered writes break the native snapshot guarantees used by readers.
     options.set_unordered_write(false);
-    options.set_max_background_jobs(2);
-    options.set_max_open_files(256);
-    options.set_max_total_wal_size(64 * 1_048_576);
-    options.set_bytes_per_sync(1_048_576);
-    options.set_wal_bytes_per_sync(1_048_576);
-    options.set_keep_log_file_num(2);
-    options.set_max_log_file_size(1_048_576);
-    options.set_max_manifest_file_size(4 * 1_048_576);
+    options.set_max_background_jobs(BACKGROUND_JOBS);
+    options.set_max_open_files(OPEN_FILE_LIMIT);
+    options.set_max_total_wal_size(WAL_SIZE_LIMIT);
+    options.set_bytes_per_sync(SYNC_INTERVAL_BYTES);
+    options.set_wal_bytes_per_sync(SYNC_INTERVAL_BYTES);
+    options.set_keep_log_file_num(RETAINED_LOG_FILES);
+    options.set_max_log_file_size(LOG_SIZE_LIMIT);
+    options.set_max_manifest_file_size(MANIFEST_SIZE_LIMIT);
     options.set_log_level(LogLevel::Warn);
     options.set_write_buffer_manager(&buffers);
     let families = family_names()
@@ -1155,13 +858,13 @@ fn database_options(policy: StorePolicy) -> (Options, Vec<ColumnFamilyDescriptor
             family.set_compression_type(DBCompressionType::Lz4);
             family.set_bottommost_compression_type(DBCompressionType::Zstd);
             family.set_level_compaction_dynamic_level_bytes(true);
-            family.set_write_buffer_size(8 * 1_048_576);
-            family.set_max_write_buffer_number(3);
+            family.set_write_buffer_size(FAMILY_WRITE_BUFFER_BYTES);
+            family.set_max_write_buffer_number(FAMILY_WRITE_BUFFERS);
             family.set_write_buffer_manager(&buffers);
             let mut table = BlockBasedOptions::default();
             table.set_block_cache(&cache);
             table.set_cache_index_and_filter_blocks(true);
-            table.set_bloom_filter(10.0, false);
+            table.set_bloom_filter(BLOOM_BITS_PER_KEY, false);
             family.set_block_based_table_factory(&table);
             ColumnFamilyDescriptor::new(name, family)
         })
@@ -1240,5 +943,112 @@ impl Serialize for StoredRevision {
         output.serialize_field("run_exclude_patterns", &self.run_excludes.len())?;
         output.serialize_field("maximum_file_bytes", &self.maximum_file_bytes)?;
         output.end()
+    }
+}
+
+/// Borrowed immutable record range with fixed revision, collection and prefix.
+pub struct PrefixScan<'query, 'store> {
+    snapshot: &'query RevisionSnapshot<'store>,
+    collection: Collection,
+    prefix: &'query [u8],
+}
+
+impl PrefixScan<'_, '_> {
+    /// Read a bounded logical-key page in ascending byte order.
+    ///
+    /// `after` is exclusive and must belong to the supplied prefix. Tombstones
+    /// and unpublished revisions never appear. Pages stop at four MiB or the
+    /// logical-key limit, including invisible keys; one indivisible record may
+    /// exceed the page byte target. Continue with `next_after` even when a page
+    /// is empty. A key's version chain is never split across pages.
+    ///
+    /// # Errors
+    /// Returns an input-bound, read-budget, corrupt-value, or storage error.
+    pub fn page(
+        &self,
+        after: Option<&RecordKey>,
+        limit: u16,
+        budget: &mut ReadBudget,
+    ) -> Result<RecordPage> {
+        let Self {
+            snapshot,
+            collection,
+            prefix,
+        } = *self;
+
+        validate_scan_request(prefix, after, limit)?;
+        let encoded_prefix = key::escape(prefix);
+        let start = after.map_or_else(
+            || Some(encoded_prefix.clone()),
+            |after| key::successor(after.prefix()),
+        );
+        let Some(start) = start else {
+            return Ok(RecordPage {
+                rows: Vec::new(),
+                next_after: None,
+            });
+        };
+        let family = snapshot.store.family(collection)?;
+        let meta = snapshot.store.meta()?;
+        let mut rows = Vec::new();
+        let mut bytes = 0_usize;
+        let mut keys = ScanKeys {
+            limit,
+            examined: 0,
+            previous: None,
+        };
+        let mut iterator = snapshot
+            .snapshot
+            .raw_iterator_cf_opt(&family, scan_read_options(&encoded_prefix));
+        budget.checkpoint()?;
+        iterator.seek(start);
+        while let Some((encoded_key, value)) = iterator.item() {
+            budget.charge(encoded_key.len().saturating_add(value.len()))?;
+            if !encoded_key.starts_with(&encoded_prefix) {
+                break;
+            }
+            let (logical_key, sequence) = key::decode(encoded_key)?;
+            if keys.at_boundary(&logical_key) {
+                return Ok(RecordPage {
+                    rows,
+                    next_after: keys.previous,
+                });
+            }
+            if sequence > snapshot.revision.sequence {
+                budget.checkpoint()?;
+                iterator.seek(logical_key.at_sequence(snapshot.revision.sequence));
+                continue;
+            }
+            if !is_published(&snapshot.snapshot, &meta, sequence)? {
+                budget.checkpoint()?;
+                iterator.next();
+                continue;
+            }
+            if let Some(value) = decode_value(value)? {
+                bytes = bytes
+                    .saturating_add(logical_key.as_bytes().len())
+                    .saturating_add(value.len());
+                rows.push((logical_key.clone(), value.to_vec()));
+                if rows.len() == usize::from(limit) || bytes >= 4 * 1_048_576 {
+                    return Ok(RecordPage {
+                        rows,
+                        next_after: Some(logical_key),
+                    });
+                }
+            }
+            // A published value or tombstone shadows every older version.
+            // Advance past this exact terminated key, retaining binary child
+            // keys that share its raw logical-byte prefix.
+            let Some(next) = key::successor(logical_key.prefix()) else {
+                break;
+            };
+            budget.checkpoint()?;
+            iterator.seek(next);
+        }
+        iterator.status().map_err(|_| operation("scan_records"))?;
+        Ok(RecordPage {
+            rows,
+            next_after: None,
+        })
     }
 }

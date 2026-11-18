@@ -9,8 +9,8 @@ pub(super) fn merge(prior: &str, request: &InstallRequest) -> Result<Option<Stri
     let Some((start, end)) = yaml_top_range(&lines, "mcp_servers") else {
         return Ok(None);
     };
-    let legacy = positions(&lines, start, end, "cartograph");
-    let canonical = positions(&lines, start, end, "codevetra");
+    let legacy = positions(&lines, start + 1..end, "cartograph");
+    let canonical = positions(&lines, start + 1..end, "codevetra");
     if legacy.len() + canonical.len() > 1 {
         return Err(InstallError::NameConflict);
     }
@@ -23,7 +23,7 @@ pub(super) fn merge(prior: &str, request: &InstallRequest) -> Result<Option<Stri
             !line.trim().is_empty() && line.starts_with("  ") && !line.starts_with("    ")
         })
         .unwrap_or(end);
-    repin(&mut lines, start, end, request.command())?;
+    repin(&mut lines[start + 1..end], request.command())?;
     "  codevetra:".clone_into(&mut lines[start]);
     let updated = join_lines(lines);
     let without_old = remove_yaml_list_item(
@@ -37,19 +37,14 @@ pub(super) fn merge(prior: &str, request: &InstallRequest) -> Result<Option<Stri
     let without_new = remove_yaml_list_item(&without_old, HERMES_TOOLSET);
     Ok(Some(append_yaml_list_item(&without_new, HERMES_TOOLSET)))
 }
-fn positions(lines: &[String], start: usize, end: usize, name: &str) -> Vec<usize> {
-    (start + 1..end)
+fn positions(lines: &[String], range: std::ops::Range<usize>, name: &str) -> Vec<usize> {
+    range
         .filter(|index| lines[*index].trim_end() == format!("  {name}:"))
         .take(2)
         .collect()
 }
-fn repin(
-    lines: &mut [String],
-    start: usize,
-    end: usize,
-    executable: &str,
-) -> Result<(), InstallError> {
-    let commands = (start + 1..end)
+fn repin(lines: &mut [String], executable: &str) -> Result<(), InstallError> {
+    let commands = (0..lines.len())
         .filter(|index| lines[*index].starts_with("    command:"))
         .take(2)
         .collect::<Vec<_>>();
@@ -62,7 +57,7 @@ fn repin(
         lines[*command_index] = format!("    command: {}", yaml_quote(executable));
         return Ok(());
     }
-    let starts = (start + 1..end)
+    let starts = (0..lines.len())
         .filter(|index| lines[*index].trim_end() == "    args:")
         .take(2)
         .collect::<Vec<_>>();
@@ -70,7 +65,7 @@ fn repin(
         return Err(InstallError::InvalidConfig);
     };
     let mut arguments = Vec::new();
-    for (index, line) in lines.iter().enumerate().take(end).skip(args_start + 1) {
+    for (index, line) in lines.iter().enumerate().skip(args_start + 1) {
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
         }

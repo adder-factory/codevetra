@@ -27,7 +27,7 @@ fn large_reference_table_publishes_and_deletes_with_one_mib_sort_workspace() -> 
         canonical(raw)
     };
     for sequence in 1_u64..=2 {
-        let native = GraphPublicationInput::new(
+        let native = codevetra_db::rocks::GraphPreparation::new(
             GraphRevision {
                 generation_id: generation(sequence),
                 source_revision: digest(9),
@@ -37,13 +37,13 @@ fn large_reference_table_publishes_and_deletes_with_one_mib_sort_workspace() -> 
                     GraphBase::Current(generation(1))
                 },
             },
-            make_facts(usize::try_from(sequence)?)?,
             GraphPolicy {
                 maximum_working_bytes: 1_048_576,
                 ..GraphPolicy::default()
             },
             &request()?,
-        )?;
+        )
+        .resident(make_facts(usize::try_from(sequence)?)?)?;
         let published = store.publish_graph(native, &request()?)?;
         if sequence == 2 {
             assert_eq!(published.report.deleted_records, 6_000);
@@ -87,9 +87,7 @@ fn large_vertices_use_dense_bounded_blocks_and_stable_pagination() -> TestResult
     let mut observed = Vec::new();
     let mut read_budget = budget()?;
     loop {
-        let page = graph.neighbors(
-            &symbol(1),
-            GraphDirection::Outgoing,
+        let page = graph.adjacency(&symbol(1), GraphDirection::Outgoing).page(
             cursor.as_ref(),
             31,
             &mut read_budget,
@@ -161,9 +159,7 @@ fn small_vertex_split_and_merge_preserve_every_edge_without_stale_blocks() -> Te
         )?;
         let snapshot = store.current_snapshot(None)?;
         let graph = snapshot.graph(&mut budget()?)?;
-        let page = graph.neighbors(
-            &symbol(1),
-            GraphDirection::Outgoing,
+        let page = graph.adjacency(&symbol(1), GraphDirection::Outgoing).page(
             None,
             200,
             &mut budget()?,
@@ -197,44 +193,29 @@ fn cursors_and_property_links_are_fenced_by_project_generation_and_direction() -
     }
     let snapshot = first.current_snapshot(None)?;
     let graph = snapshot.graph(&mut budget()?)?;
-    let page = graph.neighbors(
-        &symbol(1),
-        GraphDirection::Outgoing,
-        None,
-        1,
-        &mut budget()?,
-    )?;
+    let page =
+        graph
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(None, 1, &mut budget()?)?;
     let cursor = page.next.as_ref().ok_or("missing cursor")?;
     assert!(matches!(
-        graph.neighbors(
-            &symbol(1),
-            GraphDirection::Incoming,
-            Some(cursor),
-            1,
-            &mut budget()?
-        ),
+        graph
+            .adjacency(&symbol(1), GraphDirection::Incoming)
+            .page(Some(cursor), 1, &mut budget()?),
         Err(RocksError::GenerationChanged)
     ));
     assert!(matches!(
-        graph.neighbors(
-            &symbol(2),
-            GraphDirection::Outgoing,
-            Some(cursor),
-            1,
-            &mut budget()?
-        ),
+        graph
+            .adjacency(&symbol(2), GraphDirection::Outgoing)
+            .page(Some(cursor), 1, &mut budget()?),
         Err(RocksError::GenerationChanged)
     ));
     let second_view = second.current_snapshot(None)?;
     let second_graph = second_view.graph(&mut budget()?)?;
     assert!(matches!(
-        second_graph.neighbors(
-            &symbol(1),
-            GraphDirection::Outgoing,
-            Some(cursor),
-            1,
-            &mut budget()?
-        ),
+        second_graph
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(Some(cursor), 1, &mut budget()?),
         Err(RocksError::GenerationChanged)
     ));
     assert!(matches!(
@@ -248,13 +229,9 @@ fn cursors_and_property_links_are_fenced_by_project_generation_and_direction() -
     let current = first.current_snapshot(None)?;
     let current_graph = current.graph(&mut budget()?)?;
     assert!(matches!(
-        current_graph.neighbors(
-            &symbol(1),
-            GraphDirection::Outgoing,
-            Some(cursor),
-            1,
-            &mut budget()?
-        ),
+        current_graph
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(Some(cursor), 1, &mut budget()?),
         Err(RocksError::GenerationChanged)
     ));
     assert!(matches!(
@@ -279,13 +256,10 @@ fn every_relationship_kind_survives_binary_encoding_and_budget_limits() -> TestR
     store.publish_graph(input(1, facts(2, edges)?)?, &request()?)?;
     let snapshot = store.current_snapshot(None)?;
     let graph = snapshot.graph(&mut budget()?)?;
-    let page = graph.neighbors(
-        &symbol(1),
-        GraphDirection::Outgoing,
-        None,
-        100,
-        &mut budget()?,
-    )?;
+    let page =
+        graph
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(None, 100, &mut budget()?)?;
     assert_eq!(
         page.links
             .iter()
@@ -295,31 +269,20 @@ fn every_relationship_kind_survives_binary_encoding_and_budget_limits() -> TestR
     );
     assert!(
         graph
-            .neighbors(
-                &symbol(1),
-                GraphDirection::Outgoing,
-                None,
-                0,
-                &mut budget()?
-            )
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(None, 0, &mut budget()?)
             .is_err()
     );
     assert!(
         graph
-            .neighbors(
-                &symbol(1),
-                GraphDirection::Outgoing,
-                None,
-                4_097,
-                &mut budget()?
-            )
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(None, 4_097, &mut budget()?)
             .is_err()
     );
     assert!(
         graph
-            .neighbors(
-                &symbol(1),
-                GraphDirection::Outgoing,
+            .adjacency(&symbol(1), GraphDirection::Outgoing)
+            .page(
                 None,
                 100,
                 &mut ReadBudget::new(1, 1, Duration::from_secs(1))?

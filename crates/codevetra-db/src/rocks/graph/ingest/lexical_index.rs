@@ -21,9 +21,29 @@ pub(super) fn statistics(
         .map(Option::flatten)
 }
 
+const LEXICAL_WORKSPACE_DIVISOR: usize = 8;
+const MAXIMUM_FORWARD_WORKSPACE_BYTES: usize = 4 * 1_048_576;
+
+/// Unchanged documents retain their postings; a changed absent document deletes them.
+enum ForwardChange {
+    Unchanged,
+    Changed(Option<Forward>),
+}
+
+impl ForwardChange {
+    fn retains(&self, term: &str) -> bool {
+        match self {
+            Self::Unchanged => true,
+            Self::Changed(next) => next
+                .as_ref()
+                .is_some_and(|next| next.terms.contains_key(term)),
+        }
+    }
+}
+
 impl Delta<'_, '_> {
     pub(super) fn update_lexical(&mut self, key: &RecordKey, value: Option<&[u8]>) -> Result<()> {
-        self.request.check()?;
+        self.publication.request.check()?;
         let id = key
             .as_bytes()
             .strip_prefix(DOCUMENT)
@@ -32,12 +52,13 @@ impl Delta<'_, '_> {
         let previous = if self.lexical_bootstrap {
             None
         } else {
-            self.previous
+            self.publication
+                .previous
                 .map(|snapshot| {
                     snapshot.get(
                         Collection::Search,
                         &forward_key,
-                        &mut read_budget(self.request)?,
+                        &mut read_budget(self.publication.request)?,
                     )
                 })
                 .transpose()?
@@ -55,16 +76,16 @@ impl Delta<'_, '_> {
             .zip(document.as_ref())
             .is_some_and(|(old, document)| old.digest == Forward::digest(document));
         let next = if unchanged {
-            None
+            ForwardChange::Unchanged
         } else {
-            self.lexical_forward(document.as_ref())?
+            ForwardChange::Changed(self.lexical_forward(document.as_ref())?)
         };
         if let Some(bytes) = previous.as_deref() {
-            self.delete_obsolete_postings(bytes, id, next.as_ref(), unchanged)?;
+            self.delete_obsolete_postings(bytes, id, &next)?;
         }
-        if unchanged {
+        let ForwardChange::Changed(next) = next else {
             return Ok(());
-        }
+        };
         if let Some(old) = &metadata {
             self.subtract_lexical_statistics(old)?;
         }
@@ -90,7 +111,7 @@ impl Delta<'_, '_> {
                 *total = total.checked_add(length).ok_or_else(codec::corrupt)?;
             }
             for (term, frequencies) in &next.terms {
-                self.request.check()?;
+                self.publication.request.check()?;
                 let posting = StoredPosting {
                     lengths: next.lengths,
                     frequencies: *frequencies,
@@ -109,12 +130,11 @@ impl Delta<'_, '_> {
         &mut self,
         bytes: &[u8],
         id: &[u8],
-        next: Option<&Forward>,
-        unchanged: bool,
+        next: &ForwardChange,
     ) -> Result<()> {
         lexical::visit_forward_terms(bytes, |term| {
-            self.request.check()?;
-            if !unchanged && next.is_none_or(|next| !next.terms.contains_key(term)) {
+            self.publication.request.check()?;
+            if !next.retains(term) {
                 self.lexical_point(lexical::posting_key(term, id)?, None)?;
             }
             Ok(())
@@ -153,17 +173,17 @@ impl Delta<'_, '_> {
         // Only the next map allocates, alongside the live table/sparse workspace.
         let maximum = self
             .lexical_working_bytes
-            .min(self.policy.maximum_working_bytes / 8)
-            .min(4 * 1_048_576);
+            .min(self.policy.maximum_working_bytes / LEXICAL_WORKSPACE_DIVISOR)
+            .min(MAXIMUM_FORWARD_WORKSPACE_BYTES);
         let next = document
-            .map(
-                |document| match Forward::build(document, maximum, &read_budget(self.request)?) {
+            .map(|document| {
+                match Forward::build(document, maximum, &read_budget(self.publication.request)?) {
                     Err(super::RocksError::Limit {
                         resource: "lexical_document_workspace",
-                    }) => Forward::scan_only(document, &read_budget(self.request)?),
+                    }) => Forward::scan_only(document, &read_budget(self.publication.request)?),
                     result => result,
-                },
-            )
+                }
+            })
             .transpose()?;
         Ok(next)
     }
@@ -180,11 +200,18 @@ impl Delta<'_, '_> {
     }
 
     fn lexical_point(&mut self, key: RecordKey, value: Option<Vec<u8>>) -> Result<()> {
-        self.request.check()?;
+        self.publication.request.check()?;
         self.report.candidate_records += 1;
         let old = self
+            .publication
             .previous
-            .map(|snapshot| snapshot.get(Collection::Search, &key, &mut read_budget(self.request)?))
+            .map(|snapshot| {
+                snapshot.get(
+                    Collection::Search,
+                    &key,
+                    &mut read_budget(self.publication.request)?,
+                )
+            })
             .transpose()?
             .flatten();
         if old == value {

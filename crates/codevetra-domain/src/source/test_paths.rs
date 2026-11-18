@@ -53,8 +53,11 @@ fn is_test_filename(language: SourceLanguage, filename: &str) -> bool {
             matches!(stem.as_str(), "test" | "tests")
                 || stem.starts_with("test_")
                 || stem.ends_with("_test")
+                || stem.ends_with("_tests")
         }
-        SourceLanguage::Python => stem.starts_with("test_") || stem.ends_with("_test"),
+        SourceLanguage::Python => {
+            stem.starts_with("test_") || stem.starts_with("test-") || stem.ends_with("_test")
+        }
         SourceLanguage::Go => stem.ends_with("_test"),
         SourceLanguage::Ruby => stem.ends_with("_spec") || stem.ends_with("_test"),
         SourceLanguage::Java
@@ -86,7 +89,9 @@ mod tests {
             "SRC/TESTS.RS",
             "src\\cache\\tests.rs",
             "src/worker_test.rs",
+            "src/worker_tests.rs",
             "src/test_worker.py",
+            "scripts/test-worker.py",
             "pkg/worker_test.go",
             "spec/service_spec.rb",
             "src/component.test.tsx",
@@ -106,6 +111,10 @@ mod tests {
         for path in [
             "src/contest.rs",
             "src/tests_helper.rs",
+            "src/contests.rs",
+            "src/worker_tests.py",
+            "src/test-worker.ts",
+            "scripts/latest-worker.py",
             "src/testing_helpers.ts",
             "src/test.ts",
             "src/tests.py",

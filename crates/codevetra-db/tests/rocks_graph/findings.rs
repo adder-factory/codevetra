@@ -34,13 +34,21 @@ impl Fixture {
         let runtime = StorageRuntime::new(WorkerPolicy::default())?;
         let store = AsyncProjectStore::open(
             &runtime,
-            root.path().to_owned(),
-            digest(1),
-            StorePolicy::default(),
+            codevetra_db::rocks::ProjectOpening::new(
+                root.path().to_owned(),
+                digest(1),
+                StorePolicy::default(),
+            ),
             &request()?,
         )
         .await?;
-        store.publish_graph(input(1, facts)?, &request()?).await?;
+        {
+            let request_bound_input = input(1, facts)?;
+            store
+                .with_request(&request()?)
+                .publish_graph(request_bound_input)
+                .await
+        }?;
         let database = NativeDatabase::new(store.clone(), &digest(1));
         Ok(Self {
             _root: root,
@@ -224,6 +232,48 @@ async fn assert_inventory_refresh(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flat_mapping_coverage_is_excluded_and_missing_evidence_stays_actionable() -> TestResult {
+    let mut facts = searchable(3);
+    for document in &mut facts.documents {
+        document.metadata = json!({"health": {
+            "code_lines": 200, "cyclomatic": 50, "magic_numbers": 8
+        }});
+    }
+    facts.documents[0].metadata["health"]["flat_value_mapping"] = json!(true);
+    facts.documents[1].metadata["health"]["flat_value_mapping"] = json!(false);
+    let fixture = Fixture::new(facts).await?;
+    let stats = fixture
+        .database
+        .current_structural_finding_stats_bounded(
+            fixture.database.project_id(),
+            Duration::from_secs(30),
+        )
+        .await?;
+    for detector in ["complex_method", "brain_method"] {
+        let row = stats
+            .detector_coverage()
+            .iter()
+            .find(|row| row.detector == detector)
+            .ok_or("missing mapping detector coverage")?;
+        assert_eq!(row.considered_symbols, 3);
+        assert_eq!(row.excluded_symbols, 1);
+        assert_eq!(row.evaluated_symbols, 2);
+        assert_eq!(row.finding_count, 2);
+    }
+    for detector in ["large_method", "magic_number"] {
+        let row = stats
+            .detector_coverage()
+            .iter()
+            .find(|row| row.detector == detector)
+            .ok_or("missing retained detector coverage")?;
+        assert_eq!(row.excluded_symbols, 0);
+        assert_eq!(row.finding_count, 3);
+    }
+    fixture.runtime.shutdown(&request()?).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn complete_findings_exclude_test_documents_and_invalidate_on_publication() -> TestResult {
     let fixture = Fixture::new(detector_facts()).await?;
     let database = &fixture.database;
@@ -289,10 +339,14 @@ async fn complete_findings_exclude_test_documents_and_invalidate_on_publication(
     changed.symbols[0].structural_digest = digest(9);
     changed.documents[0].metadata = json!({});
     changed.documents[0].code = "fn edited() {}".into();
-    fixture
-        .store
-        .publish_graph(input(2, canonical(changed)?)?, &request()?)
-        .await?;
+    {
+        let request_bound_input = input(2, canonical(changed)?)?;
+        fixture
+            .store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
     assert!(
         database
             .cached_current_structural_finding_stats(project)
@@ -350,10 +404,14 @@ async fn detector_group_keeps_computation_provenance_across_refresh_and_publicat
     assert_eq!(computation.generation_id(), &generation(1));
     assert!(computation.stats().total_findings() > 0);
     assert_ne!(ready.clone().into_findings(), []);
-    fixture
-        .store
-        .publish_graph(input(2, canonical(searchable(1))?)?, &request()?)
-        .await?;
+    {
+        let request_bound_input = input(2, canonical(searchable(1))?)?;
+        fixture
+            .store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
     let invalidated = database
         .query_current_structural_findings_per_detector(project, &query)
         .await?;

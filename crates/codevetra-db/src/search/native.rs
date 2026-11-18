@@ -1,14 +1,19 @@
 //! Field-aware native BM25 with deterministic scoring and bounded candidate memory.
 
+pub(crate) const LEXICAL_NAME_WEIGHT: u32 = 4;
+pub(crate) const LEXICAL_CODE_WEIGHT: u32 = 1;
+pub(crate) const LEXICAL_NATURAL_WEIGHT: u32 = 2;
+
 use num_traits::ToPrimitive as _;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    DEFAULT_INTERACTIVE_SEARCH_TIMEOUT, DocumentId, Duration, GenerationId, SearchComponent,
-    SearchFlavor, SearchHit, SearchQuery, StorageError, SymbolKind, validate_query,
+    DEFAULT_INTERACTIVE_SEARCH_TIMEOUT, DocumentId, Duration, SearchComponent, SearchFlavor,
+    SearchHit, SearchQuery, StorageError, SymbolKind, validate_query,
 };
 use crate::{
     CanonicalSearchDocument, NativeDatabase,
+    retrieval::native::RankedRows,
     rocks::{GraphSnapshot, LexicalPosting, ReadBudget, RocksError},
 };
 
@@ -199,14 +204,8 @@ impl GraphSnapshot<'_, '_> {
                 field: "lexical_query",
             });
         }
-        let mut hits = lexical(
-            self,
-            budget,
-            self.generation_id(),
-            query,
-            limit + 1,
-            SearchFlavor::All,
-        )?;
+        let mut hits =
+            LexicalQuery::new(query, SearchFlavor::All, budget)?.search(self, budget, limit + 1)?;
         let truncated = hits.len() > usize::from(limit);
         hits.truncate(usize::from(limit));
         Ok((hits, truncated))
@@ -295,240 +294,253 @@ impl NativeDatabase {
     ) -> Result<Vec<SearchHit>, StorageError> {
         self.require_project(&input.project_id)?;
         validate_query(&input)?;
-        let generation = input.expected_generation_id.clone();
-        self.graph_with_budget(
-            &input.expected_generation_id,
-            timeout,
-            192 * 1_048_576,
-            move |graph, budget| {
-                lexical(
-                    graph,
-                    budget,
-                    &generation,
-                    &input.query,
-                    input.limit,
-                    flavor,
-                )
-            },
-        )
-        .await
-    }
-}
-
-fn lexical(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    generation: &GenerationId,
-    query: &str,
-    limit: u16,
-    flavor: SearchFlavor,
-) -> Result<Vec<SearchHit>, RocksError> {
-    let mut terms = BTreeSet::new();
-    tokens(query, budget, |token, _| {
-        terms.insert(token);
-        Ok(())
-    })?;
-    if terms.is_empty() || terms.len() > 32 {
-        return Err(RocksError::Limit {
-            resource: "lexical_query_terms",
-        });
-    }
-    let terms = terms.into_iter().collect::<Vec<_>>();
-    let (statistics, candidates) = if let Some(statistics) = graph.lexical_statistics(budget)?
-        && statistics.scan_documents == 0
-        && !matches!(flavor, SearchFlavor::FuzzyName(_))
-    {
-        indexed_corpus(graph, budget, &terms, flavor, &statistics)?
-    } else {
-        scan_corpus(graph, budget, &terms, flavor)?
-    };
-    // Scan metadata once, retaining only explicitly bounded term counts and
-    // identities. Drop that workspace before hydrating the final top-K from
-    // the same immutable snapshot. Statistics do not depend on the limit.
-    let ranked = rank_candidates(candidates, &statistics, usize::from(limit), budget)?;
-
-    ranked
-        .into_iter()
-        .map(|(score, candidate)| {
-            let document = graph
-                .document(&candidate.document, budget)?
-                .ok_or(RocksError::Format)?;
-            let symbol_kind = document
-                .symbol_id()
-                .map(|id| graph.symbol(id, budget))
-                .transpose()?
-                .flatten()
-                .and_then(|symbol| SymbolKind::from_stable_str(&symbol.symbol_kind));
-            Ok(SearchHit {
-                document_id: candidate.document,
-                generation_id: generation.clone(),
-                file_id: document.file_id().cloned(),
-                symbol_id: document.symbol_id().cloned(),
-                path: document.path().to_owned(),
-                language: document.language().to_owned(),
-                document_kind: document.kind().as_str().to_owned(),
-                qualified_name: document.qualified_name().to_owned(),
-                symbol_kind,
-                score,
-                components: [
-                    (1, SearchComponent::QualifiedName),
-                    (2, SearchComponent::Code),
-                    (4, SearchComponent::NaturalText),
-                ]
-                .into_iter()
-                .filter(|(bit, _)| candidate.components & bit != 0)
-                .map(|(_, component)| component)
-                .collect(),
+        self.graph_request(&input.expected_generation_id, timeout, 192 * 1_048_576)?
+            .read(move |graph, budget| {
+                LexicalQuery::new(&input.query, flavor, budget)?.search(graph, budget, input.limit)
             })
-        })
-        .collect()
+            .await
+    }
 }
 
-fn indexed_corpus(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    terms: &[String],
+struct LexicalQuery {
+    terms: Vec<String>,
     flavor: SearchFlavor,
-    corpus: &crate::rocks::LexicalStatistics,
-) -> Result<(CorpusStatistics, CandidateWorkspace), RocksError> {
-    let flavor_index = match flavor {
-        SearchFlavor::All => 0,
-        SearchFlavor::Name => 1,
-        SearchFlavor::Intent => 2,
-        SearchFlavor::FuzzyName(_) => return Err(RocksError::Format),
-    };
-    let mut indexed = IndexedCorpus {
-        statistics: CorpusStatistics {
-            frequencies: vec![0; terms.len()],
-            total_length: corpus.total_lengths[flavor_index],
-            documents: corpus.documents,
-        },
-        candidates: CandidateWorkspace::default(),
-        positions: BTreeMap::new(),
-    };
-    for (term_index, term) in terms.iter().enumerate() {
+}
+
+impl LexicalQuery {
+    fn new(query: &str, flavor: SearchFlavor, budget: &ReadBudget) -> Result<Self, RocksError> {
+        let mut terms = BTreeSet::new();
+        tokens(query, budget, |token, _| {
+            terms.insert(token);
+            Ok(())
+        })?;
+        if terms.is_empty() || terms.len() > 32 {
+            return Err(RocksError::Limit {
+                resource: "lexical_query_terms",
+            });
+        }
+        Ok(Self {
+            terms: terms.into_iter().collect(),
+            flavor,
+        })
+    }
+
+    fn search(
+        &self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+        limit: u16,
+    ) -> Result<Vec<SearchHit>, RocksError> {
+        let (statistics, candidates) = if let Some(statistics) = graph.lexical_statistics(budget)?
+            && statistics.scan_documents == 0
+            && !matches!(self.flavor, SearchFlavor::FuzzyName(_))
+        {
+            self.indexed_corpus(graph, budget, &statistics)?
+        } else {
+            self.scan_corpus(graph, budget)?
+        };
+        // Scan metadata once, retaining only explicitly bounded term counts and
+        // identities. Drop that workspace before hydrating the final top-K from
+        // the same immutable snapshot. Statistics do not depend on the limit.
+        let ranked = statistics.rank_candidates(candidates, usize::from(limit), budget)?;
+
+        ranked
+            .into_iter()
+            .map(|(score, candidate)| {
+                let document = graph
+                    .document(&candidate.document, budget)?
+                    .ok_or(RocksError::Format)?;
+                let symbol_kind = document
+                    .symbol_id()
+                    .map(|id| graph.symbol(id, budget))
+                    .transpose()?
+                    .flatten()
+                    .and_then(|symbol| SymbolKind::from_stable_str(&symbol.symbol_kind));
+                Ok(SearchHit {
+                    document_id: candidate.document,
+                    generation_id: graph.generation_id().clone(),
+                    file_id: document.file_id().cloned(),
+                    symbol_id: document.symbol_id().cloned(),
+                    path: document.path().to_owned(),
+                    language: document.language().to_owned(),
+                    document_kind: document.kind().as_str().to_owned(),
+                    qualified_name: document.qualified_name().to_owned(),
+                    symbol_kind,
+                    score,
+                    components: [
+                        (1, SearchComponent::QualifiedName),
+                        (2, SearchComponent::Code),
+                        (4, SearchComponent::NaturalText),
+                    ]
+                    .into_iter()
+                    .filter(|(bit, _)| candidate.components & bit != 0)
+                    .map(|(_, component)| component)
+                    .collect(),
+                })
+            })
+            .collect()
+    }
+
+    fn indexed_corpus(
+        &self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+        corpus: &crate::rocks::LexicalStatistics,
+    ) -> Result<(CorpusStatistics, CandidateWorkspace), RocksError> {
+        let flavor_index = match self.flavor {
+            SearchFlavor::All => 0,
+            SearchFlavor::Name => 1,
+            SearchFlavor::Intent => 2,
+            SearchFlavor::FuzzyName(_) => return Err(RocksError::Format),
+        };
+        let mut indexed = IndexedCorpus {
+            statistics: CorpusStatistics {
+                frequencies: vec![0; self.terms.len()],
+                total_length: corpus.total_lengths[flavor_index],
+                documents: corpus.documents,
+            },
+            candidates: CandidateWorkspace::default(),
+            positions: BTreeMap::new(),
+        };
+        for (term_index, term) in self.terms.iter().enumerate() {
+            let mut cursor = None;
+            loop {
+                let (postings, next) =
+                    graph
+                        .lexical_postings(term)
+                        .page(cursor.as_ref(), 64, budget)?;
+                for posting in postings {
+                    budget.checkpoint()?;
+                    indexed.record(posting, self.flavor, term_index)?;
+                }
+                cursor = next;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+        Ok((indexed.statistics, indexed.candidates))
+    }
+
+    fn scan_corpus(
+        &self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+    ) -> Result<(CorpusStatistics, CandidateWorkspace), RocksError> {
+        let mut statistics = CorpusStatistics {
+            frequencies: vec![0_u32; self.terms.len()],
+            total_length: 0,
+            documents: 0,
+        };
+        let mut candidates = CandidateWorkspace::default();
         let mut cursor = None;
         loop {
-            let (postings, next) = graph.lexical_postings(term, cursor.as_ref(), 64, budget)?;
-            for posting in postings {
-                budget.checkpoint()?;
-                indexed.record(posting, flavor, term_index)?;
+            let (rows, next) = graph.documents(cursor.as_ref(), 64, budget)?;
+            for document in rows {
+                let (length, frequencies, components) = self.counts(&document, budget)?;
+                statistics.record(length, &frequencies)?;
+                if frequencies.iter().any(|count| *count != 0) {
+                    candidates.push(Candidate {
+                        document: document.document_id().clone(),
+                        length,
+                        frequencies,
+                        components,
+                    })?;
+                }
             }
             cursor = next;
             if cursor.is_none() {
-                break;
+                return Ok((statistics, candidates));
             }
-        }
-    }
-    Ok((indexed.statistics, indexed.candidates))
-}
-
-fn scan_corpus(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    terms: &[String],
-    flavor: SearchFlavor,
-) -> Result<(CorpusStatistics, CandidateWorkspace), RocksError> {
-    let mut statistics = CorpusStatistics {
-        frequencies: vec![0_u32; terms.len()],
-        total_length: 0,
-        documents: 0,
-    };
-    let mut candidates = CandidateWorkspace::default();
-    let mut cursor = None;
-    loop {
-        let (rows, next) = graph.documents(cursor.as_ref(), 64, budget)?;
-        for document in rows {
-            let (length, frequencies, components) = counts(&document, terms, flavor, budget)?;
-            statistics.record(length, &frequencies)?;
-            if frequencies.iter().any(|count| *count != 0) {
-                candidates.push(Candidate {
-                    document: document.document_id().clone(),
-                    length,
-                    frequencies,
-                    components,
-                })?;
-            }
-        }
-        cursor = next;
-        if cursor.is_none() {
-            return Ok((statistics, candidates));
         }
     }
 }
 
-fn rank_candidates(
-    workspace: CandidateWorkspace,
-    statistics: &CorpusStatistics,
-    limit: usize,
-    budget: &ReadBudget,
-) -> Result<Vec<(f64, Candidate)>, RocksError> {
-    budget.checkpoint()?;
-    let average = statistics.total_length.to_f64().ok_or(RocksError::Format)?
-        / f64::from(statistics.documents.max(1));
-    let mut ranked = Vec::with_capacity(limit);
-    for candidate in workspace.candidates {
+impl CorpusStatistics {
+    fn rank_candidates(
+        &self,
+        workspace: CandidateWorkspace,
+        limit: usize,
+        budget: &ReadBudget,
+    ) -> Result<Vec<(f64, Candidate)>, RocksError> {
         budget.checkpoint()?;
-        let score = bm25(
-            &candidate,
-            &statistics.frequencies,
-            statistics.documents,
+        let average = self.total_length.to_f64().ok_or(RocksError::Format)?
+            / f64::from(self.documents.max(1));
+        let scorer = Bm25Scorer {
+            statistics: self,
             average,
-        );
-        retain_candidate(&mut ranked, (score, candidate), limit);
-    }
-    Ok(ranked)
-}
-
-fn bm25(candidate: &Candidate, document_frequencies: &[u32], documents: u32, average: f64) -> f64 {
-    candidate
-        .frequencies
-        .iter()
-        .zip(document_frequencies)
-        .map(|(frequency, df)| {
-            let frequency = f64::from(*frequency);
-            let idf =
-                (1.0 + (f64::from(documents) - f64::from(*df) + 0.5) / (f64::from(*df) + 0.5)).ln();
-            idf * frequency * 2.2
-                / (frequency + 1.2 * (0.25 + 0.75 * f64::from(candidate.length) / average.max(1.0)))
-        })
-        .sum()
-}
-
-fn retain_candidate(ranked: &mut Vec<(f64, Candidate)>, item: (f64, Candidate), limit: usize) {
-    crate::retrieval::native::retain(ranked, item, limit, |(a, left), (b, right)| {
-        b.total_cmp(a).then(left.document.cmp(&right.document))
-    });
-}
-
-fn counts(
-    document: &CanonicalSearchDocument,
-    terms: &[String],
-    flavor: SearchFlavor,
-    budget: &ReadBudget,
-) -> Result<(u32, Vec<u32>, u8), RocksError> {
-    let (mut length, mut components) = (0_u32, 0_u8);
-    let mut frequencies = vec![0_u32; terms.len()];
-    for (text, weight, bit) in [
-        (document.qualified_name(), 4_u32, 1_u8),
-        (document.code(), 1, 2),
-        (document.natural_text(), 2, 4),
-    ] {
-        if !includes_field(document, flavor, bit) {
-            continue;
+        };
+        let mut ranked = RankedRows::preallocated(limit, candidate_order);
+        for candidate in workspace.candidates {
+            budget.checkpoint()?;
+            let score = scorer.score(&candidate);
+            ranked.insert((score, candidate));
         }
-        tokens(text, budget, |token, budget| {
-            length = length.saturating_add(weight);
-            for (index, term) in terms.iter().enumerate() {
-                if token_matches(&token, term, flavor, budget)? {
-                    frequencies[index] = frequencies[index].saturating_add(weight);
-                    components |= bit;
-                }
-            }
-            Ok(())
-        })?;
+        Ok(ranked.into_vec())
     }
-    Ok((length, frequencies, components))
+}
+
+struct Bm25Scorer<'a> {
+    statistics: &'a CorpusStatistics,
+    average: f64,
+}
+
+impl Bm25Scorer<'_> {
+    fn score(&self, candidate: &Candidate) -> f64 {
+        candidate
+            .frequencies
+            .iter()
+            .zip(&self.statistics.frequencies)
+            .map(|(frequency, df)| {
+                let frequency = f64::from(*frequency);
+                let idf = (1.0
+                    + (f64::from(self.statistics.documents) - f64::from(*df) + 0.5)
+                        / (f64::from(*df) + 0.5))
+                    .ln();
+                idf * frequency * 2.2
+                    / (frequency
+                        + 1.2 * (0.25 + 0.75 * f64::from(candidate.length) / self.average.max(1.0)))
+            })
+            .sum()
+    }
+}
+
+fn candidate_order(
+    (a, left): &(f64, Candidate),
+    (b, right): &(f64, Candidate),
+) -> std::cmp::Ordering {
+    b.total_cmp(a).then(left.document.cmp(&right.document))
+}
+
+impl LexicalQuery {
+    fn counts(
+        &self,
+        document: &CanonicalSearchDocument,
+        budget: &ReadBudget,
+    ) -> Result<(u32, Vec<u32>, u8), RocksError> {
+        let (mut length, mut components) = (0_u32, 0_u8);
+        let mut frequencies = vec![0_u32; self.terms.len()];
+        for (text, weight, bit) in [
+            (document.qualified_name(), LEXICAL_NAME_WEIGHT, 1_u8),
+            (document.code(), LEXICAL_CODE_WEIGHT, 2),
+            (document.natural_text(), LEXICAL_NATURAL_WEIGHT, 4),
+        ] {
+            if !includes_field(document, self.flavor, bit) {
+                continue;
+            }
+            tokens(text, budget, |token, budget| {
+                length = length.saturating_add(weight);
+                for (index, term) in self.terms.iter().enumerate() {
+                    if self.token_matches(&token, term, budget)? {
+                        frequencies[index] = frequencies[index].saturating_add(weight);
+                        components |= bit;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok((length, frequencies, components))
+    }
 }
 
 fn includes_field(document: &CanonicalSearchDocument, flavor: SearchFlavor, bit: u8) -> bool {
@@ -541,15 +553,21 @@ fn includes_field(document: &CanonicalSearchDocument, flavor: SearchFlavor, bit:
     }
 }
 
-fn token_matches(
-    token: &str,
-    term: &str,
-    flavor: SearchFlavor,
-    budget: &ReadBudget,
-) -> Result<bool, RocksError> {
-    match flavor {
-        SearchFlavor::FuzzyName(distance) => within_distance(token, term, distance, budget),
-        _ => Ok(token == term),
+impl LexicalQuery {
+    fn token_matches(
+        &self,
+        token: &str,
+        term: &str,
+        budget: &ReadBudget,
+    ) -> Result<bool, RocksError> {
+        match self.flavor {
+            SearchFlavor::FuzzyName(distance) => FuzzyDistance {
+                maximum: distance,
+                budget,
+            }
+            .within(token, term),
+            _ => Ok(token == term),
+        }
     }
 }
 
@@ -603,55 +621,57 @@ fn word_tokens(
     Ok(())
 }
 
-fn within_distance(
-    left: &str,
-    right: &str,
+struct FuzzyDistance<'a> {
     maximum: u8,
-    budget: &ReadBudget,
-) -> Result<bool, RocksError> {
-    budget.checkpoint()?;
-    let (left, right) = (
-        left.chars().collect::<Vec<_>>(),
-        right.chars().collect::<Vec<_>>(),
-    );
-    let maximum = usize::from(maximum);
-    if left.len().abs_diff(right.len()) > maximum {
-        return Ok(false);
-    }
-    let infinity = maximum + 1;
-    let mut previous_previous = vec![infinity; right.len() + 1];
-    let mut previous = (0..=right.len())
-        .map(|i| i.min(infinity))
-        .collect::<Vec<_>>();
-    let mut row = vec![infinity; right.len() + 1];
-    for (i0, a) in left.iter().enumerate() {
-        if i0 % 16 == 0 {
-            budget.checkpoint()?;
+    budget: &'a ReadBudget,
+}
+
+impl FuzzyDistance<'_> {
+    fn within(&self, left: &str, right: &str) -> Result<bool, RocksError> {
+        self.budget.checkpoint()?;
+        let (left, right) = (
+            left.chars().collect::<Vec<_>>(),
+            right.chars().collect::<Vec<_>>(),
+        );
+        let maximum = usize::from(self.maximum);
+        if left.len().abs_diff(right.len()) > maximum {
+            return Ok(false);
         }
-        let i = i0 + 1;
-        let start = i.saturating_sub(maximum).max(1);
-        let end = (i + maximum).min(right.len());
-        row[0] = i.min(infinity);
-        if start > 1 {
-            row[start - 1] = infinity;
-        }
-        for j in start..=end {
-            let b = right[j - 1];
-            row[j] = (previous[j] + 1)
-                .min(row[j - 1] + 1)
-                .min(previous[j - 1] + usize::from(*a != b))
-                .min(infinity);
-            if i > 1 && j > 1 && *a == right[j - 2] && left[i - 2] == b {
-                row[j] = row[j].min(previous_previous[j - 2] + 1);
+        let infinity = maximum + 1;
+        let mut previous_previous = vec![infinity; right.len() + 1];
+        let mut previous = (0..=right.len())
+            .map(|i| i.min(infinity))
+            .collect::<Vec<_>>();
+        let mut row = vec![infinity; right.len() + 1];
+        for (i0, a) in left.iter().enumerate() {
+            if i0 % 16 == 0 {
+                self.budget.checkpoint()?;
             }
+            let i = i0 + 1;
+            let start = i.saturating_sub(maximum).max(1);
+            let end = (i + maximum).min(right.len());
+            row[0] = i.min(infinity);
+            if start > 1 {
+                row[start - 1] = infinity;
+            }
+            for j in start..=end {
+                let b = right[j - 1];
+                row[j] = (previous[j] + 1)
+                    .min(row[j - 1] + 1)
+                    .min(previous[j - 1] + usize::from(*a != b))
+                    .min(infinity);
+                if i > 1 && j > 1 && *a == right[j - 2] && left[i - 2] == b {
+                    row[j] = row[j].min(previous_previous[j - 2] + 1);
+                }
+            }
+            if end < right.len() {
+                row[end + 1] = infinity;
+            }
+            std::mem::swap(&mut previous_previous, &mut previous);
+            std::mem::swap(&mut previous, &mut row);
         }
-        if end < right.len() {
-            row[end + 1] = infinity;
-        }
-        std::mem::swap(&mut previous_previous, &mut previous);
-        std::mem::swap(&mut previous, &mut row);
+        Ok(previous[right.len()] <= maximum)
     }
-    Ok(previous[right.len()] <= maximum)
 }
 
 #[cfg(test)]
@@ -669,16 +689,23 @@ mod tests {
     fn field_weighted_bm25_matches_independent_corpus_statistics() {
         // These literal scores were independently evaluated from the frozen
         // real-source corpus statistics, without using the native scorer.
-        let document_frequencies = [60, 11, 14, 21];
-        let average = 348_835.0 / 6_362.0;
+        let statistics = CorpusStatistics {
+            frequencies: vec![60, 11, 14, 21],
+            documents: 6_362,
+            total_length: 348_835,
+        };
+        let scorer = Bm25Scorer {
+            statistics: &statistics,
+            average: 348_835.0 / 6_362.0,
+        };
         let candidate = |length, frequency| Candidate {
             document: DocumentId::from_uuid_v8([1; 16]),
             length,
             frequencies: vec![frequency; 4],
             components: 1,
         };
-        let corpus = bm25(&candidate(28, 4), &document_frequencies, 6_362, average);
-        let score = bm25(&candidate(42, 5), &document_frequencies, 6_362, average);
+        let corpus = scorer.score(&candidate(28, 4));
+        let score = scorer.score(&candidate(42, 5));
         assert!((corpus - 42.054_701_281_997_91).abs() < 1e-10);
         assert!((score - 41.774_553_035_347_694).abs() < 1e-10);
         assert!(corpus > score);
@@ -686,25 +713,21 @@ mod tests {
 
     #[test]
     fn common_term_top_k_stays_bounded_beyond_the_old_match_limit() {
-        let mut ranked = Vec::new();
+        let mut ranked = RankedRows::new(3, candidate_order);
         // Fixed equal scores must retain the smallest stable document identity,
         // independently of reverse admission and the number of matching rows.
         for id in (1_u64..=140_000).rev() {
             let mut bytes = [0; 16];
             bytes[8..].copy_from_slice(&id.to_be_bytes());
-            retain_candidate(
-                &mut ranked,
-                (
-                    1.0,
-                    Candidate {
-                        document: DocumentId::from_uuid_v8(bytes),
-                        length: 1,
-                        frequencies: vec![1],
-                        components: 1,
-                    },
-                ),
-                3,
-            );
+            ranked.insert((
+                1.0,
+                Candidate {
+                    document: DocumentId::from_uuid_v8(bytes),
+                    length: 1,
+                    frequencies: vec![1],
+                    components: 1,
+                },
+            ));
             assert!(ranked.len() <= 3);
         }
         let mut first = [0; 16];
@@ -735,7 +758,7 @@ mod tests {
             total_length: 140_000,
             documents: 140_000,
         };
-        let ranked = rank_candidates(workspace, &statistics, 3, &budget()?)?;
+        let ranked = statistics.rank_candidates(workspace, 3, &budget()?)?;
         assert_eq!(ranked.len(), 3);
         for (item, id) in ranked.iter().zip(1_u64..=3) {
             assert_eq!(item.1.document, compact_candidate(id, 1).document);
@@ -773,7 +796,7 @@ mod tests {
         };
         request.cancel();
         assert_eq!(
-            rank_candidates(workspace, &statistics, 1, &budget).err(),
+            statistics.rank_candidates(workspace, 1, &budget).err(),
             Some(RocksError::Cancelled)
         );
         Ok(())
@@ -793,7 +816,11 @@ mod tests {
             ("abcd", "badc", 1, false),
         ] {
             assert_eq!(
-                within_distance(left, right, maximum, &budget)?,
+                FuzzyDistance {
+                    maximum,
+                    budget: &budget
+                }
+                .within(left, right)?,
                 expected,
                 "{left} / {right}"
             );
@@ -814,7 +841,11 @@ mod tests {
         assert_eq!(result, Err(RocksError::Cancelled));
         assert!(calls < 1000);
         assert_eq!(
-            within_distance(&"a".repeat(256), &"b".repeat(256), 2, &budget),
+            FuzzyDistance {
+                maximum: 2,
+                budget: &budget
+            }
+            .within(&"a".repeat(256), &"b".repeat(256)),
             Err(RocksError::Cancelled)
         );
         Ok(())

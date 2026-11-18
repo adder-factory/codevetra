@@ -17,19 +17,22 @@ mod runtime;
 pub(crate) use runtime::StateTestGate;
 
 pub use engine::{
-    NativeStorageUsage, ProjectStore, PruneReport, RecordChange, RecordPage, RevisionSnapshot,
-    RevisionState, RevisionWriter, StateNamespace, StateTransaction, StoredRevision,
+    NativeStorageUsage, PrefixScan, ProjectOpening, ProjectStore, PruneReport, RecordChange,
+    RecordPage, RetentionPolicy, RevisionSnapshot, RevisionState, RevisionWriter, StateNamespace,
+    StateScan, StateTransaction, StoredRevision,
 };
 pub(crate) use graph::codec::{uuid as packed_uuid, uuid_text as unpacked_uuid};
 pub use graph::{
-    GraphBase, GraphCursor, GraphInfo, GraphLink, GraphNeighborPage, GraphPolicy, GraphPublication,
-    GraphPublicationError, GraphPublicationInput, GraphRetention, GraphRevision, GraphSnapshot,
-    GraphWriteReport, LexicalPosting, LexicalStatistics,
+    FileReferences, GraphAdjacency, GraphBase, GraphCursor, GraphInfo, GraphLink,
+    GraphNeighborPage, GraphPolicy, GraphPreparation, GraphPublication, GraphPublicationError,
+    GraphPublicationInput, GraphRetention, GraphRevision, GraphSnapshot, GraphWriteReport,
+    LexicalPosting, LexicalStatistics, NamedSymbols, TokenPostings,
 };
 pub use key::{Collection, RecordKey};
-pub use policy::{ReadBudget, StorePolicy};
+pub use policy::{ReadBudget, StateAccess, StorePolicy};
 pub use runtime::{
-    AsyncProjectStore, AsyncRevisionWriter, StorageRequest, StorageRuntime, WorkerPolicy,
+    AsyncProjectStore, AsyncRevisionWriter, RequestedProject, StorageRequest, StorageRuntime,
+    WorkerPolicy,
 };
 
 /// Persistence failures deliberately omit native error text and local paths.

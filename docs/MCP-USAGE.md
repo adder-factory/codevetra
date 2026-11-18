@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [CLI reference](CLI-REFERENCE.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Last release audit: 2026-11-16 (`v4.0.6`).
+Last release audit: 2026-11-18 (`v4.0.7`).
 
 CodeVetra v2 exposes a compact native stdio MCP server. Its core returns
 bounded, generation-scoped evidence and never makes the database a source of
@@ -258,6 +258,47 @@ for all 36 wire contracts and their CLI families.
 | `codevetra_playbook` | Complete agent workflow, tool-routing map, evidence discipline, and anti-patterns |
 | `codevetra_admin` | Start, inspect, or cancel bounded lifecycle, index, semantic, model, and SCIP interchange work |
 
+### Argument limits and recovery
+
+Numeric ranges and batch-size bounds are included in argument descriptions as
+well as JSON Schema constraints, so hosts that display simplified tool
+signatures retain this guidance. Mode-specific limits can be narrower than
+the overall schema range. Invalid integer arguments name the expected field
+and its applicable range without echoing submitted values.
+
+For example, `codevetra_biomarkers` ranked queries accept `limit` from 1 to 500
+(default 30). Use `mode: "stats"` for complete counts, or narrow ranked results
+with detector and metric filters. A request with `limit: 1000` returns
+`limit must be an integer from 1 to 500 (inclusive)`.
+
+Admin limits depend on `action`: `graph-export` accepts an integer from 1 to
+50,000 (default 1,000), and `classify` accepts an integer from 1 to 1,000,000
+(default 100,000). For `summarize`, prefer `summarizeLimit`; its legacy `limit`
+alias retains the same fractional, zero, and negative-value semantics. The
+schema includes these action-specific constraints as well as descriptions.
+Omit `limit` for other admin actions.
+
+The `timeoutMs` range also depends on the action: `biomarkers-refresh` accepts
+1–300,000 milliseconds, `llm-apply` accepts 1–600,000, and `scip-export` accepts
+100–1,800,000 (default 120,000). For biomarkers, prefer
+`databaseQueryTimeoutMs`; passing both names is rejected. Other admin actions
+do not accept `timeoutMs`.
+
+Review field descriptions name their accepted modes using the same allowlists
+as request validation. For example, `codevetra_review` accepts `timeoutMs` and
+`deep` only with `mode: "trust"`; omit both from a context review such as
+`{"mode":"context","baseRef":"HEAD"}`. The `limit` field is accepted in
+`risk` and `numerical` modes. Mode inference and numeric limits are unchanged.
+
+For exact-name projections, request the supported combination:
+
+```json
+{"by":"name","query":"target","compact":true,"fields":["id","path","line"]}
+```
+
+`fields` requires exact name mode and `compact: true` or `lowTokens: true`.
+Bounds are still enforced; requests are not silently clamped or coerced.
+
 ### Graph traversal fields
 
 Edge-kind, confidence and test-target filters run before retaining the bounded
@@ -337,6 +378,35 @@ and its allowed arguments.
   deadline. `timeoutMs` remains an exclusive legacy alias.
 - Results name the effective timeout and its source; the MCP client deadline
   always bounds the native operation, including its inner deadline.
+- Source-rule contract `source_rules_v4` retains raw cyclomatic complexity but
+  excludes a narrowly recognized Rust value mapping from `complex_method` and
+  `brain_method`. The whole body must be one match with unguarded, qualified
+  enum-style patterns and literal, path, member, or cast values. That match may
+  be the sole argument to one unconditional identifier/scoped-name call.
+  Per-arm calls, computed callees, method receivers, nested calls, extra
+  arguments, guards, destructuring, executable statements, malformed syntax,
+  and analysis-budget exhaustion retain ordinary detector eligibility. This is
+  a structural classification; it proves neither callee purity nor lossless
+  conversion. Other detectors, including numeric literals and large methods,
+  still apply. Raw health counters use 32-bit values so admitted large bodies
+  retain counts above 65,535; the credential score remains bounded to 100.
+- Near-clone shapes for these mappings preserve exact syntactic arm patterns and
+  the optional uniform outer callee. Output values and declaration names remain
+  normalized, so a copied table with changed outputs still qualifies. This is
+  syntactic identity, not resolved type equivalence; exact, partial, and semantic
+  clone passes keep their existing eligibility rules.
+- Detector coverage counts these mappings as intentionally excluded for those
+  two rules. Missing mapping metadata is conservative; an empty finding list
+  never substitutes for evaluated coverage. Native queries and Git comparisons
+  use the same policy.
+- Rust test ownership recognizes exact test and Kani harness attributes. A
+  `cfg(all(...))` condition must contain a test-only requirement; every branch of
+  `cfg(any(...))` must require tests. `cfg(not(test))`, `cfg(feature = "test")`,
+  and similarly named attributes do not hide production findings. Kani proof
+  fixtures retain their independent constants and assertions.
+  Shared test-path recognition also covers Rust `*_tests.rs` modules and Python
+  `test-*.py` executable harnesses, alongside the existing language-specific test
+  filenames. Names such as `contests.rs` and `latest-worker.py` remain production.
 
 ### Dead code and digest
 
@@ -482,6 +552,11 @@ project-relative `out`, or `action: "scip-import"` with a project-relative
 the SCIP artifact does not cover, and reports exact typed-edge versus unresolved
 foreign-link counts. The browser visualizer is intentionally absent; graph and
 interchange data remain available to agents.
+
+Export accepts `maximumRows` from 1 to 5,000,000; import accepts 1 to
+10,000,000. Each defaults to its maximum. Import additionally accepts
+`maximumSourceBytes` from 1 to 268,435,456, defaulting to that maximum. These
+bounds are shared by the parsers and action-specific tool schemas.
 
 ### When the transport closes
 

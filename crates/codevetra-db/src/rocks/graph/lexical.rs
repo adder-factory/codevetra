@@ -10,7 +10,10 @@ use serde::{
 
 use super::super::{Collection, ReadBudget, RecordKey, RocksError};
 use super::{GraphSnapshot, Result, codec};
-use crate::CanonicalSearchDocument;
+use crate::{
+    CanonicalSearchDocument,
+    search::native::{LEXICAL_CODE_WEIGHT, LEXICAL_NAME_WEIGHT, LEXICAL_NATURAL_WEIGHT},
+};
 
 pub(super) const STATS: &[u8] = b"cg1/xl/m";
 pub(super) const FORWARD: &[u8] = b"cg1/xl/d/";
@@ -159,6 +162,8 @@ pub(super) struct StoredPosting {
     pub(super) symbol: bool,
 }
 
+const FORWARD_TERM_ALLOWANCE_BYTES: usize = 256;
+
 impl Forward {
     pub(super) fn digest(document: &CanonicalSearchDocument) -> ContentDigest {
         let mut hasher = blake3::Hasher::new_derive_key("cartograph-lexical-forward-v1");
@@ -183,9 +188,9 @@ impl Forward {
         let mut lengths = [0_u32; 3];
         let mut bytes = 0_usize;
         for (field, (text, weight)) in [
-            (document.qualified_name(), 4_u32),
-            (document.code(), 1),
-            (document.natural_text(), 2),
+            (document.qualified_name(), LEXICAL_NAME_WEIGHT),
+            (document.code(), LEXICAL_CODE_WEIGHT),
+            (document.natural_text(), LEXICAL_NATURAL_WEIGHT),
         ]
         .into_iter()
         .enumerate()
@@ -194,7 +199,7 @@ impl Forward {
                 lengths[field] = lengths[field].saturating_add(weight);
                 if !terms.contains_key(&token) {
                     bytes = bytes
-                        .checked_add(256 + token.capacity())
+                        .checked_add(FORWARD_TERM_ALLOWANCE_BYTES + token.capacity())
                         .ok_or_else(limit)?;
                     if bytes > maximum_bytes {
                         return Err(limit());
@@ -220,9 +225,9 @@ impl Forward {
     ) -> Result<Self> {
         let mut lengths = [0_u32; 3];
         for (field, (text, weight)) in [
-            (document.qualified_name(), 4_u32),
-            (document.code(), 1),
-            (document.natural_text(), 2),
+            (document.qualified_name(), LEXICAL_NAME_WEIGHT),
+            (document.code(), LEXICAL_CODE_WEIGHT),
+            (document.natural_text(), LEXICAL_NATURAL_WEIGHT),
         ]
         .into_iter()
         .enumerate()
@@ -246,7 +251,7 @@ impl Forward {
     }
 }
 
-impl GraphSnapshot<'_, '_> {
+impl<'view, 'store> GraphSnapshot<'view, 'store> {
     /// Inspect persisted BM25 capability. Older generations explicitly use a scan.
     /// # Errors
     /// Rejects corrupt statistics and exhausted read controls.
@@ -267,49 +272,13 @@ impl GraphSnapshot<'_, '_> {
         Ok(Some(statistics))
     }
 
-    /// Read bounded postings for one exact token from this pinned generation.
-    /// # Errors
-    /// Rejects invalid tokens, corrupt postings, foreign cursors, or read exhaustion.
-    pub fn lexical_postings(
-        &self,
-        token: &str,
-        after: Option<&RecordKey>,
-        limit: u16,
-        budget: &mut ReadBudget,
-    ) -> Result<(Vec<LexicalPosting>, Option<RecordKey>)> {
-        let prefix = posting_prefix(token)?;
-        let page = self
-            .snapshot
-            .scan_prefix(Collection::Search, &prefix, after, limit, budget)?;
-        let rows = page
-            .rows
-            .into_iter()
-            .map(|(key, value)| {
-                let id = codec::symbol(
-                    key.as_bytes()
-                        .strip_prefix(prefix.as_slice())
-                        .ok_or_else(codec::corrupt)?,
-                )?;
-                let document = DocumentId::parse(id.as_str()).map_err(|_| codec::corrupt())?;
-                let row: StoredPosting = codec::decode(&value)?;
-                if row.frequencies == [0; 3]
-                    || row
-                        .frequencies
-                        .iter()
-                        .zip(row.lengths)
-                        .any(|(count, length)| *count > length)
-                {
-                    return Err(codec::corrupt());
-                }
-                Ok(LexicalPosting {
-                    document,
-                    lengths: row.lengths,
-                    frequencies: row.frequencies,
-                    symbol: row.symbol,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok((rows, page.next_after))
+    /// Bind postings to this immutable graph and one exact token.
+    #[must_use]
+    pub fn lexical_postings<'query>(
+        &'query self,
+        token: &'query str,
+    ) -> TokenPostings<'query, 'view, 'store> {
+        TokenPostings { graph: self, token }
     }
 }
 
@@ -344,6 +313,62 @@ fn posting_prefix(token: &str) -> Result<Vec<u8>> {
 fn limit() -> RocksError {
     RocksError::Limit {
         resource: "lexical_document_workspace",
+    }
+}
+
+/// Exact-token postings over a fixed immutable graph revision.
+pub struct TokenPostings<'query, 'view, 'store> {
+    graph: &'query GraphSnapshot<'view, 'store>,
+    token: &'query str,
+}
+
+impl TokenPostings<'_, '_, '_> {
+    /// Read bounded postings for one exact token from this pinned generation.
+    /// # Errors
+    /// Rejects invalid tokens, corrupt postings, foreign cursors, or read exhaustion.
+    pub fn page(
+        &self,
+        after: Option<&RecordKey>,
+        limit: u16,
+        budget: &mut ReadBudget,
+    ) -> Result<(Vec<LexicalPosting>, Option<RecordKey>)> {
+        let token = self.token;
+
+        let prefix = posting_prefix(token)?;
+        let page = self
+            .graph
+            .snapshot
+            .scan_prefix(Collection::Search, &prefix)
+            .page(after, limit, budget)?;
+        let rows = page
+            .rows
+            .into_iter()
+            .map(|(key, value)| {
+                let id = codec::symbol(
+                    key.as_bytes()
+                        .strip_prefix(prefix.as_slice())
+                        .ok_or_else(codec::corrupt)?,
+                )?;
+                let document = DocumentId::parse(id.as_str()).map_err(|_| codec::corrupt())?;
+                let row: StoredPosting = codec::decode(&value)?;
+                if row.frequencies == [0; 3]
+                    || row
+                        .frequencies
+                        .iter()
+                        .zip(row.lengths)
+                        .any(|(count, length)| *count > length)
+                {
+                    return Err(codec::corrupt());
+                }
+                Ok(LexicalPosting {
+                    document,
+                    lengths: row.lengths,
+                    frequencies: row.frequencies,
+                    symbol: row.symbol,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((rows, page.next_after))
     }
 }
 

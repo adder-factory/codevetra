@@ -13,7 +13,6 @@ use super::{
 use crate::{
     NativeDatabase,
     native_database::{decode, encode, now, timestamp_order, visit_state},
-    retrieval::native::retain,
     rocks::{ReadBudget, RocksError, StateNamespace, StateTransaction},
 };
 
@@ -48,24 +47,27 @@ impl NativeDatabase {
             started_at: timestamp.clone(),
             last_activity_at: timestamp,
         };
-        self.state(None, WRITE_BYTES, 1, move |transaction, budget| {
-            if transaction
-                .get(
+        self.state(
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, 1),
+            move |transaction, budget| {
+                if transaction
+                    .get(
+                        StateNamespace::Sessions,
+                        record.session_id.as_bytes(),
+                        budget,
+                    )?
+                    .is_some()
+                {
+                    return Err(RocksError::ReplayConflict);
+                }
+                transaction.put(
                     StateNamespace::Sessions,
                     record.session_id.as_bytes(),
-                    budget,
-                )?
-                .is_some()
-            {
-                return Err(RocksError::ReplayConflict);
-            }
-            transaction.put(
-                StateNamespace::Sessions,
-                record.session_id.as_bytes(),
-                encode(&record)?,
-            )?;
-            Ok(record)
-        })
+                    encode(&record)?,
+                )?;
+                Ok(record)
+            },
+        )
         .await
     }
 
@@ -79,21 +81,23 @@ impl NativeDatabase {
     ) -> Result<Vec<McpSessionRecord>, StorageError> {
         self.require_project(project)?;
         validate_limit(limit, MAX_SESSION_LIST)?;
-        self.state(None, 0, 0, move |transaction, budget| {
-            let mut rows = Vec::new();
-            visit_state(
-                transaction,
-                StateNamespace::Sessions,
-                b"",
-                budget,
-                |_, record: McpSessionRecord, _| {
-                    validate_session(&record)?;
-                    retain(&mut rows, record, usize::from(limit), session_order);
-                    Ok(())
-                },
-            )?;
-            Ok(rows)
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let mut rows =
+                    crate::retrieval::native::RankedRows::new(usize::from(limit), session_order);
+                visit_state(
+                    &transaction.scan(StateNamespace::Sessions, b""),
+                    budget,
+                    |_, record: McpSessionRecord, _| {
+                        validate_session(&record)?;
+                        rows.insert(record);
+                        Ok(())
+                    },
+                )?;
+                Ok(rows.into_vec())
+            },
+        )
         .await
     }
 
@@ -121,40 +125,41 @@ impl NativeDatabase {
             lookup.label.map(str::to_owned),
             lookup.require_calls,
         );
-        self.state(None, 0, 0, move |transaction, budget| {
-            let matches = |record: &McpSessionRecord| {
-                (!calls || record.tool_count > 0)
-                    && (id.is_some()
-                        || label
-                            .as_ref()
-                            .is_none_or(|label| record.label.as_ref() == Some(label)))
-            };
-            if let Some(id) = &id {
-                let record: Option<McpSessionRecord> = transaction
-                    .get(StateNamespace::Sessions, id.as_bytes(), budget)?
-                    .map(|bytes| decode(&bytes))
-                    .transpose()?;
-                if let Some(record) = &record {
-                    validate_session(record)?;
-                }
-                return Ok(record.filter(matches));
-            }
-            let mut found = Vec::new();
-            visit_state(
-                transaction,
-                StateNamespace::Sessions,
-                b"",
-                budget,
-                |_, record: McpSessionRecord, _| {
-                    validate_session(&record)?;
-                    if matches(&record) {
-                        retain(&mut found, record, 1, session_order);
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let matches = |record: &McpSessionRecord| {
+                    (!calls || record.tool_count > 0)
+                        && (id.is_some()
+                            || label
+                                .as_ref()
+                                .is_none_or(|label| record.label.as_ref() == Some(label)))
+                };
+                if let Some(id) = &id {
+                    let record: Option<McpSessionRecord> = transaction
+                        .get(StateNamespace::Sessions, id.as_bytes(), budget)?
+                        .map(|bytes| decode(&bytes))
+                        .transpose()?;
+                    if let Some(record) = &record {
+                        validate_session(record)?;
                     }
-                    Ok(())
-                },
-            )?;
-            Ok(found.pop())
-        })
+                    return Ok(record.filter(matches));
+                }
+                let mut found = crate::retrieval::native::RankedRows::new(1, session_order);
+                visit_state(
+                    &transaction.scan(StateNamespace::Sessions, b""),
+                    budget,
+                    |_, record: McpSessionRecord, _| {
+                        validate_session(&record)?;
+                        if matches(&record) {
+                            found.insert(record);
+                        }
+                        Ok(())
+                    },
+                )?;
+                Ok(found.into_iter().next())
+            },
+        )
         .await
     }
 
@@ -169,35 +174,36 @@ impl NativeDatabase {
         self.require_project(project)?;
         validate_uuid(session, "session_id")?;
         let session = session.to_ascii_lowercase();
-        self.state(None, WRITE_BYTES, 10_002, move |transaction, budget| {
-            if transaction
-                .get(StateNamespace::Sessions, session.as_bytes(), budget)?
-                .is_none()
-            {
-                return Ok(false);
-            }
-            let mut keys = Vec::new();
-            visit_state(
-                transaction,
-                StateNamespace::Trace,
-                b"",
-                budget,
-                |key, record: McpToolCallRecord, _| {
-                    if record.session_id == session {
-                        keys.push(key);
-                    }
-                    Ok(())
-                },
-            )?;
-            let count = counter(transaction, COUNT, budget)?;
-            let remaining = count.checked_sub(keys.len() as u64).ok_or(corrupt())?;
-            for key in keys {
-                transaction.delete(StateNamespace::Trace, &key)?;
-            }
-            transaction.delete(StateNamespace::Sessions, session.as_bytes())?;
-            transaction.put(StateNamespace::Metadata, COUNT, encode(&remaining)?)?;
-            Ok(true)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, 10_002),
+            move |transaction, budget| {
+                if transaction
+                    .get(StateNamespace::Sessions, session.as_bytes(), budget)?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                let mut keys = Vec::new();
+                visit_state(
+                    &transaction.scan(StateNamespace::Trace, b""),
+                    budget,
+                    |key, record: McpToolCallRecord, _| {
+                        if record.session_id == session {
+                            keys.push(key);
+                        }
+                        Ok(())
+                    },
+                )?;
+                let count = counter(transaction, COUNT, budget)?;
+                let remaining = count.checked_sub(keys.len() as u64).ok_or(corrupt())?;
+                for key in keys {
+                    transaction.delete(StateNamespace::Trace, &key)?;
+                }
+                transaction.delete(StateNamespace::Sessions, session.as_bytes())?;
+                transaction.put(StateNamespace::Metadata, COUNT, encode(&remaining)?)?;
+                Ok(true)
+            },
+        )
         .await
     }
 
@@ -222,57 +228,61 @@ impl NativeDatabase {
             success: request.input.success,
             duration_ms: request.input.duration_ms,
         };
-        self.state(None, WRITE_BYTES, 5, move |transaction, budget| {
-            let mut record: McpSessionRecord = transaction
-                .get(StateNamespace::Sessions, session.as_bytes(), budget)?
-                .map(|bytes| decode(&bytes))
-                .transpose()?
-                .ok_or(RocksError::InvalidInput {
-                    field: "session_id",
-                })?;
-            validate_session(&record)?;
-            let sequence = counter(transaction, COUNTER, budget)?
-                .checked_add(1)
-                .ok_or(corrupt())?;
-            let count = counter(transaction, COUNT, budget)?;
-            let oldest = if count >= 10_000 {
-                transaction
-                    .scan(StateNamespace::Trace, b"", None, 1, budget)?
-                    .rows
-                    .into_iter()
-                    .next()
-                    .map(|(key, _)| key)
-            } else {
-                None
-            };
-            if count >= 10_000 && oldest.is_none() {
-                return Err(corrupt());
-            }
-            record.tool_count = record.tool_count.checked_add(1).ok_or(corrupt())?;
-            record.last_activity_at.clone_from(&input.called_at);
-            let mut input = input;
-            input.step = record.tool_count;
-            if let Some(oldest) = oldest {
-                transaction.delete(StateNamespace::Trace, oldest.as_bytes())?;
-            }
-            transaction.put(
-                StateNamespace::Trace,
-                format!("{sequence:016x}").as_bytes(),
-                encode(&input)?,
-            )?;
-            transaction.put(
-                StateNamespace::Sessions,
-                session.as_bytes(),
-                encode(&record)?,
-            )?;
-            transaction.put(StateNamespace::Metadata, COUNTER, encode(&sequence)?)?;
-            transaction.put(
-                StateNamespace::Metadata,
-                COUNT,
-                encode(&count.saturating_add(1).min(10_000))?,
-            )?;
-            Ok(input)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, 5),
+            move |transaction, budget| {
+                let mut record: McpSessionRecord = transaction
+                    .get(StateNamespace::Sessions, session.as_bytes(), budget)?
+                    .map(|bytes| decode(&bytes))
+                    .transpose()?
+                    .ok_or(RocksError::InvalidInput {
+                        field: "session_id",
+                    })?;
+                validate_session(&record)?;
+                let sequence = counter(transaction, COUNTER, budget)?
+                    .checked_add(1)
+                    .ok_or(corrupt())?;
+                let count = counter(transaction, COUNT, budget)?;
+                let oldest = if count >= 10_000 {
+                    transaction
+                        .scan(StateNamespace::Trace, b"")
+                        .page(None, 1, budget)?
+                        .rows
+                        .into_iter()
+                        .next()
+                        .map(|(key, _)| key)
+                } else {
+                    None
+                };
+                if count >= 10_000 && oldest.is_none() {
+                    return Err(corrupt());
+                }
+                record.tool_count = record.tool_count.checked_add(1).ok_or(corrupt())?;
+                record.last_activity_at.clone_from(&input.called_at);
+                let mut input = input;
+                input.step = record.tool_count;
+                if let Some(oldest) = oldest {
+                    transaction.delete(StateNamespace::Trace, oldest.as_bytes())?;
+                }
+                transaction.put(
+                    StateNamespace::Trace,
+                    format!("{sequence:016x}").as_bytes(),
+                    encode(&input)?,
+                )?;
+                transaction.put(
+                    StateNamespace::Sessions,
+                    session.as_bytes(),
+                    encode(&record)?,
+                )?;
+                transaction.put(StateNamespace::Metadata, COUNTER, encode(&sequence)?)?;
+                transaction.put(
+                    StateNamespace::Metadata,
+                    COUNT,
+                    encode(&count.saturating_add(1).min(10_000))?,
+                )?;
+                Ok(input)
+            },
+        )
         .await
     }
 
@@ -288,24 +298,29 @@ impl NativeDatabase {
         validate_limit(request.limit, MAX_SESSION_CALLS)?;
         let session = request.session_id.to_ascii_lowercase();
         let limit = usize::from(request.limit);
-        self.state(None, 0, 0, move |transaction, budget| {
-            let mut rows = Vec::new();
-            visit_state(
-                transaction,
-                StateNamespace::Trace,
-                b"",
-                budget,
-                |_, record: McpToolCallRecord, _| {
-                    validate_call(&record)?;
-                    if record.session_id == session {
-                        retain(&mut rows, record, limit, |a, b| b.step.cmp(&a.step));
-                    }
-                    Ok(())
-                },
-            )?;
-            rows.reverse();
-            Ok(rows)
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let mut rows =
+                    crate::retrieval::native::RankedRows::new(limit, |a: &McpToolCallRecord, b| {
+                        b.step.cmp(&a.step)
+                    });
+                visit_state(
+                    &transaction.scan(StateNamespace::Trace, b""),
+                    budget,
+                    |_, record: McpToolCallRecord, _| {
+                        validate_call(&record)?;
+                        if record.session_id == session {
+                            rows.insert(record);
+                        }
+                        Ok(())
+                    },
+                )?;
+                let mut rows = rows.into_vec();
+                rows.reverse();
+                Ok(rows)
+            },
+        )
         .await
     }
 
@@ -317,63 +332,63 @@ impl NativeDatabase {
         project: &ProjectId,
     ) -> Result<McpTraceUsage, StorageError> {
         self.require_project(project)?;
-        self.state(None, 0, 0, |transaction, budget| {
-            let mut session_count = 0_u64;
-            visit_state(
-                transaction,
-                StateNamespace::Sessions,
-                b"",
-                budget,
-                |_, record: McpSessionRecord, _| {
-                    validate_session(&record)?;
-                    session_count = session_count.checked_add(1).ok_or(corrupt())?;
-                    Ok(())
-                },
-            )?;
-            let mut durations = BTreeMap::<String, Vec<u64>>::new();
-            let (mut calls, mut errors) = (0_u64, 0_u64);
-            visit_state(
-                transaction,
-                StateNamespace::Trace,
-                b"",
-                budget,
-                |_, record: McpToolCallRecord, _| {
-                    validate_call(&record)?;
-                    calls = calls.checked_add(1).ok_or(corrupt())?;
-                    errors += u64::from(!record.success);
-                    durations
-                        .entry(record.tool_name)
-                        .or_default()
-                        .push(record.duration_ms);
-                    Ok(())
-                },
-            )?;
-            let mut tools = Vec::new();
-            for (tool_name, mut durations) in durations {
-                durations.sort_unstable();
-                let length = durations.len();
-                let percentile =
-                    |percent: usize| durations[(length * percent).div_ceil(100).saturating_sub(1)];
-                tools.push(McpToolUsage {
-                    tool_name,
-                    call_count: length as u64,
-                    p50_duration_ms: percentile(50),
-                    p95_duration_ms: percentile(95),
-                    max_duration_ms: durations.last().copied().ok_or(corrupt())?,
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            |transaction, budget| {
+                let mut session_count = 0_u64;
+                visit_state(
+                    &transaction.scan(StateNamespace::Sessions, b""),
+                    budget,
+                    |_, record: McpSessionRecord, _| {
+                        validate_session(&record)?;
+                        session_count = session_count.checked_add(1).ok_or(corrupt())?;
+                        Ok(())
+                    },
+                )?;
+                let mut durations = BTreeMap::<String, Vec<u64>>::new();
+                let (mut calls, mut errors) = (0_u64, 0_u64);
+                visit_state(
+                    &transaction.scan(StateNamespace::Trace, b""),
+                    budget,
+                    |_, record: McpToolCallRecord, _| {
+                        validate_call(&record)?;
+                        calls = calls.checked_add(1).ok_or(corrupt())?;
+                        errors += u64::from(!record.success);
+                        durations
+                            .entry(record.tool_name)
+                            .or_default()
+                            .push(record.duration_ms);
+                        Ok(())
+                    },
+                )?;
+                let mut tools = Vec::new();
+                for (tool_name, mut durations) in durations {
+                    durations.sort_unstable();
+                    let length = durations.len();
+                    let percentile = |percent: usize| {
+                        durations[(length * percent).div_ceil(100).saturating_sub(1)]
+                    };
+                    tools.push(McpToolUsage {
+                        tool_name,
+                        call_count: length as u64,
+                        p50_duration_ms: percentile(50),
+                        p95_duration_ms: percentile(95),
+                        max_duration_ms: durations.last().copied().ok_or(corrupt())?,
+                    });
+                }
+                tools.sort_by(|a, b| {
+                    b.call_count
+                        .cmp(&a.call_count)
+                        .then(a.tool_name.cmp(&b.tool_name))
                 });
-            }
-            tools.sort_by(|a, b| {
-                b.call_count
-                    .cmp(&a.call_count)
-                    .then(a.tool_name.cmp(&b.tool_name))
-            });
-            Ok(McpTraceUsage {
-                session_count,
-                tool_call_count: calls,
-                error_count: errors,
-                tools,
-            })
-        })
+                Ok(McpTraceUsage {
+                    session_count,
+                    tool_call_count: calls,
+                    error_count: errors,
+                    tools,
+                })
+            },
+        )
         .await
     }
 
@@ -389,32 +404,35 @@ impl NativeDatabase {
         validate_macro_name(&input.name)?;
         validate_macro_steps(&input.steps)?;
         let (name, steps) = (input.name.clone(), input.steps.clone());
-        self.state(None, WRITE_BYTES, 1, move |transaction, budget| {
-            let prior: Option<McpMacroRecord> = transaction
-                .get(StateNamespace::Macros, name.as_bytes(), budget)?
-                .map(|bytes| decode(&bytes))
-                .transpose()?;
-            if let Some(record) = &prior {
-                validate_macro(record)?;
-            }
-            let timestamp = now();
-            let record = McpMacroRecord {
-                name,
-                steps,
-                created_at: prior
-                    .as_ref()
-                    .map_or_else(|| timestamp.clone(), |record| record.created_at.clone()),
-                updated_at: timestamp,
-                last_run_at: prior.as_ref().and_then(|record| record.last_run_at.clone()),
-                run_count: prior.as_ref().map_or(0, |record| record.run_count),
-            };
-            transaction.put(
-                StateNamespace::Macros,
-                record.name.as_bytes(),
-                encode(&record)?,
-            )?;
-            Ok(record)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, 1),
+            move |transaction, budget| {
+                let prior: Option<McpMacroRecord> = transaction
+                    .get(StateNamespace::Macros, name.as_bytes(), budget)?
+                    .map(|bytes| decode(&bytes))
+                    .transpose()?;
+                if let Some(record) = &prior {
+                    validate_macro(record)?;
+                }
+                let timestamp = now();
+                let record = McpMacroRecord {
+                    name,
+                    steps,
+                    created_at: prior
+                        .as_ref()
+                        .map_or_else(|| timestamp.clone(), |record| record.created_at.clone()),
+                    updated_at: timestamp,
+                    last_run_at: prior.as_ref().and_then(|record| record.last_run_at.clone()),
+                    run_count: prior.as_ref().map_or(0, |record| record.run_count),
+                };
+                transaction.put(
+                    StateNamespace::Macros,
+                    record.name.as_bytes(),
+                    encode(&record)?,
+                )?;
+                Ok(record)
+            },
+        )
         .await
     }
 
@@ -429,16 +447,19 @@ impl NativeDatabase {
         self.require_project(project)?;
         validate_macro_name(name)?;
         let name = name.to_owned();
-        self.state(None, 0, 0, move |transaction, budget| {
-            let record: Option<McpMacroRecord> = transaction
-                .get(StateNamespace::Macros, name.as_bytes(), budget)?
-                .map(|bytes| decode(&bytes))
-                .transpose()?;
-            if let Some(record) = &record {
-                validate_macro(record)?;
-            }
-            Ok(record)
-        })
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let record: Option<McpMacroRecord> = transaction
+                    .get(StateNamespace::Macros, name.as_bytes(), budget)?
+                    .map(|bytes| decode(&bytes))
+                    .transpose()?;
+                if let Some(record) = &record {
+                    validate_macro(record)?;
+                }
+                Ok(record)
+            },
+        )
         .await
     }
 
@@ -452,23 +473,27 @@ impl NativeDatabase {
     ) -> Result<Vec<McpMacroRecord>, StorageError> {
         self.require_project(project)?;
         validate_limit(limit, MAX_MACRO_LIST)?;
-        self.state(None, 0, 0, move |transaction, budget| {
-            let mut rows = Vec::new();
-            visit_state(
-                transaction,
-                StateNamespace::Macros,
-                b"",
-                budget,
-                |_, record: McpMacroRecord, _| {
-                    validate_macro(&record)?;
-                    retain(&mut rows, record, usize::from(limit), |a, b| {
+        self.state(
+            crate::rocks::StateAccess::read_only(None),
+            move |transaction, budget| {
+                let mut rows = crate::retrieval::native::RankedRows::new(
+                    usize::from(limit),
+                    |a: &McpMacroRecord, b| {
                         timestamp_order(&b.updated_at, &a.updated_at).then(a.name.cmp(&b.name))
-                    });
-                    Ok(())
-                },
-            )?;
-            Ok(rows)
-        })
+                    },
+                );
+                visit_state(
+                    &transaction.scan(StateNamespace::Macros, b""),
+                    budget,
+                    |_, record: McpMacroRecord, _| {
+                        validate_macro(&record)?;
+                        rows.insert(record);
+                        Ok(())
+                    },
+                )?;
+                Ok(rows.into_vec())
+            },
+        )
         .await
     }
 
@@ -483,16 +508,21 @@ impl NativeDatabase {
         self.require_project(project)?;
         validate_macro_name(name)?;
         let name = name.to_owned();
-        self.state(None, WRITE_BYTES, 1, move |transaction, budget| {
-            if let Some(bytes) = transaction.get(StateNamespace::Macros, name.as_bytes(), budget)? {
-                let mut record: McpMacroRecord = decode(&bytes)?;
-                validate_macro(&record)?;
-                record.run_count = record.run_count.checked_add(1).ok_or(corrupt())?;
-                record.last_run_at = Some(now());
-                transaction.put(StateNamespace::Macros, name.as_bytes(), encode(&record)?)?;
-            }
-            Ok(())
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, 1),
+            move |transaction, budget| {
+                if let Some(bytes) =
+                    transaction.get(StateNamespace::Macros, name.as_bytes(), budget)?
+                {
+                    let mut record: McpMacroRecord = decode(&bytes)?;
+                    validate_macro(&record)?;
+                    record.run_count = record.run_count.checked_add(1).ok_or(corrupt())?;
+                    record.last_run_at = Some(now());
+                    transaction.put(StateNamespace::Macros, name.as_bytes(), encode(&record)?)?;
+                }
+                Ok(())
+            },
+        )
         .await
     }
 
@@ -507,15 +537,18 @@ impl NativeDatabase {
         self.require_project(project)?;
         validate_macro_name(name)?;
         let name = name.to_owned();
-        self.state(None, WRITE_BYTES, 1, move |transaction, budget| {
-            let exists = transaction
-                .get(StateNamespace::Macros, name.as_bytes(), budget)?
-                .is_some();
-            if exists {
-                transaction.delete(StateNamespace::Macros, name.as_bytes())?;
-            }
-            Ok(exists)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, WRITE_BYTES, 1),
+            move |transaction, budget| {
+                let exists = transaction
+                    .get(StateNamespace::Macros, name.as_bytes(), budget)?
+                    .is_some();
+                if exists {
+                    transaction.delete(StateNamespace::Macros, name.as_bytes())?;
+                }
+                Ok(exists)
+            },
+        )
         .await
     }
 }

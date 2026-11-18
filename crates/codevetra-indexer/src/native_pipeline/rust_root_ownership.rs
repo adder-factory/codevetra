@@ -26,6 +26,7 @@ where
 {
     let roots = target_roots(target, cancelled)?;
     root_edges(target, &roots, cancelled)?;
+    super::rust_file_modules::directories(target, &roots, cancelled)?;
     let mut queue = VecDeque::new();
     for file in roots {
         if cancelled() {
@@ -168,6 +169,9 @@ where
             let Some(edge) = edge else {
                 continue;
             };
+            if edge.source == super::rust_path_resolution::ModuleSource::ExplicitFile {
+                continue;
+            }
             let suffix = name.replace("::", "/");
             target.budget.charge(usize_to_u64(suffix.len()))?;
             let path = joined_path(&context.directory, &suffix)?;

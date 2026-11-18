@@ -2,7 +2,7 @@
 
 use super::{
     NAMESPACE,
-    vectors::{corrupt, documents_scan, read_vector, source},
+    vectors::{SourceReader, corrupt, documents_scan},
 };
 use crate::semantic::{
     maintenance::{EmbeddingStorageAudit, RetiredEmbeddingCleanupReport},
@@ -19,6 +19,11 @@ use crate::{
 use codevetra_domain::{DocumentId, ProjectId};
 use std::{ops::ControlFlow, time::Duration};
 
+const RETIRED_WRITE_BYTES: u32 = 4 * 1_048_576;
+const RETIRED_WRITE_ROWS: u32 = 10_001;
+const MAXIMUM_RETIRED_VECTORS: usize = 256;
+const RETIRED_SCAN_PAGE: u16 = 64;
+
 impl NativeDatabase {
     /// Audit active, obsolete, and retired binary vectors against current source.
     /// # Errors
@@ -29,66 +34,65 @@ impl NativeDatabase {
         timeout: Duration,
     ) -> Result<EmbeddingStorageAudit, Error> {
         self.require_project(project)?;
-        self.transaction(None, 0, 0, timeout, |transaction, budget| {
-            let mut report = EmbeddingStorageAudit {
-                active_models: 0,
-                retired_models: 0,
-                current_documents: 0,
-                current_embeddings: 0,
-                historical_embeddings: 0,
-                retired_model_embeddings: 0,
-                model_indexes: 0,
-            };
-            let mut models = Vec::new();
-            visit_state(
-                transaction,
-                NAMESPACE,
-                b"m/",
-                budget,
-                |_, model: RegisteredEmbeddingModel, _| {
-                    if model.state == EmbeddingModelState::Active {
-                        report.active_models += 1;
-                    } else {
-                        report.retired_models += 1;
-                    }
-                    models.push(model);
-                    if models.len() > 256 {
-                        return Err(crate::rocks::RocksError::Limit {
-                            resource: "embedding_models",
-                        });
-                    }
-                    Ok(())
-                },
-            )?;
-            let current = transaction.current()?;
-            let all = audit_vector_rows(transaction, budget, &models, &mut report)?;
-            if let Some(current) = current {
-                let snapshot = transaction.graph_snapshot()?;
-                let graph = snapshot.graph(budget)?;
-                documents_scan(&graph, budget, |_, document, budget| {
-                    report.current_documents += 1;
-                    let id = document.document_id.clone();
-                    let (_, digest) = source(
-                        transaction,
-                        &graph,
-                        &current.generation_id,
-                        document,
-                        budget,
-                    )?;
-                    for model in &models {
-                        report.current_embeddings += u64::from(
-                            read_vector(transaction, &model.selector, &id, &digest, budget)?
-                                .is_some(),
-                        );
-                    }
-                    Ok(ControlFlow::Continue(()))
-                })?;
-            }
-            report.historical_embeddings = all
-                .checked_sub(report.current_embeddings)
-                .ok_or(corrupt())?;
-            Ok(report)
-        })
+        self.transaction(
+            crate::rocks::StateAccess::read_only(None),
+            timeout,
+            |transaction, budget| {
+                let mut report = EmbeddingStorageAudit {
+                    active_models: 0,
+                    retired_models: 0,
+                    current_documents: 0,
+                    current_embeddings: 0,
+                    historical_embeddings: 0,
+                    retired_model_embeddings: 0,
+                    model_indexes: 0,
+                };
+                let mut models = Vec::new();
+                visit_state(
+                    &transaction.scan(NAMESPACE, b"m/"),
+                    budget,
+                    |_, model: RegisteredEmbeddingModel, _| {
+                        if model.state == EmbeddingModelState::Active {
+                            report.active_models += 1;
+                        } else {
+                            report.retired_models += 1;
+                        }
+                        models.push(model);
+                        if models.len() > 256 {
+                            return Err(crate::rocks::RocksError::Limit {
+                                resource: "embedding_models",
+                            });
+                        }
+                        Ok(())
+                    },
+                )?;
+                let current = transaction.current()?;
+                let all = report.audit_vectors(transaction, budget, &models)?;
+                if current.is_some() {
+                    let snapshot = transaction.graph_snapshot()?;
+                    let graph = snapshot.graph(budget)?;
+                    documents_scan(&graph, budget, |_, document, budget| {
+                        report.current_documents += 1;
+                        let id = document.document_id.clone();
+                        let (_, digest) =
+                            SourceReader::new(transaction, &graph).render(document, budget)?;
+                        for model in &models {
+                            report.current_embeddings += u64::from(
+                                SourceReader::new(transaction, &graph)
+                                    .model(&model.selector)
+                                    .read(&id, &digest, budget)?
+                                    .is_some(),
+                            );
+                        }
+                        Ok(ControlFlow::Continue(()))
+                    })?;
+                }
+                report.historical_embeddings = all
+                    .checked_sub(report.current_embeddings)
+                    .ok_or(corrupt())?;
+                Ok(report)
+            },
+        )
         .await
     }
 
@@ -103,16 +107,12 @@ impl NativeDatabase {
     ) -> Result<RetiredEmbeddingCleanupReport, Error> {
         self.require_project(project)?;
         self.transaction(
-            None,
-            4 * 1_048_576,
-            10_001,
+            crate::rocks::StateAccess::write(None, RETIRED_WRITE_BYTES, RETIRED_WRITE_ROWS),
             timeout,
             move |transaction, budget| {
                 let mut retired = Vec::new();
                 visit_state(
-                    transaction,
-                    NAMESPACE,
-                    b"m/",
+                    &transaction.scan(NAMESPACE, b"m/"),
                     budget,
                     |_, model: RegisteredEmbeddingModel, _| {
                         if model.state == EmbeddingModelState::Retired {
@@ -165,40 +165,40 @@ fn delete_retired_vectors(
     Ok(())
 }
 
-fn audit_vector_rows(
-    transaction: &StateTransaction<'_>,
-    budget: &mut ReadBudget,
-    models: &[RegisteredEmbeddingModel],
-    report: &mut EmbeddingStorageAudit,
-) -> Result<u64, Error> {
-    let mut all = 0_u64;
-    for model in models {
-        let prefix = format!("v/{}/", model.selector.model_id);
-        let mut cursor = None;
-        loop {
-            let page = transaction.scan(
-                NAMESPACE,
-                prefix.as_bytes(),
-                cursor.as_ref().map(crate::rocks::RecordKey::as_bytes),
-                256,
-                budget,
-            )?;
-            for (key, bytes) in page.rows {
-                let text = std::str::from_utf8(key.as_bytes()).map_err(|_| corrupt())?;
-                DocumentId::parse(text.strip_prefix(&prefix).ok_or(corrupt())?)
-                    .map_err(|_| corrupt())?;
-                super::vectors::decode_vector(&bytes, model.selector.dimension)?;
-                all += 1;
-                report.retired_model_embeddings +=
-                    u64::from(model.state == EmbeddingModelState::Retired);
-            }
-            cursor = page.next_after;
-            if cursor.is_none() {
-                break;
+impl EmbeddingStorageAudit {
+    fn audit_vectors(
+        &mut self,
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+        models: &[RegisteredEmbeddingModel],
+    ) -> Result<u64, Error> {
+        let mut all = 0_u64;
+        for model in models {
+            let prefix = format!("v/{}/", model.selector.model_id);
+            let mut cursor = None;
+            loop {
+                let page = transaction.scan(NAMESPACE, prefix.as_bytes()).page(
+                    cursor.as_ref().map(crate::rocks::RecordKey::as_bytes),
+                    256,
+                    budget,
+                )?;
+                for (key, bytes) in page.rows {
+                    let text = std::str::from_utf8(key.as_bytes()).map_err(|_| corrupt())?;
+                    DocumentId::parse(text.strip_prefix(&prefix).ok_or(corrupt())?)
+                        .map_err(|_| corrupt())?;
+                    super::vectors::decode_vector(&bytes, model.selector.dimension)?;
+                    all += 1;
+                    self.retired_model_embeddings +=
+                        u64::from(model.state == EmbeddingModelState::Retired);
+                }
+                cursor = page.next_after;
+                if cursor.is_none() {
+                    break;
+                }
             }
         }
+        Ok(all)
     }
-    Ok(all)
 }
 
 #[derive(Default)]
@@ -233,21 +233,19 @@ impl RetiredCandidates {
         let prefix = format!("v/{}/", model.model_id);
         let mut cursor = None;
         loop {
-            let page = transaction.scan(
-                NAMESPACE,
-                prefix.as_bytes(),
+            let page = transaction.scan(NAMESPACE, prefix.as_bytes()).page(
                 cursor.as_ref().map(RecordKey::as_bytes),
-                64,
+                RETIRED_SCAN_PAGE,
                 budget,
             )?;
             self.candidates += page.rows.len() as u64;
             for (key, _) in page.rows {
-                if self.keys.len() < 256 {
+                if self.keys.len() < MAXIMUM_RETIRED_VECTORS {
                     self.keys.push(key);
                 }
             }
             cursor = page.next_after;
-            if self.keys.len() >= 256 {
+            if self.keys.len() >= MAXIMUM_RETIRED_VECTORS {
                 return Ok(true);
             }
             if cursor.is_none() {

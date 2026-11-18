@@ -1,17 +1,17 @@
 //! Metadata-only rules stream native symbol pages without rescanning source documents.
 
 use super::{
-    Kind, Record, Scope, State, WRITE_BYTES, WRITE_ROWS, corrupt, read_scope, workspace, write,
+    Kind, Record, Scope, ScopedArtifact, State, WRITE_BYTES, WRITE_ROWS, corrupt, workspace,
 };
 use crate::{
     NativeDatabase, NewAgentArtifact, StorageError,
     artifacts::{
-        PendingRoleSymbol, StructuralRoleCursor, StructuralRolePage, SymbolRoleSaveInput,
-        validate_body, validate_limit, validate_metadata, validate_model,
+        PendingRoleSymbol, PendingStructuralRoleQuery, StructuralRoleCursor, StructuralRolePage,
+        SymbolRoleSaveInput, validate_body, validate_limit, validate_metadata, validate_model,
     },
     rocks::{ReadBudget, RocksError, StateTransaction},
 };
-use codevetra_domain::{GenerationId, ProjectId, SymbolId};
+use codevetra_domain::{GenerationId, SymbolId};
 
 struct OwnedRole {
     id: SymbolId,
@@ -69,29 +69,33 @@ fn owned_roles<'a>(
     Ok(owned)
 }
 
-fn prepare_role(
-    transaction: &StateTransaction<'_>,
-    budget: &mut ReadBudget,
-    role: OwnedRole,
-    preserve_judged: bool,
-) -> Result<RoleSave, RocksError> {
-    let input = super::summaries::symbol_input(
-        transaction,
-        budget,
-        &role.id,
-        None,
-        Kind::Role,
-        role.body,
-        role.metadata,
-    )?
-    .ok_or(RocksError::GenerationChanged)?;
-    if preserve_judged && let Some(record) = preserve_judged_role(transaction, budget, &input)? {
-        return Ok(RoleSave::Existing(record));
+impl OwnedRole {
+    fn prepare(
+        self,
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+        preserve_judged: bool,
+    ) -> Result<RoleSave, RocksError> {
+        let role = self;
+
+        let input = super::summaries::SymbolArtifact {
+            id: &role.id,
+            expected: None,
+            kind: Kind::Role,
+            body: role.body,
+            metadata: role.metadata,
+        }
+        .prepare(transaction, budget)?
+        .ok_or(RocksError::GenerationChanged)?;
+        if preserve_judged && let Some(record) = preserve_judged_role(transaction, budget, &input)?
+        {
+            return Ok(RoleSave::Existing(record));
+        }
+        Ok(RoleSave::New(input))
     }
-    Ok(RoleSave::New(input))
 }
 
-pub(super) fn preserve_judged_role(
+fn preserve_judged_role(
     transaction: &StateTransaction<'_>,
     budget: &mut ReadBudget,
     input: &NewAgentArtifact,
@@ -105,13 +109,12 @@ pub(super) fn preserve_judged_role(
     ) {
         return Ok(None);
     }
-    Ok(read_scope(
-        transaction,
-        Kind::Role,
-        Scope::Symbol,
-        &input.scope_key,
-        budget,
-    )?
+    Ok((ScopedArtifact {
+        kind: Kind::Role,
+        scope: Scope::Symbol,
+        key: &input.scope_key,
+    })
+    .read(transaction, budget)?
     .filter(|record| {
         record.state == State::Complete
             && record.source_digest.as_deref()
@@ -153,19 +156,22 @@ impl NativeDatabase {
             field: "role_batch",
         })? * WRITE_ROWS;
         let preserve_judged = generation.is_some();
-        self.state(generation, WRITE_BYTES, rows, move |transaction, budget| {
-            let prepared = roles
-                .into_iter()
-                .map(|role| prepare_role(transaction, budget, role, preserve_judged))
-                .collect::<Result<Vec<_>, _>>()?;
-            prepared
-                .into_iter()
-                .map(|role| match role {
-                    RoleSave::Existing(record) => Ok(record),
-                    RoleSave::New(input) => write(transaction, budget, input, true),
-                })
-                .collect()
-        })
+        self.state(
+            crate::rocks::StateAccess::write(generation, WRITE_BYTES, rows),
+            move |transaction, budget| {
+                let prepared = roles
+                    .into_iter()
+                    .map(|role| role.prepare(transaction, budget, preserve_judged))
+                    .collect::<Result<Vec<_>, _>>()?;
+                prepared
+                    .into_iter()
+                    .map(|role| match role {
+                        RoleSave::Existing(record) => Ok(record),
+                        RoleSave::New(input) => input.write(transaction, budget, true),
+                    })
+                    .collect()
+            },
+        )
         .await
     }
 
@@ -175,11 +181,14 @@ impl NativeDatabase {
     /// Rejects invalid bounds/model, a changed generation, corrupt source or exhausted budgets.
     pub async fn pending_structural_roles(
         &self,
-        project: &ProjectId,
-        model: &str,
-        after: Option<&StructuralRoleCursor>,
-        limit: u16,
+        query: PendingStructuralRoleQuery<'_>,
     ) -> Result<StructuralRolePage, StorageError> {
+        let PendingStructuralRoleQuery {
+            project,
+            model,
+            after,
+            limit,
+        } = query;
         self.require_project(project)?;
         validate_limit(limit, super::super::MAX_ROLE_BATCH)?;
         validate_model(model)?;
@@ -190,9 +199,9 @@ impl NativeDatabase {
         }
         let (model, after) = (model.to_owned(), after.cloned());
         self.state(
-            after.as_ref().map(|cursor| cursor.generation.clone()),
-            0,
-            0,
+            crate::rocks::StateAccess::read_only(
+                after.as_ref().map(|cursor| cursor.generation.clone()),
+            ),
             move |transaction, budget| {
                 let generation_id = transaction
                     .current()?
@@ -208,15 +217,15 @@ impl NativeDatabase {
                     if matches!(symbol.symbol_kind.as_str(), "file" | "import" | "parameter") {
                         continue;
                     }
-                    let role = read_scope(
-                        transaction,
-                        Kind::Role,
-                        Scope::Symbol,
-                        symbol.symbol_id.as_str(),
-                        budget,
-                    )?;
+                    let role = (ScopedArtifact {
+                        kind: Kind::Role,
+                        scope: Scope::Symbol,
+                        key: symbol.symbol_id.as_str(),
+                    })
+                    .read(transaction, budget)?;
                     if role.is_some_and(|record| {
-                        super::backlog::role_satisfied(&record, &symbol, &model, true)
+                        crate::artifacts::RoleSweepModel::Structural(&model)
+                            .satisfied(&record, &symbol)
                     }) {
                         continue;
                     }

@@ -6,10 +6,10 @@ use super::{
 };
 use crate::{
     FileInput, GraphDirection, NativeDatabase, StorageError, SymbolInput,
-    retrieval::native::{in_directory, retain, simple_name, symbol_record, visit_symbols_named},
+    retrieval::native::{RankedRows, in_directory, simple_name, symbol_record},
     rocks::{GraphLink, GraphSnapshot, ReadBudget, RocksError},
 };
-use codevetra_domain::{EdgeKind, GenerationId};
+use codevetra_domain::EdgeKind;
 use std::{cmp::Ordering, time::Duration};
 
 struct Filters {
@@ -82,12 +82,11 @@ impl NativeDatabase {
     ) -> Result<QualifiedSymbolPage, StorageError> {
         self.require_project(input.project_id)?;
         validate_query(&input)?;
-        let expected = input.expected_generation_id.clone();
         let filters = Filters::from(input);
         self.graph(
             input.expected_generation_id,
             timeout,
-            move |graph, budget| select(graph, budget, &expected, &filters),
+            move |graph, budget| select(graph, budget, &filters),
         )
         .await
     }
@@ -96,39 +95,37 @@ impl NativeDatabase {
 fn select(
     graph: &GraphSnapshot<'_, '_>,
     budget: &mut ReadBudget,
-    generation: &GenerationId,
     filters: &Filters,
 ) -> Result<QualifiedSymbolPage, RocksError> {
     let mut page = QualifiedSymbolPage {
         total: 0,
         hits: Vec::new(),
     };
-    visit_symbols_named(graph, budget, Some(&filters.text), |symbol, budget| {
+    let mut hits = RankedRows::new(usize::from(filters.limit), |a, b| {
+        compare(a, b, filters.sort)
+    });
+    graph.visit_symbols_named(budget, Some(&filters.text), |symbol, budget| {
         if !matches_symbol(&symbol, filters) {
             return Ok(());
         }
         let file = graph
             .file(&symbol.file_id, budget)?
             .ok_or(RocksError::Format)?;
-        if !matches_file(&file, filters) || !matches_graph(graph, budget, &symbol, filters)? {
+        if !matches_file(&file, filters) || !filters.matches_graph(graph, budget, &symbol)? {
             return Ok(());
         }
         let centrality = symbol
             .pagerank_ppb
             .map(|value| f64::from(value) / 1_000_000_000.0);
         page.total = page.total.checked_add(1).ok_or(RocksError::Format)?;
-        retain(
-            &mut page.hits,
-            QualifiedSymbolHit {
-                symbol: symbol_record(generation, symbol, graph, budget)?,
-                centrality,
-                lexical_score: None,
-            },
-            usize::from(filters.limit),
-            |a, b| compare(a, b, filters.sort),
-        );
+        hits.insert(QualifiedSymbolHit {
+            symbol: symbol_record(symbol, graph, budget)?,
+            centrality,
+            lexical_score: None,
+        });
         Ok(())
     })?;
+    page.hits = hits.into_vec();
     Ok(page)
 }
 
@@ -179,71 +176,102 @@ fn centrality_matches(
     }
 }
 
-fn matches_graph(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    symbol: &SymbolInput,
-    filters: &Filters,
-) -> Result<bool, RocksError> {
-    for (names, incoming, dependency) in [
-        (&filters.callers, false, false),
-        (&filters.callees, true, false),
-        (&filters.dependencies, false, true),
-    ] {
-        if !names.is_empty() && !adjacent_name(graph, budget, symbol, names, incoming, dependency)?
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn adjacent_name(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    symbol: &SymbolInput,
-    names: &[String],
-    incoming: bool,
-    dependency: bool,
-) -> Result<bool, RocksError> {
-    let direction = if incoming {
-        GraphDirection::Incoming
-    } else {
-        GraphDirection::Outgoing
-    };
-    let mut cursor = None;
-    loop {
-        let page = graph.neighbors(&symbol.symbol_id, direction, cursor.as_ref(), 256, budget)?;
-        for link in page.links {
-            if adjacent_link_matches(graph, budget, &link, names, incoming, dependency)? {
-                return Ok(true);
+impl Filters {
+    fn matches_graph(
+        &self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+        symbol: &SymbolInput,
+    ) -> Result<bool, RocksError> {
+        for filter in [
+            AdjacentNameFilter {
+                names: &self.callers,
+                relation: NameRelation::CallsTo,
+            },
+            AdjacentNameFilter {
+                names: &self.callees,
+                relation: NameRelation::CallsFrom,
+            },
+            AdjacentNameFilter {
+                names: &self.dependencies,
+                relation: NameRelation::DependsOn,
+            },
+        ] {
+            if !filter.names.is_empty() && !filter.matches(graph, budget, symbol)? {
+                return Ok(false);
             }
         }
-        cursor = page.next;
-        if cursor.is_none() {
-            return Ok(false);
-        }
+        Ok(true)
     }
 }
 
-fn adjacent_link_matches(
-    graph: &GraphSnapshot<'_, '_>,
-    budget: &mut ReadBudget,
-    link: &GraphLink,
-    names: &[String],
-    incoming: bool,
-    dependency: bool,
-) -> Result<bool, RocksError> {
-    if !name_relationship(link.kind(), dependency) {
-        return Ok(false);
+#[derive(Clone, Copy)]
+enum NameRelation {
+    CallsTo,
+    CallsFrom,
+    DependsOn,
+}
+
+impl NameRelation {
+    const fn direction(self) -> GraphDirection {
+        match self {
+            Self::CallsFrom => GraphDirection::Incoming,
+            Self::CallsTo | Self::DependsOn => GraphDirection::Outgoing,
+        }
     }
-    let id = if incoming {
-        link.source_symbol_id()
-    } else {
-        link.target_symbol_id()
-    };
-    let adjacent = graph.symbol(id, budget)?.ok_or(RocksError::Format)?;
-    Ok(matches_adjacent_name(&adjacent, names))
+
+    fn accepts(self, kind: EdgeKind) -> bool {
+        name_relationship(kind, matches!(self, Self::DependsOn))
+    }
+}
+
+/// A name predicate carries its relationship semantics through every adjacency page.
+struct AdjacentNameFilter<'a> {
+    names: &'a [String],
+    relation: NameRelation,
+}
+
+impl AdjacentNameFilter<'_> {
+    fn matches(
+        &self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+        symbol: &SymbolInput,
+    ) -> Result<bool, RocksError> {
+        let mut cursor = None;
+        loop {
+            let page = graph
+                .adjacency(&symbol.symbol_id, self.relation.direction())
+                .page(cursor.as_ref(), 256, budget)?;
+            for link in page.links {
+                if self.link_matches(graph, budget, &link)? {
+                    return Ok(true);
+                }
+            }
+            cursor = page.next;
+            if cursor.is_none() {
+                return Ok(false);
+            }
+        }
+    }
+
+    fn link_matches(
+        &self,
+        graph: &GraphSnapshot<'_, '_>,
+        budget: &mut ReadBudget,
+        link: &GraphLink,
+    ) -> Result<bool, RocksError> {
+        if !self.relation.accepts(link.kind()) {
+            return Ok(false);
+        }
+        let id = if matches!(self.relation, NameRelation::CallsFrom) {
+            link.source_symbol_id()
+        } else {
+            link.target_symbol_id()
+        };
+        let adjacent = graph.symbol(id, budget)?.ok_or(RocksError::Format)?;
+        Ok(matches_adjacent_name(&adjacent, self.names))
+    }
 }
 
 fn name_relationship(kind: EdgeKind, dependency: bool) -> bool {

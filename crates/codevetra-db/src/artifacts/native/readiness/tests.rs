@@ -3,8 +3,8 @@ use crate::{
     FileInput, GenerationFacts, GenerationValidationLimits, SearchDocumentInput, SymbolInput,
     SymbolRoleSaveInput, SymbolSummarySaveInput,
     rocks::{
-        AsyncProjectStore, GraphBase, GraphPolicy, GraphPublicationInput, GraphRevision,
-        StorageRequest, StorageRuntime, StorePolicy, WorkerPolicy,
+        AsyncProjectStore, GraphBase, GraphPolicy, GraphRevision, StorageRequest, StorageRuntime,
+        StorePolicy, WorkerPolicy,
     },
     validate_generation_facts,
 };
@@ -97,25 +97,26 @@ async fn publish(store: &AsyncProjectStore, number: u8, mut facts: GenerationFac
         GenerationValidationLimits::new(16 * 1_048_576, 64 * 1_048_576)?,
         || false,
     )?;
-    store
-        .publish_graph(
-            GraphPublicationInput::new(
-                GraphRevision {
-                    generation_id: GenerationId::from_uuid_v8([number; 16]),
-                    source_revision: digest(9),
-                    base: if number == 1 {
-                        GraphBase::Empty
-                    } else {
-                        GraphBase::Current(GenerationId::from_uuid_v8([1; 16]))
-                    },
+    {
+        let request_bound_input = crate::rocks::GraphPreparation::new(
+            GraphRevision {
+                generation_id: GenerationId::from_uuid_v8([number; 16]),
+                source_revision: digest(9),
+                base: if number == 1 {
+                    GraphBase::Empty
+                } else {
+                    GraphBase::Current(GenerationId::from_uuid_v8([1; 16]))
                 },
-                facts,
-                GraphPolicy::default(),
-                &request()?,
-            )?,
+            },
+            GraphPolicy::default(),
             &request()?,
         )
-        .await?;
+        .resident(facts)?;
+        store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
     Ok(())
 }
 
@@ -154,9 +155,11 @@ async fn populated_status_readiness_is_exact_bounded_and_generation_fenced() -> 
     let runtime = StorageRuntime::new(WorkerPolicy::default())?;
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        digest(1),
-        StorePolicy::default(),
+        crate::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            digest(1),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
@@ -165,12 +168,12 @@ async fn populated_status_readiness_is_exact_bounded_and_generation_fenced() -> 
     populate(&db).await?;
     let policy = SummaryCandidatePolicy::default();
     let (coverage, roles) = db
-        .state(None, 0, 0, move |tx, _| {
+        .state(crate::rocks::StateAccess::read_only(None), move |tx, _| {
             // Shared physical accounting fits fewer than seven reads per symbol.
             let mut budget = ReadBudget::new(1800, 4 * 1_048_576, Duration::from_secs(5))?;
             let snapshot = tx.graph_snapshot()?;
             let graph = snapshot.graph(&mut budget)?;
-            counts(tx, &graph, &policy, &mut budget)
+            ReadinessReader { tx, graph: &graph }.counts(&policy, &mut budget)
         })
         .await?;
     assert_base_counts(&coverage, &roles);
@@ -240,7 +243,7 @@ fn assert_base_counts(coverage: &SummaryCoverageStats, roles: &[AgentRoleCount])
 }
 
 async fn reject_broken_scope(db: &NativeDatabase) -> TestResult {
-    db.state(None, 1024, 1, |tx, _| {
+    db.state(crate::rocks::StateAccess::write(None, 1024, 1), |tx, _| {
         tx.put(
             NAMESPACE,
             scope_key(Kind::Role, Scope::Symbol, symbol(1).as_str()).as_bytes(),

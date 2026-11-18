@@ -16,9 +16,11 @@ async fn cache_preparation_deadline_drains_native_headers_and_preserves_commit_o
         let identity = ContentDigest::from_bytes([42; 32]);
         let store = AsyncProjectStore::open(
             &runtime,
-            root.path().to_owned(),
-            identity.clone(),
-            StorePolicy::default(),
+            crate::rocks::ProjectOpening::new(
+                root.path().to_owned(),
+                identity.clone(),
+                StorePolicy::default(),
+            ),
             &StorageRequest::new(Duration::from_secs(30))?,
         )
         .await?;

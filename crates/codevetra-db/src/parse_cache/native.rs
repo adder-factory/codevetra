@@ -15,6 +15,8 @@ use codevetra_domain::ContentDigest;
 use serde::{Deserialize, Serialize};
 
 const CHUNK_BYTES: usize = 4 * 1_048_576;
+const CHUNK_WRITE_BYTES: u32 = 4 * 1_048_576 + 4096;
+const HEADER_COMMIT_ROWS: u32 = 512;
 mod retention;
 #[cfg(test)]
 mod tests;
@@ -59,39 +61,42 @@ impl NativeDatabase {
     ) -> Result<Vec<Option<NativeParseCacheRecord>>, NativeParseCacheError> {
         validate_keys(self, keys)?;
         let keys = keys.to_vec();
-        self.state(None, HEADER_BATCH_BYTES, 256, move |transaction, budget| {
-            let mut output = Vec::with_capacity(keys.len());
-            let mut loaded = 0_usize;
-            let timestamp = now();
-            for key in keys {
-                let encoded_key = header_key(&key)?;
-                let Some(bytes) = transaction.get(NAMESPACE, &encoded_key, budget)? else {
-                    output.push(None);
-                    continue;
-                };
-                let mut header: Header = decode(&bytes)?;
-                check_header(&header, &key)?;
-                loaded = loaded.checked_add(header.bytes).ok_or(corrupt())?;
-                if loaded
-                    > usize::try_from(MAXIMUM_CACHE_BATCH_LOAD_BYTES).map_err(|_| corrupt())?
-                {
-                    return Err(RocksError::Limit {
-                        resource: "parse_cache_load_bytes",
-                    });
+        self.state(
+            crate::rocks::StateAccess::write(None, HEADER_BATCH_BYTES, 256),
+            move |transaction, budget| {
+                let mut output = Vec::with_capacity(keys.len());
+                let mut loaded = 0_usize;
+                let timestamp = now();
+                for key in keys {
+                    let encoded_key = header_key(&key)?;
+                    let Some(bytes) = transaction.get(NAMESPACE, &encoded_key, budget)? else {
+                        output.push(None);
+                        continue;
+                    };
+                    let mut header: Header = decode(&bytes)?;
+                    check_header(&header, &key)?;
+                    loaded = loaded.checked_add(header.bytes).ok_or(corrupt())?;
+                    if loaded
+                        > usize::try_from(MAXIMUM_CACHE_BATCH_LOAD_BYTES).map_err(|_| corrupt())?
+                    {
+                        return Err(RocksError::Limit {
+                            resource: "parse_cache_load_bytes",
+                        });
+                    }
+                    let payload = load_payload(transaction, &header, budget)?;
+                    if touch_required(&header.last_used, &timestamp)? {
+                        header.last_used.clone_from(&timestamp);
+                        transaction.put(NAMESPACE, &encoded_key, encode(&header)?)?;
+                    }
+                    output.push(Some(NativeParseCacheRecord {
+                        payload,
+                        payload_digest: header.digest,
+                        source_bytes: header.key.source_bytes,
+                    }));
                 }
-                let payload = load_payload(transaction, &header, budget)?;
-                if touch_required(&header.last_used, &timestamp)? {
-                    header.last_used.clone_from(&timestamp);
-                    transaction.put(NAMESPACE, &encoded_key, encode(&header)?)?;
-                }
-                output.push(Some(NativeParseCacheRecord {
-                    payload,
-                    payload_digest: header.digest,
-                    source_bytes: header.key.source_bytes,
-                }));
-            }
-            Ok(output)
-        })
+                Ok(output)
+            },
+        )
         .await
         .map_err(NativeParseCacheError::from)
     }
@@ -143,9 +148,10 @@ impl NativeDatabase {
                 created: now(),
             })
             .map_err(|_| NativeParseCacheError::CorruptStoredValue)?;
-            self.state(None, HEADER_BATCH_BYTES, 1, move |transaction, _| {
-                transaction.put(NAMESPACE, &marker, prepared)
-            })
+            self.state(
+                crate::rocks::StateAccess::write(None, HEADER_BATCH_BYTES, 1),
+                move |transaction, _| transaction.put(NAMESPACE, &marker, prepared),
+            )
             .await
             .map_err(NativeParseCacheError::from)?;
             for (part, bytes) in entry.payload.chunks(CHUNK_BYTES).enumerate() {
@@ -155,24 +161,28 @@ impl NativeDatabase {
                 )
                 .map_err(|_| NativeParseCacheError::CorruptStoredValue)?;
                 let bytes = bytes.to_vec();
-                self.state(None, 4 * 1_048_576 + 4096, 1, move |transaction, _| {
-                    transaction.put(NAMESPACE, &key, bytes)
-                })
+                self.state(
+                    crate::rocks::StateAccess::write(None, CHUNK_WRITE_BYTES, 1),
+                    move |transaction, _| transaction.put(NAMESPACE, &key, bytes),
+                )
                 .await
                 .map_err(NativeParseCacheError::from)?;
             }
             headers.push(header);
         }
-        self.state(None, HEADER_BATCH_BYTES, 512, move |transaction, budget| {
-            // Complete validation precedes all mutations, so any conflict rolls
-            // back every header in the caller's batch.
-            let report = check_prepared_headers(transaction, budget, &headers)?;
-            for header in headers {
-                transaction.put(NAMESPACE, &header_key(&header.key)?, encode(&header)?)?;
-                transaction.delete(NAMESPACE, &prepared_key(&header)?)?;
-            }
-            Ok(report)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, HEADER_BATCH_BYTES, HEADER_COMMIT_ROWS),
+            move |transaction, budget| {
+                // Complete validation precedes all mutations, so any conflict rolls
+                // back every header in the caller's batch.
+                let report = check_prepared_headers(transaction, budget, &headers)?;
+                for header in headers {
+                    transaction.put(NAMESPACE, &header_key(&header.key)?, encode(&header)?)?;
+                    transaction.delete(NAMESPACE, &prepared_key(&header)?)?;
+                }
+                Ok(report)
+            },
+        )
         .await
         .map_err(NativeParseCacheError::from)
     }
@@ -186,20 +196,23 @@ impl NativeDatabase {
     ) -> Result<bool, NativeParseCacheError> {
         validate_keys(self, std::slice::from_ref(key))?;
         let requested = key.clone();
-        self.state(None, HEADER_BATCH_BYTES, 18, move |transaction, budget| {
-            let key = header_key(&requested)?;
-            let Some(bytes) = transaction.get(NAMESPACE, &key, budget)? else {
-                return Ok(false);
-            };
-            let header: Header = decode(&bytes)?;
-            check_header(&header, &requested)?;
-            for part in 0..header.chunks {
-                transaction.delete(NAMESPACE, &chunk_key(&header, part)?)?;
-            }
-            transaction.delete(NAMESPACE, &key)?;
-            transaction.delete(NAMESPACE, &prepared_key(&header)?)?;
-            Ok(true)
-        })
+        self.state(
+            crate::rocks::StateAccess::write(None, HEADER_BATCH_BYTES, 18),
+            move |transaction, budget| {
+                let key = header_key(&requested)?;
+                let Some(bytes) = transaction.get(NAMESPACE, &key, budget)? else {
+                    return Ok(false);
+                };
+                let header: Header = decode(&bytes)?;
+                check_header(&header, &requested)?;
+                for part in 0..header.chunks {
+                    transaction.delete(NAMESPACE, &chunk_key(&header, part)?)?;
+                }
+                transaction.delete(NAMESPACE, &key)?;
+                transaction.delete(NAMESPACE, &prepared_key(&header)?)?;
+                Ok(true)
+            },
+        )
         .await
         .map_err(NativeParseCacheError::from)
     }

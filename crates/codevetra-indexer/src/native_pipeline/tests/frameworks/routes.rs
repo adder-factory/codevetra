@@ -12,9 +12,10 @@ const INFERRED_RESOURCE_CONFIDENCE: f32 = 0.70;
 const DIRECTORY_ROUTE_CONFIDENCE: f32 = 0.80;
 const UNSUPPORTED_NAMESPACE_BYTES: usize = 1_025;
 const RESOURCE_LIMIT: usize = 256;
-// V27 adds health analyzer metadata and its domain; restored graph facts are unchanged.
+// V34 changes only the domain for this unchanged frozen corpus.
+// Independent encoding reproduces the V33 pin before deriving the V34 pin.
 const PREVIOUS_CUSTOM_FAMILY_DIGEST: &str =
-    "3f374b14f941196a22ac11e38a7d36bc0f7043e223ec29ed31a869143f8415fc";
+    "138f3cb8980341578a87023b577ef3fce16b1d2e0628d0b60c5aa324ab9b3727";
 
 #[test]
 fn flutter_route_widgets_bind_to_the_explicit_import_and_keep_ambiguity() {

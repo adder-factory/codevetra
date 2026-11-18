@@ -1,6 +1,8 @@
 //! Integration coverage for CodeVetra project-runtime and agent evidence contracts.
 
 mod dependency_ownership;
+#[path = "live_project/mapping_clones.rs"]
+mod mapping_clones;
 #[path = "live_project/rust_receivers.rs"]
 mod rust_receivers;
 #[path = "live_project/source_batches.rs"]

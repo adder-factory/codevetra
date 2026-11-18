@@ -107,15 +107,21 @@ async fn bm25_metadata_heavy_corpus_fits_the_unchanged_physical_read_allowance()
     })?;
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_path_buf(),
-        digest(1),
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            root.path().to_path_buf(),
+            digest(1),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
-    let published = store
-        .publish_graph(input(1, metadata_heavy_search_facts()?)?, &request()?)
-        .await?;
+    let published = {
+        let request_bound_input = input(1, metadata_heavy_search_facts()?)?;
+        store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
     let database = NativeDatabase::new(store, &digest(1));
     let query = |limit| {
         codevetra_db::SearchQuery::new(
@@ -160,14 +166,18 @@ async fn vectors_reuse_unchanged_documents_and_reject_changed_source_and_summari
     let runtime = StorageRuntime::new(WorkerPolicy::default())?;
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        digest(1),
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            digest(1),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
+    let initial_input = input(1, searchable(false)?)?;
     store
-        .publish_graph(input(1, searchable(false)?)?, &request()?)
+        .with_request(&request()?)
+        .publish_graph(initial_input)
         .await?;
     let database = NativeDatabase::new(store.clone(), &digest(1));
     let project = database.project_id().clone();
@@ -208,9 +218,13 @@ async fn vectors_reuse_unchanged_documents_and_reject_changed_source_and_summari
         database.upsert_current_document_embeddings(stale).await,
         Err(SemanticStorageError::SourceDigestChanged)
     );
-    store
-        .publish_graph(input(2, searchable(false)?)?, &request()?)
-        .await?;
+    {
+        let request_bound_input = input(2, searchable(false)?)?;
+        store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
     let summaries = database
         .list_agent_artifacts(
             &project,
@@ -226,9 +240,13 @@ async fn vectors_reuse_unchanged_documents_and_reject_changed_source_and_summari
         .await?;
     assert_eq!(pending.documents().len(), 1);
     assert_eq!(pending.documents()[0].document_id(), &document(1));
-    store
-        .publish_graph(input(3, searchable(true)?)?, &request()?)
-        .await?;
+    {
+        let request_bound_input = input(3, searchable(true)?)?;
+        store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
     assert_eq!(
         database
             .list_agent_artifacts(
@@ -345,15 +363,21 @@ async fn warm_semantic_cache_observes_same_generation_vector_and_summary_writes(
     let runtime = StorageRuntime::new(WorkerPolicy::default())?;
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        digest(1),
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            digest(1),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
-    store
-        .publish_graph(input(1, searchable(false)?)?, &request()?)
-        .await?;
+    {
+        let request_bound_input = input(1, searchable(false)?)?;
+        store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
     let database = NativeDatabase::new(store.clone(), &digest(1));
     let (model, first, second) = initialize_vectors(&database).await?;
     verify_exact_ranking(&database, &model).await?;
@@ -401,11 +425,84 @@ async fn warm_semantic_cache_observes_same_generation_vector_and_summary_writes(
         SemanticReadinessState::CoverageIncomplete
     );
     assert!(database.vector_top_k(query(generation(1))?).await.is_err());
-    store
-        .publish_graph(input(2, searchable(true)?)?, &request()?)
-        .await?;
+    {
+        let request_bound_input = input(2, searchable(true)?)?;
+        store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
     assert_eq!(readiness(&database, &model).await?.embedded(), 0);
     assert!(database.vector_top_k(query(generation(2))?).await.is_err());
+    runtime.shutdown(&request()?).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn centrality_reads_keep_measures_distinct_missing_and_generation_fenced() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let runtime = StorageRuntime::new(WorkerPolicy::default())?;
+    let store = AsyncProjectStore::open(
+        &runtime,
+        codevetra_db::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            digest(1),
+            StorePolicy::default(),
+        ),
+        &request()?,
+    )
+    .await?;
+    let mut raw = raw_facts(3, Vec::new());
+    raw.symbols[0].betweenness_ppb = Some(250_000_000);
+    raw.symbols[0].pagerank_ppb = Some(750_000_000);
+    raw.symbols[1].betweenness_ppb = Some(0);
+    {
+        let request_bound_input = input(1, canonical(raw)?)?;
+        store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
+    let database = NativeDatabase::new(store.clone(), &digest(1));
+    let ids = [symbol(3), symbol(1), symbol(2), symbol(1)];
+    let between = database
+        .current_symbol_betweenness(database.project_id(), &generation(1), &ids)
+        .await?;
+    let rank = database
+        .current_symbol_pagerank(database.project_id(), &generation(1), &ids)
+        .await?;
+    assert_eq!(
+        between
+            .iter()
+            .map(|row| (&row.symbol_id, row.score))
+            .collect::<Vec<_>>(),
+        vec![(&ids[1], Some(0.25)), (&ids[2], Some(0.0)), (&ids[0], None)]
+    );
+    assert_eq!(
+        rank.iter()
+            .map(|row| (&row.symbol_id, row.score))
+            .collect::<Vec<_>>(),
+        vec![(&ids[1], Some(0.75)), (&ids[2], None), (&ids[0], None)]
+    );
+    {
+        let request_bound_input = input(2, facts(3, Vec::new())?)?;
+        store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
+    assert!(
+        database
+            .current_symbol_pagerank(database.project_id(), &generation(1), &ids)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .current_symbol_betweenness(database.project_id(), &generation(1), &ids)
+            .await
+            .is_err()
+    );
     runtime.shutdown(&request()?).await?;
     Ok(())
 }

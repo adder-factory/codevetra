@@ -1,7 +1,7 @@
 //! Generation-local scoped boundary joins. A matching literal alone never crosses scopes.
 use super::{
-    DerivedEdgeInput, EdgeKind, ResolutionCandidate, ResolutionIndex, ResolutionMutation,
-    StageItemFailure, SymbolId, SymbolKind, append_derived_edge, framework_landmark_candidate,
+    DerivedEdgeInput, EdgeKind, ResolutionCandidate, ResolutionMutation, StageItemFailure,
+    SymbolId, SymbolKind, append_derived_edge, framework_landmark_candidate,
     ordered_resolution_candidates,
 };
 use codevetra_domain::BoundarySite;
@@ -17,6 +17,21 @@ struct Targets<'a> {
     exact: BTreeMap<&'a str, Vec<&'a Site<'a>>>,
     patterns: Vec<&'a Site<'a>>,
     patterns_overflow: bool,
+}
+
+/// A writer and all of its generation-local lookup state travel together.
+struct BoundaryWriter<'a, Cancel> {
+    input: ResolutionMutation<'a, Cancel>,
+    positions: BTreeMap<SymbolId, usize>,
+    handlers: BTreeSet<SymbolId>,
+    callables: BTreeMap<&'a SymbolId, &'a ResolutionCandidate>,
+}
+
+/// Edge kind and confidence come from this site, never from another caller.
+struct SiteLinks<'site, 'index> {
+    site: &'site Site<'index>,
+    kind: EdgeKind,
+    owner: Option<&'index ResolutionCandidate>,
 }
 
 pub(super) fn append<Cancel: FnMut() -> bool>(
@@ -44,19 +59,26 @@ pub(super) fn append<Cancel: FnMut() -> bool>(
         }
     }
     let targets = target_index(&sites);
+    let mut writer = BoundaryWriter {
+        input,
+        positions,
+        handlers,
+        callables,
+    };
     for site in &sites {
-        if (input.cancelled)() {
+        if (writer.input.cancelled)() {
             return Err(StageItemFailure);
         }
-        let kind = site.metadata.edge_kind().ok_or(StageItemFailure)?;
-        let owner = owner(input.index, &callables, site.candidate, input.cancelled)?;
+        let links = SiteLinks {
+            site,
+            kind: site.metadata.edge_kind().ok_or(StageItemFailure)?,
+            owner: writer.owner(site.candidate)?,
+        };
         match site.metadata.role.as_str() {
-            "registration" => {
-                append_registration(&mut input, site, owner, kind, &positions, &mut handlers)?;
+            "registration" => writer.append_registration(&links)?,
+            "source" | "unknown" | "external" => {
+                writer.append_source(&links, &targets, &blocked)?;
             }
-            "source" | "unknown" | "external" => append_source(
-                &mut input, site, owner, kind, &positions, &targets, &blocked,
-            )?,
             _ => return Err(StageItemFailure),
         }
     }
@@ -79,72 +101,54 @@ fn boundary_positions<Cancel: FnMut() -> bool>(
     Ok(positions)
 }
 
-fn append_registration<Cancel: FnMut() -> bool>(
-    input: &mut ResolutionMutation<'_, Cancel>,
-    site: &Site<'_>,
-    owner: Option<&ResolutionCandidate>,
-    kind: EdgeKind,
-    positions: &BTreeMap<SymbolId, usize>,
-    handlers: &mut BTreeSet<SymbolId>,
-) -> Result<(), StageItemFailure> {
-    if let Some(owner) =
-        owner.filter(|owner| owner.declaration_span == site.candidate.declaration_span)
-    {
-        link(
-            input,
-            &site.candidate.symbol_id,
-            &owner.symbol_id,
-            kind,
-            "framework-boundary-registration-owner-v1",
-            &site.metadata,
-        )?;
-        handlers.insert(site.candidate.symbol_id.clone());
+impl<Cancel: FnMut() -> bool> BoundaryWriter<'_, Cancel> {
+    fn append_registration(&mut self, links: &SiteLinks<'_, '_>) -> Result<(), StageItemFailure> {
+        let site = links.site;
+        if let Some(owner) = links
+            .owner
+            .filter(|owner| owner.declaration_span == site.candidate.declaration_span)
+        {
+            self.link(links.edge(
+                &site.candidate.symbol_id,
+                &owner.symbol_id,
+                "framework-boundary-registration-owner-v1",
+            ))?;
+            self.handlers.insert(site.candidate.symbol_id.clone());
+        }
+        self.annotate(
+            site,
+            if self.handlers.contains(&site.candidate.symbol_id) {
+                "registration_handler_evidenced"
+            } else {
+                "registration_handler_unresolved"
+            },
+        )
     }
-    annotate(
-        input,
-        positions,
-        site,
-        if handlers.contains(&site.candidate.symbol_id) {
-            "registration_handler_evidenced"
-        } else {
-            "registration_handler_unresolved"
-        },
-    )?;
-    Ok(())
-}
 
-fn append_source<Cancel: FnMut() -> bool>(
-    input: &mut ResolutionMutation<'_, Cancel>,
-    site: &Site<'_>,
-    owner: Option<&ResolutionCandidate>,
-    kind: EdgeKind,
-    positions: &BTreeMap<SymbolId, usize>,
-    targets: &BTreeMap<GroupKey, Targets<'_>>,
-    blocked: &BTreeSet<String>,
-) -> Result<(), StageItemFailure> {
-    if let Some(owner) = owner {
-        link(
-            input,
-            &owner.symbol_id,
-            &site.candidate.symbol_id,
-            kind,
-            "framework-boundary-source-site-v1",
-            &site.metadata,
-        )?;
+    fn append_source(
+        &mut self,
+        links: &SiteLinks<'_, '_>,
+        targets: &BTreeMap<GroupKey, Targets<'_>>,
+        blocked: &BTreeSet<String>,
+    ) -> Result<(), StageItemFailure> {
+        let site = links.site;
+        if let Some(owner) = links.owner {
+            self.link(links.edge(
+                &owner.symbol_id,
+                &site.candidate.symbol_id,
+                "framework-boundary-source-site-v1",
+            ))?;
+        }
+        let (matches, state) = matches_for(site, targets, blocked);
+        for target in matches {
+            self.link(links.edge(
+                &site.candidate.symbol_id,
+                &target.candidate.symbol_id,
+                "framework-boundary-scoped-match-v1",
+            ))?;
+        }
+        self.annotate(site, state)
     }
-    let (matches, state) = matches_for(site, targets, blocked);
-    for target in matches {
-        link(
-            input,
-            &site.candidate.symbol_id,
-            &target.candidate.symbol_id,
-            kind,
-            "framework-boundary-scoped-match-v1",
-            &site.metadata,
-        )?;
-    }
-    annotate(input, positions, site, state)?;
-    Ok(())
 }
 
 fn collect<'a, Cancel: FnMut() -> bool>(
@@ -336,71 +340,68 @@ fn route_matches(route: &str, destination: &str) -> bool {
             !value.is_empty() && pattern.starts_with(':') || *pattern == value
         })
 }
-fn owner<'a, Cancel: FnMut() -> bool>(
-    index: &'a ResolutionIndex,
-    callables: &BTreeMap<&SymbolId, &'a ResolutionCandidate>,
-    site: &ResolutionCandidate,
-    cancelled: &mut Cancel,
-) -> Result<Option<&'a ResolutionCandidate>, StageItemFailure> {
-    let mut id = &site.symbol_id;
-    for _ in 0..64 {
-        if cancelled() {
-            return Err(StageItemFailure);
+impl<'a, Cancel: FnMut() -> bool> BoundaryWriter<'a, Cancel> {
+    fn owner(
+        &mut self,
+        site: &ResolutionCandidate,
+    ) -> Result<Option<&'a ResolutionCandidate>, StageItemFailure> {
+        let mut id = &site.symbol_id;
+        for _ in 0..64 {
+            if (self.input.cancelled)() {
+                return Err(StageItemFailure);
+            }
+            if let Some(owner) = self.callables.get(id) {
+                return Ok((owner.file_id == site.file_id
+                    && owner.declaration_span.0 <= site.declaration_span.0
+                    && owner.declaration_span.1 >= site.declaration_span.1)
+                    .then_some(*owner));
+            }
+            let Some(parent) = self.input.index.parents.get(id) else {
+                return Ok(None);
+            };
+            id = parent;
         }
-        if let Some(owner) = callables.get(id) {
-            return Ok((owner.file_id == site.file_id
-                && owner.declaration_span.0 <= site.declaration_span.0
-                && owner.declaration_span.1 >= site.declaration_span.1)
-                .then_some(*owner));
-        }
-        let Some(parent) = index.parents.get(id) else {
-            return Ok(None);
-        };
-        id = parent;
+        Ok(None)
     }
-    Ok(None)
+    fn link(&mut self, edge: DerivedEdgeInput<'_>) -> Result<(), StageItemFailure> {
+        append_derived_edge(self.input.facts, self.input.budget, edge)
+    }
+
+    fn annotate(&mut self, site: &Site<'_>, state: &str) -> Result<(), StageItemFailure> {
+        self.input.budget.charge(128)?;
+        let position = self
+            .positions
+            .get(&site.candidate.symbol_id)
+            .ok_or(StageItemFailure)?;
+        self.input
+            .facts
+            .symbols
+            .get_mut(*position)
+            .ok_or(StageItemFailure)?
+            .signature = format!("boundary-state:{state}");
+        Ok(())
+    }
 }
-fn link<Cancel: FnMut() -> bool>(
-    input: &mut ResolutionMutation<'_, Cancel>,
-    source: &SymbolId,
-    target: &SymbolId,
-    kind: EdgeKind,
-    provenance: &'static str,
-    site: &BoundarySite,
-) -> Result<(), StageItemFailure> {
-    append_derived_edge(
-        input.facts,
-        input.budget,
+
+impl SiteLinks<'_, '_> {
+    fn edge<'a>(
+        &self,
+        source: &'a SymbolId,
+        target: &'a SymbolId,
+        provenance: &'static str,
+    ) -> DerivedEdgeInput<'a> {
         DerivedEdgeInput {
             source_symbol_id: source,
             target_symbol_id: target,
-            kind,
-            confidence: if site.adapter == "next-app-v1" {
+            kind: self.kind,
+            confidence: if self.site.metadata.adapter == "next-app-v1" {
                 0.8
             } else {
                 0.9
             },
             provenance,
-        },
-    )
-}
-fn annotate<Cancel: FnMut() -> bool>(
-    input: &mut ResolutionMutation<'_, Cancel>,
-    positions: &BTreeMap<SymbolId, usize>,
-    site: &Site<'_>,
-    state: &str,
-) -> Result<(), StageItemFailure> {
-    input.budget.charge(128)?;
-    let position = positions
-        .get(&site.candidate.symbol_id)
-        .ok_or(StageItemFailure)?;
-    input
-        .facts
-        .symbols
-        .get_mut(*position)
-        .ok_or(StageItemFailure)?
-        .signature = format!("boundary-state:{state}");
-    Ok(())
+        }
+    }
 }
 fn blocked_next_scopes<Cancel: FnMut() -> bool>(
     input: &mut ResolutionMutation<'_, Cancel>,

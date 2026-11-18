@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     FileInput, NativeDatabase, NumericalSiteInput,
-    retrieval::native::{in_directory, retain, visit_files},
+    retrieval::native::{in_directory, visit_files},
     rocks::{GraphSnapshot, ReadBudget, RocksError},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,7 +27,18 @@ impl NativeDatabase {
             lookup.expected_generation_id(),
             DEFAULT_NUMERICAL_READ_TIMEOUT,
             move |graph, budget| {
-                let mut sites = Vec::new();
+                let mut sites = crate::retrieval::native::RankedRows::new(
+                    usize::from(request.limit),
+                    |a: &NumericalSiteRecord, b| {
+                        (a.hazard == "none_observed")
+                            .cmp(&(b.hazard == "none_observed"))
+                            .then(b.confidence_ppm.cmp(&a.confidence_ppm))
+                            .then(a.path.cmp(&b.path))
+                            .then(a.start_line.cmp(&b.start_line))
+                            .then(a.start_byte.cmp(&b.start_byte))
+                            .then(a.numerical_site_id.cmp(&b.numerical_site_id))
+                    },
+                );
                 let mut total = 0_u64;
                 visit_sites(graph, budget, |site, budget| {
                     if !matches_site(&site, &request) {
@@ -77,22 +88,14 @@ impl NativeDatabase {
                             .map(str::to_owned)
                             .collect(),
                     };
-                    retain(&mut sites, row, usize::from(request.limit), |a, b| {
-                        (a.hazard == "none_observed")
-                            .cmp(&(b.hazard == "none_observed"))
-                            .then(b.confidence_ppm.cmp(&a.confidence_ppm))
-                            .then(a.path.cmp(&b.path))
-                            .then(a.start_line.cmp(&b.start_line))
-                            .then(a.start_byte.cmp(&b.start_byte))
-                            .then(a.numerical_site_id.cmp(&b.numerical_site_id))
-                    });
+                    sites.insert(row);
                     Ok(())
                 })?;
                 Ok(NumericalSitePage {
                     generation_id: generation,
                     total,
                     truncated: total > sites.len() as u64,
-                    sites,
+                    sites: sites.into_vec(),
                 })
             },
         )

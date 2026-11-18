@@ -8,7 +8,10 @@ use codevetra_config as _;
 use codevetra_db::{
     McpMacroStep, McpSessionCallsQuery, McpSessionLookup, McpToolCallData, McpToolCallInput,
     McpToolCallWrite, NativeDatabase, NewMcpMacro, NewMcpSession,
-    rocks::{AsyncProjectStore, StorageRequest, StorageRuntime, StorePolicy, WorkerPolicy},
+    rocks::{
+        AsyncProjectStore, ProjectOpening, StorageRequest, StorageRuntime, StorePolicy,
+        WorkerPolicy,
+    },
 };
 use codevetra_domain::{ContentDigest, ProjectId};
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
@@ -22,14 +25,12 @@ async fn sessions_macros_and_concurrent_trace_steps_are_atomic_and_durable()
     let identity = ContentDigest::from_bytes([42; 32]);
     let request = StorageRequest::new(Duration::from_secs(30))?;
     let runtime = StorageRuntime::new(WorkerPolicy::default())?;
-    let store = AsyncProjectStore::open(
-        &runtime,
+    let opening = ProjectOpening::new(
         root.path().to_owned(),
         identity.clone(),
         StorePolicy::default(),
-        &request,
-    )
-    .await?;
+    );
+    let store = AsyncProjectStore::open(&runtime, opening.clone(), &request).await?;
     let database = NativeDatabase::new(store, &identity);
     let project = database.project_id().clone();
     let session = database
@@ -77,14 +78,7 @@ async fn sessions_macros_and_concurrent_trace_steps_are_atomic_and_durable()
 
     let reopened_runtime = StorageRuntime::new(WorkerPolicy::default())?;
     let reopened = NativeDatabase::new(
-        AsyncProjectStore::open(
-            &reopened_runtime,
-            root.path().to_owned(),
-            identity.clone(),
-            StorePolicy::default(),
-            &request,
-        )
-        .await?,
+        AsyncProjectStore::open(&reopened_runtime, opening, &request).await?,
         &identity,
     );
     let restored = reopened

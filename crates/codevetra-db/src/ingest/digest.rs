@@ -30,6 +30,13 @@ const DIGEST_V24_DOMAIN: &[u8] = b"cartograph-v3-logical-generation-v24";
 const DIGEST_V25_DOMAIN: &[u8] = b"cartograph-v3-logical-generation-v25";
 const DIGEST_V26_DOMAIN: &[u8] = b"cartograph-v3-logical-generation-v26";
 const DIGEST_V27_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v27";
+const DIGEST_V28_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v28";
+const DIGEST_V29_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v29";
+const DIGEST_V30_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v30";
+const DIGEST_V31_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v31";
+const DIGEST_V32_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v32";
+const DIGEST_V33_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v33";
+const DIGEST_V34_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v34";
 
 /// Each digest contract's hash domain, in [`GenerationDigestVersion::ALL`]
 /// order. The length follows `ALL`, so a new contract does not compile until
@@ -62,6 +69,13 @@ const DIGEST_DOMAINS: [&[u8]; GenerationDigestVersion::ALL.len()] = [
     DIGEST_V25_DOMAIN,
     DIGEST_V26_DOMAIN,
     DIGEST_V27_DOMAIN,
+    DIGEST_V28_DOMAIN,
+    DIGEST_V29_DOMAIN,
+    DIGEST_V30_DOMAIN,
+    DIGEST_V31_DOMAIN,
+    DIGEST_V32_DOMAIN,
+    DIGEST_V33_DOMAIN,
+    DIGEST_V34_DOMAIN,
 ];
 
 pub(super) fn logical_digest<Cancel>(
@@ -72,56 +86,19 @@ pub(super) fn logical_digest<Cancel>(
 where
     Cancel: FnMut() -> bool,
 {
-    let mut digest = LogicalDigestBuilder::new(version);
-    digest.begin_files(usize_to_u64(facts.files.len()));
-    push_digest_rows(&facts.files, &mut cancelled, |file| digest.push_file(file))?;
-    digest.begin_symbols(usize_to_u64(facts.symbols.len()));
-    push_digest_rows(&facts.symbols, &mut cancelled, |symbol| {
-        digest.push_symbol(symbol);
-    })?;
-    digest.begin_edges(usize_to_u64(facts.edges.len()));
-    push_digest_rows(&facts.edges, &mut cancelled, |edge| digest.push_edge(edge))?;
-    digest.begin_references(usize_to_u64(facts.references.len()));
-    push_digest_rows(&facts.references, &mut cancelled, |reference| {
-        digest.push_reference(reference);
-    })?;
+    let mut digest = CanonicalDigest::for_generation(version);
+    digest.table(&facts.files, &mut cancelled)?;
+    digest.table(&facts.symbols, &mut cancelled)?;
+    digest.table(&facts.edges, &mut cancelled)?;
+    digest.table(&facts.references, &mut cancelled)?;
     if digest_includes_numerical_sites(version) {
-        digest.begin_numerical_sites(usize_to_u64(facts.numerical_sites.len()));
-        push_digest_rows(&facts.numerical_sites, &mut cancelled, |site| {
-            digest.push_numerical_site(site);
-        })?;
+        digest.table(&facts.numerical_sites, &mut cancelled)?;
     }
-    digest.begin_documents(usize_to_u64(facts.documents.len()));
-    push_digest_rows(&facts.documents, &mut cancelled, |document| {
-        digest.push_document(document);
-    })?;
-    require_digest_not_cancelled(&mut cancelled)?;
-    Ok(digest.finish())
-}
-
-fn push_digest_rows<Row, Cancel, Push>(
-    rows: &[Row],
-    cancelled: &mut Cancel,
-    mut push: Push,
-) -> Result<(), ()>
-where
-    Cancel: FnMut() -> bool,
-    Push: FnMut(&Row),
-{
-    for row in rows {
-        if cancelled() {
-            return Err(());
-        }
-        push(row);
+    digest.table(&facts.documents, &mut cancelled)?;
+    if cancelled() {
+        return Err(());
     }
-    Ok(())
-}
-
-fn require_digest_not_cancelled<Cancel>(cancelled: &mut Cancel) -> Result<(), ()>
-where
-    Cancel: FnMut() -> bool,
-{
-    if cancelled() { Err(()) } else { Ok(()) }
+    Ok(digest.finish().0)
 }
 
 const fn digest_includes_numerical_sites(version: GenerationDigestVersion) -> bool {
@@ -148,159 +125,135 @@ const fn digest_includes_numerical_sites(version: GenerationDigestVersion) -> bo
             | GenerationDigestVersion::V25
             | GenerationDigestVersion::V26
             | GenerationDigestVersion::V27
+            | GenerationDigestVersion::V28
+            | GenerationDigestVersion::V29
+            | GenerationDigestVersion::V30
+            | GenerationDigestVersion::V31
+            | GenerationDigestVersion::V32
+            | GenerationDigestVersion::V33
+            | GenerationDigestVersion::V34
     )
 }
 
-pub(crate) struct LogicalDigestBuilder {
-    digest: CanonicalDigest,
+/// A table's encoded name and row layout are selected together by its type.
+trait CanonicalRow {
+    const SECTION: &'static str;
+    fn encode(&self, digest: &mut CanonicalDigest);
 }
 
-impl LogicalDigestBuilder {
-    pub(crate) fn new(version: GenerationDigestVersion) -> Self {
-        // `ALL` lists every contract, so the fallback is never taken.
-        let domain = GenerationDigestVersion::ALL
-            .iter()
-            .zip(DIGEST_DOMAINS)
-            .find_map(|(candidate, domain)| (*candidate == version).then_some(domain))
-            .unwrap_or(DIGEST_V1_TO_V6_DOMAIN);
-        Self {
-            digest: CanonicalDigest::new(domain),
-        }
+impl CanonicalRow for FileInput {
+    const SECTION: &'static str = "files";
+    fn encode(&self, digest: &mut CanonicalDigest) {
+        digest.text(self.file_id.as_str());
+        digest.text(&self.normalized_path);
+        digest.text(&self.language);
+        digest.text(self.content_hash.as_str());
+        digest.u64(self.byte_size);
+        digest.text(self.parse_status.as_str());
     }
+}
 
-    pub(crate) fn begin_files(&mut self, count: u64) {
-        self.digest.section("files", count);
+impl CanonicalRow for SymbolInput {
+    const SECTION: &'static str = "symbols";
+    fn encode(&self, digest: &mut CanonicalDigest) {
+        digest.text(self.symbol_id.as_str());
+        digest.text(self.file_id.as_str());
+        digest.text(&self.symbol_kind);
+        digest.text(&self.qualified_name);
+        digest.text(&self.signature);
+        digest.u64(self.start_byte);
+        digest.u64(self.end_byte);
+        digest.u32(self.start_line);
+        digest.u32(self.end_line);
+        digest.text(self.structural_digest.as_str());
+        digest.optional_text(self.visibility.map(codevetra_domain::Visibility::as_str));
+        digest.boolean(self.export.exported);
+        digest.boolean(self.export.default_export);
+        digest.boolean(self.execution.async_symbol);
+        digest.boolean(self.execution.static_member);
+        digest.boolean(self.declaration_only);
     }
+}
 
-    pub(crate) fn push_file(&mut self, file: &FileInput) {
-        self.digest.text(file.file_id.as_str());
-        self.digest.text(&file.normalized_path);
-        self.digest.text(&file.language);
-        self.digest.text(file.content_hash.as_str());
-        self.digest.u64(file.byte_size);
-        self.digest.text(file.parse_status.as_str());
+impl CanonicalRow for EdgeInput {
+    const SECTION: &'static str = "edges";
+    fn encode(&self, digest: &mut CanonicalDigest) {
+        digest.text(self.source_symbol_id.as_str());
+        digest.text(self.target_symbol_id.as_str());
+        digest.text(self.kind.as_str());
+        digest.u32(self.confidence.to_bits());
+        digest.text(&self.provenance);
+        digest.u32(self.site_count);
     }
+}
 
-    pub(crate) fn begin_symbols(&mut self, count: u64) {
-        self.digest.section("symbols", count);
-    }
-
-    pub(crate) fn push_symbol(&mut self, symbol: &SymbolInput) {
-        self.digest.text(symbol.symbol_id.as_str());
-        self.digest.text(symbol.file_id.as_str());
-        self.digest.text(&symbol.symbol_kind);
-        self.digest.text(&symbol.qualified_name);
-        self.digest.text(&symbol.signature);
-        self.digest.u64(symbol.start_byte);
-        self.digest.u64(symbol.end_byte);
-        self.digest.u32(symbol.start_line);
-        self.digest.u32(symbol.end_line);
-        self.digest.text(symbol.structural_digest.as_str());
-        self.digest
-            .optional_text(symbol.visibility.map(codevetra_domain::Visibility::as_str));
-        self.digest.boolean(symbol.export.exported);
-        self.digest.boolean(symbol.export.default_export);
-        self.digest.boolean(symbol.execution.async_symbol);
-        self.digest.boolean(symbol.execution.static_member);
-        self.digest.boolean(symbol.declaration_only);
-    }
-
-    pub(crate) fn begin_edges(&mut self, count: u64) {
-        self.digest.section("edges", count);
-    }
-
-    pub(crate) fn push_edge(&mut self, edge: &EdgeInput) {
-        self.digest.text(edge.source_symbol_id.as_str());
-        self.digest.text(edge.target_symbol_id.as_str());
-        self.digest.text(edge.kind.as_str());
-        self.digest.u32(edge.confidence.to_bits());
-        self.digest.text(&edge.provenance);
-        self.digest.u32(edge.site_count);
-    }
-
-    pub(crate) fn begin_references(&mut self, count: u64) {
-        self.digest.section("references", count);
-    }
-
-    pub(crate) fn push_reference(&mut self, reference: &ReferenceInput) {
-        self.digest.text(reference.file_id.as_str());
-        self.digest.optional_text(
-            reference
-                .owner_symbol_id
+impl CanonicalRow for ReferenceInput {
+    const SECTION: &'static str = "references";
+    fn encode(&self, digest: &mut CanonicalDigest) {
+        digest.text(self.file_id.as_str());
+        digest.optional_text(
+            self.owner_symbol_id
                 .as_ref()
                 .map(codevetra_domain::SymbolId::as_str),
         );
-        self.digest.optional_text(
-            reference
-                .target_symbol_id
+        digest.optional_text(
+            self.target_symbol_id
                 .as_ref()
                 .map(codevetra_domain::SymbolId::as_str),
         );
-        self.digest.text(&reference.reference_name);
-        self.digest.text(&reference.reference_kind);
-        self.digest.u64(reference.start_byte);
-        self.digest.u64(reference.end_byte);
-        self.digest.u32(reference.confidence.to_bits());
-        self.digest.text(&reference.resolution_provenance);
-        self.digest.u32(reference.site_count);
-        self.digest.text(reference.span_precision.as_str());
+        digest.text(&self.reference_name);
+        digest.text(&self.reference_kind);
+        digest.u64(self.start_byte);
+        digest.u64(self.end_byte);
+        digest.u32(self.confidence.to_bits());
+        digest.text(&self.resolution_provenance);
+        digest.u32(self.site_count);
+        digest.text(self.span_precision.as_str());
     }
+}
 
-    pub(crate) fn begin_numerical_sites(&mut self, count: u64) {
-        self.digest.section("numerical_sites", count);
-    }
-
-    pub(crate) fn push_numerical_site(&mut self, site: &NumericalSiteInput) {
-        self.digest.text(site.site_id.as_str());
-        self.digest.text(site.file_id.as_str());
-        self.digest.optional_text(
-            site.owner_symbol_id
+impl CanonicalRow for NumericalSiteInput {
+    const SECTION: &'static str = "numerical_sites";
+    fn encode(&self, digest: &mut CanonicalDigest) {
+        digest.text(self.site_id.as_str());
+        digest.text(self.file_id.as_str());
+        digest.optional_text(
+            self.owner_symbol_id
                 .as_ref()
                 .map(codevetra_domain::SymbolId::as_str),
         );
-        self.digest.u64(site.start_byte);
-        self.digest.u64(site.end_byte);
-        self.digest.u32(site.start_line);
-        self.digest.u32(site.end_line);
-        self.digest.text(&site.operation);
-        self.digest.text(&site.hazard);
-        self.digest.text(&site.precision);
-        self.digest.text(site.expression_digest.as_str());
-        self.digest.u32(site.confidence_ppm);
-        self.digest.text(&site.provenance);
-        self.digest.text(&site.evidence_level);
-        self.digest.text(&site.unknowns);
+        digest.u64(self.start_byte);
+        digest.u64(self.end_byte);
+        digest.u32(self.start_line);
+        digest.u32(self.end_line);
+        digest.text(&self.operation);
+        digest.text(&self.hazard);
+        digest.text(&self.precision);
+        digest.text(self.expression_digest.as_str());
+        digest.u32(self.confidence_ppm);
+        digest.text(&self.provenance);
+        digest.text(&self.evidence_level);
+        digest.text(&self.unknowns);
     }
+}
 
-    pub(crate) fn begin_documents(&mut self, count: u64) {
-        self.digest.section("search_documents", count);
-    }
-
-    pub(crate) fn push_document(&mut self, document: &CanonicalSearchDocument) {
-        self.digest.text(document.document_id.as_str());
-        self.digest.optional_text(
-            document
-                .file_id
-                .as_ref()
-                .map(codevetra_domain::FileId::as_str),
-        );
-        self.digest.optional_text(
-            document
-                .symbol_id
+impl CanonicalRow for CanonicalSearchDocument {
+    const SECTION: &'static str = "search_documents";
+    fn encode(&self, digest: &mut CanonicalDigest) {
+        digest.text(self.document_id.as_str());
+        digest.optional_text(self.file_id.as_ref().map(codevetra_domain::FileId::as_str));
+        digest.optional_text(
+            self.symbol_id
                 .as_ref()
                 .map(codevetra_domain::SymbolId::as_str),
         );
-        self.digest.text(&document.path);
-        self.digest.text(&document.language);
-        self.digest.text(document.kind.as_str());
-        self.digest.text(&document.qualified_name);
-        self.digest.text(&document.code);
-        self.digest.text(&document.natural_text);
-        self.digest.text(&document.metadata_json);
-    }
-
-    pub(crate) fn finish(self) -> ContentDigest {
-        self.digest.finish().0
+        digest.text(&self.path);
+        digest.text(&self.language);
+        digest.text(self.kind.as_str());
+        digest.text(&self.qualified_name);
+        digest.text(&self.code);
+        digest.text(&self.natural_text);
+        digest.text(&self.metadata_json);
     }
 }
 
@@ -318,6 +271,31 @@ struct CanonicalDigest {
 }
 
 impl CanonicalDigest {
+    fn for_generation(version: GenerationDigestVersion) -> Self {
+        // `ALL` lists every contract, so the fallback is never taken.
+        let domain = GenerationDigestVersion::ALL
+            .iter()
+            .zip(DIGEST_DOMAINS)
+            .find_map(|(candidate, domain)| (*candidate == version).then_some(domain))
+            .unwrap_or(DIGEST_V1_TO_V6_DOMAIN);
+        Self::new(domain)
+    }
+
+    fn table<Row: CanonicalRow>(
+        &mut self,
+        rows: &[Row],
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(), ()> {
+        self.section(Row::SECTION, usize_to_u64(rows.len()));
+        for row in rows {
+            if cancelled() {
+                return Err(());
+            }
+            row.encode(self);
+        }
+        Ok(())
+    }
+
     fn new(domain: &[u8]) -> Self {
         let mut hasher = Hasher::new();
         hasher.update(domain);
@@ -415,6 +393,63 @@ impl CanonicalDigest {
 mod tests {
     use super::CanonicalDigest;
     use codevetra_domain::ContentDigest;
+
+    #[test]
+    fn typed_edge_table_preserves_its_name_count_and_exact_row_bytes() {
+        let source = codevetra_domain::SymbolId::parse("11111111-1111-4111-8111-111111111111")
+            .unwrap_or_else(|error| panic!("source: {error}"));
+        let target = codevetra_domain::SymbolId::parse("22222222-2222-4222-8222-222222222222")
+            .unwrap_or_else(|error| panic!("target: {error}"));
+        let rows = [super::EdgeInput {
+            source_symbol_id: source,
+            target_symbol_id: target,
+            kind: codevetra_domain::EdgeKind::Calls,
+            confidence: 0.75,
+            provenance: "syntax".to_owned(),
+            site_count: 7,
+        }];
+        let mut digest = CanonicalDigest::new(b"typed-table");
+        assert_eq!(digest.table(&rows, &mut || false), Ok(()));
+        let encoded = concat!(
+            "5\x00edges1\x001",
+            "36\x0011111111-1111-4111-8111-111111111111",
+            "36\x0022222222-2222-4222-8222-222222222222",
+            "5\x00calls\x3f\x40\x00\x00",
+            "6\x00syntax\x00\x00\x00\x07",
+        )
+        .as_bytes();
+        let mut oracle = blake3::Hasher::new();
+        oracle.update(b"typed-table");
+        oracle.update(encoded);
+        assert_eq!(
+            digest.finish(),
+            (
+                ContentDigest::from_bytes(*oracle.finalize().as_bytes()),
+                encoded.len() as u64
+            )
+        );
+
+        let mut cancelled = CanonicalDigest::new(b"typed-table");
+        assert_eq!(cancelled.table(&rows, &mut || true), Err(()));
+        // Cancellation is checked after the table header and before the first row.
+        assert_eq!(cancelled.finish().1, 10);
+    }
+
+    #[test]
+    fn empty_generation_digest_still_checks_final_cancellation() {
+        let facts = super::ValidatedFactTables {
+            files: Vec::new(),
+            symbols: Vec::new(),
+            edges: Vec::new(),
+            references: Vec::new(),
+            numerical_sites: Vec::new(),
+            documents: Vec::new(),
+        };
+        for version in codevetra_domain::GenerationDigestVersion::ALL {
+            assert!(super::logical_digest(&facts, version, || true).is_err());
+            assert!(super::logical_digest(&facts, version, || false).is_ok());
+        }
+    }
 
     #[test]
     fn canonical_wire_format_preserves_lengths_markers_and_integer_widths() {

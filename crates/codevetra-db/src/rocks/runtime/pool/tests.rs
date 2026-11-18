@@ -50,13 +50,17 @@ async fn hold_reserving(pool: &Arc<StoragePool>, mutation: bool, reservation: u3
     let pool = Arc::clone(pool);
     let request = request()?;
     let task = tokio::spawn(async move {
-        pool.run(&request, reservation, mutation, move |_| {
-            let _notified = send_started.send(());
-            released
-                .recv_timeout(Duration::from_secs(5))
-                .map_err(|_| operation("test_gate"))?;
-            Ok(42)
-        })
+        pool.run(
+            &request,
+            JobCapacity::new(reservation, mutation),
+            move |_| {
+                let _notified = send_started.send(());
+                released
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| operation("test_gate"))?;
+                Ok(42)
+            },
+        )
         .await
     });
     tokio::time::timeout(Duration::from_secs(2), started)
@@ -74,7 +78,7 @@ async fn queued_cancellation_is_prompt_and_does_not_execute_the_operation() -> T
     let called = Arc::new(AtomicBool::new(false));
     let invoked = Arc::clone(&called);
     let request = request()?;
-    let mut queued = Box::pin(pool.run(&request, 1, false, move |_| {
+    let mut queued = Box::pin(pool.run(&request, JobCapacity::read(1), move |_| {
         invoked.store(true, Ordering::Release);
         Ok(99)
     }));
@@ -98,7 +102,7 @@ async fn dropping_a_queued_future_releases_its_job_and_memory_admission() -> Tes
     let first = hold(&pool, false).await?;
     let second = hold(&pool, false).await?;
     let request = request()?;
-    let mut queued = Box::pin(pool.run(&request, 4_096, false, |_| Ok(99)));
+    let mut queued = Box::pin(pool.run(&request, JobCapacity::read(4_096), |_| Ok(99)));
     assert!(futures_util::poll!(queued.as_mut()).is_pending());
     assert_eq!(pool.slots.available_permits(), 1);
     drop(queued);
@@ -116,9 +120,9 @@ async fn waiting_writers_leave_worker_and_queue_capacity_for_reads() -> TestResu
     let pool = pool()?;
     let first = hold(&pool, true).await?;
     let request = request()?;
-    let mut waiting_writer = Box::pin(pool.run(&request, 1, true, |_| Ok(7)));
+    let mut waiting_writer = Box::pin(pool.run(&request, JobCapacity::write(1), |_| Ok(7)));
     assert!(futures_util::poll!(waiting_writer.as_mut()).is_pending());
-    let read = pool.run(&request, 1, false, |_| Ok(99)).await;
+    let read = pool.run(&request, JobCapacity::read(1), |_| Ok(99)).await;
     first.finish().await?;
     assert_eq!(waiting_writer.await?, 7);
     pool.close();
@@ -137,7 +141,7 @@ async fn cancellation_during_started_native_work_preserves_its_actual_result() -
     let task_pool = Arc::clone(&pool);
     let task = tokio::spawn(async move {
         task_pool
-            .run(&task_request, 1, true, move |_| {
+            .run(&task_request, JobCapacity::write(1), move |_| {
                 let _entered = entered.send(());
                 released
                     .recv_timeout(Duration::from_secs(5))
@@ -162,7 +166,8 @@ async fn byte_admission_is_released_after_cancellation_and_oversize_is_rejected(
     let pool = pool()?;
     let request = request()?;
     assert_eq!(
-        pool.run(&request, 1_048_577, false, |_| Ok(1)).await,
+        pool.run(&request, JobCapacity::read(1_048_577), |_| Ok(1))
+            .await,
         Err(RocksError::Limit {
             resource: "worker_bytes"
         })
@@ -170,7 +175,7 @@ async fn byte_admission_is_released_after_cancellation_and_oversize_is_rejected(
     let (admitted, returned) = oneshot::channel();
     let held = hold_reserving(&pool, false, 1_048_576).await?;
     let cancel = StorageRequest::new(Duration::from_secs(1))?;
-    let mut waiting = Box::pin(pool.run(&cancel, 1, false, move |_| {
+    let mut waiting = Box::pin(pool.run(&cancel, JobCapacity::read(1), move |_| {
         let _admitted = admitted.send(());
         Ok(99)
     }));
@@ -179,7 +184,11 @@ async fn byte_admission_is_released_after_cancellation_and_oversize_is_rejected(
     assert_eq!(waiting.await, Err(RocksError::Cancelled));
     assert_eq!(held.finish().await?, 42);
     assert!(returned.await.is_err());
-    assert_eq!(pool.run(&request, 1_048_576, false, |_| Ok(7)).await?, 7);
+    assert_eq!(
+        pool.run(&request, JobCapacity::read(1_048_576), |_| Ok(7))
+            .await?,
+        7
+    );
     pool.close();
     pool.drain(&drain_request()?).await?;
     Ok(())
@@ -206,7 +215,7 @@ async fn shutdown_drains_started_work_and_runs_finalization_on_a_storage_thread(
     draining.await?;
     assert!(finalized.load(Ordering::Acquire));
     assert_eq!(
-        pool.run(&request()?, 1, false, |_| Ok(1)).await,
+        pool.run(&request()?, JobCapacity::read(1), |_| Ok(1)).await,
         Err(RocksError::Closed)
     );
     Ok(())

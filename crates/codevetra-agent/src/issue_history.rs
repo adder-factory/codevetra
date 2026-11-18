@@ -127,7 +127,7 @@ impl ProjectRuntime {
             .await
     }
 
-    pub(crate) async fn prepare_issue_history(
+    async fn prepare_issue_history(
         &self,
         options: IssueHistoryIndexOptions,
         cancellation: ProjectCancellation,
@@ -152,7 +152,7 @@ impl ProjectRuntime {
         })
     }
 
-    pub(crate) async fn persist_issue_history(
+    async fn persist_issue_history(
         &self,
         project_id: ProjectId,
         generation_id: GenerationId,
@@ -328,7 +328,7 @@ async fn load_issue_commits(
     parse_issue_commits(&output.stdout, maximum_commits)
 }
 
-pub(crate) struct PreparedIssueHistory {
+struct PreparedIssueHistory {
     head: String,
     commits_scanned: u64,
     tagged_commits: u64,

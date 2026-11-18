@@ -9,17 +9,18 @@ async fn state_readers_keep_one_snapshot_while_writer_publishes() -> TestResult 
     let runtime = StorageRuntime::new(WorkerPolicy::default())?;
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        digest(1),
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            digest(1),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
+    let initial_input = input(1, facts(2, vec![edge(1, 2, "before")])?)?;
     store
-        .publish_graph(
-            input(1, facts(2, vec![edge(1, 2, "before")])?)?,
-            &request()?,
-        )
+        .with_request(&request()?)
+        .publish_graph(initial_input)
         .await?;
     let mut tasks = tokio::task::JoinSet::new();
     let mut gates = Vec::new();
@@ -31,13 +32,14 @@ async fn state_readers_keep_one_snapshot_while_writer_publishes() -> TestResult 
         started.push(entered);
         let store = store.clone();
         tasks.spawn(async move {
+            let request_bound_access =
+                codevetra_db::rocks::StateAccess::read_only(Some(generation(1)));
+            let request_bound_budget = ReadBudget::new(100, 1_048_576, Duration::from_secs(20))?;
             store
+                .with_request(&StorageRequest::new(Duration::from_secs(20))?)
                 .state(
-                    Some(generation(1)),
-                    ReadBudget::new(100, 1_048_576, Duration::from_secs(20))?,
-                    0,
-                    0,
-                    &StorageRequest::new(Duration::from_secs(20))?,
+                    request_bound_access,
+                    request_bound_budget,
                     move |transaction, budget| {
                         let before = transaction
                             .current()?
@@ -52,13 +54,9 @@ async fn state_readers_keep_one_snapshot_while_writer_publishes() -> TestResult 
                             .generation_id;
                         let snapshot = transaction.graph_snapshot()?;
                         let graph = snapshot.graph(budget)?;
-                        let links = graph.neighbors(
-                            &symbol(1),
-                            GraphDirection::Outgoing,
-                            None,
-                            10,
-                            budget,
-                        )?;
+                        let links = graph
+                            .adjacency(&symbol(1), GraphDirection::Outgoing)
+                            .page(None, 10, budget)?;
                         let edge = graph
                             .edge(links.links.first().ok_or(RocksError::Transition)?, budget)?;
                         let value = transaction.get(
@@ -92,10 +90,14 @@ async fn state_readers_keep_one_snapshot_while_writer_publishes() -> TestResult 
         assert_eq!(provenance, "before");
         assert_eq!(value, None);
     }
+    let read_budget = budget()?;
     let current = store
-        .state(None, budget()?, 0, 0, &request()?, |transaction, _| {
-            transaction.current()
-        })
+        .with_request(&request()?)
+        .state(
+            codevetra_db::rocks::StateAccess::read_only(None),
+            read_budget,
+            |transaction, _| transaction.current(),
+        )
         .await?
         .ok_or("current missing")?;
     assert_eq!(current.generation_id, generation(2));
@@ -104,21 +106,28 @@ async fn state_readers_keep_one_snapshot_while_writer_publishes() -> TestResult 
 }
 
 async fn publish_update(store: &AsyncProjectStore) -> TestResult {
-    store
-        .publish_graph(input(2, facts(2, vec![edge(1, 2, "after")])?)?, &request()?)
-        .await?;
-    store
-        .state(
-            Some(generation(2)),
-            budget()?,
-            4096,
-            1,
-            &request()?,
-            |transaction, _| {
-                transaction.put(StateNamespace::Metadata, b"concurrent-write", vec![1])
-            },
-        )
-        .await?;
+    {
+        let request_bound_input = input(2, facts(2, vec![edge(1, 2, "after")])?)?;
+        store
+            .with_request(&request()?)
+            .publish_graph(request_bound_input)
+            .await
+    }?;
+    {
+        let request_bound_access =
+            codevetra_db::rocks::StateAccess::write(Some(generation(2)), 4096, 1);
+        let request_bound_budget = budget()?;
+        store
+            .with_request(&request()?)
+            .state(
+                request_bound_access,
+                request_bound_budget,
+                |transaction, _| {
+                    transaction.put(StateNamespace::Metadata, b"concurrent-write", vec![1])
+                },
+            )
+            .await
+    }?;
     Ok(())
 }
 
@@ -128,81 +137,94 @@ async fn native_multiget_preserves_input_order_and_transaction_local_overrides()
     let runtime = StorageRuntime::new(WorkerPolicy::default())?;
     let store = AsyncProjectStore::open(
         &runtime,
-        root.path().to_owned(),
-        digest(1),
-        StorePolicy::default(),
+        codevetra_db::rocks::ProjectOpening::new(
+            root.path().to_owned(),
+            digest(1),
+            StorePolicy::default(),
+        ),
         &request()?,
     )
     .await?;
-    store
-        .state(
-            None,
-            budget()?,
-            4096,
-            4,
-            &request()?,
-            |transaction, budget| {
-                transaction.put(StateNamespace::Metadata, b"one", vec![1])?;
-                transaction.put(StateNamespace::Metadata, b"two", vec![2])?;
-                assert_eq!(
-                    transaction.get_many(
-                        StateNamespace::Metadata,
-                        &[
-                            b"two".to_vec(),
-                            b"one".to_vec(),
-                            b"two".to_vec(),
-                            b"none".to_vec()
-                        ],
-                        budget
-                    )?,
-                    vec![Some(vec![2]), Some(vec![1]), Some(vec![2]), None]
-                );
-                transaction.delete(StateNamespace::Metadata, b"one")?;
-                assert_eq!(
-                    transaction.get_many(
-                        StateNamespace::Metadata,
-                        &[b"one".to_vec(), b"two".to_vec()],
-                        budget
-                    )?,
-                    vec![None, Some(vec![2])]
-                );
-                assert!(
-                    transaction
-                        .get_many(StateNamespace::Metadata, &[], budget)
-                        .is_err()
-                );
-                assert!(
-                    transaction
-                        .get_many(
+    {
+        let request_bound_access = codevetra_db::rocks::StateAccess::write(None, 4096, 4);
+        let request_bound_budget = budget()?;
+        store
+            .with_request(&request()?)
+            .state(
+                request_bound_access,
+                request_bound_budget,
+                |transaction, budget| {
+                    transaction.put(StateNamespace::Metadata, b"one", vec![1])?;
+                    transaction.put(StateNamespace::Metadata, b"two", vec![2])?;
+                    assert_eq!(
+                        transaction.get_many(
                             StateNamespace::Metadata,
-                            &vec![b"two".to_vec(); 129],
+                            &[
+                                b"two".to_vec(),
+                                b"one".to_vec(),
+                                b"two".to_vec(),
+                                b"none".to_vec()
+                            ],
                             budget
-                        )
-                        .is_err()
-                );
-                Ok(())
-            },
-        )
-        .await?;
-    store
-        .state(None, budget()?, 0, 0, &request()?, |transaction, budget| {
-            assert_eq!(
-                transaction.get_many(
-                    StateNamespace::Metadata,
-                    &[b"one".to_vec(), b"two".to_vec()],
-                    budget
-                )?,
-                vec![None, Some(vec![2])]
-            );
-            let mut tiny = ReadBudget::new(10, 1, Duration::from_secs(5))?;
-            assert!(
-                transaction
-                    .get_many(StateNamespace::Metadata, &[b"two".to_vec()], &mut tiny)
-                    .is_err()
-            );
-            Ok(())
-        })
-        .await?;
+                        )?,
+                        vec![Some(vec![2]), Some(vec![1]), Some(vec![2]), None]
+                    );
+                    transaction.delete(StateNamespace::Metadata, b"one")?;
+                    assert_eq!(
+                        transaction.get_many(
+                            StateNamespace::Metadata,
+                            &[b"one".to_vec(), b"two".to_vec()],
+                            budget
+                        )?,
+                        vec![None, Some(vec![2])]
+                    );
+                    assert!(
+                        transaction
+                            .get_many(StateNamespace::Metadata, &[], budget)
+                            .is_err()
+                    );
+                    assert!(
+                        transaction
+                            .get_many(
+                                StateNamespace::Metadata,
+                                &vec![b"two".to_vec(); 129],
+                                budget
+                            )
+                            .is_err()
+                    );
+                    Ok(())
+                },
+            )
+            .await
+    }?;
+    {
+        let request_bound_access = codevetra_db::rocks::StateAccess::read_only(None);
+        let request_bound_budget = budget()?;
+        store
+            .with_request(&request()?)
+            .state(
+                request_bound_access,
+                request_bound_budget,
+                |transaction, budget| {
+                    assert_eq!(
+                        transaction.get_many(
+                            StateNamespace::Metadata,
+                            &[b"one".to_vec(), b"two".to_vec()],
+                            budget
+                        )?,
+                        vec![None, Some(vec![2])]
+                    );
+                    let mut tiny = ReadBudget::new(10, 1, Duration::from_secs(5))?;
+                    assert!(
+                        transaction
+                            .get_many(StateNamespace::Metadata, &[b"two".to_vec()], &mut tiny)
+                            .is_err()
+                    );
+                    Ok(())
+                },
+            )
+            .await
+    }?;
     runtime.shutdown(&request()?).await?;
     Ok(())
 }

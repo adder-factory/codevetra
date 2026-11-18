@@ -1,5 +1,4 @@
 use std::{
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,8 +10,8 @@ use codevetra_domain::{ContentDigest, GenerationDigestVersion, GenerationId};
 use tokio::sync::{Notify, watch};
 
 use super::{
-    ProjectStore, PruneReport, ReadBudget, RecordChange, Result, RevisionSnapshot, RevisionWriter,
-    RocksError, StorePolicy, StoredRevision,
+    ProjectOpening, ProjectStore, PruneReport, ReadBudget, RecordChange, Result, RevisionSnapshot,
+    RevisionWriter, RocksError, StoredRevision,
 };
 
 mod group;
@@ -23,7 +22,7 @@ mod projects;
 mod tests;
 
 use group::StageGroup;
-use pool::StoragePool;
+use pool::{JobCapacity, StoragePool};
 use projects::{ProjectAccess, Projects};
 
 /// Finite foreground concurrency and admission for one project owner.
@@ -41,13 +40,35 @@ pub struct WorkerPolicy {
     pub pending_bytes: u32,
 }
 
+impl WorkerPolicy {
+    const DEFAULT: Self = Self {
+        threads: 4,
+        pending_jobs: 32,
+        pending_bytes: 256 * 1_048_576,
+    };
+    const MINIMUM_THREADS: u8 = 2;
+    const MAXIMUM_THREADS: u8 = 16;
+    const MAXIMUM_PENDING_JOBS: u16 = 1_024;
+    const MINIMUM_PENDING_BYTES: u32 = 1_048_576;
+    const MAXIMUM_PENDING_BYTES: u32 = 512 * 1_048_576;
+
+    fn validate(self) -> Result<Self> {
+        if !(Self::MINIMUM_THREADS..=Self::MAXIMUM_THREADS).contains(&self.threads)
+            || !(u16::from(self.threads)..=Self::MAXIMUM_PENDING_JOBS).contains(&self.pending_jobs)
+            || !(Self::MINIMUM_PENDING_BYTES..=Self::MAXIMUM_PENDING_BYTES)
+                .contains(&self.pending_bytes)
+        {
+            return Err(RocksError::Limit {
+                resource: "worker_policy",
+            });
+        }
+        Ok(self)
+    }
+}
+
 impl Default for WorkerPolicy {
     fn default() -> Self {
-        Self {
-            threads: 4,
-            pending_jobs: 32,
-            pending_bytes: 256 * 1_048_576,
-        }
+        Self::DEFAULT
     }
 }
 
@@ -379,45 +400,91 @@ impl AsyncRevisionWriter {
     }
 }
 
+/// A borrowed project handle bound to one parent request's control and deadline.
+///
+/// Each operation still receives a separate worker admission, child control,
+/// and snapshot. This view owns no worker, writer, reservation, or transaction.
+#[derive(Clone, Copy)]
+pub struct RequestedProject<'a> {
+    store: &'a AsyncProjectStore,
+    request: &'a StorageRequest,
+}
+
 impl AsyncProjectStore {
+    /// Bind subsequent operations to this project and parent request.
+    /// Construction performs no validation, admission, or native work.
+    #[must_use]
+    pub const fn with_request<'a>(&'a self, request: &'a StorageRequest) -> RequestedProject<'a> {
+        RequestedProject {
+            store: self,
+            request,
+        }
+    }
+
+    /// Open one project database without blocking a Tokio executor thread.
+    ///
+    /// # Errors
+    /// Returns policy, directory, ownership, lock, deadline, or worker errors.
+    pub async fn open(
+        runtime: &StorageRuntime,
+        opening: ProjectOpening,
+        request: &StorageRequest,
+    ) -> Result<Self> {
+        let pool = Arc::clone(&runtime.pool);
+        let projects = Arc::clone(&runtime.projects);
+        let project = pool
+            .run(request, JobCapacity::write(64 * 1_024), move |control| {
+                projects.open(opening, &control)
+            })
+            .await?;
+        Ok(Self {
+            project,
+            pool,
+            #[cfg(test)]
+            state_gate: Arc::default(),
+            #[cfg(test)]
+            graph_reclaim_gate: Arc::default(),
+        })
+    }
+}
+
+impl RequestedProject<'_> {
     /// Run one atomic mutable-state transaction on an owned storage worker.
     /// Graph-derived writes can require the exact current generation. Saved
     /// sessions and notes remain usable before the first graph is published.
     /// # Errors
     /// Returns admission, generation-fence, read/write bounds, or storage errors.
     pub async fn state<T, F>(
-        &self,
-        expected: Option<GenerationId>,
+        self,
+        access: super::StateAccess,
         budget: ReadBudget,
-        maximum_write_bytes: u32,
-        maximum_write_rows: u32,
-        request: &StorageRequest,
         operation: F,
     ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut super::StateTransaction<'_>, &mut ReadBudget) -> Result<T> + Send + 'static,
     {
-        let reservation = budget
-            .reservation_bytes()?
-            .checked_add(
-                maximum_write_bytes
-                    .checked_mul(3)
-                    .ok_or(RocksError::Limit {
+        let store = self.store;
+        let request = self.request;
+        let reservation =
+            budget
+                .reservation_bytes()?
+                .checked_add(access.maximum_write_bytes.checked_mul(3).ok_or(
+                    RocksError::Limit {
                         resource: "worker_bytes",
-                    })?,
-            )
-            .ok_or(RocksError::Limit {
-                resource: "worker_bytes",
-            })?;
-        let project = self.project.clone();
+                    },
+                )?)
+                .ok_or(RocksError::Limit {
+                    resource: "worker_bytes",
+                })?;
+        let project = store.project.clone();
         #[cfg(test)]
-        let state_gate = self.state_gate.clone();
-        self.pool
+        let state_gate = store.state_gate.clone();
+        store
+            .pool
             .run(
                 request,
-                reservation,
-                maximum_write_rows != 0,
+                JobCapacity::new(reservation, access.maximum_write_rows != 0),
                 move |control| {
                     #[cfg(test)]
                     let gate = {
@@ -426,7 +493,7 @@ impl AsyncProjectStore {
                             .map_err(|_| super::operation("fixture-gate"))?;
                         if gate
                             .as_ref()
-                            .is_some_and(|gate| gate.write_rows == maximum_write_rows)
+                            .is_some_and(|gate| gate.write_rows == access.maximum_write_rows)
                         {
                             gate.take()
                         } else {
@@ -443,13 +510,7 @@ impl AsyncProjectStore {
                     };
                     let result = project.run(&control, |store| {
                         let mut budget = budget.with_control(control.clone());
-                        store.state(
-                            expected.as_ref(),
-                            maximum_write_bytes as usize,
-                            maximum_write_rows as usize,
-                            &mut budget,
-                            operation,
-                        )
+                        store.state(&access, &mut budget, operation)
                     });
                     #[cfg(test)]
                     if let Some(gate) = gate {
@@ -469,21 +530,21 @@ impl AsyncProjectStore {
     /// # Errors
     /// Returns admission, stale-base, request, format, or native storage errors.
     pub async fn publish_graph(
-        &self,
+        self,
         input: super::GraphPublicationInput,
-        request: &StorageRequest,
     ) -> std::result::Result<super::GraphPublication, super::GraphPublicationError> {
+        let store = self.store;
+        let request = self.request;
         let bytes = input.reservation_bytes()?;
         let maximum_reclamation = input.reclaimable_bytes()?;
-        let project = self.project.clone();
+        let project = store.project.clone();
         #[cfg(test)]
-        let graph_reclaim_gate = self.graph_reclaim_gate.clone();
-        self.pool
+        let graph_reclaim_gate = store.graph_reclaim_gate.clone();
+        store
+            .pool
             .run_reclaiming(
                 request,
-                bytes,
-                true,
-                maximum_reclamation,
+                JobCapacity::write(bytes).reclaiming(maximum_reclamation),
                 move |control, credit| {
                     #[cfg(test)]
                     let mut gate = graph_reclaim_gate
@@ -507,49 +568,22 @@ impl AsyncProjectStore {
             .await?
     }
 
-    /// Open one project database without blocking a Tokio executor thread.
-    ///
-    /// # Errors
-    /// Returns policy, directory, ownership, lock, deadline, or worker errors.
-    pub async fn open(
-        runtime: &StorageRuntime,
-        project_root: PathBuf,
-        project_identity: ContentDigest,
-        store_policy: StorePolicy,
-        request: &StorageRequest,
-    ) -> Result<Self> {
-        let pool = Arc::clone(&runtime.pool);
-        let projects = Arc::clone(&runtime.projects);
-        let project = pool
-            .run(request, 64 * 1_024, true, move |control| {
-                projects.open(&project_root, project_identity, store_policy, &control)
-            })
-            .await?;
-        Ok(Self {
-            project,
-            pool,
-            #[cfg(test)]
-            state_gate: Arc::default(),
-            #[cfg(test)]
-            graph_reclaim_gate: Arc::default(),
-        })
-    }
-
     /// Reserve one revision on a blocking storage worker.
     ///
     /// # Errors
     /// Returns ownership, lifecycle, admission, or request errors.
     pub async fn begin_revision(
-        &self,
+        self,
         generation_id: GenerationId,
         source_revision: ContentDigest,
         lease_duration: Duration,
-        request: &StorageRequest,
     ) -> Result<AsyncRevisionWriter> {
-        let project = self.project.clone();
-        let writer = self
+        let store = self.store;
+        let request = self.request;
+        let project = store.project.clone();
+        let writer = store
             .pool
-            .run(request, 4_096, true, move |control| {
+            .run(request, JobCapacity::write(4_096), move |control| {
                 project.run(&control, |store| {
                     store.begin_revision(generation_id, source_revision, lease_duration)
                 })
@@ -566,11 +600,12 @@ impl AsyncProjectStore {
     /// # Errors
     /// Rejects sealed/draining writers and propagates native/request errors.
     pub async fn stage(
-        &self,
+        self,
         writer: &AsyncRevisionWriter,
         changes: Vec<RecordChange>,
-        request: &StorageRequest,
     ) -> Result<StoredRevision> {
+        let store = self.store;
+        let request = self.request;
         let registration = writer.group.register()?;
         let mut bytes = super::engine::MAXIMUM_RECORD_BYTES * 2 + 4_096;
         for change in &changes {
@@ -583,10 +618,11 @@ impl AsyncProjectStore {
         let bytes = u32::try_from(bytes).map_err(|_| RocksError::Limit {
             resource: "worker_bytes",
         })?;
-        let project = self.project.clone();
+        let project = store.project.clone();
         let writer = writer.writer.clone();
-        self.pool
-            .run(request, bytes, true, move |control| {
+        store
+            .pool
+            .run(request, JobCapacity::write(bytes), move |control| {
                 let mut registration = registration;
                 let result = project.run(&control, |store| {
                     store.stage_controlled(&writer, &changes, Some(&control))
@@ -603,17 +639,19 @@ impl AsyncProjectStore {
     /// Returns drain/deadline, fence, lifecycle, or native errors. A stopped
     /// drain stays closed and can be retried with a fresh request.
     pub async fn seal(
-        &self,
+        self,
         writer: &AsyncRevisionWriter,
         content_digest: ContentDigest,
         digest_version: GenerationDigestVersion,
-        request: &StorageRequest,
     ) -> Result<StoredRevision> {
+        let store = self.store;
+        let request = self.request;
         writer.group.close_and_drain(request, true).await?;
-        let project = self.project.clone();
+        let project = store.project.clone();
         let writer = writer.writer.clone();
-        self.pool
-            .run(request, 4_096, true, move |control| {
+        store
+            .pool
+            .run(request, JobCapacity::write(4_096), move |control| {
                 project.run(&control, |store| {
                     store.seal(&writer, content_digest, digest_version)
                 })
@@ -625,15 +663,14 @@ impl AsyncProjectStore {
     ///
     /// # Errors
     /// Returns request, fence, lifecycle, or native storage errors.
-    pub async fn publish(
-        &self,
-        writer: &AsyncRevisionWriter,
-        request: &StorageRequest,
-    ) -> Result<StoredRevision> {
-        let project = self.project.clone();
+    pub async fn publish(self, writer: &AsyncRevisionWriter) -> Result<StoredRevision> {
+        let store = self.store;
+        let request = self.request;
+        let project = store.project.clone();
         let writer = writer.writer.clone();
-        self.pool
-            .run(request, 4_096, true, move |control| {
+        store
+            .pool
+            .run(request, JobCapacity::write(4_096), move |control| {
                 project.run(&control, |store| store.publish(&writer))
             })
             .await
@@ -649,26 +686,32 @@ impl AsyncProjectStore {
     /// # Errors
     /// Returns generation, request, read-budget, or native storage errors.
     pub async fn read<T, F>(
-        &self,
+        self,
         expected: Option<GenerationId>,
         budget: ReadBudget,
-        request: &StorageRequest,
         read: F,
     ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&RevisionSnapshot<'_>, &mut ReadBudget) -> Result<T> + Send + 'static,
     {
-        let project = self.project.clone();
+        let store = self.store;
+        let request = self.request;
+        let project = store.project.clone();
         let reservation_bytes = budget.reservation_bytes()?;
-        self.pool
-            .run(request, reservation_bytes, false, move |control| {
-                project.run(&control, |store| {
-                    let snapshot = store.current_snapshot(expected.as_ref())?;
-                    let mut budget = budget.with_control(control.clone());
-                    read(&snapshot, &mut budget)
-                })
-            })
+        store
+            .pool
+            .run(
+                request,
+                JobCapacity::read(reservation_bytes),
+                move |control| {
+                    project.run(&control, |store| {
+                        let snapshot = store.current_snapshot(expected.as_ref())?;
+                        let mut budget = budget.with_control(control.clone());
+                        read(&snapshot, &mut budget)
+                    })
+                },
+            )
             .await
     }
 
@@ -677,15 +720,17 @@ impl AsyncProjectStore {
     /// # Errors
     /// Returns request, lease-policy, or writer-fence errors.
     pub async fn heartbeat(
-        &self,
+        self,
         writer: &AsyncRevisionWriter,
         lease_duration: Duration,
-        request: &StorageRequest,
     ) -> Result<()> {
-        let project = self.project.clone();
+        let store = self.store;
+        let request = self.request;
+        let project = store.project.clone();
         let writer = writer.writer.clone();
-        self.pool
-            .run(request, 4_096, false, move |control| {
+        store
+            .pool
+            .run(request, JobCapacity::read(4_096), move |control| {
                 project.run(&control, |store| store.heartbeat(&writer, lease_duration))
             })
             .await
@@ -695,12 +740,15 @@ impl AsyncProjectStore {
     ///
     /// # Errors
     /// Returns drain, request, exact-fence, or storage errors.
-    pub async fn fail(&self, writer: &AsyncRevisionWriter, request: &StorageRequest) -> Result<()> {
+    pub async fn fail(self, writer: &AsyncRevisionWriter) -> Result<()> {
+        let store = self.store;
+        let request = self.request;
         writer.group.close_and_drain(request, false).await?;
-        let project = self.project.clone();
+        let project = store.project.clone();
         let writer = writer.writer.clone();
-        self.pool
-            .run(request, 4_096, true, move |control| {
+        store
+            .pool
+            .run(request, JobCapacity::write(4_096), move |control| {
                 project.run(&control, |store| store.fail(&writer))
             })
             .await
@@ -711,41 +759,38 @@ impl AsyncProjectStore {
     /// # Errors
     /// Returns request, budget, writer-busy, or native storage errors.
     pub async fn prune(
-        &self,
-        keep_superseded: u8,
-        maximum_generations: u16,
-        maximum_versions: u32,
+        self,
+        policy: super::RetentionPolicy,
         budget: ReadBudget,
-        request: &StorageRequest,
     ) -> Result<PruneReport> {
-        let project = self.project.clone();
-        self.pool
-            .run(request, 64 * 1_048_576, true, move |control| {
-                let mut budget = budget.with_control(control.clone());
-                project.run(&control, |store| {
-                    store.prune(
-                        keep_superseded,
-                        maximum_generations,
-                        maximum_versions,
-                        &mut budget,
-                    )
-                })
-            })
+        let store = self.store;
+        let request = self.request;
+        let project = store.project.clone();
+        store
+            .pool
+            .run(
+                request,
+                JobCapacity::write(64 * 1_048_576),
+                move |control| {
+                    let mut budget = budget.with_control(control.clone());
+                    project.run(&control, |store| store.prune(policy, &mut budget))
+                },
+            )
             .await
     }
 }
 
-impl AsyncProjectStore {
+impl RequestedProject<'_> {
     /// Read project-local file allocation and bounded native property estimates.
     /// # Errors
     /// Returns closed-owner, cancellation, property or directory-enumeration failures.
-    pub async fn storage_usage(
-        &self,
-        request: &StorageRequest,
-    ) -> Result<super::NativeStorageUsage> {
-        let project = self.project.clone();
-        self.pool
-            .run(request, 1_048_576, false, move |control| {
+    pub async fn storage_usage(self) -> Result<super::NativeStorageUsage> {
+        let store = self.store;
+        let request = self.request;
+        let project = store.project.clone();
+        store
+            .pool
+            .run(request, JobCapacity::read(1_048_576), move |control| {
                 project.run(&control, super::ProjectStore::storage_usage)
             })
             .await

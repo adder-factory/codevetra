@@ -151,39 +151,20 @@ impl PackedGraph {
             request.check()?;
             let mut builder = Builder::new(kind, &mut budget)?;
             if kind.canonical() {
-                let length = match kind {
-                    Table::Files => facts.files().len(),
-                    Table::Symbols => facts.symbols().len(),
-                    Table::Edges => facts.edges().len(),
-                    Table::References => facts.references().len(),
-                    Table::Numerical => facts.numerical_sites().len(),
-                    Table::Documents => facts.documents().len(),
-                    _ => return Err(codec::corrupt()),
-                };
-                ingest::visit_table_rows(
-                    &facts,
-                    kind.prefix(),
-                    length,
+                ingest::CanonicalTable::new(&facts, kind.prefix())?.visit(
                     policy,
                     request,
                     |_, row, _| builder.row(&row.canonical_encode()?, request),
                 )?;
             } else if kind == Table::Names {
-                pack_names(
-                    &facts,
-                    info.name_index_version != 0,
-                    policy,
-                    request,
-                    &mut builder,
-                )?;
+                if info.name_index_version != 0 {
+                    builder.pack_names(&facts, policy, request)?;
+                }
             } else {
-                let report = ingest::adjacency::visit(
-                    facts.edges(),
-                    kind == Table::Incoming,
-                    policy,
-                    request,
-                    |key, value| builder.record(&key, &value, request),
-                )?;
+                let report = ingest::adjacency::AdjacencyWriter::new(request, |key, value| {
+                    builder.record(&key, &value, request)
+                })
+                .visit(facts.edges(), kind == Table::Incoming, policy)?;
                 adjacency_blocks = adjacency_blocks
                     .checked_add(report.blocks)
                     .ok_or_else(super::limit)?;
@@ -670,41 +651,39 @@ fn record(kind: Table, bytes: Vec<u8>) -> Result<(RecordKey, Vec<u8>)> {
     Ok((codec::key(kind.prefix(), &suffix)?, bytes))
 }
 
-fn pack_names(
-    facts: &CanonicalGenerationFacts,
-    enabled: bool,
-    policy: GraphPolicy,
-    request: &StorageRequest,
-    builder: &mut Builder<'_>,
-) -> Result<()> {
-    if !enabled {
-        return Ok(());
+impl Builder<'_> {
+    fn pack_names(
+        &mut self,
+        facts: &CanonicalGenerationFacts,
+        policy: GraphPolicy,
+        request: &StorageRequest,
+    ) -> Result<()> {
+        let length = facts
+            .symbols()
+            .len()
+            .checked_mul(2)
+            .ok_or_else(super::limit)?;
+        super::check_workspace::<[u8; names::SUFFIX_BYTES]>(length, 0, policy)?;
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(length).map_err(|_| super::limit())?;
+        super::check_workspace::<[u8; names::SUFFIX_BYTES]>(keys.capacity(), 0, policy)?;
+        for symbol in facts.symbols() {
+            request.check()?;
+            keys.push(names::suffix(
+                &symbol.qualified_name,
+                symbol.symbol_id.as_str(),
+            )?);
+            keys.push(names::suffix(
+                names::simple(&symbol.qualified_name),
+                symbol.symbol_id.as_str(),
+            )?);
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        for key in keys {
+            request.check()?;
+            self.record(&codec::key(names::PREFIX, &key)?, &[1], request)?;
+        }
+        Ok(())
     }
-    let length = facts
-        .symbols()
-        .len()
-        .checked_mul(2)
-        .ok_or_else(super::limit)?;
-    super::check_workspace::<[u8; names::SUFFIX_BYTES]>(length, 0, policy)?;
-    let mut keys = Vec::new();
-    keys.try_reserve_exact(length).map_err(|_| super::limit())?;
-    super::check_workspace::<[u8; names::SUFFIX_BYTES]>(keys.capacity(), 0, policy)?;
-    for symbol in facts.symbols() {
-        request.check()?;
-        keys.push(names::suffix(
-            &symbol.qualified_name,
-            symbol.symbol_id.as_str(),
-        )?);
-        keys.push(names::suffix(
-            names::simple(&symbol.qualified_name),
-            symbol.symbol_id.as_str(),
-        )?);
-    }
-    keys.sort_unstable();
-    keys.dedup();
-    for key in keys {
-        request.check()?;
-        builder.record(&codec::key(names::PREFIX, &key)?, &[1], request)?;
-    }
-    Ok(())
 }

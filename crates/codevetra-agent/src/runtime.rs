@@ -1,5 +1,6 @@
 //! The shared feature runtime borrows one native project owner.
 
+use codevetra_db::rocks::RetentionPolicy;
 use std::future::Future;
 
 use super::{
@@ -15,6 +16,10 @@ use super::{
     load_project_source_settings, monotonic_millis, project_root_identity, source_revision,
 };
 use codevetra_db::rocks::{RocksError, StorageRequest};
+
+const INDEX_TIMEOUT: Duration = Duration::from_secs(300);
+const SOURCE_REBUILD_ATTEMPTS: usize = 3;
+const INDEX_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Project-scoped graph, source and auxiliary services sharing one `RocksDB` owner.
 pub struct ProjectRuntime {
@@ -190,9 +195,9 @@ impl ProjectRuntime {
         cancellation: ProjectCancellation,
     ) -> Result<IndexReport, IndexFailure> {
         let started = Instant::now();
-        let request = CodeVetraDatabase::request_control(Duration::from_secs(300))
+        let request = CodeVetraDatabase::request_control(INDEX_TIMEOUT)
             .map_err(|_| ProjectError::RequestCancelled)?;
-        for attempt in 0..3 {
+        for attempt in 0..SOURCE_REBUILD_ATTEMPTS {
             let result = loop {
                 match self
                     .index_once(options.clone(), cancellation.clone(), &request)
@@ -206,7 +211,7 @@ impl ProjectRuntime {
                             biased;
                             () = cancellation.cancelled() => return Err(ProjectError::RequestCancelled.into()),
                             error = request.stopped() => return Err(native_storage_error(error).into()),
-                            () = tokio::time::sleep(Duration::from_millis(50)) => {},
+                            () = tokio::time::sleep(INDEX_ADMISSION_POLL_INTERVAL) => {},
                         }
                     }
                     result => break result,
@@ -224,7 +229,7 @@ impl ProjectRuntime {
                 }
                 Err(failure)
                     if options.source_drift == SourceDriftPolicy::Rebuild
-                        && attempt < 2
+                        && attempt + 1 < SOURCE_REBUILD_ATTEMPTS
                         && matches!(failure.error(), ProjectError::SourceChangedDuringIndex) => {}
                 Err(failure) => return Err(failure),
             }
@@ -406,7 +411,7 @@ impl ProjectRuntime {
     }
 }
 
-pub(super) fn native_error(error: RocksProjectError) -> ProjectError {
+fn native_error(error: RocksProjectError) -> ProjectError {
     match error {
         RocksProjectError::Source(error) => error,
         RocksProjectError::SourceChanged => ProjectError::SourceChangedDuringIndex,
@@ -487,15 +492,11 @@ impl ProjectRuntime {
     /// Rejects invalid limits, concurrent writers, cancellation or storage failure.
     pub async fn prune_generations(
         &self,
-        keep: u8,
-        generations: u16,
-        versions: u32,
+        policy: RetentionPolicy,
         cancellation: ProjectCancellation,
     ) -> Result<codevetra_db::rocks::PruneReport, ProjectError> {
         let request = StorageRequest::new(Duration::from_secs(30)).map_err(native_storage_error)?;
-        let operation = self
-            .native
-            .prune_generations(keep, generations, versions, &request);
+        let operation = self.native.prune_generations(policy, &request);
         tokio::pin!(operation);
         tokio::select! {
             biased;

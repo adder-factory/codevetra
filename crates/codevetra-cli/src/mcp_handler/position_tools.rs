@@ -13,6 +13,20 @@ use super::{
     required_bounded_text,
 };
 
+const SYMBOL_ID_BYTES: usize = 64;
+const PATH_BYTES: usize = 4096;
+const CONTINUATION_BYTES: usize = 2048;
+const DEFAULT_LIMIT: u32 = 50;
+const MAXIMUM_LIMIT: u16 = 100;
+const DEFAULT_TRACE_STEPS: u32 = 128;
+const MAXIMUM_TRACE_STEPS: u32 = 512;
+const DEFAULT_TRACE_DEPTH: u32 = 2;
+const MAXIMUM_TRACE_DEPTH: u32 = 4;
+const DEFAULT_TRACE_BYTES: u32 = 128 * 1024;
+const MINIMUM_TRACE_BYTES: u32 = 16 * 1024;
+const MAXIMUM_TRACE_BYTES: u32 = 512 * 1024;
+const SUMMARY_STEPS: usize = 32;
+
 pub(super) fn definition(
     annotations: ToolAnnotations,
 ) -> Result<ToolDefinition, ToolContractError> {
@@ -21,16 +35,16 @@ pub(super) fn definition(
         description: "Navigate exact cursor occurrences to definitions, references by resolved symbol identity, or evidenced implementations/overrides. Uses one-based lines, zero-based UTF-8 byte columns and half-open byte ranges. Ambiguous, coarse, unsupported and stale evidence remain explicit; reference continuations never mix generations. trace returns bounded possible static execution paths for JS/TS with nested source steps, exact call evidence and explicit unknowns.",
         schema: json!({
             "operation":{"type":"string","enum":["definition","references","implementation","trace"]},
-            "focusSymbolId":{"type":"string","minLength":1,"maxLength":64,"description":"trace only: annotate an exact target/changed symbol without hiding guards."},
-            "maxSteps":{"type":"integer","minimum":1,"maximum":512},
-            "maxDepth":{"type":"integer","minimum":0,"maximum":4},
-            "maxBytes":{"type":"integer","minimum":16_384,"maximum":524_288},
-            "symbolId":{"type":"string","minLength":1,"maxLength":64},
-            "file":{"type":"string","minLength":1,"maxLength":4096},
+            "focusSymbolId":{"type":"string","minLength":1,"maxLength":SYMBOL_ID_BYTES,"description":"trace only: annotate an exact target/changed symbol without hiding guards."},
+            "maxSteps":{"type":"integer","minimum":1,"maximum":MAXIMUM_TRACE_STEPS},
+            "maxDepth":{"type":"integer","minimum":0,"maximum":MAXIMUM_TRACE_DEPTH},
+            "maxBytes":{"type":"integer","minimum":MINIMUM_TRACE_BYTES,"maximum":MAXIMUM_TRACE_BYTES},
+            "symbolId":{"type":"string","minLength":1,"maxLength":SYMBOL_ID_BYTES},
+            "file":{"type":"string","minLength":1,"maxLength":PATH_BYTES},
             "line":{"type":"integer","minimum":1,"maximum":u32::MAX},
             "column":{"type":"integer","minimum":0,"maximum":u32::MAX},
-            "limit":{"type":"integer","minimum":1,"maximum":100},
-            "after":{"type":"string","minLength":1,"maxLength":2048}
+            "limit":{"type":"integer","minimum":1,"maximum":MAXIMUM_LIMIT},
+            "after":{"type":"string","minLength":1,"maxLength":CONTINUATION_BYTES}
         }),
         required: &["operation"],
         annotations,
@@ -77,7 +91,7 @@ fn parse(arguments: &Map<String, Value>) -> Result<PositionRequest, ToolError> {
         reject_present(arguments, &["file", "line", "column"])?;
         PositionAnchor::Symbol(SymbolId::parse(symbol).map_err(|_| invalid_arguments())?)
     } else {
-        let path = NormalizedPath::parse(required_bounded_text(arguments, "file", 4096)?)
+        let path = NormalizedPath::parse(required_bounded_text(arguments, "file", PATH_BYTES)?)
             .map_err(|_| invalid_arguments())?;
         PositionAnchor::Cursor {
             path,
@@ -85,15 +99,11 @@ fn parse(arguments: &Map<String, Value>) -> Result<PositionRequest, ToolError> {
             column: number(arguments, "column", None)?,
         }
     };
-    let limit =
-        u16::try_from(number(arguments, "limit", Some(50))?).map_err(|_| invalid_arguments())?;
+    let limit = u16::try_from(number(arguments, "limit", Some(DEFAULT_LIMIT))?)
+        .map_err(|_| invalid_arguments())?;
     let after = optional_text(arguments, "after")?.map(str::to_owned);
-    if limit == 0
-        || limit > 100
-        || after
-            .as_ref()
-            .is_some_and(|value| value.is_empty() || value.len() > 2048)
-        || (after.is_some() && operation != PositionOperation::References)
+    if !(1..=MAXIMUM_LIMIT).contains(&limit)
+        || !valid_continuation(after.as_deref(), operation)
         || matches!(anchor, PositionAnchor::Cursor { line: 0, .. })
     {
         return Err(invalid_arguments());
@@ -103,6 +113,14 @@ fn parse(arguments: &Map<String, Value>) -> Result<PositionRequest, ToolError> {
         anchor,
         limit,
         after,
+    })
+}
+
+fn valid_continuation(after: Option<&str>, operation: PositionOperation) -> bool {
+    after.is_none_or(|value| {
+        operation == PositionOperation::References
+            && !value.is_empty()
+            && value.len() <= CONTINUATION_BYTES
     })
 }
 
@@ -136,8 +154,12 @@ async fn static_trace(
             "maxBytes",
         ],
     )?;
-    let symbol_id = SymbolId::parse(required_bounded_text(arguments, "symbolId", 64)?)
-        .map_err(|_| invalid_arguments())?;
+    let symbol_id = SymbolId::parse(required_bounded_text(
+        arguments,
+        "symbolId",
+        SYMBOL_ID_BYTES,
+    )?)
+    .map_err(|_| invalid_arguments())?;
     let focus = optional_text(arguments, "focusSymbolId")?
         .map(SymbolId::parse)
         .transpose()
@@ -148,12 +170,24 @@ async fn static_trace(
             codevetra_agent::StaticTraceRequest {
                 symbol_id,
                 focus,
-                maximum_steps: usize::try_from(number(arguments, "maxSteps", Some(128))?)
-                    .map_err(|_| invalid_arguments())?,
-                maximum_depth: usize::try_from(number(arguments, "maxDepth", Some(2))?)
-                    .map_err(|_| invalid_arguments())?,
-                maximum_bytes: usize::try_from(number(arguments, "maxBytes", Some(128 * 1024))?)
-                    .map_err(|_| invalid_arguments())?,
+                maximum_steps: usize::try_from(number(
+                    arguments,
+                    "maxSteps",
+                    Some(DEFAULT_TRACE_STEPS),
+                )?)
+                .map_err(|_| invalid_arguments())?,
+                maximum_depth: usize::try_from(number(
+                    arguments,
+                    "maxDepth",
+                    Some(DEFAULT_TRACE_DEPTH),
+                )?)
+                .map_err(|_| invalid_arguments())?,
+                maximum_bytes: usize::try_from(number(
+                    arguments,
+                    "maxBytes",
+                    Some(DEFAULT_TRACE_BYTES),
+                )?)
+                .map_err(|_| invalid_arguments())?,
             },
             cancellation,
         )
@@ -173,7 +207,7 @@ async fn static_trace(
     let mut shown = 0;
     for function in &report.functions {
         for step in &function.syntax.steps {
-            if shown == 32 {
+            if shown == SUMMARY_STEPS {
                 break;
             }
             let _written = write!(

@@ -6,11 +6,20 @@ use codevetra_domain::{DocumentId, GenerationId, ProjectId};
 
 use super::types::{SemanticStorageError, invalid, validate_timeout};
 use crate::{
-    CanonicalSearchDocument, NativeDatabase, artifacts::native::summaries::embedding_summary,
+    CanonicalSearchDocument, CurrentGenerationLookup, NativeDatabase,
+    artifacts::native::summaries::SummaryReader,
 };
 
 const MAXIMUM_DOCUMENTS: usize = 100;
 const MAXIMUM_TEXT_BYTES: usize = 1_536;
+// Per-field allocations preserve name/path identity and leave bounded room for
+// intent and source evidence. The total output ceiling still applies first.
+const IDENTITY_TEXT_BYTES: usize = 192;
+const KIND_TEXT_BYTES: usize = 32;
+const INTENT_TEXT_BYTES: usize = 384;
+const CODE_TEXT_BYTES: usize = 512;
+const FIELD_SEPARATOR: &str = ": ";
+const FIELD_TERMINATOR: char = '\n';
 
 /// A bounded list of unique documents from one exact current generation.
 pub struct RerankDocumentsRequest {
@@ -25,8 +34,7 @@ impl RerankDocumentsRequest {
     /// # Errors
     /// Rejects empty/oversized lists, duplicate document identities, or invalid deadlines.
     pub fn new(
-        project_id: ProjectId,
-        expected_generation_id: GenerationId,
+        generation: CurrentGenerationLookup<'_>,
         documents: Vec<DocumentId>,
         timeout: Duration,
     ) -> Result<Self, SemanticStorageError> {
@@ -38,8 +46,8 @@ impl RerankDocumentsRequest {
             return Err(invalid("rerank_documents"));
         }
         Ok(Self {
-            project_id,
-            expected_generation_id,
+            project_id: generation.project_id().clone(),
+            expected_generation_id: generation.expected_generation_id().clone(),
             documents,
             timeout,
         })
@@ -88,9 +96,7 @@ impl NativeDatabase {
     ) -> Result<Vec<RerankDocument>, SemanticStorageError> {
         self.require_project(&request.project_id)?;
         self.transaction(
-            Some(request.expected_generation_id.clone()),
-            0,
-            0,
+            crate::rocks::StateAccess::read_only(Some(request.expected_generation_id.clone())),
             request.timeout,
             move |transaction, budget| {
                 let snapshot = transaction.graph_snapshot()?;
@@ -104,13 +110,8 @@ impl NativeDatabase {
                                 field: "rerank_document",
                             },
                         )?;
-                        let summary = embedding_summary(
-                            transaction,
-                            &graph,
-                            &request.expected_generation_id,
-                            &document,
-                            budget,
-                        )?;
+                        let summary = SummaryReader::new(transaction, &graph)
+                            .embedding_summary(&document, budget)?;
                         Ok(RerankDocument {
                             document_id,
                             text: render_rerank_text(&document, &summary)?,
@@ -132,20 +133,30 @@ pub(crate) fn render_rerank_text(
         .try_reserve(MAXIMUM_TEXT_BYTES)
         .map_err(|_| super::types::database_error("render-rerank-document"))?;
     for (label, value, maximum) in [
-        ("name", document.qualified_name.as_str(), 192),
-        ("path", document.path.as_str(), 192),
-        ("kind", document.kind.as_str(), 32),
-        ("summary", summary, 384),
-        ("documentation", document.natural_text.as_str(), 384),
-        ("code", document.code.as_str(), 512),
+        (
+            "name",
+            document.qualified_name.as_str(),
+            IDENTITY_TEXT_BYTES,
+        ),
+        ("path", document.path.as_str(), IDENTITY_TEXT_BYTES),
+        ("kind", document.kind.as_str(), KIND_TEXT_BYTES),
+        ("summary", summary, INTENT_TEXT_BYTES),
+        (
+            "documentation",
+            document.natural_text.as_str(),
+            INTENT_TEXT_BYTES,
+        ),
+        ("code", document.code.as_str(), CODE_TEXT_BYTES),
     ] {
-        let remaining = MAXIMUM_TEXT_BYTES.saturating_sub(output.len() + label.len() + 3);
+        let remaining = MAXIMUM_TEXT_BYTES.saturating_sub(
+            output.len() + label.len() + FIELD_SEPARATOR.len() + FIELD_TERMINATOR.len_utf8(),
+        );
         let end = value.floor_char_boundary(value.len().min(maximum).min(remaining));
         if end > 0 {
             output.push_str(label);
-            output.push_str(": ");
+            output.push_str(FIELD_SEPARATOR);
             output.push_str(&value[..end]);
-            output.push('\n');
+            output.push(FIELD_TERMINATOR);
         }
     }
     Ok(output)
@@ -195,8 +206,7 @@ mod tests {
         for documents in [Vec::new(), vec![id.clone(); 2], vec![id.clone(); 101]] {
             assert!(
                 RerankDocumentsRequest::new(
-                    project.clone(),
-                    generation.clone(),
+                    CurrentGenerationLookup::new(&project, &generation),
                     documents,
                     Duration::from_secs(10)
                 )
@@ -204,7 +214,12 @@ mod tests {
             );
         }
         assert!(
-            RerankDocumentsRequest::new(project, generation, vec![id], Duration::ZERO).is_err()
+            RerankDocumentsRequest::new(
+                CurrentGenerationLookup::new(&project, &generation),
+                vec![id],
+                Duration::ZERO
+            )
+            .is_err()
         );
     }
 }

@@ -1,3 +1,4 @@
+use codevetra_db::rocks::RetentionPolicy;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
@@ -23,11 +24,10 @@ use codevetra_agent::{
     PipelineFailureReason, PipelineStage, ProjectCancellation, ProjectError, ProjectRuntime,
     ProjectStatus, RenamePlanError, RenamePlanOptions, RenamePlanRequest, RetrievalFailureCause,
     RetrievalFailureStage, RetrievalOptions, RetrievalRequest, ReviewError, ReviewOptions,
-    RoleCandidate, RoleVerdict, ScipExportRequest, ScipImportLimits, ScipImportRequest,
-    SourceCompareError, SourceCompareOptions, SourceContextOptions, SourceContextRequest,
-    SourceSearchError, SourceSearchHit, SourceSearchOptions, SupervisorStatus, SymbolSourceContext,
-    TestEvidenceError, TestEvidenceOptions, TestEvidenceReport, VerificationCommand,
-    WorkingTreeOverlayRequest, judge_dead_code_candidates,
+    RoleCandidate, RoleVerdict, SourceCompareError, SourceCompareOptions, SourceContextOptions,
+    SourceContextRequest, SourceSearchError, SourceSearchHit, SourceSearchOptions,
+    SupervisorStatus, SymbolSourceContext, TestEvidenceError, TestEvidenceOptions,
+    TestEvidenceReport, VerificationCommand, WorkingTreeOverlayRequest, judge_dead_code_candidates,
 };
 use codevetra_db::{
     AgentArtifactContent, AgentArtifactKind, AgentArtifactQuery, AgentArtifactScope,
@@ -95,6 +95,10 @@ use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::auto_sync::{AutoSyncError, AutoSyncStatus, ProjectAutoSync};
+mod admin_arguments;
+mod argument_guidance;
+#[cfg(test)]
+mod argument_guidance_tests;
 mod decision_accounting;
 mod native_maintenance;
 mod native_reads;
@@ -241,6 +245,16 @@ const TESTS_FOR_DESCRIPTION_CANDIDATES: u16 = 100;
 const TESTS_FOR_DESCRIPTION_MATCHES: usize = 10;
 const REVIEW_DEFAULT_FILES: u16 = 200;
 const REVIEW_MAXIMUM_FILES: u16 = 512;
+const ADMIN_JOB_TIMEOUT: Duration = Duration::from_secs(300);
+const ADMIN_RECENT_JOB_LIMIT: usize = 8;
+const EXPLORE_SOURCE_SYMBOL_LIMIT: usize = 100;
+const EXPLORE_SOURCE_BYTES: usize = 512 * 1024;
+const CONTEXT_SOURCE_SELECTION_LIMIT: usize = 100;
+const CONTEXT_SOURCE_BYTES: usize = 128 * 1024;
+const FILE_SOURCE_DEFAULT_BYTE_LIMIT: u32 = 65_536;
+const FILE_SOURCE_MAXIMUM_BYTE_LIMIT: u32 = 262_144;
+const FILES_KINDS_MAXIMUM_BYTES: usize = 1024;
+const FILES_LANGUAGE_MAXIMUM_BYTES: usize = 64;
 const ADMIN_MAXIMUM_WORKERS: u16 = 16;
 const ADMIN_LANGUAGE_ID_MAXIMUM_BYTES: usize = 64;
 const ADMIN_QUERY_TIMEOUT_MAXIMUM_MS: u64 = 600_000;
@@ -249,7 +263,6 @@ pub(super) const ADMIN_BIOMARKER_REFRESH_MAXIMUM_TIMEOUT_MS: u64 = 300_000;
 const ADMIN_MAX_FILE_SIZE_TEXT_BYTES: usize = 32;
 const ADMIN_SIMILARITY_MAXIMUM_K: u16 = 50;
 const ADMIN_SIMILARITY_DEFAULT_K: u16 = 20;
-const ADMIN_RESULT_MAXIMUM_LIMIT: u16 = 500;
 const ADMIN_LLM_ENV_NAME_MAXIMUM_BYTES: usize = 128;
 const ADMIN_LLM_MODEL_NAME_MAXIMUM_BYTES: usize = 256;
 const ADMIN_LLM_ENDPOINT_MAXIMUM_BYTES: usize = 4_096;
@@ -260,14 +273,6 @@ const ADMIN_LLM_CLI_ARGUMENT_TOTAL_BYTES_MAXIMUM: usize = 32 * 1_024;
 const ADMIN_LLM_CREDENTIAL_ARGV_MAXIMUM: usize = ADMIN_LLM_CLI_ARGUMENTS_MAXIMUM + 1;
 const ADMIN_LLM_CLI_PROMPT_TEMPLATE_MAXIMUM_BYTES: usize = 64 * 1_024;
 const ADMIN_MAINTENANCE_TIMEOUT: Duration = Duration::from_mins(4);
-const ADMIN_DEFAULT_IMPORT_ROWS: u64 = 10_000_000;
-const ADMIN_MAXIMUM_IMPORT_ROWS: u64 = 100_000_000;
-const ADMIN_DEFAULT_IMPORT_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
-const ADMIN_SCIP_MAXIMUM_BYTES: u64 = 256 * 1024 * 1024;
-const ADMIN_SCIP_EXPORT_MAXIMUM_ROWS: u64 = 5_000_000;
-const ADMIN_SCIP_IMPORT_MAXIMUM_ROWS: u64 = 10_000_000;
-const ADMIN_SCIP_DEFAULT_TIMEOUT_MS: u64 = 120_000;
-const ADMIN_SCIP_MAXIMUM_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 const EMBEDDING_DEFAULT_WORKERS: u16 = 4;
 const SOURCE_DEFAULT_CONTEXT_LINES: u16 = 3;
 const SOURCE_MAXIMUM_CONTEXT_LINES: u16 = 200;
@@ -3123,7 +3128,7 @@ impl AdminJobs {
             .checked_add(1)
             .ok_or_else(ToolError::internal)?;
         let view = AdminJobView::running(job_id, action);
-        let native_control = codevetra_db::rocks::StorageRequest::new(Duration::from_secs(300))
+        let native_control = codevetra_db::rocks::StorageRequest::new(ADMIN_JOB_TIMEOUT)
             .map_err(|_| ToolError::internal())?;
         let job_cancellation = cancellation.clone();
         let handle = tokio::spawn(async move {
@@ -3135,7 +3140,7 @@ impl AdminJobs {
             let result = tokio::select! {
                 result = &mut operation => result,
                 () = job_cancellation.cancelled() => { native_control.cancel(); operation.await },
-                () = tokio::time::sleep(Duration::from_secs(300)) => { job_cancellation.cancel(); native_control.cancel(); operation.await },
+                () = tokio::time::sleep(ADMIN_JOB_TIMEOUT) => { job_cancellation.cancel(); native_control.cancel(); operation.await },
             }.map_err(|_| IndexFailure::from(ProjectError::IndexFailed)).and_then(|result| result.map_err(Into::into));
             let mut state = shared.state.lock().await;
             let Some(active) = state.active.take() else {
@@ -3148,7 +3153,7 @@ impl AdminJobs {
             state
                 .recent
                 .push_back(AdminJobView::finished(job_id, active.view.action, result));
-            while state.recent.len() > 8 {
+            while state.recent.len() > ADMIN_RECENT_JOB_LIMIT {
                 state.recent.pop_front();
             }
             drop(state);
@@ -4121,20 +4126,18 @@ fn uses_recommended_local_models(configured: &[Value], directory: &Path) -> bool
 
 fn optional_bounded_admin_u64(
     arguments: &Map<String, Value>,
-    key: &str,
+    key: &'static str,
     maximum: u64,
 ) -> Result<Option<u64>, ToolError> {
-    optional_u64(arguments, key)?.map_or(Ok(None), |value| {
-        (1..=maximum)
-            .contains(&value)
-            .then_some(Some(value))
-            .ok_or_else(invalid_arguments)
-    })
+    if !arguments.contains_key(key) {
+        return Ok(None);
+    }
+    optional_integer(arguments, key, NumericBounds::new(1, 1, maximum)).map(Some)
 }
 
 fn optional_bounded_admin_u16(
     arguments: &Map<String, Value>,
-    key: &str,
+    key: &'static str,
     maximum: u16,
 ) -> Result<Option<u16>, ToolError> {
     optional_bounded_admin_u64(arguments, key, u64::from(maximum))?
@@ -4388,6 +4391,12 @@ impl<T> NumericBounds<T> {
     }
 }
 
+impl<T: Serialize> NumericBounds<T> {
+    fn schema(&self) -> Value {
+        json!({"type":"integer", "minimum":self.minimum, "maximum":self.maximum, "default":self.default})
+    }
+}
+
 /// Product adapter joining the bounded MCP transport to public v2 services.
 pub struct CodeVetraMcpHandler {
     runtime: Arc<ProjectRuntime>,
@@ -4531,7 +4540,12 @@ impl CoreTools<'_> {
         .map_err(|_| safe_error(ToolErrorCode::Timeout, "CodeVetra request deadline expired"))?;
         let operation = codevetra_db::NativeDatabase::with_request(
             storage_request.clone(),
-            self.execute_routed(call, context.clone(), macro_stack, cancellation.signal()),
+            self.execute_routed(DispatchRequest {
+                call,
+                context: context.clone(),
+                macro_stack,
+                cancellation: cancellation.signal(),
+            }),
         );
         tokio::pin!(operation);
         tokio::select! {
@@ -4552,32 +4566,26 @@ impl CoreTools<'_> {
         }
     }
 
-    async fn execute_routed(
-        &self,
-        mut call: ToolCall,
-        context: ToolCallContext,
-        macro_stack: Vec<String>,
-        cancellation: ProjectCancellation,
-    ) -> Result<ToolResult, ToolError> {
-        self.apply_connection_defaults(&mut call);
-        if let Some(project_path) = call.arguments.remove("projectPath") {
+    async fn execute_routed(&self, mut request: DispatchRequest) -> Result<ToolResult, ToolError> {
+        self.apply_connection_defaults(&mut request.call);
+        if let Some(project_path) = request.call.arguments.remove("projectPath") {
             let project_path = project_path.as_str().ok_or_else(invalid_arguments)?;
             let runtime = self
                 .project_cache
-                .runtime_for_bounded(project_path, &context)
+                .runtime_for_bounded(project_path, &request.context)
                 .await
                 .map_err(project_route_error)?;
             let scoped = self.scoped_to(runtime);
             return Box::pin(CoreTools(&scoped).execute_with_macro_stack(
-                call,
-                context,
-                macro_stack,
+                request.call,
+                request.context,
+                request.macro_stack,
             ))
             .await;
         }
-        let control = call.name == ADMIN_TOOL
+        let control = request.call.name == ADMIN_TOOL
             && matches!(
-                call.arguments.get("action").and_then(Value::as_str),
+                request.call.arguments.get("action").and_then(Value::as_str),
                 Some("status" | "cancel")
             );
         let trace = if self.defaults.execution.trace_calls && !control {
@@ -4585,28 +4593,30 @@ impl CoreTools<'_> {
         } else {
             None
         };
-        if context.should_stop() {
+        if request.context.should_stop() {
             return Err(safe_error(
                 ToolErrorCode::Unavailable,
                 "CodeVetra request was cancelled before execution",
             ));
         }
-        let reuse = source_reuse::take(&call.name, &mut call.arguments)?;
-        let reuse_cancellation = cancellation.clone();
-        let trace_name = call.name.clone();
-        let trace_arguments = sanitize_trace_arguments(&call.arguments);
+        let reuse = source_reuse::take(&request.call.name, &mut request.call.arguments)?;
+        let reuse_cancellation = request.cancellation.clone();
+        let trace_name = request.call.name.clone();
+        let trace_arguments = sanitize_trace_arguments(&request.call.arguments);
         let started = Instant::now();
         // `dispatch` contains every MCP branch and therefore compiles into a large
         // future. Keep that state machine on the heap so a bounded macro replay
         // does not recursively consume a Tokio worker's native stack.
-        let result =
-            Box::pin(self.dispatch(call, context.clone(), macro_stack, cancellation)).await;
+        let context = request.context.clone();
+        let result = Box::pin(self.dispatch(request)).await;
         let result = result.and_then(|result| match reuse {
             Some(reuse) => source_reuse::apply(
                 result,
-                self.runtime.root_identity(),
-                reuse,
-                &reuse_cancellation,
+                source_reuse::Projection::new(
+                    self.runtime.root_identity(),
+                    reuse,
+                    &reuse_cancellation,
+                ),
             ),
             None => Ok(result),
         });
@@ -4652,20 +4662,8 @@ impl CoreTools<'_> {
         }
     }
 
-    async fn dispatch(
-        &self,
-        call: ToolCall,
-        context: ToolCallContext,
-        macro_stack: Vec<String>,
-        cancellation: ProjectCancellation,
-    ) -> Result<ToolResult, ToolError> {
-        let group = dispatch_group(&call.name)?;
-        let request = DispatchRequest {
-            call,
-            cancellation,
-            context,
-            macro_stack,
-        };
+    async fn dispatch(&self, request: DispatchRequest) -> Result<ToolResult, ToolError> {
+        let group = dispatch_group(&request.call.name)?;
         match group {
             DispatchGroup::Context => Box::pin(dispatch_context_tools(self, request)).await,
             DispatchGroup::Evidence => Box::pin(dispatch_evidence_tools(self, request)).await,
@@ -4954,41 +4952,7 @@ async fn admin_dispatch_analysis(
     dispatch: AdminDispatch<'_>,
 ) -> Result<ToolResult, ToolError> {
     match dispatch.action {
-        AdminAction::GraphExport => {
-            let arguments = dispatch.arguments;
-            reject_admin_extras(
-                arguments,
-                &[
-                    "exportFormat",
-                    "limit",
-                    "kinds",
-                    "edgeKinds",
-                    "languages",
-                    "filePrefix",
-                ],
-            )?;
-            let limit = optional_integer(arguments, "limit", NumericBounds::new(1, 1000, 50000))?;
-            let (project_id, freshness) =
-                current_project(handler, dispatch.cancellation.clone()).await?;
-            if freshness != IndexFreshness::Current {
-                return Err(stale_index_error());
-            }
-            let format = match optional_text(arguments, "exportFormat")?.unwrap_or("json") {
-                "json" => crate::graph_export::GraphExportFormat::Json,
-                "dot" => crate::graph_export::GraphExportFormat::Dot,
-                "mermaid" => crate::graph_export::GraphExportFormat::Mermaid,
-                "cytoscape" => crate::graph_export::GraphExportFormat::Cytoscape,
-                _ => return Err(invalid_arguments()),
-            };
-            let artifact = crate::graph_export::run_graph_export(handler.runtime.database(), crate::graph_export::GraphExportRequest {
-                project_id, format, context: dispatch.context.clone(), limit,
-                kinds: optional_text(arguments, "kinds")?.map(str::to_owned),
-                edge_kinds: optional_text(arguments, "edgeKinds")?.map(str::to_owned),
-                languages: optional_text(arguments, "languages")?.map(str::to_owned),
-                file_prefix: optional_text(arguments, "filePrefix")?.map(str::to_owned),
-            }).await.map_err(|_| safe_error(ToolErrorCode::Unavailable, "Native graph export exceeded its bounds or is unavailable; reduce the export limit"))?;
-            json_result(&json!({"artifact":artifact}))
-        }
+        AdminAction::GraphExport => admin_graph_export(handler, dispatch).await,
         AdminAction::EmbeddingAudit => {
             AdminCoreTools(handler)
                 .admin_embedding_audit(dispatch.arguments)
@@ -5033,6 +4997,69 @@ async fn admin_dispatch_analysis(
         }
         _ => Err(ToolError::internal()),
     }
+}
+
+fn parse_graph_export_limit(arguments: &Map<String, Value>) -> Result<u16, ToolError> {
+    optional_integer(
+        arguments,
+        "limit",
+        NumericBounds::new(
+            1,
+            crate::graph_export::DEFAULT_NODE_LIMIT,
+            crate::graph_export::MAXIMUM_NODE_LIMIT,
+        ),
+    )
+}
+
+async fn admin_graph_export(
+    handler: &CodeVetraMcpHandler,
+    dispatch: AdminDispatch<'_>,
+) -> Result<ToolResult, ToolError> {
+    let arguments = dispatch.arguments;
+    reject_admin_extras(
+        arguments,
+        &[
+            "exportFormat",
+            "limit",
+            "kinds",
+            "edgeKinds",
+            "languages",
+            "filePrefix",
+        ],
+    )?;
+    let limit = parse_graph_export_limit(arguments)?;
+    let (project_id, freshness) = current_project(handler, dispatch.cancellation.clone()).await?;
+    if freshness != IndexFreshness::Current {
+        return Err(stale_index_error());
+    }
+    let format = match optional_text(arguments, "exportFormat")?.unwrap_or("json") {
+        "json" => crate::graph_export::GraphExportFormat::Json,
+        "dot" => crate::graph_export::GraphExportFormat::Dot,
+        "mermaid" => crate::graph_export::GraphExportFormat::Mermaid,
+        "cytoscape" => crate::graph_export::GraphExportFormat::Cytoscape,
+        _ => return Err(invalid_arguments()),
+    };
+    let artifact = crate::graph_export::run_graph_export(
+        handler.runtime.database(),
+        crate::graph_export::GraphExportRequest {
+            project_id,
+            format,
+            context: dispatch.context.clone(),
+            limit,
+            kinds: optional_text(arguments, "kinds")?.map(str::to_owned),
+            edge_kinds: optional_text(arguments, "edgeKinds")?.map(str::to_owned),
+            languages: optional_text(arguments, "languages")?.map(str::to_owned),
+            file_prefix: optional_text(arguments, "filePrefix")?.map(str::to_owned),
+        },
+    )
+    .await
+    .map_err(|_| {
+        safe_error(
+            ToolErrorCode::Unavailable,
+            "Native graph export exceeded its bounds or is unavailable; reduce the export limit",
+        )
+    })?;
+    json_result(&json!({"artifact":artifact}))
 }
 
 async fn admin_dispatch_models(
@@ -5736,10 +5763,19 @@ async fn explore_source_windows(
     handler
         .runtime
         .allocate_source_with_cancellation(
-            generation.generation_id(),
-            source_selection::select(packet, input.task, 100, usize::from(input.max_files)),
-            codevetra_agent::SourceAllocationOptions::new(input.source_policy, 512 * 1024)
+            codevetra_agent::SourceAllocationRequest::new(
+                generation.generation_id(),
+                source_selection::SelectionBounds {
+                    symbols: EXPLORE_SOURCE_SYMBOL_LIMIT,
+                    files: usize::from(input.max_files),
+                }
+                .select(packet, input.task),
+                codevetra_agent::SourceAllocationOptions::new(
+                    input.source_policy,
+                    EXPLORE_SOURCE_BYTES,
+                )
                 .map_err(|_| invalid_arguments())?,
+            ),
             input.cancellation,
         )
         .await
@@ -6210,22 +6246,23 @@ impl ContextTools<'_> {
         let Some(generation) = request.packet.generation() else {
             return Ok(ContextSourceWindows::NotRequested);
         };
-        let selections = source_selection::select(
-            request.packet,
-            request.parsed.task,
-            usize::from(request.parsed.maximum_nodes).min(100),
-            100,
-        );
+        let selections = source_selection::SelectionBounds {
+            symbols: usize::from(request.parsed.maximum_nodes).min(CONTEXT_SOURCE_SELECTION_LIMIT),
+            files: CONTEXT_SOURCE_SELECTION_LIMIT,
+        }
+        .select(request.packet, request.parsed.task);
         let options = codevetra_agent::SourceAllocationOptions::new(
             request.parsed.presentation.source_policy,
-            128 * 1024,
+            CONTEXT_SOURCE_BYTES,
         )
         .map_err(|_| invalid_arguments())?;
         self.runtime
             .allocate_source_with_cancellation(
-                generation.generation_id(),
-                selections,
-                options,
+                codevetra_agent::SourceAllocationRequest::new(
+                    generation.generation_id(),
+                    selections,
+                    options,
+                ),
                 request.cancellation.clone(),
             )
             .await
@@ -7637,7 +7674,11 @@ impl FilesTools<'_> {
                 optional_integer(
                     execution.arguments,
                     "byteLimit",
-                    NumericBounds::new(1_u32, 65_536, 262_144),
+                    NumericBounds::new(
+                        1_u32,
+                        FILE_SOURCE_DEFAULT_BYTE_LIMIT,
+                        FILE_SOURCE_MAXIMUM_BYTE_LIMIT,
+                    ),
                 )?,
             )
         } else {
@@ -7874,34 +7915,14 @@ impl GraphTools<'_> {
             presentation,
             allow_stale,
         } = parsed;
-        let GraphTraversalOptions {
-            budget,
-            limit,
-            rank_by,
-            minimum_confidence,
-            edge_kind,
-        } = traversal;
-        let GraphPresentationOptions {
-            compact,
-            fields,
-            since,
-            include_roles,
-            include_tests,
-        } = presentation;
-        let direction_kind = direction;
-        let direction = direction_kind.as_str();
         let (project_id, freshness) =
             current_project_for_evidence(self, cancellation.clone(), allow_stale).await?;
         let (roots, resolution) = self
             .resolve_graph_roots(
-                &project_id,
                 &requested_roots,
                 &cancellation,
                 arguments.contains_key("symbols")
-                    && !matches!(
-                        direction_kind,
-                        GraphDirection::Path | GraphDirection::Similar
-                    ),
+                    && !matches!(direction, GraphDirection::Path | GraphDirection::Similar),
             )
             .await?;
         if roots.is_empty() {
@@ -7911,28 +7932,28 @@ impl GraphTools<'_> {
             project_id: &project_id,
             freshness,
             arguments: &arguments,
-            since,
+            since: presentation.since,
         };
-        if direction == "similar" {
+        if direction == GraphDirection::Similar {
             return self
                 .graph_similar(SimilarGraphExecution {
                     cursor,
                     roots,
-                    limit,
+                    limit: traversal.limit,
                     edge_kind_text,
                 })
                 .await;
         }
-        if direction == "path" {
+        if direction == GraphDirection::Path {
             return self
                 .graph_path(PathGraphExecution {
                     cursor,
                     roots,
-                    budget,
-                    minimum_confidence,
-                    edge_kind,
-                    include_roles,
-                    include_tests,
+                    budget: traversal.budget,
+                    minimum_confidence: traversal.minimum_confidence,
+                    edge_kind: traversal.edge_kind,
+                    include_roles: presentation.include_roles,
+                    include_tests: presentation.include_tests,
                 })
                 .await;
         }
@@ -7941,21 +7962,9 @@ impl GraphTools<'_> {
             requested_roots,
             roots,
             resolution,
-            direction: direction_kind,
-            traversal: GraphTraversalOptions {
-                budget,
-                limit,
-                rank_by,
-                minimum_confidence,
-                edge_kind,
-            },
-            presentation: GraphPresentationOptions {
-                compact,
-                fields,
-                since,
-                include_roles,
-                include_tests,
-            },
+            direction,
+            traversal,
+            presentation,
         })
         .await
     }
@@ -8170,11 +8179,11 @@ impl GraphTools<'_> {
 
     async fn resolve_graph_roots(
         &self,
-        project_id: &ProjectId,
         requested_roots: &[String],
         cancellation: &ProjectCancellation,
         batch: bool,
     ) -> Result<(Vec<SymbolId>, GraphRootDiagnostics), ToolError> {
+        let project_id = self.runtime.database().project_id();
         let mut roots = Vec::with_capacity(requested_roots.len());
         let mut diagnostics = GraphRootDiagnostics::default();
         for requested in requested_roots {
@@ -9085,6 +9094,7 @@ fn parse_biomarker_request(arguments: &Map<String, Value>) -> Result<BiomarkerRe
         ],
     )?;
     let mode = BiomarkerMode::parse(optional_text(arguments, "mode")?.unwrap_or("ranked"))?;
+    mode.validate_arguments(arguments)?;
     if mode == BiomarkerMode::Coverage {
         validate_coverage_arguments(arguments)?;
     }
@@ -10434,13 +10444,12 @@ async fn review_supplied_diff(
         .await
         .map_err(diff_review_error)?;
     let priorities = report.changed_symbol_ids().cloned().collect();
-    let allocation = source_selection::review_allocation(
+    let allocation = source_selection::ReviewAllocation {
         handler,
-        report.packet(),
-        Some(&priorities),
-        source_policy,
-        source_cancellation,
-    )
+        policy: source_policy,
+        cancellation: source_cancellation,
+    }
+    .allocate(report.packet(), Some(&priorities))
     .await?;
     let mut value = serde_json::to_value(&report).map_err(|_| ToolError::internal())?;
     value["sourceAllocation"] = allocation;
@@ -11848,13 +11857,12 @@ impl SummaryReviewTools<'_> {
             .review_with_cancellation(&options, cancellation.clone())
             .await
             .map_err(review_error)?;
-        let allocation = source_selection::review_allocation(
-            self,
-            report.packet(),
-            None,
-            source_selection::parse_policy(&arguments)?,
+        let allocation = source_selection::ReviewAllocation {
+            handler: self,
+            policy: source_selection::parse_policy(&arguments)?,
             cancellation,
-        )
+        }
+        .allocate(report.packet(), None)
         .await?;
         let mut value = serde_json::to_value(&report).map_err(|_| ToolError::internal())?;
         value["sourceAllocation"] = allocation;
@@ -12781,14 +12789,17 @@ fn parse_admin_index_request(
     )?;
     let force = optional_bool(arguments, "force")?.unwrap_or(false);
     let clear_parse_cache = optional_bool(arguments, "clearParseCache")?.unwrap_or(false);
-    let clear_parse_cache_language =
-        optional_bounded_text(arguments, "clearParseCacheLanguage", 64)?
-            .map(|language| {
-                SourceLanguage::from_stable_str(&language.to_ascii_lowercase())
-                    .map(|language| language.as_str().to_owned())
-                    .ok_or_else(invalid_arguments)
-            })
-            .transpose()?;
+    let clear_parse_cache_language = optional_bounded_text(
+        arguments,
+        "clearParseCacheLanguage",
+        ADMIN_LANGUAGE_ID_MAXIMUM_BYTES,
+    )?
+    .map(|language| {
+        SourceLanguage::from_stable_str(&language.to_ascii_lowercase())
+            .map(|language| language.as_str().to_owned())
+            .ok_or_else(invalid_arguments)
+    })
+    .transpose()?;
     let reparse_requested = clear_parse_cache || clear_parse_cache_language.is_some();
     let workers = optional_integer(
         arguments,
@@ -12811,18 +12822,24 @@ fn parse_admin_index_request(
     .map_err(|_| invalid_arguments())?;
     let excludes = match arguments.get("exclude") {
         None => Vec::new(),
-        Some(Value::Array(patterns)) if patterns.len() <= 4096 => patterns
-            .iter()
-            .map(|pattern| {
-                pattern
-                    .as_str()
-                    .filter(|pattern| {
-                        !pattern.is_empty() && pattern.len() <= 4096 && !pattern.contains('\0')
-                    })
-                    .map(str::to_owned)
-                    .ok_or_else(invalid_arguments)
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        Some(Value::Array(patterns))
+            if patterns.len() <= admin_arguments::EXCLUDES.maximum_items =>
+        {
+            patterns
+                .iter()
+                .map(|pattern| {
+                    pattern
+                        .as_str()
+                        .filter(|pattern| {
+                            !pattern.is_empty()
+                                && pattern.len() <= admin_arguments::EXCLUDES.maximum_item_bytes
+                                && !pattern.contains('\0')
+                        })
+                        .map(str::to_owned)
+                        .ok_or_else(invalid_arguments)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
         _ => return Err(invalid_arguments()),
     };
     options = options
@@ -12914,29 +12931,7 @@ impl AdminLifecycleTools<'_> {
         action: AdminAction,
         arguments: &Map<String, Value>,
     ) -> Result<ToolResult, ToolError> {
-        reject_admin_extras(arguments, &["out", "maximumRows", "timeoutMs"])?;
-        let output = optional_text(arguments, "out")?.unwrap_or("index.scip");
-        let maximum_rows = optional_integer(
-            arguments,
-            "maximumRows",
-            NumericBounds::new(
-                1,
-                ADMIN_SCIP_EXPORT_MAXIMUM_ROWS,
-                ADMIN_SCIP_EXPORT_MAXIMUM_ROWS,
-            ),
-        )?;
-        let timeout_ms = optional_integer(
-            arguments,
-            "timeoutMs",
-            NumericBounds::new(
-                100,
-                ADMIN_SCIP_DEFAULT_TIMEOUT_MS,
-                ADMIN_SCIP_MAXIMUM_TIMEOUT_MS,
-            ),
-        )?;
-        let request = ScipExportRequest::new(output, maximum_rows)
-            .and_then(|request| request.with_timeout(Duration::from_millis(timeout_ms)))
-            .map_err(|_| invalid_arguments())?;
+        let request = admin_arguments::scip_export(arguments)?;
         let cancellation = ProjectCancellation::new();
         let operation_cancellation = cancellation.clone();
         let runtime = self.runtime.clone();
@@ -12961,31 +12956,7 @@ impl AdminLifecycleTools<'_> {
         action: AdminAction,
         arguments: &Map<String, Value>,
     ) -> Result<ToolResult, ToolError> {
-        reject_admin_extras(
-            arguments,
-            &["in", "maximumRows", "maximumSourceBytes", "workers"],
-        )?;
-        let input = optional_text(arguments, "in")?.unwrap_or("index.scip");
-        let maximum_rows = optional_integer(
-            arguments,
-            "maximumRows",
-            NumericBounds::new(1, ADMIN_DEFAULT_IMPORT_ROWS, ADMIN_SCIP_IMPORT_MAXIMUM_ROWS),
-        )?;
-        let maximum_bytes = optional_integer(
-            arguments,
-            "maximumSourceBytes",
-            NumericBounds::new(1, ADMIN_SCIP_MAXIMUM_BYTES, ADMIN_SCIP_MAXIMUM_BYTES),
-        )?;
-        let workers = optional_integer(
-            arguments,
-            "workers",
-            NumericBounds::new(1, ADMIN_MAXIMUM_WORKERS, ADMIN_MAXIMUM_WORKERS),
-        )?;
-        let maximum_bytes = usize::try_from(maximum_bytes).map_err(|_| invalid_arguments())?;
-        let maximum_rows = usize::try_from(maximum_rows).map_err(|_| invalid_arguments())?;
-        let limits = ScipImportLimits::new(maximum_bytes, maximum_rows, workers)
-            .map_err(|_| invalid_arguments())?;
-        let request = ScipImportRequest::new(input, limits).map_err(|_| invalid_arguments())?;
+        let request = admin_arguments::scip_import(arguments)?;
         let cancellation = ProjectCancellation::new();
         let operation_cancellation = cancellation.clone();
         let runtime = self.runtime.clone();
@@ -13100,16 +13071,16 @@ impl AdminLifecycleTools<'_> {
                 "prune-generations requires confirm true",
             ));
         }
-        let keep = optional_integer(arguments, "keepSuperseded", NumericBounds::new(0_u8, 2, 32))?;
+        let keep = optional_integer(arguments, "keepSuperseded", admin_arguments::PRUNE_KEEP)?;
         let generations = optional_integer(
             arguments,
             "maximumDeletions",
-            NumericBounds::new(1_u16, 4, 100),
+            admin_arguments::PRUNE_GENERATIONS,
         )?;
         let versions = optional_integer(
             arguments,
             "maximumCascadeRows",
-            NumericBounds::new(1_u32, 10_000, 10_000),
+            admin_arguments::PRUNE_VERSIONS,
         )?;
         let cancellation = ProjectCancellation::new();
         let operation_cancellation = cancellation.clone();
@@ -13121,7 +13092,10 @@ impl AdminLifecycleTools<'_> {
                 cancellation,
                 operation: async move {
                     let report = runtime
-                        .prune_generations(keep, generations, versions, operation_cancellation)
+                        .prune_generations(
+                            RetentionPolicy::new(keep, generations, versions),
+                            operation_cancellation,
+                        )
                         .await?;
                     serde_json::to_value(report).map_err(|_| ProjectError::IndexFailed)
                 },
@@ -13515,120 +13489,127 @@ async fn run_structural_rollup_sweep(
         runtime,
         cancellation,
     };
-    let files = run_structural_rollups(&context, StructuralRollupKind::File).await?;
+    let files = context.run(StructuralRollupKind::File).await?;
     let modules = if files.source_changed {
         ModuleSummarySweepStats {
             source_changed: true,
             ..ModuleSummarySweepStats::default()
         }
     } else {
-        run_structural_rollups(&context, StructuralRollupKind::Module).await?
+        context.run(StructuralRollupKind::Module).await?
     };
     Ok(render_structural_rollup_report(&context, &files, &modules))
 }
 
-async fn run_structural_rollups(
-    context: &StructuralRollupContext,
-    kind: StructuralRollupKind,
-) -> Result<RollupSummarySweepStats, ProjectError> {
-    let mut stats = RollupSummarySweepStats::default();
-    let mut after = None::<String>;
-    loop {
-        if context.cancellation.is_cancelled() {
-            return Err(ProjectError::RequestCancelled);
-        }
-        let pending = load_structural_rollup_page(context, kind, after.as_deref()).await?;
-        if pending.is_empty() {
-            break;
-        }
-        after = pending.last().map(|item| item.cursor().to_owned());
-        stats.candidates = stats.candidates.saturating_add(
-            u64::try_from(pending.len()).map_err(|_| ProjectError::InvalidOptions)?,
-        );
-        save_structural_rollup_page(context, kind, &pending, &mut stats).await?;
-        if stats.source_changed {
-            break;
-        }
-    }
-    Ok(stats)
-}
-
-async fn save_structural_rollup_page(
-    context: &StructuralRollupContext,
-    kind: StructuralRollupKind,
-    pending: &[PendingStructuralRollup],
-    stats: &mut RollupSummarySweepStats,
-) -> Result<(), ProjectError> {
-    for batch in pending.chunks(16) {
-        if batch
-            .iter()
-            .any(|pending| pending.generation_id() != context.expected_generation)
-        {
-            stats.source_changed = true;
-            break;
-        }
-        for outcome in save_structural_rollup_batch(context, kind, batch).await? {
-            match outcome {
-                StructuralRollupSaveOutcome::Saved => {
-                    stats.saved = stats.saved.saturating_add(1);
-                }
-                StructuralRollupSaveOutcome::PreservedHigherQuality => {
-                    stats.preserved_higher_quality =
-                        stats.preserved_higher_quality.saturating_add(1);
-                }
-                StructuralRollupSaveOutcome::SourceChanged => {
-                    stats.skipped_source_changed = stats.skipped_source_changed.saturating_add(1);
-                    stats.source_changed = true;
-                    break;
-                }
+impl StructuralRollupContext {
+    async fn run(
+        &self,
+        kind: StructuralRollupKind,
+    ) -> Result<RollupSummarySweepStats, ProjectError> {
+        let mut stats = RollupSummarySweepStats::default();
+        let mut after = None::<String>;
+        loop {
+            if self.cancellation.is_cancelled() {
+                return Err(ProjectError::RequestCancelled);
+            }
+            let pending = self.load_page(kind, after.as_deref()).await?;
+            if pending.is_empty() {
+                break;
+            }
+            after = pending.last().map(|item| item.cursor().to_owned());
+            stats.candidates = stats.candidates.saturating_add(
+                u64::try_from(pending.len()).map_err(|_| ProjectError::InvalidOptions)?,
+            );
+            self.save_page(kind, &pending, &mut stats).await?;
+            if stats.source_changed {
+                break;
             }
         }
-        if stats.source_changed {
-            break;
-        }
+        Ok(stats)
     }
-    Ok(())
 }
 
-async fn load_structural_rollup_page(
-    context: &StructuralRollupContext,
-    kind: StructuralRollupKind,
-    after: Option<&str>,
-) -> Result<Vec<PendingStructuralRollup>, ProjectError> {
-    let query = || {
-        PendingSummaryRollupQuery::new(
-            &context.project_id,
-            STRUCTURAL_SUMMARY_MODEL,
-            &context.anchor.digest,
-        )
-        .after(after)
-        .page(FILE_SUMMARY_PAGE_SIZE, kind.item_limit())
-    };
-    match kind {
-        StructuralRollupKind::File => context
-            .runtime
-            .database()
-            .pending_file_summaries(query())
-            .await
-            .map(|pending| {
-                pending
-                    .into_iter()
-                    .map(PendingStructuralRollup::File)
-                    .collect()
-            }),
-        StructuralRollupKind::Module => context
-            .runtime
-            .database()
-            .pending_module_summaries(query())
-            .await
-            .map(|pending| {
-                pending
-                    .into_iter()
-                    .map(PendingStructuralRollup::Module)
-                    .collect()
-            }),
+impl StructuralRollupContext {
+    async fn save_page(
+        &self,
+        kind: StructuralRollupKind,
+        pending: &[PendingStructuralRollup],
+        stats: &mut RollupSummarySweepStats,
+    ) -> Result<(), ProjectError> {
+        for batch in pending.chunks(16) {
+            if batch
+                .iter()
+                .any(|pending| pending.generation_id() != self.expected_generation)
+            {
+                stats.source_changed = true;
+                break;
+            }
+            for outcome in self.save_batch(kind, batch).await? {
+                match outcome {
+                    StructuralRollupSaveOutcome::Saved => {
+                        stats.saved = stats.saved.saturating_add(1);
+                    }
+                    StructuralRollupSaveOutcome::PreservedHigherQuality => {
+                        stats.preserved_higher_quality =
+                            stats.preserved_higher_quality.saturating_add(1);
+                    }
+                    StructuralRollupSaveOutcome::SourceChanged => {
+                        stats.skipped_source_changed =
+                            stats.skipped_source_changed.saturating_add(1);
+                        stats.source_changed = true;
+                        break;
+                    }
+                }
+            }
+            if stats.source_changed {
+                break;
+            }
+        }
+        Ok(())
     }
-    .map_err(|_| ProjectError::EnrichmentReadFailed)
+}
+
+impl StructuralRollupContext {
+    async fn load_page(
+        &self,
+        kind: StructuralRollupKind,
+        after: Option<&str>,
+    ) -> Result<Vec<PendingStructuralRollup>, ProjectError> {
+        let query = || {
+            PendingSummaryRollupQuery::new(
+                &self.project_id,
+                STRUCTURAL_SUMMARY_MODEL,
+                &self.anchor.digest,
+            )
+            .after(after)
+            .page(FILE_SUMMARY_PAGE_SIZE, kind.item_limit())
+        };
+        match kind {
+            StructuralRollupKind::File => self
+                .runtime
+                .database()
+                .pending_file_summaries(query())
+                .await
+                .map(|pending| {
+                    pending
+                        .into_iter()
+                        .map(PendingStructuralRollup::File)
+                        .collect()
+                }),
+            StructuralRollupKind::Module => self
+                .runtime
+                .database()
+                .pending_module_summaries(query())
+                .await
+                .map(|pending| {
+                    pending
+                        .into_iter()
+                        .map(PendingStructuralRollup::Module)
+                        .collect()
+                }),
+        }
+        .map_err(|_| ProjectError::EnrichmentReadFailed)
+    }
 }
 
 struct PreparedStructuralRollup {
@@ -13663,62 +13644,62 @@ impl PreparedStructuralRollup {
     }
 }
 
-async fn save_structural_rollup_batch(
-    context: &StructuralRollupContext,
-    kind: StructuralRollupKind,
-    pending: &[PendingStructuralRollup],
-) -> Result<Vec<StructuralRollupSaveOutcome>, ProjectError> {
-    let prepared = pending
-        .iter()
-        .map(PreparedStructuralRollup::new)
-        .collect::<Result<Vec<_>, _>>()?;
-    let result = match kind {
-        StructuralRollupKind::File => {
-            let requests = prepared
-                .iter()
-                .map(|item| {
-                    FileSummarySaveRequest::new(&item.scope, item.input(context, kind))
-                        .and_then(|request| request.with_generation_mode("structural_rule"))
+impl StructuralRollupContext {
+    async fn save_batch(
+        &self,
+        kind: StructuralRollupKind,
+        pending: &[PendingStructuralRollup],
+    ) -> Result<Vec<StructuralRollupSaveOutcome>, ProjectError> {
+        let prepared = pending
+            .iter()
+            .map(PreparedStructuralRollup::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = match kind {
+            StructuralRollupKind::File => {
+                let requests = prepared
+                    .iter()
+                    .map(|item| {
+                        FileSummarySaveRequest::new(&item.scope, item.input(self, kind))
+                            .and_then(|request| request.with_generation_mode("structural_rule"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| ProjectError::EnrichmentDataInvalid)?;
+                self.runtime
+                    .database()
+                    .save_file_summaries(&self.project_id, &requests)
+                    .await
+            }
+            StructuralRollupKind::Module => {
+                let requests = prepared
+                    .iter()
+                    .map(|item| {
+                        ModuleSummarySaveRequest::new(&item.scope, item.input(self, kind))
+                            .and_then(|request| request.with_generation_mode("structural_rule"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| ProjectError::EnrichmentDataInvalid)?;
+                self.runtime
+                    .database()
+                    .save_module_summaries(&self.project_id, &requests)
+                    .await
+            }
+        };
+        match result {
+            Ok(records) => Ok(records
+                .into_iter()
+                .map(|record| {
+                    if record.is_some() {
+                        StructuralRollupSaveOutcome::Saved
+                    } else {
+                        StructuralRollupSaveOutcome::PreservedHigherQuality
+                    }
                 })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| ProjectError::EnrichmentDataInvalid)?;
-            context
-                .runtime
-                .database()
-                .save_file_summaries(&context.project_id, &requests)
-                .await
+                .collect()),
+            Err(StorageError::CurrentGenerationChanged) => {
+                Ok(vec![StructuralRollupSaveOutcome::SourceChanged])
+            }
+            Err(_) => Err(ProjectError::EnrichmentWriteFailed),
         }
-        StructuralRollupKind::Module => {
-            let requests = prepared
-                .iter()
-                .map(|item| {
-                    ModuleSummarySaveRequest::new(&item.scope, item.input(context, kind))
-                        .and_then(|request| request.with_generation_mode("structural_rule"))
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| ProjectError::EnrichmentDataInvalid)?;
-            context
-                .runtime
-                .database()
-                .save_module_summaries(&context.project_id, &requests)
-                .await
-        }
-    };
-    match result {
-        Ok(records) => Ok(records
-            .into_iter()
-            .map(|record| {
-                if record.is_some() {
-                    StructuralRollupSaveOutcome::Saved
-                } else {
-                    StructuralRollupSaveOutcome::PreservedHigherQuality
-                }
-            })
-            .collect()),
-        Err(StorageError::CurrentGenerationChanged) => {
-            Ok(vec![StructuralRollupSaveOutcome::SourceChanged])
-        }
-        Err(_) => Err(ProjectError::EnrichmentWriteFailed),
     }
 }
 
@@ -14603,7 +14584,10 @@ async fn run_metadata_role_sweep(
         let page = context
             .runtime
             .database()
-            .pending_structural_roles(&project_id, &context.model, cursor.as_ref(), limit)
+            .pending_structural_roles(
+                codevetra_db::PendingStructuralRoleQuery::new(&project_id, &context.model)
+                    .page(cursor.as_ref(), limit),
+            )
             .await
             .map_err(|_| ProjectError::IndexFailed)?;
         progress.attempted = progress.attempted.saturating_add(
@@ -14691,11 +14675,11 @@ async fn structural_roles_remaining(
             .runtime
             .database()
             .pending_structural_roles(
-                project_id,
-                &context.model,
-                Some(&after),
-                u16::try_from(ROLE_CLASSIFICATION_MAXIMUM_PAGE_SIZE)
-                    .map_err(|_| ProjectError::InvalidOptions)?,
+                codevetra_db::PendingStructuralRoleQuery::new(project_id, &context.model).page(
+                    Some(&after),
+                    u16::try_from(ROLE_CLASSIFICATION_MAXIMUM_PAGE_SIZE)
+                        .map_err(|_| ProjectError::InvalidOptions)?,
+                ),
             )
             .await
             .map_err(|_| ProjectError::IndexFailed)?;
@@ -18104,19 +18088,6 @@ fn attach_biomarker_catalog(mode: BiomarkerMode, evidence: &mut Value) {
 }
 
 fn validate_coverage_arguments(arguments: &Map<String, Value>) -> Result<(), ToolError> {
-    reject_present(
-        arguments,
-        &[
-            "symbol",
-            "symbols",
-            "minSeverity",
-            "minCentrality",
-            "minMetric",
-            "maxMetric",
-            "excludeFile",
-            "limit",
-        ],
-    )?;
     let selected = optional_text(arguments, "biomarker")?;
     if selected
         .is_some_and(|name| codevetra_domain::biomarkers::detector_capability(name).is_none())
@@ -18159,20 +18130,6 @@ fn biomarker_coverage(
 }
 
 fn biomarker_stats(execution: BiomarkerExecution<'_>) -> Result<ToolResult, ToolError> {
-    reject_present(
-        execution.arguments,
-        &[
-            "symbol",
-            "symbols",
-            "biomarker",
-            "minSeverity",
-            "minCentrality",
-            "minMetric",
-            "maxMetric",
-            "excludeFile",
-            "limit",
-        ],
-    )?;
     let stats = merge_layer_finding_stats(execution.stats, execution.layer_violation_count)?;
     biomarker_result(
         execution.freshness,
@@ -18221,18 +18178,6 @@ async fn biomarker_symbols(
     handler: &CodeVetraMcpHandler,
     execution: BiomarkerExecution<'_>,
 ) -> Result<ToolResult, ToolError> {
-    reject_present(
-        execution.arguments,
-        &[
-            "biomarker",
-            "minSeverity",
-            "minCentrality",
-            "minMetric",
-            "maxMetric",
-            "excludeFile",
-            "limit",
-        ],
-    )?;
     let symbol_name =
         optional_bounded_text(execution.arguments, "symbol", CONTEXT_ANCHOR_MAXIMUM_BYTES)?;
     let symbol_names = optional_string_array(
@@ -19197,11 +19142,11 @@ fn find_definition(annotations: ToolAnnotations) -> Result<ToolDefinition, ToolC
         "key": {"type": "string", "minLength": 1, "maxLength": CONTEXT_ANCHOR_MAXIMUM_BYTES, "description": "Exact environment variable, SQL relation, or build-context identifier."},
         "op": {"type": "string", "enum": ["read", "write", "ddl"], "description": "SQL reference operation filter."},
         "includeTests": {"type": "boolean", "default": true, "description": "Environment and SQL axes only."},
-        "limit": {"type": "integer", "minimum": 1, "maximum": FIND_SOURCE_MAXIMUM_LIMIT},
+        "limit": {"type": "integer", "minimum": 1, "maximum": FIND_SOURCE_MAXIMUM_LIMIT, "description": format!("For by=name/path/reference/bm25/hybrid/auto: 1 to {FIND_NAME_MAXIMUM_LIMIT}. For by=content/env/sql/build: 1 to {FIND_SOURCE_MAXIMUM_LIMIT}. Omit to use the mode-specific default.")},
         "since": {"type": "string", "minLength": 1, "maxLength": FIND_CURSOR_MAXIMUM_BYTES, "description": "Delta cursor for exact name and content results."},
-        "compact": {"type": "boolean", "description": "Exact name mode only."},
-        "fields": {"type": "array", "minItems": 1, "maxItems": FIND_MAXIMUM_FIELDS, "items": {"type": "string", "enum": ["name", "kind", "path", "line", "signature", "id"]}},
-        "lowTokens": {"type": "boolean", "default": false, "description": "Use compact minified BM25/hybrid output while retaining generation, rank, identity, and channel provenance."},
+        "compact": {"type": "boolean", "description": "Exact name mode only. Set compact=true when requesting fields."},
+        "fields": {"type": "array", "minItems": 1, "maxItems": FIND_MAXIMUM_FIELDS, "description": "Select columns for exact name search (by=name, mode=exact). Requires compact=true or lowTokens=true.", "items": {"type": "string", "enum": ["name", "kind", "path", "line", "signature", "id"]}},
+        "lowTokens": {"type": "boolean", "default": false, "description": "Use compact exact-name or minified BM25/hybrid output while retaining provenance. With by=name, requires mode=exact and also enables compact fields."},
         "allowStale": {"type": "boolean"}
     });
     read_definition(ReadDefinition {
@@ -19560,17 +19505,17 @@ fn files_definition(annotations: ToolAnnotations) -> Result<ToolDefinition, Tool
         "pattern": {"type": "string", "minLength": 1, "maxLength": CONTEXT_ANCHOR_MAXIMUM_BYTES},
         "format": {"type": "string", "enum": ["tree", "flat", "grouped", "summary", "symbols", "deps", "module", "read"]},
         "file": {"type": "string", "minLength": 1, "maxLength": CONTEXT_ANCHOR_MAXIMUM_BYTES},
-        "sourceHandle": {"type":"string","minLength":1,"maxLength":8192,"description":"Recover exact delivered bytes after revalidating generation and source hash. Mutually exclusive with file/range/stale options."},
+        "sourceHandle": {"type":"string","minLength":1,"maxLength":source_reuse::MAX_HANDLE_BYTES,"description":"Recover exact delivered bytes after revalidating generation and source hash. Mutually exclusive with file/range/stale options."},
         "byteOffset": {"type":"integer","minimum":0,"description":"UTF-8 byte offset; use excerpt.endByte for continuation, including very long single lines."},
-        "byteLimit": {"type":"integer","minimum":1,"maximum":262_144},
+        "byteLimit": {"type":"integer","minimum":1,"maximum":FILE_SOURCE_MAXIMUM_BYTE_LIMIT},
         "lineOffset": {"type": "integer", "minimum": 0, "maximum": RANGE_MAXIMUM_LINE},
         "lineLimit": {"type": "integer", "minimum": 1, "maximum": FILE_SOURCE_MAXIMUM_LINE_LIMIT},
-        "kinds": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "kinds": {"type": "string", "minLength": 1, "maxLength": FILES_KINDS_MAXIMUM_BYTES},
         "includeParameters": {"type": "boolean"},
         "includeImports": {"type": "boolean"},
         "direction": {"type": "string", "enum": ["dependencies", "dependents", "both"]},
         "symbols": {"type": "boolean"},
-        "language": {"type": "string", "minLength": 1, "maxLength": 64},
+        "language": {"type": "string", "minLength": 1, "maxLength": FILES_LANGUAGE_MAXIMUM_BYTES},
         "limit": {"type": "integer", "minimum": 1, "maximum": FILES_MAXIMUM_LIMIT},
         "dirPath": {"type": "string", "minLength": 1, "maxLength": CONTEXT_ANCHOR_MAXIMUM_BYTES},
         "metadata": {"type": "boolean"},
@@ -19768,21 +19713,22 @@ fn biomarkers_definition(
     annotations: ToolAnnotations,
 ) -> Result<ToolDefinition, ToolContractError> {
     let schema = json!({
-        "mode": {"type": "string", "enum": ["ranked", "symbol", "stats", "coverage"]},
-        "symbol": {"type": "string", "minLength": 1, "maxLength": CONTEXT_ANCHOR_MAXIMUM_BYTES},
+        "mode": {"type": "string", "enum": ["ranked", "symbol", "stats", "coverage"], "description": "Default ranked. stats returns complete unfiltered counts: omit all selection and filter fields. coverage accepts only biomarker as a selection. symbol requires symbol or symbols and accepts no ranked filters."},
+        "symbol": {"description": "Symbol mode only. One exact name; mutually exclusive with symbols.", "type": "string", "minLength": 1, "maxLength": CONTEXT_ANCHOR_MAXIMUM_BYTES},
         "symbols": {
+            "description": "Symbol mode only. Exact names; mutually exclusive with symbol.",
             "type": "array",
             "minItems": 1,
             "maxItems": 20,
             "items": {"type": "string", "minLength": 1, "maxLength": CONTEXT_ANCHOR_MAXIMUM_BYTES}
         },
-        "biomarker": {"type": "string", "enum": codevetra_domain::biomarkers::detector_capabilities().iter().map(|rule| rule.name).collect::<Vec<_>>()},
-        "minSeverity": {"type": "string", "enum": ["info", "warning", "error"]},
-        "minCentrality": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "minMetric": {"type": "number"},
-        "maxMetric": {"type": "number"},
-        "excludeFile": {"type": "string", "minLength": 1, "maxLength": 4096},
-        "limit": {"type": "integer", "minimum": 1, "maximum": INSIGHT_MAXIMUM_LIMIT},
+        "biomarker": {"description": "Ranked or coverage mode only. Omit in stats and symbol modes.", "type": "string", "enum": codevetra_domain::biomarkers::detector_capabilities().iter().map(|rule| rule.name).collect::<Vec<_>>()},
+        "minSeverity": {"description": "Ranked mode only; omit in stats, symbol and coverage modes.", "type": "string", "enum": ["info", "warning", "error"]},
+        "minCentrality": {"description": "Ranked mode only; omit in stats, symbol and coverage modes.", "type": "number", "minimum": 0.0, "maximum": 1.0},
+        "minMetric": {"description": "Ranked mode only; omit in stats, symbol and coverage modes.", "type": "number"},
+        "maxMetric": {"description": "Ranked mode only; omit in stats, symbol and coverage modes.", "type": "number"},
+        "excludeFile": {"description": "Ranked mode only; omit in stats, symbol and coverage modes.", "type": "string", "minLength": 1, "maxLength": 4096},
+        "limit": {"type": "integer", "minimum": 1, "maximum": INSIGHT_MAXIMUM_LIMIT, "default": BIOMARKER_DEFAULT_LIMIT, "description": "Ranked mode only; omit in stats, symbol and coverage modes. Result cap. Use mode=stats for complete counts; use biomarker and metric filters to narrow a truncated ranked result."},
         "format": {"type": "string", "enum": ["markdown", "json"]},
         "lowTokens": {"type": "boolean"},
         "allowStale": {"type": "boolean"}
@@ -20121,7 +20067,7 @@ fn verify_definition(annotations: ToolAnnotations) -> Result<ToolDefinition, Too
 }
 
 fn review_definition(annotations: ToolAnnotations) -> Result<ToolDefinition, ToolContractError> {
-    let schema = json!({
+    let mut schema = json!({
         "sourceDetail":{"type":"string","enum":["adaptive","full","focused","outline"],"description":"(context) Prioritize changed indexed bodies and explicitly report omitted or stale source."},
         "mode": {
             "type": "string",
@@ -20152,7 +20098,7 @@ fn review_definition(annotations: ToolAnnotations) -> Result<ToolDefinition, Too
         "dedupeByName": {"type": "boolean", "default": true, "description": "(neighbors) Collapse same-named semantic neighbors, retaining the strongest result."},
         "modelId": {"type": "string", "minLength": SESSION_ID_MAXIMUM_BYTES, "maxLength": SESSION_ID_MAXIMUM_BYTES, "description": "(neighbors) Exact active embedding-model UUID when multiple models are available."},
         "topN": {"type": "integer", "minimum": 1, "maximum": REVIEW_MAXIMUM_LENS_ROWS, "default": REVIEW_DEFAULT_LENS_ROWS},
-        "limit": {"type": "integer", "minimum": 1, "maximum": REVIEW_MAXIMUM_LENS_ROWS, "description": "(risk) Alias for topN; topN wins."},
+        "limit": {"type": "integer", "minimum": 1, "maximum": REVIEW_MAXIMUM_LENS_ROWS, "description": "Alias for topN; topN wins."},
         "minCentrality": {"type": "number", "minimum": 0, "maximum": 1},
         "coverageSource": {"type": "string", "minLength": 1, "maxLength": ARTIFACT_MAXIMUM_LABEL_BYTES},
         "pathFilter": {"type": "string", "minLength": 1, "maxLength": MAX_PROJECT_PATH_BYTES, "description": "Restrict path-bearing review lenses and context-mode Git or supplied-diff evidence to one canonical project-relative prefix."},
@@ -20162,6 +20108,9 @@ fn review_definition(annotations: ToolAnnotations) -> Result<ToolDefinition, Too
         "timeoutMs": {"type": "integer", "minimum": REVIEW_TRUST_MINIMUM_TIMEOUT_MS, "maximum": REVIEW_TRUST_MAXIMUM_TIMEOUT_MS, "default": REVIEW_TRUST_DEFAULT_TIMEOUT_MS},
         "allowStale": {"type": "boolean", "default": false, "description": "Allow explicitly labeled stale indexed evidence for non-Git review lenses; accepted as a compatibility no-op in context mode because Git evidence already reports freshness."}
     });
+    if let Some(properties) = schema.as_object_mut() {
+        argument_guidance::describe_review_modes(properties);
+    }
     read_definition(ReadDefinition {
         name: REVIEW_TOOL,
         description: "Six-mode review and triage surface: Git/unified-diff context with graph impact and tests; semantic sister implementations; project-wide risk lenses; all 16 agent-prone detectors; generation-scoped numerical hazards; or live native storage, embedding, and LLM trust checks.",
@@ -20663,10 +20612,10 @@ fn admin_definition() -> Result<ToolDefinition, ToolContractError> {
         "databaseQueryTimeoutMs": {"type": "integer", "minimum": 1, "maximum": ADMIN_BIOMARKER_REFRESH_MAXIMUM_TIMEOUT_MS, "description": "biomarkers-refresh native operation deadline, bounded to 300000 milliseconds."},
 
         "exportFormat": {"type":"string","enum":["json","dot","mermaid","cytoscape"]},
-        "kinds": {"type":"string","maxLength":4096},
-        "edgeKinds": {"type":"string","maxLength":4096},
-        "languages": {"type":"string","maxLength":4096},
-        "filePrefix": {"type":"string","maxLength":4096},
+        "kinds": {"type":"string","maxLength":admin_arguments::MAXIMUM_FILTER_BYTES},
+        "edgeKinds": {"type":"string","maxLength":admin_arguments::MAXIMUM_FILTER_BYTES},
+        "languages": {"type":"string","maxLength":admin_arguments::MAXIMUM_FILTER_BYTES},
+        "filePrefix": {"type":"string","maxLength":admin_arguments::MAXIMUM_FILTER_BYTES},
         "index": {"type": "boolean", "description": "Init only. Build and publish the initial immutable generation before the command completes."},
         "force": {"type": "boolean"},
         "clearParseCache": {"type": "boolean", "description": "Index only. Bypass the exact source-and-policy extraction cache and reparse a complete generation."},
@@ -20674,7 +20623,7 @@ fn admin_definition() -> Result<ToolDefinition, ToolContractError> {
         "workers": {"type": "integer", "minimum": 1, "maximum": ADMIN_MAXIMUM_WORKERS},
         "maxFileSize": {"type": "string", "minLength": 1, "maxLength": ADMIN_MAX_FILE_SIZE_TEXT_BYTES, "description": "Init/index/sync/embed-only source-file ceiling. Accepts bytes or kb/mb suffixes through 10mb; oversized supported files are skipped and counted rather than failing the generation."},
         "profile": {"type": "boolean", "description": "Index/sync only. Include native bounded phase timing evidence."},
-        "exclude": {"type":"array","items":{"type":"string","minLength":1,"maxLength":4096},"maxItems":4096,"description":"Index/sync run-scoped exclusion globs, layered over project defaults."},
+        "exclude": {"type":"array","items":{"type":"string","minLength":1,"maxLength":admin_arguments::EXCLUDES.maximum_item_bytes},"maxItems":admin_arguments::EXCLUDES.maximum_items,"description":"Index/sync run-scoped exclusion globs, layered over project defaults."},
         "preserveCurrentExcludes":{"type":"boolean","description":"Inherit current run exclusions when no replacements are provided."},
         "singlePublication":{"type":"boolean","description":"Report source edits after a successful publication without another rebuild."},
         "refreshHistory":{"type":"boolean","description":"Refresh independent Git and issue history after indexing."},
@@ -20685,17 +20634,17 @@ fn admin_definition() -> Result<ToolDefinition, ToolContractError> {
         "confirm": {"type": "boolean", "description": "Required with biomarkers-refresh when dryRun is false and for other explicitly guarded admin mutations."},
 
         "dryRun": {"type": "boolean", "default": true, "description": "biomarkers-refresh plans without mutation by default; set false only with confirm true."},
-        "maximumRows": {"type": "integer", "minimum": 1, "maximum": ADMIN_MAXIMUM_IMPORT_ROWS},
-        "maximumSourceBytes": {"type": "integer", "minimum": 1, "maximum": ADMIN_DEFAULT_IMPORT_SOURCE_BYTES},
-        "keepSuperseded": {"type": "integer", "minimum": 0, "maximum": 32},
-        "maximumDeletions": {"type": "integer", "minimum": 1, "maximum": 100},
-        "maximumCascadeRows": {"type":"integer","minimum":1,"maximum":10000,"description":"Maximum physical graph versions visited by one resumable native retention batch."},
+        "maximumRows": {"type": "integer", "minimum": 1, "maximum": admin_arguments::SCIP_IMPORT_ROWS.maximum, "description":format!("SCIP only. scip-export maximum and default: {} rows. scip-import maximum and default: {} rows.", admin_arguments::SCIP_EXPORT_ROWS.maximum, admin_arguments::SCIP_IMPORT_ROWS.maximum)},
+        "maximumSourceBytes": {"type": "integer", "minimum": 1, "maximum": admin_arguments::SCIP_IMPORT_BYTES.maximum, "default":admin_arguments::SCIP_IMPORT_BYTES.default, "description":"scip-import only. Maximum encoded input artifact bytes."},
+        "keepSuperseded": admin_arguments::PRUNE_KEEP.schema(),
+        "maximumDeletions": admin_arguments::PRUNE_GENERATIONS.schema(),
+        "maximumCascadeRows": {"type":"integer", "minimum":admin_arguments::PRUNE_VERSIONS.minimum, "maximum":admin_arguments::PRUNE_VERSIONS.maximum, "default":admin_arguments::PRUNE_VERSIONS.default, "description":"Maximum physical graph versions visited by one resumable native retention batch."},
 
         "k": {"type": "integer", "minimum": 1, "maximum": ADMIN_SIMILARITY_MAXIMUM_K},
         "minScore": {"type": "number", "minimum": 0, "maximum": 1},
         "maxAgeDays": {"type": "number", "minimum": 0},
         "concurrency": {"type": "integer", "minimum": 1, "maximum": ADMIN_MAXIMUM_WORKERS},
-        "limit": {"type": "integer", "minimum": 1, "maximum": ADMIN_RESULT_MAXIMUM_LIMIT},
+        "limit": {"type": "number", "maximum": SUMMARY_MAXIMUM_SWEEP_LIMIT, "description": format!("Action-specific limit. graph-export: integer 1 to {}, default {}. classify: integer 1 to {}, default {}. summarize: legacy alias for summarizeLimit; use summarizeLimit instead. Omit for other actions.", crate::graph_export::MAXIMUM_NODE_LIMIT, crate::graph_export::DEFAULT_NODE_LIMIT, ROLE_CLASSIFICATION_MAXIMUM_LIMIT, ROLE_CLASSIFICATION_DEFAULT_LIMIT)},
         "summarizeLimit": {"type": "number", "maximum": SUMMARY_MAXIMUM_SWEEP_LIMIT, "description": "Summarize only: omit for the importance-ranked default, 0 for ad-hoc-only, a positive cap for this pass (fractional caps preserve v1 ceiling behavior), or any negative value for an explicitly uncapped backlog drain."},
         "out": {"type": "string"},
         "in": {"type": "string"},
@@ -20711,18 +20660,20 @@ fn admin_definition() -> Result<ToolDefinition, ToolContractError> {
         "responsePath": {"type": "string", "minLength": 1, "maxLength": ADMIN_LLM_ENDPOINT_MAXIMUM_BYTES, "description": "cli-bridge json-path only. Validated dotted path with array indexes."},
         "apiKeyEnv": {"type": "string"},
         "apiKeyCommand": {"type": "array", "minItems": 1, "maxItems": ADMIN_LLM_CREDENTIAL_ARGV_MAXIMUM, "items": {"type": "string", "minLength": 1, "maxLength": ADMIN_LLM_CLI_ARGUMENT_BYTES_MAXIMUM}, "description": "Remote llm-apply presets only; exclusive with apiKeyEnv. Credential helper argv the MCP server runs without a shell on the tier's first use; its stdout is the key and only the argv is stored."},
-        "timeoutMs": {"type": "integer", "minimum": 1, "maximum": ADMIN_BIOMARKER_REFRESH_MAXIMUM_TIMEOUT_MS, "description": "Legacy biomarkers-refresh statement-timeout alias, or the bounded execution timeout for supported LLM/SCIP admin operations. Prefer databaseQueryTimeoutMs for biomarkers-refresh."},
+        "timeoutMs": {"type": "integer", "minimum": 1, "maximum": admin_arguments::SCIP_EXPORT_TIMEOUT.maximum, "description": format!("Action-specific milliseconds: biomarkers-refresh 1 to {} (legacy alias; prefer databaseQueryTimeoutMs, and never pass both); llm-apply 1 to {}; scip-export {} to {}, default {}. Omit for other actions.", ADMIN_BIOMARKER_REFRESH_MAXIMUM_TIMEOUT_MS, ADMIN_QUERY_TIMEOUT_MAXIMUM_MS, admin_arguments::SCIP_EXPORT_TIMEOUT.minimum, admin_arguments::SCIP_EXPORT_TIMEOUT.maximum, admin_arguments::SCIP_EXPORT_TIMEOUT.default)},
         "minimal": {"type": "boolean"},
         "dir": {"type": "string"},
         "writeConfig": {"type": "boolean"},
         "fix": {"type": "boolean"},
         "skipProjectChecks": {"type": "boolean", "description": "Doctor only: verify the Rust runtime and native storage capability plane without requiring an index, embeddings, or chat configuration."}
     });
+    let mut schema = object_schema(schema, &["action"]);
+    schema["allOf"] = admin_arguments::constraints();
     ToolDefinition::new(
         ToolDefinitionInput::new(
             ADMIN_TOOL,
             "Per-project RocksDB indexing, bounded graph and derived-state retention, model pipelines, and SCIP interoperability. Long actions return an owned in-process job; poll status until terminal. Graph publication, enrichment, and maintenance outcomes remain separate.",
-            object_schema(schema, &["action"]),
+            schema,
         )
         .with_profiles(ToolProfiles::FULL.union(ToolProfiles::CORE)),
     )
@@ -20743,6 +20694,7 @@ fn object_schema(properties: Value, required: &[&str]) -> Value {
             "description": "Optional path to another initialized CodeVetra project. The server walks upward to the nearest validated .codevetra state directory or explicit migration alias, uses a bounded LRU runtime cache, and honors CODEVETRA_ALLOWED_PROJECTS when configured."
         })
     });
+    argument_guidance::describe_bounds(&mut properties);
     json!({
         "type": "object",
         "properties": properties,
@@ -22310,32 +22262,7 @@ fn validate_review_mode_arguments(
     mode: &str,
 ) -> Result<(), ToolError> {
     const COMMON_ARGUMENTS: &[&str] = &["mode", "allowStale"];
-    let mode_arguments: &[&str] = match mode {
-        "context" => &[
-            "baseRef",
-            "sourceDetail",
-            "maxChangedFiles",
-            "diff",
-            "maxCallersPerSymbol",
-            "maxCalleesPerSymbol",
-            "maxCoChangeWarnings",
-            "minCoChangeJaccard",
-            "minDiffMagnitude",
-            "pathFilter",
-        ],
-        "neighbors" => &["files", "symbols", "k", "dedupeByName", "modelId"],
-        "risk" => &[
-            "topN",
-            "limit",
-            "minCentrality",
-            "coverageSource",
-            "pathFilter",
-        ],
-        "agent-audit" => &["perDetectorLimit", "minSeverity", "pathFilter"],
-        "numerical" => &["topN", "limit", "pathFilter"],
-        "trust" => &["deep", "timeoutMs"],
-        _ => return Err(invalid_arguments()),
-    };
+    let mode_arguments = argument_guidance::review_arguments(mode).ok_or_else(invalid_arguments)?;
     if let Some(key) = arguments.keys().find(|key| {
         !COMMON_ARGUMENTS.contains(&key.as_str()) && !mode_arguments.contains(&key.as_str())
     }) {
@@ -24827,20 +24754,29 @@ fn optional_number(
 
 fn optional_integer<T>(
     arguments: &Map<String, Value>,
-    key: &str,
+    key: &'static str,
     bounds: NumericBounds<T>,
 ) -> Result<T, ToolError>
 where
-    T: Copy + PartialOrd + TryFrom<u64>,
+    T: Copy + PartialOrd + TryFrom<u64> + std::fmt::Display,
 {
+    let invalid = || {
+        safe_error(
+            ToolErrorCode::InvalidArguments,
+            format!(
+                "{key} must be an integer from {} to {} (inclusive)",
+                bounds.minimum, bounds.maximum
+            ),
+        )
+    };
     let value = match arguments.get(key) {
         None => return Ok(bounds.default),
-        Some(Value::Number(value)) => value.as_u64().ok_or_else(invalid_arguments)?,
-        Some(_) => return Err(invalid_arguments()),
+        Some(Value::Number(value)) => value.as_u64().ok_or_else(invalid)?,
+        Some(_) => return Err(invalid()),
     };
-    let value = T::try_from(value).map_err(|_| invalid_arguments())?;
+    let value = T::try_from(value).map_err(|_| invalid())?;
     if value < bounds.minimum || value > bounds.maximum {
-        Err(invalid_arguments())
+        Err(invalid())
     } else {
         Ok(value)
     }
@@ -24848,14 +24784,20 @@ where
 
 fn required_integer<T>(
     arguments: &Map<String, Value>,
-    key: &str,
+    key: &'static str,
     bounds: NumericBounds<T>,
 ) -> Result<T, ToolError>
 where
-    T: Copy + PartialOrd + TryFrom<u64>,
+    T: Copy + PartialOrd + TryFrom<u64> + std::fmt::Display,
 {
     if !arguments.contains_key(key) {
-        return Err(invalid_arguments());
+        return Err(safe_error(
+            ToolErrorCode::InvalidArguments,
+            format!(
+                "{key} is required; supply an integer from {} to {} (inclusive)",
+                bounds.minimum, bounds.maximum
+            ),
+        ));
     }
     optional_integer(arguments, key, bounds)
 }

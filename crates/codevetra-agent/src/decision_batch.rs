@@ -126,40 +126,43 @@ async fn decide_batch<T, R>(
 where
     R: BatchRequest<T>,
 {
-    let mut requests = Vec::new();
-    let decided = match decide_once(provider, request, batch, &mut requests).await {
-        Err(
-            error @ (JevError::InvalidResponse
-            | JevError::EndpointUnavailable
-            | JevError::RateLimited),
-        ) => {
-            if error == JevError::RateLimited {
-                tokio::time::sleep(RATE_LIMIT_PAUSE).await;
-            }
-            decide_once(provider, request, batch, &mut requests).await
+    let mut outcome = decide_once(provider, request, batch).await;
+    if let Err(
+        error @ (JevError::InvalidResponse | JevError::EndpointUnavailable | JevError::RateLimited),
+    ) = &outcome.decided
+    {
+        if *error == JevError::RateLimited {
+            tokio::time::sleep(RATE_LIMIT_PAUSE).await;
         }
-        decided => decided,
-    };
-    BatchDecision {
-        count: batch.len(),
-        decided,
-        requests,
+        let retry = decide_once(provider, request, batch).await;
+        outcome.requests.extend(retry.requests);
+        outcome.decided = retry.decided;
     }
+    outcome
 }
 
 async fn decide_once<T, R>(
     provider: &impl DecisionProvider,
     request: &R,
     batch: &[T],
-    requests: &mut Vec<DecisionRequestMetrics>,
-) -> Result<Vec<R::Answer>, JevError>
+) -> BatchDecision<R::Answer>
 where
     R: BatchRequest<T>,
 {
     let (state, questions) = request.build(batch);
-    let decision = provider.decide(&state, &questions).await?;
-    requests.extend(decision.metrics);
-    request.read(&decision, batch.len())
+    let decision = provider.decide(&state, &questions).await;
+    let requests = decision
+        .as_ref()
+        .ok()
+        .and_then(|decision| decision.metrics)
+        .into_iter()
+        .collect();
+    let decided = decision.and_then(|decision| request.read(&decision, batch.len()));
+    BatchDecision {
+        count: batch.len(),
+        decided,
+        requests,
+    }
 }
 
 /// `text` cut to at most `limit` bytes on a character boundary.
@@ -292,7 +295,7 @@ mod tests {
                 .collect();
             Ok(JevDecision {
                 usage: None,
-                metrics: None,
+                metrics: Some(fixture_request_metrics()),
                 model: JEV_MODEL.to_owned(),
                 answers,
             })
@@ -373,5 +376,46 @@ mod tests {
         let outcomes = decide_batches(&unavailable, echo(&items, 2)).await;
         assert_eq!(outcomes.stopped, Some(JevError::EndpointUnavailable));
         assert_eq!(answers(&outcomes), [Some(0.0), Some(0.01)]);
+    }
+
+    struct RejectFirstRead(AtomicUsize);
+
+    impl BatchRequest<u32> for RejectFirstRead {
+        type Answer = f64;
+
+        fn build(&self, batch: &[u32]) -> (Value, BTreeMap<String, JevQuestion>) {
+            Echo.build(batch)
+        }
+
+        fn read(&self, decision: &JevDecision, count: usize) -> Result<Vec<f64>, JevError> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(JevError::InvalidResponse)
+            } else {
+                Echo.read(decision, count)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_metrics_from_a_response_rejected_by_the_answer_reader() {
+        let provider = Provider::failing(Vec::new());
+        let request = RejectFirstRead(AtomicUsize::new(0));
+        let outcome = decide_batch(&provider, &request, &[50]).await;
+        assert_eq!(outcome.count, 1);
+        assert_eq!(outcome.decided, Ok(vec![0.5]));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome.requests.len(), 2);
+        assert!(
+            outcome
+                .requests
+                .iter()
+                .all(|metrics| metrics.elapsed_ms == 7)
+        );
+
+        let unavailable = Provider::failing(vec![(50, JevError::EndpointUnavailable, 1)]);
+        let recovered = decide_batch(&unavailable, &Echo, &[50]).await;
+        assert_eq!(recovered.decided, Ok(vec![0.5]));
+        assert_eq!(unavailable.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recovered.requests.len(), 1);
     }
 }

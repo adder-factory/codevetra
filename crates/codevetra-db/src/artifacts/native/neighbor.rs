@@ -2,18 +2,18 @@
 
 use super::backlog::evidence;
 use super::summaries::{current_symbol_summary, summary_kind};
-use super::{Kind, Record, Scope, State, WRITE_BYTES, WRITE_ROWS, workspace, write};
+use super::{Kind, Record, Scope, State, WRITE_BYTES, WRITE_ROWS, workspace};
 use crate::{
     NativeDatabase, NewAgentArtifact, StorageError,
     artifacts::{
         NeighborSummarySaveRequest, NeighborSummarySource, PendingNeighborSummary,
         PendingNeighborSummaryQuery, validate_limit,
     },
-    retrieval::native::{retain, visit_symbols},
+    retrieval::native::visit_symbols,
     rocks::StateNamespace,
     semantic::{
         SemanticStorageError,
-        native::{embedded_symbols, feature_error},
+        native::{feature_error, vectors::SourceReader},
     },
 };
 use codevetra_domain::{GenerationId, ProjectId, SymbolId};
@@ -36,24 +36,24 @@ impl NativeDatabase {
             usize::from(request.limit),
         );
         self.transaction(
-            Some(generation.clone()),
-            0,
-            0,
+            crate::rocks::StateAccess::read_only(Some(generation.clone())),
             super::super::ARTIFACT_TIMEOUT,
             move |transaction, budget| -> Result<_, SemanticStorageError> {
                 let snapshot = transaction.graph_snapshot()?;
                 let graph = snapshot.graph(budget)?;
-                let embedded = embedded_symbols(transaction, &graph, &model, budget)?;
-                let mut selected = Vec::new();
+                let embedded =
+                    SourceReader::new(transaction, &graph).embedded_symbols(&model, budget)?;
+                let mut selected = crate::retrieval::native::RankedRows::new(
+                    limit,
+                    |a: &crate::SymbolInput, b| a.symbol_id.cmp(&b.symbol_id),
+                );
                 visit_symbols(&graph, budget, |symbol, budget| {
                     if summary_kind(&symbol.symbol_kind)
                         && embedded.contains(&symbol.symbol_id)
                         && after.as_ref().is_none_or(|after| &symbol.symbol_id > after)
                         && current_symbol_summary(transaction, &symbol, budget)?.is_none()
                     {
-                        retain(&mut selected, symbol, limit, |a, b| {
-                            a.symbol_id.cmp(&b.symbol_id)
-                        });
+                        selected.insert(symbol);
                         if selected
                             .iter()
                             .map(|symbol| {
@@ -107,9 +107,7 @@ impl NativeDatabase {
         }
         let ids = symbols.iter().cloned().collect::<BTreeSet<_>>();
         self.state(
-            Some(generation.clone()),
-            0,
-            0,
+            crate::rocks::StateAccess::read_only(Some(generation.clone())),
             move |transaction, budget| {
                 let snapshot = transaction.graph_snapshot()?;
                 let graph = snapshot.graph(budget)?;
@@ -168,7 +166,7 @@ impl NativeDatabase {
             request.embedding_model_id.clone(),
             request.similarity,
         );
-        self.state(None, WRITE_BYTES, WRITE_ROWS, move |transaction, budget| {
+        self.state(crate::rocks::StateAccess::write(None, WRITE_BYTES, WRITE_ROWS),  move |transaction, budget| {
             let Some(current) = transaction.current()? else {return Ok(None);};
             let snapshot = transaction.graph_snapshot()?;
             let graph = snapshot.graph(budget)?;
@@ -183,9 +181,9 @@ impl NativeDatabase {
                 "sourceModel":producer(&summary), "embeddingModelId":model.as_str(), "similarity":similarity});
             drop(graph);
             drop(snapshot);
-            let saved = write(transaction, budget, NewAgentArtifact {kind:Kind::Summary, scope:Scope::Symbol,
+            let saved = (NewAgentArtifact {kind:Kind::Summary, scope:Scope::Symbol,
                 scope_key:id.to_string(), body, metadata, generation_id:Some(current.generation_id.clone()),
-                source_digest:Some(digest), state:State::Complete}, true)?;
+                source_digest:Some(digest), state:State::Complete}).write(transaction, budget, true)?;
             transaction.delete(StateNamespace::Derived, &crate::summary_priority::native::key(&current.generation_id, &id))?;
             Ok(Some(saved))
         }).await

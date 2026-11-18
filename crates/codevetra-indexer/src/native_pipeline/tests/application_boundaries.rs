@@ -302,3 +302,57 @@ fn application_boundaries_receivers_do_not_escape_lexical_scope() {
             .any(|edge| edge.provenance == "framework-boundary-scoped-match-v1")
     );
 }
+
+#[test]
+fn application_boundary_links_retain_their_site_channel_confidence_and_direction() {
+    let facts = bridge_details::generation(&[
+        (
+            "events.ts",
+            "import { EventEmitter } from 'node:events'; import Queue from 'bull'; const bus = new EventEmitter(); const jobs = new Queue('jobs'); function handler() {} bus.on('change', handler); jobs.process('work', handler); export function send() { bus.emit('change'); jobs.add('work', {}); }",
+        ),
+        (
+            "app/client.ts",
+            "'use client'; export function send() { fetch('/api'); }",
+        ),
+        ("app/api/route.ts", "export function GET() { return 1; }"),
+    ]);
+    let mut seen = BTreeSet::new();
+    for edge in facts
+        .edges()
+        .iter()
+        .filter(|edge| edge.provenance.starts_with("framework-boundary-"))
+    {
+        let site_id = match edge.provenance.as_str() {
+            "framework-boundary-source-site-v1" => &edge.target_symbol_id,
+            "framework-boundary-registration-owner-v1" | "framework-boundary-scoped-match-v1" => {
+                &edge.source_symbol_id
+            }
+            other => panic!("unexpected boundary provenance: {other}"),
+        };
+        let symbol = facts
+            .symbols()
+            .iter()
+            .find(|symbol| &symbol.symbol_id == site_id)
+            .unwrap_or_else(|| panic!("missing boundary site"));
+        let site = BoundarySite::from_qualified_name(&symbol.qualified_name)
+            .unwrap_or_else(|| panic!("edge is not anchored to a boundary site"));
+        let (kind, confidence) = match site.channel.as_str() {
+            "event" => (EdgeKind::EventDispatch, 0.9_f32),
+            "queue" => (EdgeKind::QueueDispatch, 0.9_f32),
+            "http" => (EdgeKind::HttpRequest, 0.8_f32),
+            other => panic!("unexpected fixture channel: {other}"),
+        };
+        assert_eq!(edge.kind, kind);
+        assert_eq!(edge.confidence.to_bits(), confidence.to_bits());
+        if edge.provenance == "framework-boundary-registration-owner-v1" {
+            assert_eq!(site.role, "registration");
+        } else {
+            assert_eq!(site.role, "source");
+        }
+        seen.insert(site.channel);
+    }
+    assert_eq!(
+        seen,
+        BTreeSet::from(["event".to_owned(), "queue".to_owned(), "http".to_owned()])
+    );
+}

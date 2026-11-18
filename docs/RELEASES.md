@@ -24,6 +24,7 @@ provenance live on GitHub Releases.
 
 | Version | Date | Schema · Contract | Headline |
 | --- | --- | --- | --- |
+| [v4.0.7](releases/v4.0.7.md) | 2026-11-18 | Rocks v1 · V34 ↑ | Precise biomarkers, Rust module and macro resolution, actionable tool arguments, and bounded native lifecycle handling |
 | [v4.0.6](releases/v4.0.6.md) | 2026-11-16 | Rocks v1 · V27 | Rust 1.100.0, Jiff 1.0, dependency refresh, and standard-library cancellation guards |
 | [v4.0.5](releases/v4.0.5.md) | 2026-11-13 | Rocks v1 · V27 | Implementation-query ordering, compact context metadata, symbol-impact arguments, boundary fixes, and bounded formal verification |
 | [v4.0.4](releases/v4.0.4.md) | 2026-11-01 | Rocks v1 · V27 | Complete large-graph biomarkers with bounded stages, compact inventories, and embedded-script metrics |

@@ -135,9 +135,30 @@ path/content-digest pairs in deterministic order. The encoding lives in
 source context, indexing, and v1 import. An exact set mismatch fails closed.
 
 Generation freshness additionally requires the current native generation-digest
-contract. Contract V26 corrects JavaScript-family initializer call ownership and updates
-the Ada grammar to 0.9.1. V25 added FreeSWITCH XML, Kamailio routes and
-configuration, and rtpengine sections/options. An unchanged older-contract
+contract. Contract V34 admits qualified paths inside bounded, proven standard
+expression-macro arguments. Blocks, declarations, nested invocations, diagnostic
+macros, unproven macro imports, and unqualified argument names remain opaque.
+Extern-crate macro-use imports cover their entire enclosing scope. Explicit named
+Cargo benchmark, test, and example tables establish roots through an exact path or
+one unambiguous conventional file; duplicate names and more than 256 targets per
+kind abstain. This adds no automatic target discovery. Contract V33 adds exact top-level Rust `#[path = "relative/file.rs"]` module
+bindings. A single plain, unescaped relative path selects only that indexed file;
+missing files never use conventional-name fallback. Child modules use the path-loaded
+file directory; conflicting conventional loading contexts abstain. Direct parent
+visibility is retained for standalone proof inputs, while `pub(crate)` requires a
+proven requesting crate. Mixed attributes, nested path attributes, raw module heads,
+and ambiguous declarations remain unresolved. Contract V32 binds conventional Rust file modules carrying only bounded,
+well-formed `cfg` attributes. The graph retains potential source relationships across
+configurations; it does not evaluate which configuration is active. Unknown/path-rewriting
+attributes and ambiguous declarations still abstain under that contract. Contract V31 retains full-width raw health counts and admits one uniform
+outer call around a flat Rust value mapping (source-rule contract v4). Mapping clone shapes retain exact arm-pattern
+syntax and the uniform outer callee while normalizing output values and declaration
+names, separating different mapping domains without hiding changed-output copies.
+Contract V30 corrects Rust qualified-path method namespaces and
+local named-constant health evidence. Contract V29 corrects explicit Rust receiver metrics. Contract V28 fences conservative Rust test/proof ownership and
+syntactic flat value-mapping evidence. V27 added operation-local safety facts,
+scoped application boundaries, receiver resolution, and analyzer-language
+metadata. An unchanged older-contract
 project reports stale once and publishes current-contract facts.
 
 After an upgrade from an older contract, unchanged source remains stale until a
@@ -146,10 +167,18 @@ separate from the source-manifest digest so v1 import still compares exact
 checkout bytes rather than a binary-specific identity.
 
 <details>
-<summary>Details: generation-digest contract history (V5–V26)</summary>
+<summary>Details: generation-digest contract history (V5–V34)</summary>
 
 | Contract | What it fences |
 | --- | --- |
+| V34 | Proven qualified standard-macro arguments, macro-use prelude scope, and explicit named Cargo target roots; requires a source rebuild |
+| V33 | Exact literal Rust file-module paths, physical loading directories, and declaration-scoped visibility; requires a source rebuild |
+| V32 | Bounded cfg-only conventional Rust module bindings; configuration activation remains unevaluated; requires a source rebuild |
+| V31 | Raw health counts above 65,535 remain exact within AST bounds; one uniform call around a flat Rust value mapping; source-rule contract v4; mapping-pattern-aware near clones; requires a source rebuild |
+| V30 | Associated method names do not shadow module path heads; local named Rust constants retain literal bytes without magic-number findings; requires a source rebuild |
+| V29 | Explicit Rust receiver parameters excluded from caller argument counts; requires a source rebuild from older contracts |
+| V28 | Exact Rust test/proof attributes and cfg implication, plus bounded flat value-mapping evidence; source-rule contract v3; requires a source rebuild from older contracts |
+| V27 | Operation-local safety facts, scoped application boundaries, receiver resolution, and analyzer-language metadata |
 | V26 | JavaScript-family initializer calls belong to the enclosing callable; Ada grammar 0.9.1; requires a source rebuild from older contracts |
 | V25 | FreeSWITCH XML, Kamailio routes and configuration, rtpengine sections and keys; requires a source rebuild from older contracts |
 | V24 | Shared language-aware test paths, including Rust leaf test modules; requires a native source rebuild from older contracts |
@@ -299,6 +328,12 @@ log, and square-root calls remain visible with explicit unknowns but use
 `none_observed`; unguarded forms remain hazards.
 
 </details>
+
+Structural-health counters retain their full 32-bit range. Immutable metric records
+share an empty representation only when every field is empty or zero. A recorded
+analyzer language, counter, or operation site keeps its evidence and the same
+serialized fields. Extraction and resolution charge the owned metric allocation
+and operation-site capacity against their existing memory limits.
 
 Structural-health extraction also retains bounded context, not raw literals:
 

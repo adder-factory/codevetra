@@ -1631,14 +1631,7 @@ impl SourceSpan {
         start: SourcePosition,
         end: SourcePosition,
     ) -> Result<Self, InvalidSourceSpan> {
-        if !coordinates::valid_span(
-            start.byte,
-            end.byte,
-            start.line,
-            end.line,
-            start.column,
-            end.column,
-        ) {
+        if !coordinates::valid_span(&start, &end) {
             return Err(InvalidSourceSpan);
         }
         Ok(Self { start, end })

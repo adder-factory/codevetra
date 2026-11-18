@@ -1,5 +1,6 @@
 use std::{error::Error, sync::Mutex, time::Duration};
 
+use codevetra_db::rocks::{GraphPolicy, GraphRevision, StorageRequest};
 use codevetra_db::{GenerationFacts, GenerationValidationLimits, validate_generation_facts};
 use codevetra_domain::{ContentDigest, GenerationId};
 use tokio::time::Instant;
@@ -24,49 +25,51 @@ async fn cancelled_preparation_retains_its_worker_and_bytes_until_actual_complet
         || false,
     )?;
     let work = tokio::spawn(async move {
-        run_with(
-            &runner,
+        let policy = Policy {
+            maximum_bytes,
+            deadlines: NativePipelineDeadlines::new(
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+                Duration::from_millis(50),
+            )
+            .map_err(|_| RocksError::Cancelled)?,
+        };
+        Preparation {
             facts,
-            GraphRevision {
-                generation_id: GenerationId::from_uuid_v8([1; 16]),
-                source_revision: ContentDigest::from_bytes([1; 32]),
-                base: codevetra_db::rocks::GraphBase::Empty,
-            },
-            Policy {
-                graph: GraphPolicy::default(),
-                maximum_bytes,
-                deadlines: NativePipelineDeadlines::new(
-                    Duration::from_secs(10),
-                    Duration::from_secs(20),
-                    Duration::from_millis(50),
-                )
-                .map_err(|_| RocksError::Cancelled)?,
-            },
-            &StorageRequest::new(Duration::from_secs(30))?,
-            move |identity, facts, policy, bytes, request| {
-                let _ = entered
-                    .lock()
-                    .map_err(|_| RocksError::Cancelled)?
-                    .take()
-                    .ok_or(RocksError::Cancelled)?
-                    .send(());
-                while request.check().is_ok() {
-                    std::thread::yield_now();
-                }
-                let _ = noticed
-                    .lock()
-                    .map_err(|_| RocksError::Cancelled)?
-                    .take()
-                    .ok_or(RocksError::Cancelled)?
-                    .send(());
-                released
-                    .lock()
-                    .map_err(|_| RocksError::Cancelled)?
-                    .recv_timeout(Duration::from_secs(10))
-                    .map_err(|_| RocksError::Cancelled)?;
-                GraphPublicationInput::prepare(identity, facts, policy, bytes, request)
-            },
-        )
+            graph: GraphPreparation::new(
+                GraphRevision {
+                    generation_id: GenerationId::from_uuid_v8([1; 16]),
+                    source_revision: ContentDigest::from_bytes([1; 32]),
+                    base: codevetra_db::rocks::GraphBase::Empty,
+                },
+                GraphPolicy::default(),
+                &StorageRequest::new(Duration::from_secs(30))?,
+            ),
+            policy,
+        }
+        .run_with(&runner, move |preparation, facts, bytes| {
+            let _ = entered
+                .lock()
+                .map_err(|_| RocksError::Cancelled)?
+                .take()
+                .ok_or(RocksError::Cancelled)?
+                .send(());
+            while preparation.check().is_ok() {
+                std::thread::yield_now();
+            }
+            let _ = noticed
+                .lock()
+                .map_err(|_| RocksError::Cancelled)?
+                .take()
+                .ok_or(RocksError::Cancelled)?
+                .send(());
+            released
+                .lock()
+                .map_err(|_| RocksError::Cancelled)?
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| RocksError::Cancelled)?;
+            preparation.prepare(facts, bytes)
+        })
         .await
     });
     tokio::time::timeout(Duration::from_secs(5), started).await??;

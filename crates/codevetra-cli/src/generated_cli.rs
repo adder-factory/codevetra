@@ -783,6 +783,9 @@ fn configure_argument(mut argument: Arg, configuration: &ArgumentConfiguration<'
             argument = argument.num_args(1).action(ArgAction::Set);
         }
     }
+    if configuration.kind == PropertyKind::Number {
+        argument = argument.allow_negative_numbers(true);
+    }
     if let Some(values) = configuration.property.get("enum").and_then(Value::as_array) {
         let values = values
             .iter()
@@ -1349,6 +1352,14 @@ fn parse_integer(name: &str, raw: &str) -> Result<Value, String> {
 }
 
 fn parse_number(name: &str, raw: &str) -> Result<Value, String> {
+    // A shared number schema can narrow to integer for a selected action.
+    // Keep whole-number tokens exact instead of rounding them through f64.
+    if let Ok(integer) = raw.parse::<u64>() {
+        return Ok(Value::Number(Number::from(integer)));
+    }
+    if let Ok(integer) = raw.parse::<i64>() {
+        return Ok(Value::Number(Number::from(integer)));
+    }
     let number = raw
         .parse::<f64>()
         .ok()
@@ -1462,16 +1473,16 @@ async fn execute(invocation: GeneratedToolInvocation) -> Result<ToolResult, Stri
         .is_some()
     {
         let timeout = generated_tool_timeout(&invocation.tool_name, &invocation.arguments);
-        return crate::rocks_cli::remote_job::run(
-            &invocation.project_path,
-            ToolCall {
-                name: invocation.tool_name,
-                arguments: invocation.arguments,
-            },
-            ToolCallContext::local(timeout),
-            |_| {},
-        )
-        .await;
+        return crate::rocks_cli::remote_job::RemoteJobs::new(&invocation.project_path)
+            .run(
+                ToolCall {
+                    name: invocation.tool_name,
+                    arguments: invocation.arguments,
+                },
+                ToolCallContext::local(timeout),
+                |_| {},
+            )
+            .await;
     }
     let runtime = std::sync::Arc::new(crate::open_runtime(&invocation.project_path).await?);
     let handler = mcp_handler::CodeVetraMcpHandler::new(runtime)
@@ -2006,6 +2017,23 @@ mod tests {
                 }
                 ParseFailure::Contract(error) => panic!("{name}: {error}"),
             }
+        }
+    }
+
+    #[test]
+    fn numeric_cli_values_preserve_integer_precision_and_fractional_semantics() {
+        assert_eq!(
+            parse_number("limit", "9007199254740993"),
+            Ok(Value::from(9_007_199_254_740_993_u64))
+        );
+        assert_eq!(parse_number("limit", "-1"), Ok(Value::from(-1)));
+        assert_eq!(parse_number("limit", "1.5"), Ok(Value::from(1.5)));
+        assert_eq!(parse_number("limit", "1e3"), Ok(Value::from(1000.0)));
+        for raw in ["NaN", "inf", "-inf", "1e999", "secret"] {
+            assert_eq!(
+                parse_number("limit", raw),
+                Err("--limit must be a finite number".to_owned())
+            );
         }
     }
 

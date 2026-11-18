@@ -12,7 +12,8 @@ use crate::{ProjectCancellation, ProjectError, ProjectRuntime};
 mod allocation;
 mod window;
 pub use allocation::{
-    SourceAllocation, SourceAllocationOptions, SourceSelection, SourceSelectionPolicy,
+    SourceAllocation, SourceAllocationOptions, SourceAllocationRequest, SourceSelection,
+    SourceSelectionPolicy,
 };
 
 const DEFAULT_CONTEXT_LINES: u16 = 3;
@@ -431,12 +432,7 @@ impl ProjectRuntime {
         };
         let paths = symbols.iter().map(|symbol| symbol.path().clone()).collect();
         let source = self
-            .scan_source_batch(
-                paths,
-                current.source_admission.run_excludes(),
-                current.source_admission.maximum_file_bytes(),
-                cancellation.clone(),
-            )
+            .scan_source_batch(paths, Some(&current.source_admission), cancellation.clone())
             .await?;
         let fresh = current.source_revision == source.digest.as_str()
             && current.digest_version == GenerationDigestVersion::CURRENT;
@@ -784,7 +780,9 @@ fn build_symbol_source_context(
         None
     };
     let (representation, omitted_ranges) =
-        source_representation(&symbol, excerpt.as_ref(), options.detail, file_fresh);
+        options
+            .detail
+            .representation(&symbol, excerpt.as_ref(), file_fresh);
     Ok(SymbolSourceContext {
         symbol,
         live_source_revision: source.digest.clone(),
@@ -797,48 +795,50 @@ fn build_symbol_source_context(
     })
 }
 
-fn source_representation(
-    symbol: &CurrentSymbolRecord,
-    excerpt: Option<&SourceExcerpt>,
-    detail: SourceDetail,
-    file_fresh: bool,
-) -> (SourceRepresentation, Vec<OmittedSourceRange>) {
-    let start = symbol.start_byte();
-    let end = symbol.end_byte();
-    let mut omitted = Vec::new();
-    if let Some(excerpt) = excerpt.filter(|_| file_fresh) {
-        let included_start = excerpt.start_byte.clamp(start, end);
-        let included_end = excerpt.end_byte.clamp(start, end);
-        if start < included_start {
+impl SourceDetail {
+    fn representation(
+        self,
+        symbol: &CurrentSymbolRecord,
+        excerpt: Option<&SourceExcerpt>,
+        file_fresh: bool,
+    ) -> (SourceRepresentation, Vec<OmittedSourceRange>) {
+        let start = symbol.start_byte();
+        let end = symbol.end_byte();
+        let mut omitted = Vec::new();
+        if let Some(excerpt) = excerpt.filter(|_| file_fresh) {
+            let included_start = excerpt.start_byte.clamp(start, end);
+            let included_end = excerpt.end_byte.clamp(start, end);
+            if start < included_start {
+                omitted.push(OmittedSourceRange {
+                    start_byte: start,
+                    end_byte: included_start,
+                });
+            }
+            if included_end < end {
+                omitted.push(OmittedSourceRange {
+                    start_byte: included_end,
+                    end_byte: end,
+                });
+            }
+        } else {
             omitted.push(OmittedSourceRange {
                 start_byte: start,
-                end_byte: included_start,
-            });
-        }
-        if included_end < end {
-            omitted.push(OmittedSourceRange {
-                start_byte: included_end,
                 end_byte: end,
             });
         }
-    } else {
-        omitted.push(OmittedSourceRange {
-            start_byte: start,
-            end_byte: end,
-        });
+        let representation = if !file_fresh {
+            SourceRepresentation::Unavailable
+        } else if self == SourceDetail::Outline {
+            SourceRepresentation::Outline
+        } else if omitted.is_empty() {
+            SourceRepresentation::Full
+        } else if self == SourceDetail::Focused {
+            SourceRepresentation::Focused
+        } else {
+            SourceRepresentation::Truncated
+        };
+        (representation, omitted)
     }
-    let representation = if !file_fresh {
-        SourceRepresentation::Unavailable
-    } else if detail == SourceDetail::Outline {
-        SourceRepresentation::Outline
-    } else if omitted.is_empty() {
-        SourceRepresentation::Full
-    } else if detail == SourceDetail::Focused {
-        SourceRepresentation::Focused
-    } else {
-        SourceRepresentation::Truncated
-    };
-    (representation, omitted)
 }
 
 fn extract_file_excerpt(

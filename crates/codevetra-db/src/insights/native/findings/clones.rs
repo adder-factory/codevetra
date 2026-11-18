@@ -10,7 +10,6 @@ use super::{
 };
 use crate::{
     insights::StructuralFinding,
-    retrieval::native::retain,
     rocks::{GraphSnapshot, ReadBudget, RocksError, StateTransaction, packed_uuid, unpacked_uuid},
     semantic::native::materialize,
 };
@@ -35,15 +34,58 @@ struct Class {
     score: Option<f64>,
 }
 type PackedSymbol = [u8; 16];
-type SemanticLinks = BTreeMap<PackedSymbol, BTreeMap<PackedSymbol, f64>>;
+type LinkRows = BTreeMap<PackedSymbol, BTreeMap<PackedSymbol, f64>>;
+
+const MAXIMUM_CLONE_BYTES: usize = 16 * 1_048_576;
+const MAXIMUM_SEMANTIC_BYTES: usize = 32 * 1_048_576;
+const MINIMUM_EXACT_LINES: u32 = 6;
+const MINIMUM_NEAR_LINES: u32 = 12;
+const MAXIMUM_LITERAL_FRACTION: f64 = 0.6;
+const SEMANTIC_THRESHOLD: f64 = 0.95;
+const MAXIMUM_COMPONENT_PENDING: usize = 65_536;
+
+struct Source<'a, 'view, 'store> {
+    graph: &'a GraphSnapshot<'view, 'store>,
+    documents: &'a Documents,
+}
+
+#[derive(Clone, Copy)]
+enum ShapeKind {
+    Exact,
+    Near,
+}
+
+impl ShapeKind {
+    const fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Exact => ("exact", "exact_copies"),
+            Self::Near => ("near", "normalized_shape_copies"),
+        }
+    }
+}
+
+struct SemanticLinks {
+    rows: LinkRows,
+    bytes: usize,
+}
+
+struct Components<'a> {
+    links: &'a LinkRows,
+    visited: BTreeSet<PackedSymbol>,
+}
 
 impl Classes {
     pub(super) fn new(
         transaction: &StateTransaction<'_>,
-        graph: &GraphSnapshot<'_, '_>,
         documents: &Documents,
         budget: &mut ReadBudget,
     ) -> Result<Self, RocksError> {
+        let snapshot = transaction.graph_snapshot()?;
+        let graph = snapshot.graph(budget)?;
+        let source = Source {
+            graph: &graph,
+            documents,
+        };
         let mut output = Self {
             representatives: BTreeMap::new(),
             claimed: BTreeSet::new(),
@@ -68,7 +110,7 @@ impl Classes {
             if !framework::production(&file.normalized_path)? {
                 continue;
             }
-            let document = handle.load(graph, budget)?;
+            let document = handle.load(&graph, budget)?;
             if !document.clones.enabled {
                 continue;
             }
@@ -76,27 +118,27 @@ impl Classes {
             let node = packed_tree_insertion_bytes(output.production.len());
             output.production.insert(packed);
             bytes = bytes.checked_add(node).ok_or_else(workspace)?;
-            if symbol.end_line - symbol.start_line + 1 >= 6 {
+            if symbol.end_line - symbol.start_line + 1 >= MINIMUM_EXACT_LINES {
                 let hash = blake3::Hash::from_hex(symbol.structural_digest.as_str())
                     .map_err(|_| corrupt())?;
                 exact.push(*hash.as_bytes(), packed, &mut bytes)?;
             }
-            if bytes > 16 * 1_048_576 {
+            if bytes > MAXIMUM_CLONE_BYTES {
                 return Err(workspace());
             }
         }
-        output.absorb(exact, "exact", "exact_copies", budget)?;
-        let near = output.near_groups(graph, documents, budget)?;
-        output.absorb(near, "near", "normalized_shape_copies", budget)?;
-        output.semantic(transaction, graph, documents, budget)?;
+        output.absorb(exact, ShapeKind::Exact, budget)?;
+        let near = output.near_groups(&source, budget)?;
+        output.absorb(near, ShapeKind::Near, budget)?;
+        output.semantic(transaction, &source, budget)?;
         Ok(output)
     }
     fn near_groups(
         &self,
-        graph: &GraphSnapshot<'_, '_>,
-        documents: &Documents,
+        source: &Source<'_, '_, '_>,
         budget: &mut ReadBudget,
     ) -> Result<Groups, RocksError> {
+        let Source { graph, documents } = source;
         let mut groups = Groups::default();
         let mut bytes = self.bytes();
         for id in self.production.difference(&self.claimed) {
@@ -119,13 +161,13 @@ impl Classes {
                 .max(1)
                 .to_f64()
                 .ok_or(corrupt())?;
-            if symbol.end_line - symbol.start_line + 1 < 12
-                || document.health("literal_bytes") / size > 0.6
+            if symbol.end_line - symbol.start_line + 1 < MINIMUM_NEAR_LINES
+                || document.health("literal_bytes") / size > MAXIMUM_LITERAL_FRACTION
             {
                 continue;
             }
             groups.push(*blake3::hash(shape.as_bytes()).as_bytes(), *id, &mut bytes)?;
-            if bytes > 16 * 1_048_576 {
+            if bytes > MAXIMUM_CLONE_BYTES {
                 return Err(workspace());
             }
         }
@@ -134,10 +176,10 @@ impl Classes {
     fn absorb(
         &mut self,
         groups: Groups,
-        kind: &'static str,
-        metric: &'static str,
+        shape: ShapeKind,
         budget: &ReadBudget,
     ) -> Result<(), RocksError> {
+        let (kind, metric) = shape.labels();
         let mut groups = groups.sorted(budget)?.peekable();
         while let Some((hash, first)) = groups.next() {
             budget.checkpoint()?;
@@ -162,7 +204,7 @@ impl Classes {
                 },
             );
         }
-        if self.bytes() > 16 * 1_048_576 {
+        if self.bytes() > MAXIMUM_CLONE_BYTES {
             return Err(workspace());
         }
         Ok(())
@@ -184,10 +226,10 @@ impl Classes {
     fn semantic(
         &mut self,
         transaction: &StateTransaction<'_>,
-        graph: &GraphSnapshot<'_, '_>,
-        documents: &Documents,
+        source: &Source<'_, '_, '_>,
         budget: &mut ReadBudget,
     ) -> Result<(), RocksError> {
+        let Source { graph, documents } = source;
         let mut eligible = BTreeSet::new();
         for id in self.production.difference(&self.claimed) {
             let document = documents
@@ -195,25 +237,29 @@ impl Classes {
                 .ok_or(corrupt())?
                 .load(graph, budget)?;
             let symbol = graph.symbol(&symbol_id(id)?, budget)?.ok_or(corrupt())?;
-            if document.partial.peers == 0 && symbol.end_line - symbol.start_line + 1 >= 6 {
+            if document.partial.peers == 0
+                && symbol.end_line - symbol.start_line + 1 >= MINIMUM_EXACT_LINES
+            {
                 eligible.insert(*id);
             }
         }
-        let (links, bytes) = semantic_links(
-            transaction,
-            budget,
-            &eligible,
-            self.bytes() + packed_tree_bytes(eligible.len()),
-        )?;
-        let mut visited = BTreeSet::new();
-        for start in links.keys() {
+        let mut links = SemanticLinks {
+            rows: LinkRows::new(),
+            bytes: self.bytes() + packed_tree_bytes(eligible.len()),
+        };
+        links.collect(transaction, budget, &eligible)?;
+        let mut components = Components {
+            links: &links.rows,
+            visited: BTreeSet::new(),
+        };
+        for start in links.rows.keys() {
             budget.checkpoint()?;
-            if visited.contains(start) {
+            if components.visited.contains(start) {
                 continue;
             }
-            let members = connected_members(&links, start, &mut visited, budget)?;
+            let members = components.connected_members(start, budget)?;
             let representative = *members.first().ok_or(corrupt())?;
-            let peers = links.get(&representative).ok_or(corrupt())?;
+            let peers = links.rows.get(&representative).ok_or(corrupt())?;
             let score = peers.values().copied().reduce(f64::max).ok_or(corrupt())?;
             self.claimed.extend(members.iter().copied());
             self.representatives.insert(
@@ -226,7 +272,7 @@ impl Classes {
                     score: Some(score),
                 },
             );
-            if self.bytes() + bytes > 32 * 1_048_576 {
+            if self.bytes() + links.bytes > MAXIMUM_SEMANTIC_BYTES {
                 return Err(workspace());
             }
         }
@@ -245,27 +291,29 @@ impl Classes {
                 "members":members(class.members.iter().filter(|peer| *peer != id), graph, budget)? });
             if let Some(score) = class.score {
                 detail["maximumSemanticScore"] = json!(score);
-                detail["semanticThreshold"] = json!(0.95);
+                detail["semanticThreshold"] = json!(SEMANTIC_THRESHOLD);
             }
-            return Ok(Some(rules::finding(
-                base,
-                "duplicate_code",
-                class.metric,
-                class.count.to_f64().ok_or(corrupt())?,
-                if class.kind == "exact" {
-                    "warning"
-                } else {
-                    "info"
-                },
-                Some(detail),
-            )));
+            return Ok(Some(
+                rules::FindingEvidence {
+                    name: "duplicate_code",
+                    metric: class.metric,
+                    value: class.count.to_f64().ok_or(corrupt())?,
+                    severity: if class.kind == "exact" {
+                        "warning"
+                    } else {
+                        "info"
+                    },
+                    detail: Some(detail),
+                }
+                .project(base),
+            ));
         }
         let partial = &base.document.partial;
         if self.claimed.contains(id)
             || !self.production.contains(id)
             || partial.peers == 0
             || partial.representative.as_ref() != Some(&base.symbol.symbol_id)
-            || base.symbol.end_line - base.symbol.start_line + 1 < 12
+            || base.symbol.end_line - base.symbol.start_line + 1 < MINIMUM_NEAR_LINES
         {
             return Ok(None);
         }
@@ -278,84 +326,90 @@ impl Classes {
             "symmetricMemberRowsSuppressed":true, "loc":base.symbol.end_line - base.symbol.start_line + 1,
             "maximumOverlap":partial.maximum, "minimumOverlap":partial.minimum,
             "members":members(listed.iter().filter(|id| self.production.contains(*id)), graph, budget)? });
-        Ok(Some(rules::finding(
-            base,
-            "duplicate_code",
-            "partial_clone_peers",
-            partial.peers.to_f64().ok_or(corrupt())?,
-            "info",
-            Some(detail),
-        )))
+        Ok(Some(
+            rules::FindingEvidence {
+                name: "duplicate_code",
+                metric: "partial_clone_peers",
+                value: partial.peers.to_f64().ok_or(corrupt())?,
+                severity: "info",
+                detail: Some(detail),
+            }
+            .project(base),
+        ))
     }
 }
 
-fn semantic_links(
-    transaction: &StateTransaction<'_>,
-    budget: &mut ReadBudget,
-    eligible: &BTreeSet<PackedSymbol>,
-    mut bytes: usize,
-) -> Result<(SemanticLinks, usize), RocksError> {
-    let mut links = SemanticLinks::new();
-    materialize::visit_current(transaction, budget, |edge, _| {
-        let source = packed_uuid(edge.source.as_str())?;
-        let target = packed_uuid(edge.target.as_str())?;
-        if edge.score >= 0.95 && eligible.contains(&source) && eligible.contains(&target) {
-            for (source, target) in [(source, target), (target, source)] {
-                add_semantic_link(&mut links, &mut bytes, source, target, edge.score);
+impl SemanticLinks {
+    fn collect(
+        &mut self,
+        transaction: &StateTransaction<'_>,
+        budget: &mut ReadBudget,
+        eligible: &BTreeSet<PackedSymbol>,
+    ) -> Result<(), RocksError> {
+        materialize::visit_current(transaction, budget, |edge, _| {
+            let source = packed_uuid(edge.source.as_str())?;
+            let target = packed_uuid(edge.target.as_str())?;
+            if edge.score >= SEMANTIC_THRESHOLD
+                && eligible.contains(&source)
+                && eligible.contains(&target)
+            {
+                for (source, target) in [(source, target), (target, source)] {
+                    self.add(source, target, edge.score);
+                }
+                if self.bytes > MAXIMUM_CLONE_BYTES {
+                    return Err(workspace());
+                }
             }
-            if bytes > 16 * 1_048_576 {
+            Ok(())
+        })
+    }
+
+    fn add(&mut self, source: PackedSymbol, target: PackedSymbol, score: f64) {
+        if !self.rows.contains_key(&source) {
+            self.bytes += if self.rows.is_empty() { 512 } else { 128 };
+        }
+        let peers = self.rows.entry(source).or_default();
+        if !peers.contains_key(&target) {
+            self.bytes += packed_tree_insertion_bytes(peers.len());
+        }
+        peers
+            .entry(target)
+            .and_modify(|old| *old = old.max(score))
+            .or_insert(score);
+    }
+}
+
+impl Components<'_> {
+    fn connected_members(
+        &mut self,
+        start: &PackedSymbol,
+        budget: &mut ReadBudget,
+    ) -> Result<Vec<PackedSymbol>, RocksError> {
+        let mut pending = vec![*start];
+        let mut members = Vec::new();
+        while let Some(id) = pending.pop() {
+            budget.checkpoint()?;
+            if !self.visited.insert(id) {
+                continue;
+            }
+            members.push(id);
+            if let Some(peers) = self.links.get(&id) {
+                pending.extend(
+                    peers
+                        .keys()
+                        .filter(|id| !self.visited.contains(*id))
+                        .copied(),
+                );
+            }
+            if pending.len() > MAXIMUM_COMPONENT_PENDING {
                 return Err(workspace());
             }
         }
-        Ok(())
-    })?;
-    Ok((links, bytes))
+        members.sort_unstable();
+        Ok(members)
+    }
 }
 
-fn add_semantic_link(
-    links: &mut SemanticLinks,
-    bytes: &mut usize,
-    source: PackedSymbol,
-    target: PackedSymbol,
-    score: f64,
-) {
-    if !links.contains_key(&source) {
-        *bytes += if links.is_empty() { 512 } else { 128 };
-    }
-    let peers = links.entry(source).or_default();
-    if !peers.contains_key(&target) {
-        *bytes += packed_tree_insertion_bytes(peers.len());
-    }
-    peers
-        .entry(target)
-        .and_modify(|old| *old = old.max(score))
-        .or_insert(score);
-}
-
-fn connected_members(
-    links: &SemanticLinks,
-    start: &PackedSymbol,
-    visited: &mut BTreeSet<PackedSymbol>,
-    budget: &mut ReadBudget,
-) -> Result<Vec<PackedSymbol>, RocksError> {
-    let mut pending = vec![*start];
-    let mut members = Vec::new();
-    while let Some(id) = pending.pop() {
-        budget.checkpoint()?;
-        if !visited.insert(id) {
-            continue;
-        }
-        members.push(id);
-        if let Some(peers) = links.get(&id) {
-            pending.extend(peers.keys().filter(|id| !visited.contains(*id)).copied());
-        }
-        if pending.len() > 65_536 {
-            return Err(workspace());
-        }
-    }
-    members.sort_unstable();
-    Ok(members)
-}
 fn symbol_id(id: &PackedSymbol) -> Result<SymbolId, RocksError> {
     SymbolId::parse(&unpacked_uuid(id)?).map_err(|_| corrupt())
 }
@@ -364,7 +418,10 @@ fn members<'a>(
     graph: &GraphSnapshot<'_, '_>,
     budget: &mut ReadBudget,
 ) -> Result<Vec<Value>, RocksError> {
-    let mut output = Vec::new();
+    let mut output =
+        crate::retrieval::native::RankedRows::new(10, |a: &(String, u32, SymbolId, String), b| {
+            a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+        });
     for id in ids {
         budget.checkpoint()?;
         let symbol = graph.symbol(&symbol_id(id)?, budget)?.ok_or(corrupt())?;
@@ -375,9 +432,7 @@ fn members<'a>(
             symbol.symbol_id,
             symbol.qualified_name,
         );
-        retain(&mut output, row, 10, |a, b| {
-            a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
-        });
+        output.insert(row);
     }
     Ok(output.into_iter().map(|(path, line, id, name)|json!({ "symbolId":id, "qualifiedName":name, "location":format!("{path}:{line}") })).collect())
 }
@@ -388,21 +443,23 @@ mod allocation_tests {
 
     #[test]
     fn sparse_semantic_pairs_charge_each_independent_leaf() {
-        let mut links = SemanticLinks::new();
-        let mut bytes = 0;
-        add_semantic_link(&mut links, &mut bytes, [1; 16], [2; 16], 0.96);
-        assert_eq!(bytes, 896);
-        add_semantic_link(&mut links, &mut bytes, [1; 16], [2; 16], 0.99);
-        assert_eq!(bytes, 896);
+        let mut links = SemanticLinks {
+            rows: LinkRows::new(),
+            bytes: 0,
+        };
+        links.add([1; 16], [2; 16], 0.96);
+        assert_eq!(links.bytes, 896);
+        links.add([1; 16], [2; 16], 0.99);
+        assert_eq!(links.bytes, 896);
         let mut exceeded = false;
         for index in 1_u64..17_000 {
             let mut source = [0; 16];
             source[8..].copy_from_slice(&(index * 2).to_be_bytes());
             let mut target = [0; 16];
             target[8..].copy_from_slice(&(index * 2 + 1).to_be_bytes());
-            add_semantic_link(&mut links, &mut bytes, source, target, 0.96);
-            add_semantic_link(&mut links, &mut bytes, target, source, 0.96);
-            if bytes > 16 * 1_048_576 {
+            links.add(source, target, 0.96);
+            links.add(target, source, 0.96);
+            if links.bytes > 16 * 1_048_576 {
                 exceeded = true;
                 break;
             }

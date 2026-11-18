@@ -27,9 +27,20 @@
         },
         {
           "name": "valid_span",
-          "signature": "fn valid_span(\n    start_byte: u64,\n    end_byte: u64,\n    start_line: u32,\n    end_line: u32,\n    start_column: u32,\n    end_column: u32,\n) -> bool",
+          "signature": "fn valid_span(start: &SourcePosition, end: &SourcePosition) -> bool",
           "ensures": [
-            "result <==> start_line > 0 && start_byte < end_byte && (start_line < end_line || (start_line == end_line && start_column <= end_column))"
+            "result <==> start.line > 0 && start.byte < end.byte && (start.line < end.line || (start.line == end.line && start.column <= end.column))"
+          ]
+        }
+      ],
+      "types": [
+        {
+          "source": "crates/codevetra-domain/src/source.rs",
+          "name": "SourcePosition",
+          "declaration": "struct SourcePosition { byte: u64, line: u32, column: u32, }",
+          "attributes": [
+            "#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]",
+            "#[serde(try_from = \"SourcePositionValue\")]"
           ]
         }
       ]
@@ -100,17 +111,89 @@
           ]
         },
         {
-          "name": "retention_batch_fits",
-          "signature": "fn retention_batch_fits(\n    batch: usize,\n    counters: usize,\n    key: usize,\n    maximum: usize,\n) -> bool",
+          "name": "retention_workspace",
+          "signature": "fn retention_workspace(batch: usize, counters: usize, key: usize) -> Option<usize>",
           "ensures": [
-            "result <==> batch as int + counters as int * 96 + 131072 + key as int * 2 + 256 <= maximum as int"
+            "match result { Some(n) => n as int == batch as int + counters as int * 96 + 131072 + key as int * 2 + 256, None => batch as int + counters as int * 96 + 131072 + key as int * 2 + 256 > usize::MAX as int }"
           ]
         },
         {
           "name": "valid_store_policy",
-          "signature": "fn valid_store_policy(cache: usize, memtable: usize, batch: usize, rows: usize) -> bool",
+          "signature": "fn valid_store_policy(policy: &StorePolicy) -> bool",
           "ensures": [
-            "result <==> 8388608 <= cache <= 4294967296 && 4194304 <= memtable <= cache && 1048576 <= batch <= 67108864 && 1 <= rows <= 100000"
+            "result <==> 8388608 <= policy.cache_bytes <= 4294967296 && 4194304 <= policy.memtable_bytes <= policy.cache_bytes && 1048576 <= policy.maximum_batch_bytes <= 67108864 && 1 <= policy.maximum_batch_rows <= 100000"
+          ]
+        }
+      ],
+      "constants": [
+        {
+          "name": "WORKSPACE_RESERVATION_MULTIPLIER",
+          "signature": "const WORKSPACE_RESERVATION_MULTIPLIER: usize"
+        },
+        {
+          "name": "WORKER_RESERVATION_OVERHEAD_BYTES",
+          "signature": "const WORKER_RESERVATION_OVERHEAD_BYTES: usize"
+        },
+        {
+          "name": "CHANGE_KEY_MULTIPLIER",
+          "signature": "const CHANGE_KEY_MULTIPLIER: usize"
+        },
+        {
+          "name": "CHANGE_VALUE_MULTIPLIER",
+          "signature": "const CHANGE_VALUE_MULTIPLIER: usize"
+        },
+        {
+          "name": "CHANGE_OVERHEAD_BYTES",
+          "signature": "const CHANGE_OVERHEAD_BYTES: usize"
+        },
+        {
+          "name": "RETENTION_COUNTER_BYTES",
+          "signature": "const RETENTION_COUNTER_BYTES: usize"
+        },
+        {
+          "name": "RETENTION_CURSOR_ALLOWANCE_BYTES",
+          "signature": "const RETENTION_CURSOR_ALLOWANCE_BYTES: usize"
+        },
+        {
+          "name": "RETENTION_KEY_MULTIPLIER",
+          "signature": "const RETENTION_KEY_MULTIPLIER: usize"
+        },
+        {
+          "name": "RETENTION_RECORD_OVERHEAD_BYTES",
+          "signature": "const RETENTION_RECORD_OVERHEAD_BYTES: usize"
+        },
+        {
+          "name": "MINIMUM_CACHE_BYTES",
+          "signature": "const MINIMUM_CACHE_BYTES: u64"
+        },
+        {
+          "name": "MAXIMUM_CACHE_BYTES",
+          "signature": "const MAXIMUM_CACHE_BYTES: u64"
+        },
+        {
+          "name": "MINIMUM_MEMTABLE_BYTES",
+          "signature": "const MINIMUM_MEMTABLE_BYTES: usize"
+        },
+        {
+          "name": "MINIMUM_BATCH_BYTES",
+          "signature": "const MINIMUM_BATCH_BYTES: usize"
+        },
+        {
+          "name": "MAXIMUM_BATCH_BYTES",
+          "signature": "const MAXIMUM_BATCH_BYTES: usize"
+        },
+        {
+          "name": "MAXIMUM_BATCH_ROWS",
+          "signature": "const MAXIMUM_BATCH_ROWS: usize"
+        }
+      ],
+      "types": [
+        {
+          "source": "crates/codevetra-db/src/rocks/policy.rs",
+          "name": "StorePolicy",
+          "declaration": "struct StorePolicy { pub cache_bytes: usize, pub memtable_bytes: usize, pub maximum_batch_bytes: usize, pub maximum_batch_rows: usize, }",
+          "attributes": [
+            "#[derive(Clone, Copy, Debug, PartialEq, Eq)]"
           ]
         }
       ]
@@ -121,7 +204,7 @@
       "functions": [
         {
           "name": "owns_writer",
-          "signature": "fn owns_writer(\n    active_sequence: u64,\n    active_fence: &[u8; 32],\n    sequence: u64,\n    fence: &[u8; 32],\n) -> bool",
+          "signature": "fn owns_writer(active: &WriterIdentity, requested: &WriterIdentity) -> bool",
           "verus": false
         },
         {
@@ -140,17 +223,40 @@
         },
         {
           "name": "keep_superseded",
-          "signature": "fn keep_superseded(sequence: u64, previous_floor: u64, retained: u8, keep: u8) -> bool",
+          "signature": "fn keep_superseded(sequence: u64, selection: &RetentionSelection) -> bool",
           "ensures": [
-            "result <==> sequence >= previous_floor && retained < keep"
+            "result <==> sequence >= selection.previous_floor && selection.retained < selection.keep"
           ]
         },
         {
           "name": "remove_version",
-          "signature": "fn remove_version(\n    published: bool,\n    sequence: u64,\n    floor: u64,\n    kept_anchor: bool,\n) -> bool",
+          "signature": "fn remove_version(published: bool, sequence: u64, anchor: &VersionAnchor) -> bool",
           "ensures": [
-            "!result <==> published && (sequence >= floor || !kept_anchor)"
+            "!result <==> published && (sequence >= anchor.floor || !anchor.kept_anchor)"
           ]
+        }
+      ],
+      "types": [
+        {
+          "source": "crates/codevetra-db/src/rocks/engine.rs",
+          "name": "WriterIdentity",
+          "declaration": "struct WriterIdentity { sequence: u64, fence: [u8; 32], }",
+          "attributes": [
+            "#[derive(Clone, Copy)]"
+          ]
+        },
+        {
+          "source": "crates/codevetra-db/src/rocks/engine.rs",
+          "name": "VersionAnchor",
+          "declaration": "struct VersionAnchor { floor: u64, kept_anchor: bool, }",
+          "attributes": [
+            "#[derive(Default, Serialize, Deserialize)]"
+          ]
+        },
+        {
+          "source": "crates/codevetra-db/src/rocks/engine.rs",
+          "name": "RetentionSelection",
+          "declaration": "struct RetentionSelection { previous_floor: u64, retained: u8, keep: u8, }"
         }
       ]
     },
@@ -230,10 +336,10 @@
           "verus": false
         },
         {
-          "name": "delimited_end",
-          "signature": "fn delimited_end(\n    current: usize,\n    tag_bytes: usize,\n    length_bytes: usize,\n    payload: usize,\n    maximum: usize,\n) -> Option<usize>",
+          "name": "delimited_size",
+          "signature": "fn delimited_size(\n    tag_bytes: usize,\n    length_bytes: usize,\n    payload: usize,\n) -> Option<usize>",
           "ensures": [
-            "match result { Some(n) => n as int == current as int + tag_bytes as int + length_bytes as int + payload as int && n <= maximum, None => current as int + tag_bytes as int + length_bytes as int + payload as int > maximum as int }"
+            "match result { Some(n) => n as int == tag_bytes as int + length_bytes as int + payload as int, None => tag_bytes as int + length_bytes as int + payload as int > usize::MAX as int }"
           ]
         },
         {
@@ -307,6 +413,12 @@
           "name": "append_component",
           "signature": "fn append_component(canonical: &mut Vec<u8>, component: &[u8]) -> Option<()>",
           "verus": false
+        },
+        {
+          "name": "has_drive_prefix",
+          "signature": "fn has_drive_prefix(path: &[u8]) -> bool",
+          "verus": false,
+          "reason": "Covered with production path normalization by the bounded Kani path harnesses."
         }
       ]
     },

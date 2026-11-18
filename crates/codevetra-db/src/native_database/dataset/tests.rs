@@ -5,6 +5,58 @@ use crate::rocks::{AsyncProjectStore, StorageRequest, StorageRuntime, StorePolic
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+#[test]
+fn manifest_validation_preserves_identity_capacity_and_page_geometry() {
+    let mut manifest = Manifest {
+        token: "0".repeat(64),
+        generation: None,
+        metadata: serde_json::Value::Null,
+        rows: 0,
+        bytes: 0,
+        parts: 0,
+        digest: ContentDigest::from_bytes([0; 32]),
+        created: "2026-01-01T00:00:00Z".into(),
+    };
+    for (rows, parts, bytes, valid) in [
+        (0, 0, 0, true),
+        (1, 1, 1, true),
+        (256, 1, 2, true),
+        (257, 1, 2, false),
+        (1, 2, 2, false),
+        (1, 0, 0, false),
+        (0, 0, 1, false),
+        (0, 1, 1, false),
+        (3_000_000, 12_000, 536_870_912, true),
+        (3_000_001, 12_000, 1, false),
+        (12_001, 12_001, 1, false),
+        (1, 1, 536_870_913, false),
+    ] {
+        manifest.rows = rows;
+        manifest.parts = parts;
+        manifest.bytes = bytes;
+        assert_eq!(
+            validate_manifest(&manifest).is_ok(),
+            valid,
+            "{rows}/{parts}/{bytes}"
+        );
+    }
+    manifest.rows = 0;
+    manifest.parts = 0;
+    manifest.bytes = 0;
+    for token in [
+        "0".repeat(63),
+        "0".repeat(65),
+        "A".repeat(64),
+        "g".repeat(64),
+    ] {
+        manifest.token = token;
+        assert!(validate_manifest(&manifest).is_err());
+    }
+    manifest.token = "0".repeat(64);
+    manifest.created = "invalid".into();
+    assert!(validate_manifest(&manifest).is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_native_state_deadline_survives_thirty_seconds_of_work() -> TestResult {
     let fixture = Fixture::new().await?;
@@ -14,9 +66,7 @@ async fn explicit_native_state_deadline_survives_thirty_seconds_of_work() -> Tes
     let work = tokio::spawn(async move {
         database
             .state_with_timeout(
-                None,
-                1024,
-                1,
+                crate::rocks::StateAccess::write(None, 1024, 1),
                 Duration::from_secs(60),
                 move |transaction, budget| {
                     transaction.put(StateNamespace::Metadata, b"long-request", vec![42])?;
@@ -45,9 +95,12 @@ async fn explicit_native_state_deadline_survives_thirty_seconds_of_work() -> Tes
     assert_eq!(
         fixture
             .database
-            .state(None, 0, 0, |transaction, budget| {
-                transaction.get(StateNamespace::Metadata, b"long-request", budget)
-            })
+            .state(
+                crate::rocks::StateAccess::read_only(None),
+                |transaction, budget| {
+                    transaction.get(StateNamespace::Metadata, b"long-request", budget)
+                }
+            )
             .await?,
         Some(vec![42])
     );
@@ -82,12 +135,14 @@ async fn dataset_preparation_deadline_drains_the_native_head_job_and_preserves_c
             NativeDatabase::with_preparation_deadline(
                 Duration::from_millis(500),
                 database.prepare_dataset(
-                    StateNamespace::Derived,
-                    "atomic".to_owned(),
-                    None,
-                    serde_json::Value::Null,
+                    crate::native_database::dataset::DatasetReplacement {
+                        namespace: StateNamespace::Derived,
+                        name: "atomic".to_owned(),
+                        expected: None,
+                        metadata: serde_json::Value::Null,
+                        guard: CommitGuard::default(),
+                    },
                     vec!["new-complete".to_owned()].into_iter(),
-                    CommitGuard::default(),
                 ),
             )
             .await
@@ -185,9 +240,11 @@ impl Fixture {
         let request = StorageRequest::new(Duration::from_secs(30))?;
         let store = AsyncProjectStore::open(
             &runtime,
-            root.path().to_owned(),
-            identity.clone(),
-            StorePolicy::default(),
+            crate::rocks::ProjectOpening::new(
+                root.path().to_owned(),
+                identity.clone(),
+                StorePolicy::default(),
+            ),
             &request,
         )
         .await?;
@@ -200,10 +257,13 @@ impl Fixture {
     async fn write(&self, values: Vec<String>) -> TestResult {
         self.database
             .replace_dataset(
-                StateNamespace::Derived,
-                "atomic",
-                None,
-                &(),
+                crate::native_database::dataset::DatasetReplacement {
+                    namespace: StateNamespace::Derived,
+                    name: "atomic".to_owned(),
+                    expected: None,
+                    metadata: &(),
+                    guard: crate::native_database::dataset::CommitGuard::default(),
+                },
                 values.into_iter(),
             )
             .await?;
@@ -212,23 +272,23 @@ impl Fixture {
     async fn values(&self) -> TestResult<Vec<String>> {
         Ok(self
             .database
-            .state(None, 0, 0, |transaction, budget| {
-                let manifest = manifest(transaction, StateNamespace::Derived, "atomic", budget)?
-                    .ok_or(corrupt())?;
-                let mut output = Vec::new();
-                visit(
-                    transaction,
-                    StateNamespace::Derived,
-                    "atomic",
-                    &manifest,
-                    budget,
-                    |value: String, _| {
-                        output.push(value);
-                        Ok(())
-                    },
-                )?;
-                Ok(output)
-            })
+            .state(
+                crate::rocks::StateAccess::read_only(None),
+                |transaction, budget| {
+                    let manifest = Reader::new(transaction, StateNamespace::Derived)
+                        .at("atomic")
+                        .manifest(budget)?
+                        .ok_or(corrupt())?;
+                    let mut output = Vec::new();
+                    Reader::new(transaction, StateNamespace::Derived)
+                        .at("atomic")
+                        .visit(&manifest, budget, |value: String, _| {
+                            output.push(value);
+                            Ok(())
+                        })?;
+                    Ok(output)
+                },
+            )
             .await?)
     }
 }
@@ -264,24 +324,25 @@ async fn failed_later_part_keeps_the_old_complete_head_and_collects_only_obsolet
 
 async fn age_preparations(database: &NativeDatabase) -> TestResult {
     database
-        .state(None, 1_048_576, 10, |transaction, budget| {
-            let mut updates = Vec::new();
-            super::super::visit_state::<Prepared>(
-                transaction,
-                StateNamespace::Derived,
-                b"dataset/s/",
-                budget,
-                |key, mut prepared, _| {
-                    prepared.manifest.created = "2000-01-01T00:00:00Z".into();
-                    updates.push((key, encode(&prepared)?));
-                    Ok(())
-                },
-            )?;
-            for (key, bytes) in updates {
-                transaction.put(StateNamespace::Derived, &key, bytes)?;
-            }
-            Ok(())
-        })
+        .state(
+            crate::rocks::StateAccess::write(None, 1_048_576, 10),
+            |transaction, budget| {
+                let mut updates = Vec::new();
+                super::super::visit_state::<Prepared>(
+                    &transaction.scan(StateNamespace::Derived, b"dataset/s/"),
+                    budget,
+                    |key, mut prepared, _| {
+                        prepared.manifest.created = "2000-01-01T00:00:00Z".into();
+                        updates.push((key, encode(&prepared)?));
+                        Ok(())
+                    },
+                )?;
+                for (key, bytes) in updates {
+                    transaction.put(StateNamespace::Derived, &key, bytes)?;
+                }
+                Ok(())
+            },
+        )
         .await?;
     Ok(())
 }
@@ -293,26 +354,32 @@ async fn changed_auxiliary_inputs_reject_a_precomputed_dataset_without_replacing
     fixture.write(vec!["old-complete".into()]).await?;
     let guard = fixture
         .database
-        .state(None, 0, 0, |transaction, budget| {
-            CommitGuard::capture(transaction, &[b"coverage_epoch"], budget)
-        })
+        .state(
+            crate::rocks::StateAccess::read_only(None),
+            |transaction, budget| CommitGuard::capture(transaction, &[b"coverage_epoch"], budget),
+        )
         .await?;
     fixture
         .database
-        .state(None, 4096, 1, |transaction, budget| {
-            crate::artifacts::native::bump_epoch(transaction, budget, b"coverage_epoch")
-        })
+        .state(
+            crate::rocks::StateAccess::write(None, 4096, 1),
+            |transaction, budget| {
+                crate::artifacts::native::bump_epoch(transaction, budget, b"coverage_epoch")
+            },
+        )
         .await?;
     assert_eq!(
         fixture
             .database
-            .replace_dataset_guarded(
-                StateNamespace::Derived,
-                "atomic",
-                None,
-                &(),
+            .replace_dataset(
+                crate::native_database::dataset::DatasetReplacement {
+                    namespace: StateNamespace::Derived,
+                    name: "atomic".to_owned(),
+                    expected: None,
+                    metadata: &(),
+                    guard,
+                },
                 vec!["stale-computation".to_owned()].into_iter(),
-                guard
             )
             .await,
         Err(StorageError::CurrentGenerationChanged)
@@ -320,19 +387,22 @@ async fn changed_auxiliary_inputs_reject_a_precomputed_dataset_without_replacing
     assert_eq!(fixture.values().await?, ["old-complete"]);
     let guard = fixture
         .database
-        .state(None, 0, 0, |transaction, budget| {
-            CommitGuard::capture(transaction, &[b"coverage_epoch"], budget)
-        })
+        .state(
+            crate::rocks::StateAccess::read_only(None),
+            |transaction, budget| CommitGuard::capture(transaction, &[b"coverage_epoch"], budget),
+        )
         .await?;
     fixture
         .database
-        .replace_dataset_guarded(
-            StateNamespace::Derived,
-            "atomic",
-            None,
-            &(),
+        .replace_dataset(
+            crate::native_database::dataset::DatasetReplacement {
+                namespace: StateNamespace::Derived,
+                name: "atomic".to_owned(),
+                expected: None,
+                metadata: &(),
+                guard,
+            },
             vec!["new-complete".to_owned()].into_iter(),
-            guard,
         )
         .await?;
     assert_eq!(fixture.values().await?, ["new-complete"]);
