@@ -71,6 +71,15 @@ Checkout paths and `CARGO_MANIFEST_DIR` are retained in keys, so a cache hit
 cannot silently substitute a fixture path from another worktree. See the
 [pinned sccache Rust limitations](https://github.com/mozilla/sccache/blob/v0.19.0/docs/Rust.md).
 
+Ubuntu unit, quality, and native jobs share the same dependency-cache key and
+fallback namespace. A workspace version bump changes the exact key but still
+reuses compatible native build artifacts from the previous main cache. Cargo
+fingerprints and compiler-cache inputs invalidate changed sources, dependencies,
+and toolchains. Cache restoration never substitutes for executing the complete
+tests, and the existing job deadlines and concurrency limits remain enforced.
+The quality job remains the sole publisher of this Ubuntu cache after its
+required checks pass.
+
 Linux release builds persist registry, toolchain, target and compiler caches
 under a key containing architecture, exact compiler and build-image digest.
 Inside the bounded Linux release container, Rust uses Cargo's persistent target
