@@ -303,7 +303,7 @@ The key contract, correction policy and current disposition counts are in the
 
 Generation freshness includes the native generation-digest contract, so a
 change to the facts an existing language publishes needs a new contract;
-otherwise an unchanged checkout keeps reporting fresh with the old facts. The
+otherwise an unchanged checkout keeps reporting fresh with the old facts. The V36 contract adds same-impl Rust call evidence and symbol-level test ownership. The
 V35 contract counts numeric syntax wrappers for the same source span once, retaining
 distinct source literals and numeric body roots. PowerShell callable boundaries keep
 numeric and control metrics with their declared owner. The V34 contract proves

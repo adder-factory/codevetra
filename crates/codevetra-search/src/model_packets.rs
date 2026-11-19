@@ -308,6 +308,8 @@ pub struct ContextPacket {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EditCandidateBasis {
+    /// Task-matched file represented by its highest-ranked eligible implementation.
+    RankedImplementation,
     /// A caller-supplied exact name, path, or reference anchor selected the file.
     ExactAnchor,
     /// The file had the strongest distinct task-term concentration in retrieval evidence.
@@ -954,11 +956,7 @@ impl ContextPacket {
         for (position, item) in positions.into_iter().zip(items) {
             self.details.evidence[position] = item;
         }
-        if let Some(candidates) = crate::packet::decision_edit_candidates(
-            task,
-            &self.details.evidence,
-            &self.details.edit_candidates,
-        ) {
+        if let Some(candidates) = crate::packet::decision_edit_candidates(task, &self) {
             self.details.edit_candidates = candidates;
         }
         Ok(self)

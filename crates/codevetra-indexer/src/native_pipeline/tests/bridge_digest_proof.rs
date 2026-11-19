@@ -1,12 +1,12 @@
 //! Remove six physical `ObjC` alias links after restoring the receiver delta
-//! to recover the exact wave-2 facts, with V35 hash domain and unchanged V27 health metadata.
+//! to recover the exact wave-2 facts, with V36 hash domain and unchanged V27 health metadata.
 
 use super::*;
 
-// V35 changes only the domain for this unchanged frozen corpus.
-// Independent encoding reproduces the V34 pin before deriving the V35 pin.
+// V36 changes only the domain for this unchanged frozen corpus.
+// Independent encoding reproduces the V35 pin before deriving the V36 pin.
 pub(super) const PREVIOUS_GENERIC_DIGEST: &str =
-    "296949b7aa374babc7cb8591342914fc1bf8834eccd02521acb1af407571aee2";
+    "16d328edf18d4344a73844949c4621639c439a29827eb09ed8157759600b7774";
 const PHYSICAL_ALIAS_EDGES: usize = 6;
 
 pub(super) fn restore(facts: &CanonicalGenerationFacts) -> CanonicalGenerationFacts {

@@ -625,9 +625,10 @@ impl GraphEdgeFilter {
         let Some(symbol) = graph.symbol(adjacent, budget)? else {
             return Ok(false);
         };
-        Ok(graph
-            .file(&symbol.file_id, budget)?
-            .is_some_and(|file| test_path(&file.normalized_path)))
+        Ok(symbol.implementation.test_symbol
+            || graph
+                .file(&symbol.file_id, budget)?
+                .is_some_and(|file| test_path(&file.normalized_path)))
     }
 }
 
@@ -757,7 +758,7 @@ pub(crate) fn symbol_record(
         visibility: symbol.visibility,
         export: symbol.export,
         execution: symbol.execution,
-        declaration_only: symbol.declaration_only,
+        implementation: symbol.implementation,
     })
 }
 

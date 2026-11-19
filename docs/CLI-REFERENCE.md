@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [MCP usage](MCP-USAGE.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Last release audit: 2026-11-18 (`v4.0.8`).
+Last release audit: 2026-11-18 (`v4.0.9`).
 
 The installed executable is `codevetra`. Run `codevetra <command> --help` for
 the exact bounds in the installed version. Bounded maintenance and its
@@ -251,6 +251,7 @@ function/class categories.
 | Field | Contents |
 | --- | --- |
 | `ready` (legacy) and `capabilitiesReady` | Booleans that preserve the existing exit-code contract |
+| `embedding` | Detailed model and generation, state, embedded and total document counts, measured shortfall in `missing_documents`, index and query probe readiness when observed. For partial coverage, run `codevetra embed <path>`. |
 | `projectReadiness` | Independent `database`, `index`, `freshness`, `deterministicRetrieval`, `semanticRetrieval`, `registration`, `liveTransport`, and `overall` states |
 | `nextActions` | Next steps that use placeholders rather than absolute paths or database settings |
 

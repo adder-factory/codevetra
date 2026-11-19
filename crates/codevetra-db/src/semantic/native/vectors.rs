@@ -714,13 +714,16 @@ impl ScoredDocument {
         budget: &mut ReadBudget,
     ) -> Result<VectorSearchHit, Error> {
         let document = graph.document(&self.id, budget)?.ok_or(corrupt())?;
-        let symbol_kind = document
+        let symbol = document
             .symbol_id
             .as_ref()
             .map(|id| graph.symbol(id, budget))
             .transpose()?
-            .flatten()
+            .flatten();
+        let symbol_kind = symbol
+            .as_ref()
             .and_then(|symbol| SymbolKind::from_stable_str(&symbol.symbol_kind));
+        let declaration_only = symbol.map(|symbol| symbol.implementation.declaration_only);
         let rerank = crate::semantic::rerank::render_rerank_text(&document, "")?;
         Ok(VectorSearchHit {
             generation_id: graph.generation_id().clone(),
@@ -732,6 +735,7 @@ impl ScoredDocument {
             document_kind: document.kind,
             qualified_name: document.qualified_name,
             symbol_kind,
+            declaration_only,
             distance: self.distance,
             rerank_text: Some(rerank),
         })

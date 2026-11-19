@@ -138,7 +138,8 @@ pub struct CurrentSymbolRecord {
     export: SymbolExportFlags,
     #[serde(flatten)]
     execution: SymbolExecutionFlags,
-    declaration_only: bool,
+    #[serde(flatten)]
+    implementation: codevetra_domain::SymbolImplementationFlags,
 }
 
 impl CurrentSymbolRecord {
@@ -250,10 +251,16 @@ impl CurrentSymbolRecord {
         self.execution.static_member
     }
 
+    /// Whether extraction attributed this declaration to a test scope.
+    #[must_use]
+    pub const fn test_symbol(&self) -> bool {
+        self.implementation.test_symbol
+    }
+
     /// Whether the declaration lacks an implementation body.
     #[must_use]
     pub const fn declaration_only(&self) -> bool {
-        self.declaration_only
+        self.implementation.declaration_only
     }
 }
 

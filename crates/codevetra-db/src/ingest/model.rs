@@ -54,8 +54,9 @@ pub struct SymbolInput {
     pub export: SymbolExportFlags,
     /// Async and static execution modifiers proven by the extractor.
     pub execution: SymbolExecutionFlags,
-    /// Whether the source contains a declaration without an implementation body.
-    pub declaration_only: bool,
+    /// Declaration presence and inline test ownership from extraction.
+    #[serde(flatten)]
+    pub implementation: codevetra_domain::SymbolImplementationFlags,
     /// Sampled directed Brandes betweenness, normalized to parts per billion.
     ///
     /// The value is derived from this generation's structural graph and is

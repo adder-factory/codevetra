@@ -24,6 +24,7 @@ provenance live on GitHub Releases.
 
 | Version | Date | Schema · Contract | Headline |
 | --- | --- | --- | --- |
+| [v4.0.9](releases/v4.0.9.md) | 2026-11-18 | Rocks v1 · V36 ↑ | Rust method and test navigation, executable trace candidates, and embedding coverage in doctor |
 | [v4.0.8](releases/v4.0.8.md) | 2026-11-18 | Rocks v1 · V35 ↑ | Precise biomarkers, Rust relationships, actionable tool arguments, and portable Windows release builds |
 | [v4.0.7](releases/v4.0.7.md) | 2026-11-18 | Rocks v1 · V34 | Tag-only candidate, superseded by v4.0.8 after a Windows compiler-wrapper failure (no GitHub release) |
 | [v4.0.6](releases/v4.0.6.md) | 2026-11-16 | Rocks v1 · V27 | Rust 1.100.0, Jiff 1.0, dependency refresh, and standard-library cancellation guards |

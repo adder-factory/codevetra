@@ -174,6 +174,15 @@ pub fn is_test_path(path: &str) -> bool {
     codevetra_domain::is_test_source_path(path)
 }
 
+pub(crate) fn test_identity(
+    symbol: &codevetra_db::CurrentSymbolRecord,
+) -> (codevetra_domain::FileId, Option<SymbolId>) {
+    (
+        symbol.file_id().clone(),
+        symbol.test_symbol().then(|| symbol.symbol_id().clone()),
+    )
+}
+
 pub(crate) fn affected_tests_from_traversal(
     traversal: &TraversalResult,
     limit: u16,
@@ -185,24 +194,25 @@ pub(crate) fn affected_tests_from_nodes(
     nodes: &[crate::TraversalNode],
     limit: u16,
 ) -> (Vec<AffectedTest>, bool) {
-    let mut by_file = BTreeMap::new();
+    let mut by_identity = BTreeMap::new();
     for node in nodes {
         let edge_is_test = node.via().edge_kind() == "tests";
-        if !edge_is_test && !is_test_path(node.symbol().path().as_str()) {
-            continue;
-        }
         let reason = if edge_is_test {
             "tests-edge"
-        } else {
+        } else if node.symbol().test_symbol() {
+            "test-symbol"
+        } else if is_test_path(node.symbol().path().as_str()) {
             "test-path"
+        } else {
+            continue;
         };
-        by_file
-            .entry(node.symbol().file_id().clone())
+        by_identity
+            .entry(test_identity(node.symbol()))
             .or_insert_with(|| {
                 AffectedTest::new(node.symbol().clone(), node.depth(), reason.to_owned())
             });
     }
-    let mut tests = by_file.into_values().collect::<Vec<_>>();
+    let mut tests = by_identity.into_values().collect::<Vec<_>>();
     tests.sort_by(|left, right| {
         left.distance()
             .cmp(&right.distance())

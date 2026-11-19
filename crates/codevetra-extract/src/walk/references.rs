@@ -722,7 +722,7 @@ fn rust_self_nominal_type(
             break;
         };
         if node.kind() == "function_item" {
-            if receiver_seen || !rust_function_has_self_parameter(node) {
+            if receiver_seen || !super::syntax::rust_function_has_self_parameter(node) {
                 return Ok(None);
             }
             receiver_seen = true;
@@ -733,14 +733,6 @@ fn rust_self_nominal_type(
         ancestor = node.parent();
     }
     Ok(None)
-}
-
-fn rust_function_has_self_parameter(function: Node<'_>) -> bool {
-    function
-        .child_by_field_name("parameters")
-        .is_some_and(|parameters| {
-            named_children(parameters).any(|parameter| parameter.kind() == "self_parameter")
-        })
 }
 
 fn rust_impl_nominal_type(

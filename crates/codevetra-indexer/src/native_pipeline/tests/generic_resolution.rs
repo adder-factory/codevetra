@@ -253,8 +253,16 @@ fn receiver_overloads_do_not_prefer_a_different_implemented_signature() {
         .filter(|symbol| symbol.qualified_name == "Worker::helper")
         .collect::<Vec<_>>();
     assert_eq!(overloads.len(), 2);
-    assert!(overloads.iter().any(|symbol| symbol.declaration_only));
-    assert!(overloads.iter().any(|symbol| !symbol.declaration_only));
+    assert!(
+        overloads
+            .iter()
+            .any(|symbol| symbol.implementation.declaration_only)
+    );
+    assert!(
+        overloads
+            .iter()
+            .any(|symbol| !symbol.implementation.declaration_only)
+    );
     let owner = capability_symbol(&facts, "src/Worker.java", "Worker::run");
     let call =
         CapabilityReferenceQuery::new(&facts, owner).named("this.helper", ReferenceKind::Calls);
@@ -442,8 +450,16 @@ fn casefold_overloads_do_not_prefer_a_different_implemented_signature() {
         .filter(|symbol| symbol.qualified_name == "Worker::process")
         .collect::<Vec<_>>();
     assert_eq!(overloads.len(), 2);
-    assert!(overloads.iter().any(|symbol| symbol.declaration_only));
-    assert!(overloads.iter().any(|symbol| !symbol.declaration_only));
+    assert!(
+        overloads
+            .iter()
+            .any(|symbol| symbol.implementation.declaration_only)
+    );
+    assert!(
+        overloads
+            .iter()
+            .any(|symbol| !symbol.implementation.declaration_only)
+    );
     let owner = capability_symbol(&facts, "src/worker.vb", "Worker::run");
     let call = CapabilityReferenceQuery::new(&facts, owner).named("PROCESS", ReferenceKind::Calls);
     assert!(call.target_symbol_id.is_none(), "{call:?}");

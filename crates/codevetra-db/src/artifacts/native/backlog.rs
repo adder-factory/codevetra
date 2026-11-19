@@ -155,7 +155,7 @@ impl NativeDatabase {
                         start_line: symbol.start_line,
                         end_line: symbol.end_line,
                         content_hash: symbol.structural_digest.to_string(),
-                        declaration_only: symbol.declaration_only,
+                        declaration_only: symbol.implementation.declaration_only,
                         edges: edges.remove(&symbol.symbol_id).unwrap_or_default(),
                     });
                 }

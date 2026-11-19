@@ -98,7 +98,7 @@ fn raw_facts(nodes: u64, edges: Vec<EdgeInput>) -> GenerationFacts {
             visibility: None,
             export: SymbolExportFlags::default(),
             execution: SymbolExecutionFlags::default(),
-            declaration_only: false,
+            implementation: codevetra_domain::SymbolImplementationFlags::default(),
             betweenness_ppb: None,
             pagerank_ppb: None,
         })

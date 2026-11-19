@@ -1,17 +1,34 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    ExtractError, ExtractedFile, SourceSnapshot, budget::native_output_limit, is_test_source_path,
+    ExtractError, ExtractedFile, ExtractedSymbol, SourceSnapshot, budget::native_output_limit,
+    is_test_source_path,
 };
 
 const MAXIMUM_TEST_SEARCH_BYTES: usize = 16 * 1_024;
 const MAXIMUM_TEST_TITLE_BYTES: usize = 256;
 
+impl ExtractedSymbol {
+    /// Whether this declaration contributes a named case to test lookup for the file.
+    #[must_use]
+    pub fn contributes_test_name(&self, test_file: bool) -> bool {
+        (test_file || self.implementation.test_symbol)
+            && matches!(
+                self.kind,
+                codevetra_domain::SymbolKind::Function
+                    | codevetra_domain::SymbolKind::Method
+                    | codevetra_domain::SymbolKind::Class
+                    | codevetra_domain::SymbolKind::Component
+            )
+    }
+}
+
 pub(crate) fn enrich(
     snapshot: &SourceSnapshot,
     mut extracted: ExtractedFile,
 ) -> Result<ExtractedFile, ExtractError> {
-    if !is_test_source_path(snapshot.path().as_str()) && !extracted.has_inline_tests {
+    let test_file = is_test_source_path(snapshot.path().as_str());
+    if !test_file && !extracted.has_inline_tests {
         return Ok(extracted);
     }
     let mut names = literal_test_names(snapshot.source());
@@ -19,12 +36,7 @@ pub(crate) fn enrich(
         extracted
             .symbols
             .iter()
-            .filter(|symbol| {
-                matches!(
-                    symbol.kind.as_str(),
-                    "function" | "method" | "class" | "component"
-                )
-            })
+            .filter(|symbol| symbol.contributes_test_name(test_file))
             .map(|symbol| bounded(&symbol.qualified_name, MAXIMUM_TEST_TITLE_BYTES)),
     );
     let mut text = String::new();

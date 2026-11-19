@@ -1006,6 +1006,7 @@ fn semantic_candidate(
     if let Some(symbol_id) = hit.symbol_id() {
         document = document.with_symbol_id(symbol_id.clone());
     }
+    document = document.with_declaration_only(hit.declaration_only());
     if let Some(symbol_kind) = hit.symbol_kind() {
         document = document.with_symbol_kind(symbol_kind);
     }

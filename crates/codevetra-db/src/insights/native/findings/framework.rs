@@ -165,7 +165,7 @@ mod tests {
                 ..Default::default()
             },
             execution: codevetra_domain::SymbolExecutionFlags::default(),
-            declaration_only: false,
+            implementation: codevetra_domain::SymbolImplementationFlags::default(),
             betweenness_ppb: None,
             pagerank_ppb: None,
         }

@@ -1712,6 +1712,10 @@ struct EvidenceDetails {
     language: Option<SourceLanguage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     document_kind: Option<DocumentKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_kind: Option<codevetra_domain::SymbolKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declaration_only: Option<bool>,
     qualified_name: String,
     start_line: Option<u32>,
     end_line: Option<u32>,
@@ -1784,6 +1788,25 @@ impl EvidenceItem {
     #[must_use]
     pub const fn document_kind(&self) -> Option<DocumentKind> {
         self.details.document_kind
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_fixture_kind(
+        mut self,
+        kind: codevetra_domain::SymbolKind,
+        declaration_only: bool,
+    ) -> Self {
+        self.details.symbol_kind = Some(kind);
+        self.details.declaration_only = Some(declaration_only);
+        self
+    }
+
+    pub(crate) const fn declaration_only(&self) -> Option<bool> {
+        self.details.declaration_only
+    }
+
+    pub(crate) const fn symbol_kind(&self) -> Option<codevetra_domain::SymbolKind> {
+        self.details.symbol_kind
     }
 
     /// Declaration/reference name when available.
@@ -1884,11 +1907,15 @@ pub(crate) fn evidence_from_symbol(
     item.details.boundary = symbol.boundary().cloned();
     item.details.symbol_id = Some(symbol.symbol_id().clone());
     item.details.language = SourceLanguage::from_stable_str(symbol.language());
-    item.details.document_kind = Some(if is_test_path(symbol.path().as_str()) {
-        DocumentKind::Test
-    } else {
-        DocumentKind::Symbol
-    });
+    item.details.declaration_only = Some(symbol.declaration_only());
+    item.details.symbol_kind = codevetra_domain::SymbolKind::from_stable_str(symbol.symbol_kind());
+    item.details.document_kind = Some(
+        if symbol.test_symbol() || is_test_path(symbol.path().as_str()) {
+            DocumentKind::Test
+        } else {
+            DocumentKind::Symbol
+        },
+    );
     item.details.start_line = Some(symbol.start_line());
     item.details.end_line = Some(symbol.end_line());
     item.details.reasons.push(reason);
@@ -1952,6 +1979,8 @@ pub(crate) fn evidence_from_fused_item(fused: &FusedSearchItem) -> EvidenceItem 
     item.details.symbol_id = document.symbol_id().cloned();
     item.details.document_id = Some(document.document_id().clone());
     item.details.language = Some(document.language());
+    item.details.declaration_only = document.declaration_only();
+    item.details.symbol_kind = document.symbol_kind();
     item.details.document_kind = Some(document.document_kind());
     item.details.fused_rank = Some(fused.rank());
     item.details.reciprocal_rank_score = Some(fused.reciprocal_rank_score());
@@ -2049,6 +2078,11 @@ pub(crate) fn merge_evidence(item: &mut EvidenceItem, mut other: EvidenceItem) {
         item.details.reciprocal_rank_score,
         other.details.reciprocal_rank_score,
     );
+    item.details.declaration_only = item
+        .details
+        .declaration_only
+        .or(other.details.declaration_only);
+    item.details.symbol_kind = item.details.symbol_kind.or(other.details.symbol_kind);
     if incoming_fused_metadata_is_stronger {
         item.details.language = other.details.language;
         item.details.document_kind = other.details.document_kind;
@@ -2272,6 +2306,8 @@ fn evidence_base(
             path: path.into(),
             language: None,
             document_kind: None,
+            symbol_kind: None,
+            declaration_only: None,
             qualified_name: qualified_name.into(),
             start_line: None,
             end_line: None,

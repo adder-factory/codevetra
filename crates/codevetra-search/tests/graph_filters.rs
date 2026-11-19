@@ -60,6 +60,8 @@ fn high_degree_facts() -> GenerationFacts {
     edges.extend([
         edge(1, 2, EdgeKind::Calls, 1),
         edge(4, 3, EdgeKind::Calls, 1),
+        edge(4, 8, EdgeKind::Calls, 1),
+        edge(5, 8, EdgeKind::Calls, 1),
     ]);
     GenerationFacts {
         files: vec![FileInput {
@@ -85,7 +87,10 @@ fn high_degree_facts() -> GenerationFacts {
                 visibility: None,
                 export: SymbolExportFlags::default(),
                 execution: SymbolExecutionFlags::default(),
-                declaration_only: false,
+                implementation: codevetra_domain::SymbolImplementationFlags {
+                    test_symbol: matches!(id, 4 | 5),
+                    declaration_only: false,
+                },
                 betweenness_ppb: None,
                 pagerank_ppb: None,
             })
@@ -181,6 +186,7 @@ async fn native_filters_precede_candidate_cap_for_traversal_and_paths() -> TestR
     assert_eq!(impact.nodes().len(), 1);
     assert_eq!(impact.nodes()[0].symbol().symbol_id(), &symbol(4));
     assert!(!impact.truncated());
+    verify_inline_test_selection(&retriever, &traversal(8)?, &traversal(2)?).await?;
     let path = retriever
         .path(
             &GraphPathRequest::new(GraphPathRequestInput {
@@ -197,5 +203,36 @@ async fn native_filters_precede_candidate_cap_for_traversal_and_paths() -> TestR
     runtime
         .shutdown(&StorageRequest::new(Duration::from_secs(30))?)
         .await?;
+    Ok(())
+}
+
+async fn verify_inline_test_selection(
+    retriever: &DeterministicRetriever,
+    inline_target: &TraversalRequest,
+    ordinary_target: &TraversalRequest,
+) -> TestResult {
+    let affected = retriever.affected_tests(inline_target, 10).await?;
+    let ids: Vec<_> = affected
+        .tests()
+        .iter()
+        .map(|test| test.symbol().symbol_id().clone())
+        .collect();
+    assert_eq!(ids, [symbol(4), symbol(5)]);
+    assert!(
+        affected
+            .tests()
+            .iter()
+            .all(|test| test.reason() == "test-symbol")
+    );
+    assert!(!affected.truncated());
+    let limited = retriever.affected_tests(inline_target, 1).await?;
+    assert_eq!(limited.tests().len(), 1);
+    assert!(limited.truncated());
+    let ordinary = retriever.affected_tests(ordinary_target, 10).await?;
+    assert_eq!(ordinary.tests(), []);
+    let production_only = retriever
+        .callers(&inline_target.clone().with_test_nodes(false))
+        .await?;
+    assert_eq!(production_only.nodes(), []);
     Ok(())
 }

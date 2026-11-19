@@ -38,6 +38,7 @@ const DIGEST_V32_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v32";
 const DIGEST_V33_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v33";
 const DIGEST_V34_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v34";
 const DIGEST_V35_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v35";
+const DIGEST_V36_DOMAIN: &[u8] = b"codevetra-v4-logical-generation-v36";
 
 /// Each digest contract's hash domain, in [`GenerationDigestVersion::ALL`]
 /// order. The length follows `ALL`, so a new contract does not compile until
@@ -78,6 +79,7 @@ const DIGEST_DOMAINS: [&[u8]; GenerationDigestVersion::ALL.len()] = [
     DIGEST_V33_DOMAIN,
     DIGEST_V34_DOMAIN,
     DIGEST_V35_DOMAIN,
+    DIGEST_V36_DOMAIN,
 ];
 
 pub(super) fn logical_digest<Cancel>(
@@ -135,6 +137,7 @@ const fn digest_includes_numerical_sites(version: GenerationDigestVersion) -> bo
             | GenerationDigestVersion::V33
             | GenerationDigestVersion::V34
             | GenerationDigestVersion::V35
+            | GenerationDigestVersion::V36
     )
 }
 
@@ -174,7 +177,10 @@ impl CanonicalRow for SymbolInput {
         digest.boolean(self.export.default_export);
         digest.boolean(self.execution.async_symbol);
         digest.boolean(self.execution.static_member);
-        digest.boolean(self.declaration_only);
+        digest.byte(
+            u8::from(self.implementation.declaration_only)
+                | (u8::from(self.implementation.test_symbol && digest.test_ownership) << 1),
+        );
     }
 }
 
@@ -265,6 +271,7 @@ fn usize_to_u64(value: usize) -> u64 {
 }
 
 struct CanonicalDigest {
+    test_ownership: bool,
     hasher: Hasher,
     encoded_bytes: u64,
     // Bound the transient stream workspace while letting BLAKE3 process whole
@@ -281,7 +288,10 @@ impl CanonicalDigest {
             .zip(DIGEST_DOMAINS)
             .find_map(|(candidate, domain)| (*candidate == version).then_some(domain))
             .unwrap_or(DIGEST_V1_TO_V6_DOMAIN);
-        Self::new(domain)
+        let mut digest = Self::new(domain);
+        digest.test_ownership =
+            version.database_value() >= GenerationDigestVersion::V36.database_value();
+        digest
     }
 
     fn table<Row: CanonicalRow>(
@@ -304,6 +314,7 @@ impl CanonicalDigest {
         hasher.update(domain);
         Self {
             hasher,
+            test_ownership: false,
             encoded_bytes: 0,
             buffer: [0; 8192],
             buffered: 0,
@@ -356,8 +367,12 @@ impl CanonicalDigest {
     }
 
     fn boolean(&mut self, value: bool) {
+        self.byte(u8::from(value));
+    }
+
+    fn byte(&mut self, value: u8) {
         self.encoded_bytes = self.encoded_bytes.saturating_add(1);
-        self.bytes(&[u8::from(value)]);
+        self.bytes(&[value]);
     }
 
     fn bytes(&mut self, mut bytes: &[u8]) {

@@ -590,7 +590,7 @@ impl SemanticReadinessRequest {
 }
 
 /// Exact coverage and live-index evidence used to gate semantic retrieval.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticReadinessReport {
     pub(crate) model_id: ModelId,
     pub(crate) generation_id: Option<GenerationId>,
@@ -716,6 +716,8 @@ pub struct VectorSearchHit {
     pub(crate) qualified_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) symbol_kind: Option<SymbolKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) declaration_only: Option<bool>,
     pub(crate) distance: f64,
     #[serde(skip)]
     pub(crate) rerank_text: Option<String>,
@@ -734,6 +736,7 @@ impl fmt::Debug for VectorSearchHit {
             .field("document_kind", &self.document_kind)
             .field("qualified_name", &self.qualified_name)
             .field("symbol_kind", &self.symbol_kind)
+            .field("declaration_only", &self.declaration_only)
             .field("distance", &self.distance)
             .field(
                 "rerank_text_bytes",
@@ -938,6 +941,12 @@ impl VectorSearchHit {
     #[must_use]
     pub const fn symbol_kind(&self) -> Option<SymbolKind> {
         self.symbol_kind
+    }
+
+    /// Whether the generation's symbol is a bodyless declaration, when known.
+    #[must_use]
+    pub const fn declaration_only(&self) -> Option<bool> {
+        self.declaration_only
     }
 
     /// Bounded current-generation text reserved for an optional reranker call.
@@ -1201,6 +1210,7 @@ mod tests {
             document_kind: DocumentKind::Symbol,
             qualified_name: "private_candidate".to_owned(),
             symbol_kind: Some(SymbolKind::Function),
+            declaration_only: Some(false),
             distance: 0.25,
             rerank_text: Some(source_text.to_owned()),
         };

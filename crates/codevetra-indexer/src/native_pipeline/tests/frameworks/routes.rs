@@ -12,10 +12,10 @@ const INFERRED_RESOURCE_CONFIDENCE: f32 = 0.70;
 const DIRECTORY_ROUTE_CONFIDENCE: f32 = 0.80;
 const UNSUPPORTED_NAMESPACE_BYTES: usize = 1_025;
 const RESOURCE_LIMIT: usize = 256;
-// V35 changes only the domain for this unchanged frozen corpus.
-// Independent encoding reproduces the V34 pin before deriving the V35 pin.
+// V36 changes only the domain for this unchanged frozen corpus.
+// Independent encoding reproduces the V35 pin before deriving the V36 pin.
 const PREVIOUS_CUSTOM_FAMILY_DIGEST: &str =
-    "a8719903b6ccb4d18edcd642f9e466a686c61a0331019d394224ed783bbe6d98";
+    "6b934f4c5daef174bfeeaf557566f776a6721cb89ad8079c012abe9b717dae2d";
 
 #[test]
 fn flutter_route_widgets_bind_to_the_explicit_import_and_keep_ambiguity() {

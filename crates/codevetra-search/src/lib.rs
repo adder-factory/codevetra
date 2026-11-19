@@ -596,6 +596,90 @@ mod contract_tests {
     }
 
     #[test]
+    fn implementation_trace_prefers_methods_and_retains_field_evidence() {
+        let path = "src/embeddings.rs";
+        let task = "trace embeddings and reused documents";
+        let packet = assemble_packet(PacketAssembly {
+            task,
+            generation: Some(fixture_generation()),
+            intent: TaskIntent::ImplementationTrace,
+            graph_direction: Some(ContextGraphDirection::Callees),
+            freshness: IndexFreshness::Current,
+            retrieval: fixture_retrieval(),
+            evidence: vec![
+                ranked_symbol_evidence(
+                    path,
+                    "EmbeddingSweepReport::reused_documents",
+                    EvidenceReason::Bm25,
+                    1,
+                    "11111111-1111-4111-8111-111111111111",
+                )
+                .with_fixture_kind(codevetra_domain::SymbolKind::Field, false),
+                ranked_symbol_evidence(
+                    path,
+                    "Runtime::sweep_pending_embeddings",
+                    EvidenceReason::Bm25,
+                    2,
+                    "22222222-2222-4222-8222-222222222222",
+                )
+                .with_fixture_kind(codevetra_domain::SymbolKind::Method, false),
+                ranked_symbol_evidence(
+                    path,
+                    "EmbeddingSweepReport::reused_documents",
+                    EvidenceReason::Bm25,
+                    3,
+                    "33333333-3333-4333-8333-333333333333",
+                )
+                .with_fixture_kind(codevetra_domain::SymbolKind::Method, false),
+                ranked_symbol_evidence(
+                    path,
+                    "EmbeddingTrait::sweep_pending_embeddings",
+                    EvidenceReason::Bm25,
+                    1,
+                    "44444444-4444-4444-4444-444444444444",
+                )
+                .with_fixture_kind(codevetra_domain::SymbolKind::Method, true),
+            ],
+            affected_tests: Vec::new(),
+            evidence_limit: PACKET_EVIDENCE_LIMIT,
+            truncated: false,
+        });
+        assert_eq!(packet.evidence().len(), 4);
+        assert_eq!(
+            packet.edit_candidates().candidates()[0].basis(),
+            EditCandidateBasis::RankedImplementation
+        );
+        assert_eq!(
+            packet.edit_candidates().candidates()[0].qualified_names(),
+            &["Runtime::sweep_pending_embeddings"]
+        );
+        let judgments = packet
+            .evidence()
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let score = if item.qualified_name() == "Runtime::sweep_pending_embeddings" {
+                    0.9
+                } else if item.symbol_kind() == Some(codevetra_domain::SymbolKind::Method)
+                    && item.declaration_only() == Some(false)
+                {
+                    0.8
+                } else {
+                    0.99
+                };
+                (index, score)
+            })
+            .collect::<Vec<_>>();
+        let judged = packet
+            .with_decision_relevance(task, &judgments)
+            .unwrap_or_else(|error| panic!("invalid decision fixture: {error}"));
+        assert_eq!(
+            judged.edit_candidates().candidates()[0].qualified_names(),
+            &["Runtime::sweep_pending_embeddings"]
+        );
+    }
+
+    #[test]
     fn packet_edit_candidates_prefer_concentrated_task_terms_over_generic_hits() {
         let packet = assemble_packet(PacketAssembly {
             task: "Fix the watcher event gate so an empty file path never triggers incremental sync",
