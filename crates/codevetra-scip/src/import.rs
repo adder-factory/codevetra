@@ -679,7 +679,7 @@ fn persist_scip_symbol(imported: &mut ImportAccumulator, input: ScipSymbolPersis
         visibility: None,
         export: codevetra_domain::SymbolExportFlags::default(),
         execution: codevetra_domain::SymbolExecutionFlags::default(),
-        declaration_only: false,
+        implementation: codevetra_domain::SymbolImplementationFlags::default(),
         betweenness_ppb: None,
         pagerank_ppb: None,
     });
@@ -1272,7 +1272,7 @@ mod tests {
                 visibility: None,
                 export: codevetra_domain::SymbolExportFlags::default(),
                 execution: codevetra_domain::SymbolExecutionFlags::default(),
-                declaration_only: false,
+                implementation: codevetra_domain::SymbolImplementationFlags::default(),
                 betweenness_ppb: None,
                 pagerank_ppb: None,
             }],

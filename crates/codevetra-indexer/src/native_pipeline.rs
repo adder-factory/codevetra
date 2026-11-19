@@ -2682,7 +2682,7 @@ fn normalize_native_symbol(
             visibility,
             export,
             execution,
-            declaration_only: implementation.declaration_only,
+            implementation,
             betweenness_ppb: None,
             pagerank_ppb: None,
         },
@@ -14472,7 +14472,7 @@ fn native_file_symbol_input(input: &FileRecordInput<'_>) -> Result<SymbolInput, 
         visibility: None,
         export: SymbolExportFlags::default(),
         execution: SymbolExecutionFlags::default(),
-        declaration_only: false,
+        implementation: codevetra_domain::SymbolImplementationFlags::default(),
         betweenness_ppb: None,
         pagerank_ppb: None,
     })
@@ -14803,15 +14803,15 @@ mod tests {
 
     const FULL_TEST_EVIDENCE: NativeEvidencePolicy = NativeEvidencePolicy::FULL;
     const STRUCTURAL_TEST_EVIDENCE: NativeEvidencePolicy = NativeEvidencePolicy::STRUCTURAL;
-    // V35 changes only the domain for these frozen fixtures.
-    // Independent encoding reproduces each V34 digest before deriving its V35 pin.
+    // V36 changes only the domain for these frozen fixtures.
+    // Independent encoding reproduces each V35 digest before deriving its V36 pin.
     const PARSER_ONLY_FILE_COUNT: usize = 6;
     const EXPECTED_PARSER_ONLY_DIGEST: &str =
-        "2710e10df47b11abe72df567f38686229bbf858ae03e264da533c98e888cba9f";
+        "de60c61bff6f84204d5c4945efc3e9f03b3bf82ae4e8fb29ec3c6c70fc4de07b";
     const EXPECTED_PARSER_ONLY_PROJECTION: (usize, usize, usize, usize, usize) = (6, 6, 0, 0, 6);
     const ADMITTED_FAMILY_FILE_COUNT: usize = 14;
     const EXPECTED_ADMITTED_FAMILY_DIGEST: &str =
-        "018236c946f20a79443f6cab36f557b86d641bd59d6104632ab4a16a63793f17";
+        "092e188642c3202e4ea3d4b0ee378fe262585f628280a793f72288b4bd231149";
     const EXPECTED_ADMITTED_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
         (14, 33, 19, 6, 33);
     const GENERIC_FAMILY_FILE_COUNT: usize = 28;
@@ -14838,7 +14838,7 @@ mod tests {
     // references and centrality; bridge_digest_proof then removes six alias
     // links to recover 04a9f9b9... exactly under the V23 domain.
     const EXPECTED_GENERIC_FAMILY_DIGEST: &str =
-        "1aad348e35d21f5483354c24b6fe8602f310eccc55d299630703441ec9d8d030";
+        "e22cf4e2bb26d52277f24b1ecdf9ba65f23f4e75409d5a498476310d1c9e68f3";
     const EXPECTED_GENERIC_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
         (28, 260, 292, 135, 260);
     const CUSTOM_FAMILY_FILE_COUNT: usize = 13;
@@ -14849,7 +14849,7 @@ mod tests {
     // frameworks::routes::mybatis_local_sql_roles_preserve_the_frozen_custom_digest
     // regression removes the hint and compares every fact table and digest.
     const EXPECTED_CUSTOM_FAMILY_DIGEST: &str =
-        "a8719903b6ccb4d18edcd642f9e466a686c61a0331019d394224ed783bbe6d98";
+        "6b934f4c5daef174bfeeaf557566f776a6721cb89ad8079c012abe9b717dae2d";
     // A Liquid `{% render %}` partner is a Component as well as an Import
     // (+1 symbol and its containment).
     const EXPECTED_CUSTOM_FAMILY_PROJECTION: (usize, usize, usize, usize, usize) =
@@ -17532,7 +17532,7 @@ pub fn score(a: u16, b: u16, value: f32) -> f32 {
             .as_ref()
             .and_then(|target| aliases.iter().find(|alias| &alias.symbol_id == target))
             .unwrap_or_else(|| panic!("bridge abstained: {call:?}"));
-        assert!(!target.declaration_only);
+        assert!(!target.implementation.declaration_only);
         assert_eq!(call.resolution_provenance, APPLE_BRIDGE_PROVENANCE);
     }
 
@@ -17729,7 +17729,10 @@ pub fn score(a: u16, b: u16, value: f32) -> f32 {
             CapabilitySymbolQuery::new(&forward, "ios/Shape.m").of_kind("Shape", SymbolKind::Class);
         let category = CapabilitySymbolQuery::new(&forward, "ios/Shape+Extras.m")
             .of_kind("Shape", SymbolKind::Class);
-        assert!(category.declaration_only, "a category augments its class");
+        assert!(
+            category.implementation.declaration_only,
+            "a category augments its class"
+        );
         let square = CapabilitySymbolQuery::new(&forward, "ios/Square.m")
             .of_kind("Square", SymbolKind::Class);
         let extends =
@@ -17816,7 +17819,8 @@ pub fn score(a: u16, b: u16, value: f32) -> f32 {
             .symbols()
             .iter()
             .find(|symbol| {
-                symbol.qualified_name == "RCTCalculator::multiply:b:" && !symbol.declaration_only
+                symbol.qualified_name == "RCTCalculator::multiply:b:"
+                    && !symbol.implementation.declaration_only
             })
             .unwrap_or_else(|| panic!("missing native implementation: {:?}", forward.symbols()));
         let bridges = forward
@@ -20565,7 +20569,7 @@ export function secondClone(value: number) {
                 (
                     path,
                     symbol.qualified_name.as_str(),
-                    symbol.declaration_only,
+                    symbol.implementation.declaration_only,
                 )
             });
         assert_eq!(
@@ -20585,7 +20589,7 @@ export function secondClone(value: number) {
             &symbol.symbol_id == vhdl_target
                 && symbol.qualified_name == "math_pkg::normalize"
                 && symbol.symbol_kind == SymbolKind::Function.as_str()
-                && !symbol.declaration_only
+                && !symbol.implementation.declaration_only
         }));
         assert_eq!(vhdl_call.resolution_provenance, IMPORT_BINDING_PROVENANCE);
     }

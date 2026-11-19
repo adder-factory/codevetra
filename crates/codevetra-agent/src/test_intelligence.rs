@@ -201,15 +201,15 @@ where
             return Err(TestEvidenceError::SourceChanged);
         }
         let mut cases = literal_test_cases(snapshot.source());
+        let test_file = codevetra_domain::is_test_source_path(path.as_str());
         if let Ok(mut extractor) = NativeExtractor::new(snapshot.language())
             && let Ok(extracted) = extractor.extract_with_cancellation(&snapshot, &mut cancelled)
         {
-            for symbol in extracted.symbols.iter().filter(|symbol| {
-                matches!(
-                    symbol.kind.as_str(),
-                    "function" | "method" | "class" | "component"
-                )
-            }) {
+            for symbol in extracted
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.contributes_test_name(test_file))
+            {
                 cases.insert(TestCaseEvidence {
                     line: symbol.span.start_line(),
                     name: bounded_title(&symbol.qualified_name),
@@ -414,6 +414,29 @@ fn one_based_line(bytes: &[u8], offset: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_test_names_exclude_production_declarations() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::tempdir()?;
+        let source = "fn main() {} fn run() {} #[cfg(test)] mod tests { #[test] fn verifies_run() { super::run(); } }";
+        std::fs::write(root.path().join("main.rs"), source)?;
+        let path = NormalizedPath::parse("main.rs")?;
+        let hash = ContentDigest::from_bytes(*blake3::hash(source.as_bytes()).as_bytes());
+        let evidence = scan_test_evidence(
+            root.path(),
+            BTreeMap::from([(path, hash)]),
+            TestEvidenceOptions::new(10)?,
+            || false,
+        )?;
+        let names: Vec<_> = evidence[0]
+            .cases
+            .iter()
+            .map(|case| case.name.as_str())
+            .collect();
+        assert_eq!(names, ["tests::verifies_run"]);
+        Ok(())
+    }
 
     #[test]
     fn literal_test_mining_skips_comments_and_unrelated_strings() {

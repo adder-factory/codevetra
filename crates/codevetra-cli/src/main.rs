@@ -21,7 +21,7 @@ use codevetra_agent::{
     RetrievalOptions, RetrievalRequest, ReviewOptions, ReviewReport, SourceContextOptions,
     SourceContextRequest, WorkingTreeOverlayRequest, semantic_readiness_from_database,
 };
-use codevetra_db::{GenerationStorageSummary, SemanticReadinessState};
+use codevetra_db::{GenerationStorageSummary, SemanticReadinessReport, SemanticReadinessState};
 use codevetra_domain::{EdgeKind, ModelId, NormalizedPath, ProjectId, SourceLanguage, SymbolId};
 use codevetra_llm::{
     CredentialCommand, CredentialCommandError, JevError, JevSettings, ProjectLlmConfigError,
@@ -3751,11 +3751,56 @@ struct DoctorReport {
     ready: bool,
     capabilities_ready: bool,
     project_readiness: ProjectReadiness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding: Option<DoctorEmbedding>,
     next_actions: Vec<String>,
     fixes_applied: Vec<String>,
     checks: Vec<DoctorCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     database: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DoctorEmbedding {
+    #[serde(flatten)]
+    readiness: SemanticReadinessReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    missing_documents: Option<u64>,
+}
+
+impl DoctorEmbedding {
+    fn write_coverage(&self, output: &mut String) {
+        let _ = writeln!(
+            output,
+            "- embedding state: {:?}, embedded {}/{} documents, index ready: {}, query probe ready: {}",
+            self.readiness.state(),
+            self.readiness.embedded(),
+            self.readiness.documents(),
+            self.readiness.index_ready(),
+            self.readiness.query_probe_ready()
+        );
+        if let Some(missing) = self.missing_documents {
+            let _ = writeln!(output, "  Missing embeddings: {missing}");
+        }
+    }
+}
+
+impl From<SemanticReadinessReport> for DoctorEmbedding {
+    fn from(readiness: SemanticReadinessReport) -> Self {
+        let missing_documents = match readiness.state() {
+            SemanticReadinessState::Ready
+            | SemanticReadinessState::CoverageIncomplete
+            | SemanticReadinessState::QueryProbeFailed
+            | SemanticReadinessState::NoDocuments => {
+                readiness.documents().checked_sub(readiness.embedded())
+            }
+            _ => None,
+        };
+        Self {
+            readiness,
+            missing_documents,
+        }
+    }
 }
 
 struct DoctorRunInput {
@@ -3857,6 +3902,7 @@ async fn build_doctor_report_with_settings(
         database,
         project_index,
         semantic,
+        embedding,
     } = probe_native_doctor(&project_path, input.skip_project_checks, &mut checks).await?;
     if !input.skip_project_checks {
         check_llm_configuration(&project_path, &mut checks).await;
@@ -3881,7 +3927,12 @@ async fn build_doctor_report_with_settings(
         ready: capabilities_ready,
         capabilities_ready,
         project_readiness,
-        next_actions: doctor_next_actions(project_readiness, input.skip_project_checks),
+        next_actions: doctor_next_actions(
+            project_readiness,
+            input.skip_project_checks,
+            embedding.as_ref(),
+        ),
+        embedding: embedding.map(DoctorEmbedding::from),
         fixes_applied,
         checks,
         database,
@@ -3889,6 +3940,7 @@ async fn build_doctor_report_with_settings(
 }
 
 struct NativeDoctorObservation {
+    embedding: Option<SemanticReadinessReport>,
     database: Option<Value>,
     project_index: ProjectIndexObservation,
     semantic: SemanticRetrievalReadinessState,
@@ -3926,6 +3978,7 @@ async fn probe_native_doctor(
         )
         .unwrap_or(SemanticRetrievalReadinessState::Unavailable);
     }
+    let mut embedding = None;
     let database = match observation {
         Ok(result) if !result.is_error() => {
             let value: Value = serde_json::from_str(
@@ -3939,7 +3992,8 @@ async fn probe_native_doctor(
                 "RocksDB format, project identity and owned worker access passed.",
             ));
             if !skip_project_checks {
-                (project_index, semantic) = observe_native_doctor_project(&value, checks)?;
+                (project_index, semantic, embedding) =
+                    observe_native_doctor_project(&value, checks)?;
             }
             Some(value["capabilities"].clone())
         }
@@ -3954,6 +4008,7 @@ async fn probe_native_doctor(
         }
     };
     Ok(NativeDoctorObservation {
+        embedding,
         database,
         project_index,
         semantic,
@@ -3963,7 +4018,14 @@ async fn probe_native_doctor(
 fn observe_native_doctor_project(
     value: &Value,
     checks: &mut Vec<DoctorCheck>,
-) -> Result<(ProjectIndexObservation, SemanticRetrievalReadinessState), String> {
+) -> Result<
+    (
+        ProjectIndexObservation,
+        SemanticRetrievalReadinessState,
+        Option<SemanticReadinessReport>,
+    ),
+    String,
+> {
     let status = &value["project"];
     let fresh = status["fresh"]
         .as_bool()
@@ -3987,18 +4049,24 @@ fn observe_native_doctor_project(
             "A complete current native generation matches live source.",
         )
     });
-    let semantic = match value["embedding"]["state"].as_str() {
-        Some("not_configured") => SemanticRetrievalReadinessState::NotConfigured,
-        Some("ready") => serde_json::from_value::<SemanticReadinessState>(
-            value["embedding"]["report"]["readiness"]["state"].clone(),
-        )
-        .map_or(
-            SemanticRetrievalReadinessState::Unavailable,
-            map_semantic_readiness,
-        ),
-        _ => SemanticRetrievalReadinessState::Unavailable,
+    let report = (value["embedding"]["state"] == "ready")
+        .then(|| {
+            serde_json::from_value::<SemanticReadinessReport>(
+                value["embedding"]["report"]["readiness"].clone(),
+            )
+            .ok()
+        })
+        .flatten();
+    let semantic = if value["embedding"]["state"] == "not_configured" {
+        SemanticRetrievalReadinessState::NotConfigured
+    } else {
+        report
+            .as_ref()
+            .map_or(SemanticRetrievalReadinessState::Unavailable, |detail| {
+                map_semantic_readiness(detail.state())
+            })
     };
-    Ok((project_index, semantic))
+    Ok((project_index, semantic, report))
 }
 
 fn check_native_executable(checks: &mut Vec<DoctorCheck>) {
@@ -4132,7 +4200,11 @@ fn build_project_readiness(input: ProjectReadinessInput) -> ProjectReadiness {
     }
 }
 
-fn doctor_next_actions(readiness: ProjectReadiness, project_checks_skipped: bool) -> Vec<String> {
+fn doctor_next_actions(
+    readiness: ProjectReadiness,
+    project_checks_skipped: bool,
+    embedding: Option<&SemanticReadinessReport>,
+) -> Vec<String> {
     let mut actions = Vec::new();
     if readiness.overall == OverallOnboardingReadinessState::Blocked {
         actions.push(
@@ -4169,16 +4241,8 @@ fn doctor_next_actions(readiness: ProjectReadiness, project_checks_skipped: bool
                     .to_owned(),
             );
         }
-        if matches!(
-            readiness.semantic_retrieval,
-            SemanticRetrievalReadinessState::NotIndexed
-                | SemanticRetrievalReadinessState::Stale
-                | SemanticRetrievalReadinessState::Unavailable
-        ) {
-            actions.push(
-                "Optional semantic retrieval: run `codevetra embedding-status <path>` and follow its generation-scoped remediation."
-                    .to_owned(),
-            );
+        if let Some(action) = semantic_repair_action(readiness.semantic_retrieval, embedding) {
+            actions.push(action.to_owned());
         }
     }
     if readiness.registration == HostVerificationReadinessState::NotChecked {
@@ -4191,6 +4255,28 @@ fn doctor_next_actions(readiness: ProjectReadiness, project_checks_skipped: bool
         );
     }
     actions
+}
+
+fn semantic_repair_action(
+    state: SemanticRetrievalReadinessState,
+    report: Option<&SemanticReadinessReport>,
+) -> Option<&'static str> {
+    if !matches!(
+        state,
+        SemanticRetrievalReadinessState::NotIndexed
+            | SemanticRetrievalReadinessState::Stale
+            | SemanticRetrievalReadinessState::Unavailable
+    ) {
+        return None;
+    }
+    Some(match report.map(SemanticReadinessReport::state) {
+        Some(SemanticReadinessState::CoverageIncomplete | SemanticReadinessState::ModelMissing) => {
+            "Run `codevetra embed <path>` to fill missing embeddings for the current model."
+        }
+        _ => {
+            "Optional semantic retrieval: run `codevetra embedding-status <path>` and follow its generation-scoped remediation."
+        }
+    })
 }
 
 fn semantic_readiness_without_probe(
@@ -4659,6 +4745,9 @@ fn render_doctor_report(report: &DoctorReport) -> String {
         report.project_readiness.live_transport.label(),
         report.project_readiness.overall.label(),
     );
+    if let Some(embedding) = &report.embedding {
+        embedding.write_coverage(&mut output);
+    }
     if !report.next_actions.is_empty() {
         output.push_str("\nNext actions:\n");
         for action in &report.next_actions {
@@ -4937,8 +5026,54 @@ mod tests {
     }
 
     #[test]
+    fn doctor_exposes_partial_embedding_counts_and_the_matching_repair() -> Result<(), String> {
+        let readiness = serde_json::json!({
+            "model_id": "11111111-1111-4111-8111-111111111111",
+            "generation_id": "22222222-2222-4222-8222-222222222222",
+            "documents": 12, "embedded": 9, "index_ready": true, "query_probe_ready": true,
+            "state": "coverage_incomplete"
+        });
+        let observation = serde_json::json!({"project":{"fresh":true,"snapshot":{"current":{}}}, "embedding":{"state":"ready","report":{"readiness":readiness}}});
+        let mut checks = Vec::new();
+        let (project_index, semantic_retrieval, embedding) =
+            observe_native_doctor_project(&observation, &mut checks)?;
+        assert_eq!(
+            semantic_retrieval,
+            SemanticRetrievalReadinessState::NotIndexed
+        );
+        let project_readiness = build_project_readiness(ProjectReadinessInput {
+            capabilities_ready: true,
+            database: DatabaseReadinessState::Ready,
+            project_index,
+            semantic_retrieval,
+            project_checks_skipped: false,
+            registration: HostVerificationReadinessState::NotChecked,
+            live_transport: HostVerificationReadinessState::NotChecked,
+        });
+        let report = DoctorReport {
+            ready: true,
+            capabilities_ready: true,
+            project_readiness,
+            next_actions: doctor_next_actions(project_readiness, false, embedding.as_ref()),
+            embedding: embedding.map(DoctorEmbedding::from),
+            checks,
+            fixes_applied: Vec::new(),
+            database: None,
+        };
+        let json = serde_json::to_value(&report).map_err(|error| error.to_string())?;
+        let mut expected = readiness;
+        expected["missing_documents"] = Value::from(3);
+        assert_eq!(json["embedding"], expected);
+        let text = render_doctor_report(&report);
+        assert!(text.contains("Missing embeddings: 3"));
+        assert!(text.contains("codevetra embed <path>"));
+        Ok(())
+    }
+
+    #[test]
     fn text_report_includes_actionable_failure_and_terminal_state() {
         let report = DoctorReport {
+            embedding: None,
             ready: false,
             capabilities_ready: false,
             project_readiness: build_project_readiness(ProjectReadinessInput {
@@ -4984,10 +5119,11 @@ mod tests {
             live_transport: HostVerificationReadinessState::NotChecked,
         });
         let report = DoctorReport {
+            embedding: None,
             ready: true,
             capabilities_ready: true,
             project_readiness,
-            next_actions: doctor_next_actions(project_readiness, false),
+            next_actions: doctor_next_actions(project_readiness, false, None),
             fixes_applied: Vec::new(),
             checks: vec![doctor_warn(
                 "project-index",
@@ -5182,7 +5318,7 @@ mod tests {
             live_transport: HostVerificationReadinessState::NotChecked,
             overall: OverallOnboardingReadinessState::Blocked,
         };
-        let actions = doctor_next_actions(degraded, false);
+        let actions = doctor_next_actions(degraded, false, None);
         assert!(
             actions
                 .iter()

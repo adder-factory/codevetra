@@ -222,6 +222,8 @@ fn contract_harness() {}
         assert!(!symbol(&file, name).implementation.test_symbol, "{name}");
     }
     assert!(file.has_inline_tests);
+    assert!(file.test_search_text.contains("proof_harness"));
+    assert!(!file.test_search_text.contains("production_only"));
 }
 
 #[test]

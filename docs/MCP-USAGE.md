@@ -3,7 +3,7 @@
 [Documentation home](README.md) · [Project overview](../README.md) ·
 [CLI reference](CLI-REFERENCE.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-Last release audit: 2026-11-18 (`v4.0.8`).
+Last release audit: 2026-11-18 (`v4.0.9`).
 
 CodeVetra v2 exposes a compact native stdio MCP server. Its core returns
 bounded, generation-scoped evidence and never makes the database a source of
@@ -446,14 +446,21 @@ when traversal is partial. `countsComplete: false` labels incomplete counts.
 If the node budget runs out before any test is found, they return
 `truncated_before_any_result` with guidance to increase `maxNodes` or split the
 input files. A truncated empty search does not establish that no tests are
-affected.
+affected. Rust callers identified as test-owned can appear in production files with
+reason `test-symbol`. Distinct test-owned callers in the same file retain their
+symbol identities up to the requested limit. For these files, test-name lookup returns test-owned
+declarations and omits ordinary production declarations.
 
 ### Context intents, Jev ranking, and the live overlay
 
 `codevetra_context` classifies deterministic task intents such as symbol
 lookup, implementation trace, change planning, test selection, error diagnosis,
 architecture survey, and documentation lookup. Intent selects bounded candidate,
-graph, evidence, and affected-test policy and is returned in the packet.
+graph, evidence, and affected-test policy and is returned in the packet. For an
+implementation trace, relevant functions and methods with a known implementation body take priority over fields
+in edit candidates. The `ranked_implementation` basis identifies a task-matched file
+and its highest-ranked eligible callable. Fields remain in the evidence, and explicit anchors retain
+priority.
 
 When the project's Jev decision tier lists the `context` feature, the packet's
 BM25/semantic candidates are reordered by one metadata-only relevance request

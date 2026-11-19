@@ -196,7 +196,7 @@ fn pascal_calls_resolve_through_units_implicit_self_and_project_names() {
     assert_eq!(member.target_symbol_id.as_ref(), Some(&validate.symbol_id));
     assert_eq!(validate.symbol_kind, SymbolKind::Method.as_str());
     assert!(
-        !validate.declaration_only,
+        !validate.implementation.declaration_only,
         "the implementation body is attached"
     );
 }

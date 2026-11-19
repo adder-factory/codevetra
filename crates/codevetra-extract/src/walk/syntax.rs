@@ -902,6 +902,14 @@ fn is_implicit_receiver_parameter(
     }
 }
 
+pub(super) fn rust_function_has_self_parameter(function: Node<'_>) -> bool {
+    function
+        .child_by_field_name("parameters")
+        .is_some_and(|parameters| {
+            named_children(parameters).any(|parameter| parameter.kind() == "self_parameter")
+        })
+}
+
 fn rust_self_parameter(parameter: Node<'_>) -> bool {
     let Some(pattern) = parameter.child_by_field_name("pattern") else {
         return false;

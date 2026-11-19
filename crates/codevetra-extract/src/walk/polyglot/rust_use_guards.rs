@@ -349,9 +349,29 @@ pub(super) fn plain_impl(
     {
         return Ok(());
     }
+    if node.child_by_field_name("trait").is_none()
+        && let Some(body) = node.child_by_field_name("body")
+    {
+        for method in super::named_children(body) {
+            builder.context.ensure_active()?;
+            if method.kind() == "function_item"
+                && crate::walk::syntax::rust_function_has_self_parameter(method)
+            {
+                emit_impl_scope(builder, method, "<rust-inherent-receiver-method>")?;
+            }
+        }
+    }
+    emit_impl_scope(builder, node, "<rust-plain-root-impl>")
+}
+
+fn emit_impl_scope(
+    builder: &mut ExtractionBuilder<'_, '_>,
+    node: Node<'_>,
+    marker: &str,
+) -> Result<(), ExtractError> {
     builder.emit_import_binding(ExtractedImportBinding {
         kind: ImportBindingKind::Namespace,
-        module_specifier: "<rust-plain-root-impl>".to_owned(),
+        module_specifier: marker.to_owned(),
         imported_name: "*".to_owned(),
         local_name: "*".to_owned(),
         span: crate::walk::syntax::span_for(node)?,

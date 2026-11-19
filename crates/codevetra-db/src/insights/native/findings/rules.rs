@@ -71,7 +71,7 @@ pub(super) fn evaluate(base: &Base<'_>) -> Result<Vec<StructuralFinding>, RocksE
         analyzed_language: base.document.analyzed_language,
         scope: SourceRuleScope::from_declaration(
             &base.symbol.symbol_kind,
-            base.symbol.declaration_only,
+            base.symbol.implementation.declaration_only,
             base.document.test,
         ),
         framework_owned: base.topology.framework,
@@ -167,7 +167,7 @@ fn unused_export(base: &Base<'_>) -> bool {
         && base.file.language != "python"
         && base.file.normalized_path != "src/index.ts"
         && !base.file.normalized_path.ends_with(".d.ts")
-        && !base.symbol.declaration_only
+        && !base.symbol.implementation.declaration_only
         && !base.topology.function_local
         && !base.topology.framework
         && base.symbol.visibility != Some(Visibility::Public)

@@ -287,6 +287,8 @@ struct RetrievalDocumentDetails {
     document_kind: DocumentKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     symbol_kind: Option<SymbolKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declaration_only: Option<bool>,
     qualified_name: String,
 }
 
@@ -311,6 +313,7 @@ impl RetrievalDocument {
                 language,
                 document_kind,
                 symbol_kind: None,
+                declaration_only: None,
                 qualified_name: String::new(),
             },
         }
@@ -334,6 +337,13 @@ impl RetrievalDocument {
     #[must_use]
     pub const fn with_symbol_kind(mut self, symbol_kind: SymbolKind) -> Self {
         self.details.symbol_kind = Some(symbol_kind);
+        self
+    }
+
+    /// Preserve declaration evidence from the same generation as the search hit.
+    #[must_use]
+    pub const fn with_declaration_only(mut self, declaration_only: Option<bool>) -> Self {
+        self.details.declaration_only = declaration_only;
         self
     }
 
@@ -388,6 +398,12 @@ impl RetrievalDocument {
     #[must_use]
     pub const fn symbol_kind(&self) -> Option<SymbolKind> {
         self.details.symbol_kind
+    }
+
+    /// Whether the generation's symbol is a bodyless declaration, when known.
+    #[must_use]
+    pub const fn declaration_only(&self) -> Option<bool> {
+        self.details.declaration_only
     }
 
     /// Optional current-generation file identity.

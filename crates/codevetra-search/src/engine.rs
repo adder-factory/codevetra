@@ -1110,6 +1110,7 @@ fn lexical_candidate(hit: &SearchHit, index: usize) -> Result<ChannelCandidate, 
     if let Some(symbol_id) = hit.symbol_id() {
         document = document.with_symbol_id(symbol_id.clone());
     }
+    document = document.with_declaration_only(hit.declaration_only());
     if let Some(symbol_kind) = hit.symbol_kind() {
         document = document.with_symbol_kind(symbol_kind);
     }
@@ -1840,7 +1841,7 @@ async fn collect_direct_tests(
         .map(|symbol| (symbol.symbol_id().clone(), symbol))
         .collect::<BTreeMap<_, _>>();
     let mut tests = Vec::new();
-    let mut seen_files = BTreeSet::new();
+    let mut seen_tests = BTreeSet::new();
     let mut truncated = candidates_were_truncated;
     for candidate in candidates {
         let symbol = match candidate {
@@ -1863,7 +1864,7 @@ async fn collect_direct_tests(
             truncated = true;
             continue;
         };
-        if seen_files.insert(symbol.file_id().clone()) {
+        if seen_tests.insert(crate::traversal::test_identity(&symbol)) {
             tests.push(AffectedTest::new(
                 symbol,
                 0,
@@ -1886,21 +1887,20 @@ fn direct_test_candidates(
         .iter()
         .filter(|item| item.document_kind() == Some(DocumentKind::Test))
     {
-        let candidate = if let Some(file_id) = item.file_id() {
-            if !seen_files.insert(file_id.clone()) {
-                continue;
+        let exact_inline_symbol =
+            !crate::is_test_path(item.path()) && !item.qualified_name().is_empty();
+        let candidate = match (item.symbol_id(), item.file_id()) {
+            (Some(symbol), file) if exact_inline_symbol || file.is_none() => {
+                if !seen_symbols.insert(symbol.clone()) {
+                    continue;
+                }
+                DirectTestCandidate::Symbol(symbol.clone())
             }
-            item.symbol_id().map_or_else(
-                || DirectTestCandidate::File(file_id.clone()),
-                |symbol_id| DirectTestCandidate::Symbol(symbol_id.clone()),
-            )
-        } else if let Some(symbol_id) = item.symbol_id() {
-            if !seen_symbols.insert(symbol_id.clone()) {
-                continue;
-            }
-            DirectTestCandidate::Symbol(symbol_id.clone())
-        } else {
-            continue;
+            (symbol, Some(file)) if seen_files.insert(file.clone()) => symbol.map_or_else(
+                || DirectTestCandidate::File(file.clone()),
+                |id| DirectTestCandidate::Symbol(id.clone()),
+            ),
+            _ => continue,
         };
         if candidates.len() < usize::from(limit) {
             candidates.push(candidate);
@@ -1981,11 +1981,11 @@ fn merge_affected_tests(
     graph: Vec<AffectedTest>,
     limit: u16,
 ) -> (Vec<AffectedTest>, bool) {
-    let mut seen_files = BTreeSet::new();
+    let mut seen_tests = BTreeSet::new();
     let mut tests = Vec::new();
     let mut truncated = false;
     for test in direct.into_iter().chain(graph) {
-        if !seen_files.insert(test.symbol().file_id().clone()) {
+        if !seen_tests.insert(crate::traversal::test_identity(test.symbol())) {
             continue;
         }
         if tests.len() < usize::from(limit) {

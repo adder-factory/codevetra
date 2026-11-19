@@ -67,6 +67,8 @@ pub struct SearchHit {
     qualified_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     symbol_kind: Option<SymbolKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declaration_only: Option<bool>,
     score: f64,
     components: Vec<SearchComponent>,
 }
@@ -124,6 +126,12 @@ impl SearchHit {
     #[must_use]
     pub const fn symbol_kind(&self) -> Option<SymbolKind> {
         self.symbol_kind
+    }
+
+    /// Whether the generation's symbol is a bodyless declaration, when known.
+    #[must_use]
+    pub const fn declaration_only(&self) -> Option<bool> {
+        self.declaration_only
     }
 
     /// Native field-weighted BM25 score; only ordering within this candidate channel

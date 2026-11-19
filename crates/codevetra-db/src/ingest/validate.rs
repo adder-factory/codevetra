@@ -1558,7 +1558,7 @@ mod tests {
             visibility: None,
             export: codevetra_domain::SymbolExportFlags::default(),
             execution: codevetra_domain::SymbolExecutionFlags::default(),
-            declaration_only: false,
+            implementation: codevetra_domain::SymbolImplementationFlags::default(),
             betweenness_ppb: None,
             pagerank_ppb: None,
         }
@@ -1622,6 +1622,30 @@ mod tests {
             MAX_VALIDATION_RETAINED_BYTES,
         )
         .unwrap_or_else(|error| panic!("test validation limits were invalid: {error}"))
+    }
+
+    #[test]
+    fn legacy_symbol_payloads_decode_and_current_digest_fences_test_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let production = symbol();
+        let mut legacy = serde_json::to_value(&production)?;
+        legacy
+            .as_object_mut()
+            .ok_or("expected object")?
+            .remove("test_symbol");
+        assert_eq!(serde_json::from_value::<SymbolInput>(legacy)?, production);
+        let mut inline_test = production.clone();
+        inline_test.implementation.test_symbol = true;
+        let digest = |symbol| {
+            validate_and_reduce(GenerationFacts {
+                files: vec![file()],
+                symbols: vec![symbol],
+                ..GenerationFacts::default()
+            })
+            .map(|facts| facts.digest().clone())
+        };
+        assert_ne!(digest(production)?, digest(inline_test)?);
+        Ok(())
     }
 
     #[test]

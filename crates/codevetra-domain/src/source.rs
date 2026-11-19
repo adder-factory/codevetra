@@ -1841,6 +1841,7 @@ pub struct SymbolImplementationFlags {
     /// Whether this declaration has no implementation body, such as an overload signature.
     pub declaration_only: bool,
     /// Whether this declaration is owned by an inline test scope or test attribute.
+    #[serde(default)]
     pub test_symbol: bool,
 }
 

@@ -63,7 +63,7 @@ fn facts(count: u64) -> TestResult<CanonicalGenerationFacts> {
             visibility: None,
             export: SymbolExportFlags::default(),
             execution: SymbolExecutionFlags::default(),
-            declaration_only: false,
+            implementation: codevetra_domain::SymbolImplementationFlags::default(),
             betweenness_ppb: None,
             pagerank_ppb: None,
         });

@@ -15,6 +15,9 @@ pub(super) fn resolve<Cancel>(
 where
     Cancel: FnMut() -> bool,
 {
+    if let Some(target) = super::rust_use_bindings::same_impl_method(index, request, cancelled)? {
+        return Ok(Some(ReferenceResolution::resolved(target)));
+    }
     if let Some(resolution) = javascript_member_resolution::guard(index, request, cancelled)? {
         return Ok(Some(resolution));
     }

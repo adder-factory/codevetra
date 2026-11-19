@@ -142,7 +142,7 @@ impl<'a> Subject<'a> {
     }
 
     fn disposition(&self, rule: &DetectorCapability) -> Disposition {
-        if self.document.test || self.symbol.declaration_only {
+        if self.document.test || self.symbol.implementation.declaration_only {
             return Disposition::Excluded;
         }
         if !rule.languages.admits(self.language(rule.input))

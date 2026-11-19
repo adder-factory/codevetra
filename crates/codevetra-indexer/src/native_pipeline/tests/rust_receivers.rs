@@ -321,3 +321,61 @@ fn rust_self_calls_in_inline_modules_keep_their_lexical_owner() {
         CapabilityReferenceQuery::new(&generation, caller).named("self.scan", ReferenceKind::Calls);
     assert_eq!(reference.target_symbol_id.as_ref(), Some(&target.symbol_id));
 }
+
+#[test]
+fn rust_self_calls_in_an_impl_of_a_reexported_type_resolve_same_impl_helpers() {
+    let fixtures = [
+        (
+            "src/lib.rs",
+            "mod runtime; mod embeddings; pub use runtime::ProjectRuntime;",
+        ),
+        ("src/runtime.rs", "pub struct ProjectRuntime;"),
+        (
+            "src/embeddings.rs",
+            "use crate::{ProjectRuntime}; impl ProjectRuntime { pub async fn embed(&self) { self.start().await; self.sweep().await; self.finish().await; } async fn start(&self) {} async fn sweep(&self) {} async fn finish(&self) {} fn associated() {} fn invalid(&self) { self.associated(); } }",
+        ),
+    ];
+    let generation = build_capability_generation(&fixtures, false);
+    let caller = capability_symbol(&generation, "src/embeddings.rs", "ProjectRuntime::embed");
+    let invalid = capability_symbol(&generation, "src/embeddings.rs", "ProjectRuntime::invalid");
+    assert!(
+        CapabilityReferenceQuery::new(&generation, invalid)
+            .named("self.associated", ReferenceKind::Calls)
+            .target_symbol_id
+            .is_none()
+    );
+    for helper in ["start", "sweep", "finish"] {
+        let target = capability_symbol(
+            &generation,
+            "src/embeddings.rs",
+            &format!("ProjectRuntime::{helper}"),
+        );
+        assert!(
+            generation
+                .edges()
+                .iter()
+                .any(|edge| edge.source_symbol_id == caller.symbol_id
+                    && edge.target_symbol_id == target.symbol_id
+                    && edge.kind == EdgeKind::Calls),
+            "{helper}"
+        );
+    }
+}
+
+#[test]
+fn rust_self_wrapped_in_arc_does_not_call_the_pointee_method() {
+    let generation = build_capability_generation(
+        &[(
+            "src/lib.rs",
+            "struct Item; impl Item { fn clone(&self) -> Item { Item } fn snapshot(self: std::sync::Arc<Self>) -> std::sync::Arc<Self> { self.clone() } }",
+        )],
+        false,
+    );
+    let caller = capability_symbol(&generation, "src/lib.rs", "Item::snapshot");
+    assert!(
+        CapabilityReferenceQuery::new(&generation, caller)
+            .named("self.clone", ReferenceKind::Calls)
+            .target_symbol_id
+            .is_none()
+    );
+}

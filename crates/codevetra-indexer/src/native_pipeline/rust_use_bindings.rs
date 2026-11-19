@@ -18,6 +18,7 @@ pub(super) struct ImplScopes {
 #[derive(Default)]
 struct FileScopes {
     impls: Vec<(u64, u64)>,
+    receiver_methods: Vec<(u64, u64)>,
     lifetime_functions: Vec<(u64, u64)>,
     macros: Vec<(u64, u64)>,
     /// Argument scopes that remain opaque even to qualified type/module paths.
@@ -50,6 +51,7 @@ pub(super) fn metadata_binding(language: &str, binding: &ExtractedImportBinding)
         && matches!(
             binding.module_specifier.as_str(),
             "<rust-plain-root-impl>"
+                | "<rust-inherent-receiver-method>"
                 | "<rust-lifetime-root-function>"
                 | "<rust-inline-file-module>"
                 | "<rust-scoped-module-glob>"
@@ -85,6 +87,7 @@ where
         return Ok(());
     }
     scopes.impls.sort_unstable();
+    scopes.receiver_methods.sort_unstable();
     scopes.lifetime_functions.sort_unstable();
     scopes.macros.sort_unstable();
     merge_block_scopes(&mut scopes.opaque_qualified_arguments, cancelled)?;
@@ -307,6 +310,9 @@ fn retain_binding(
     let (scopes, binding) = entry;
     match binding.module_specifier.as_str() {
         "<rust-plain-root-impl>" => push_scope(budget, (&mut scopes.impls, binding)),
+        "<rust-inherent-receiver-method>" => {
+            push_scope(budget, (&mut scopes.receiver_methods, binding))
+        }
         "<rust-lifetime-root-function>" => {
             push_scope(budget, (&mut scopes.lifetime_functions, binding))
         }
@@ -449,6 +455,77 @@ pub(super) fn plain_impl(index: &ResolutionIndex, request: &ResolutionRequest<'_
         &file.impls,
         (request.span.start_byte(), request.span.end_byte()),
     )
+}
+
+/// Prove a receiver call and its uniquely named method share a root inherent impl.
+pub(super) fn same_impl_method<Cancel>(
+    index: &ResolutionIndex,
+    request: &ResolutionRequest<'_>,
+    cancelled: &mut Cancel,
+) -> Result<Option<super::ResolvedTarget>, StageItemFailure>
+where
+    Cancel: FnMut() -> bool,
+{
+    if request.language != "rust"
+        || request.dispatch != super::ReferenceDispatch::RustSelf
+        || request.kind != super::ReferenceKind::Calls
+    {
+        return Ok(None);
+    }
+    let Some((_, method)) = request.name.rsplit_once("::") else {
+        return Ok(None);
+    };
+    let Some((file, receiver, scope)) = inherent_caller(index, request) else {
+        return Ok(None);
+    };
+    let candidates = resolution_candidates_for_file(index, method, request.file_id);
+    let target = super::select_candidate(
+        candidates,
+        |candidate| {
+            candidate.kind == SymbolKind::Method
+                && !candidate.static_member
+                && candidate.qualified_name.rsplit_once("::") == Some((receiver, method))
+        },
+        cancelled,
+    )?;
+    Ok(target
+        .filter(|candidate| {
+            candidate.declaration_span.0 >= scope.0
+                && candidate.declaration_span.1 <= scope.1
+                && file
+                    .receiver_methods
+                    .binary_search(&candidate.declaration_span)
+                    .is_ok()
+        })
+        .map(|candidate| super::ResolvedTarget {
+            symbol_id: candidate.symbol_id.clone(),
+            kind: candidate.kind,
+            confidence: super::EXACT_SAME_FILE_CONFIDENCE,
+            provenance: super::EXACT_SAME_FILE_PROVENANCE,
+        }))
+}
+
+fn inherent_caller<'a>(
+    index: &'a ResolutionIndex,
+    request: &ResolutionRequest<'_>,
+) -> Option<(&'a FileScopes, &'a str, (u64, u64))> {
+    let owner = index.qualtype.owners.get(request.owner?)?;
+    let (source, start, end) = owner.source_scope.as_ref()?;
+    let file = file_scopes(index, request.file_id)?;
+    if source != request.file_id
+        || file
+            .receiver_methods
+            .binary_search(&(*start, *end))
+            .is_err()
+    {
+        return None;
+    }
+    let boundary = file
+        .impls
+        .partition_point(|(position, _)| position <= start);
+    let scope = *file.impls[..boundary].last()?;
+    let (receiver, _) = owner.name.rsplit_once("::")?;
+    (*end <= scope.1).then_some((file, receiver, scope))
 }
 
 pub(super) fn lifetime_function(

@@ -5,10 +5,10 @@ use super::{
     validate_generation_facts,
 };
 
-// V35 changes only the domain for this unchanged frozen corpus.
-// Independent encoding reproduces the V34 pin before deriving the V35 pin.
+// V36 changes only the domain for this unchanged frozen corpus.
+// Independent encoding reproduces the V35 pin before deriving the V36 pin.
 const PREVIOUS_GENERIC_DIGEST: &str =
-    "bec4cf15a70730b858c076521c47347365727360afb35d3110e9f0179109d7ee";
+    "3cdb97112eea2fab9b461c2f80b373c92c1b12ed8564f77c59f4952decdcbcfd";
 
 pub(super) fn unordered_copy(facts: &CanonicalGenerationFacts) -> GenerationFacts {
     GenerationFacts {

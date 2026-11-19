@@ -29,7 +29,7 @@ pub(crate) struct PacketAssembly<'task> {
 
 pub(crate) fn assemble_packet(input: PacketAssembly<'_>) -> ContextPacket {
     let (evidence, evidence_was_truncated) = bound_evidence(input.evidence, input.evidence_limit);
-    let edit_candidates = build_edit_candidates(input.task, &evidence);
+    let edit_candidates = build_edit_candidates(input.task, input.intent, &evidence);
     let (confidence, abstention) = classify_packet(
         input.generation.as_ref(),
         input.freshness,
@@ -76,15 +76,43 @@ struct EditCandidateAccumulator {
     qualified_names: BTreeSet<String>,
 }
 
-fn build_edit_candidates(task: &str, evidence: &[EvidenceItem]) -> EditCandidateSet {
+impl EditCandidateAccumulator {
+    /// Term overlap establishes file relevance. The strongest retrieved callable
+    /// in that file is the entry to follow for an implementation trace.
+    fn record_implementation(&mut self, item: &EvidenceItem, rank: u16, matched: u16) {
+        self.matched_term_count = self.matched_term_count.max(matched);
+        if self.best_rank.is_none_or(|best| rank < best) {
+            self.best_rank = Some(rank);
+            self.qualified_names.clear();
+        }
+        if self.best_rank == Some(rank) {
+            self.qualified_names
+                .insert(item.qualified_name().to_owned());
+        }
+    }
+}
+
+fn build_edit_candidates(
+    task: &str,
+    intent: TaskIntent,
+    evidence: &[EvidenceItem],
+) -> EditCandidateSet {
     let task_terms = normalized_terms(task);
     let exact = collect_exact_edit_candidates(evidence, &task_terms);
     if !exact.is_empty() {
         return finish_edit_candidates(exact, EditCandidateBasis::ExactAnchor, false);
     }
 
+    let candidates_with_rank = || {
+        evidence
+            .iter()
+            .filter(|item| is_edit_evidence(item) && item.fused_rank().is_some())
+    };
+    let prefer_functions = intent == TaskIntent::ImplementationTrace
+        && candidates_with_rank()
+            .any(|item| executable(item) && matched_term_count(&task_terms, item) > 0);
     let mut candidates = BTreeMap::<String, EditCandidateAccumulator>::new();
-    for item in evidence.iter().filter(|item| is_edit_evidence(item)) {
+    for item in candidates_with_rank().filter(|item| !prefer_functions || executable(item)) {
         let Some(rank) = item.fused_rank() else {
             continue;
         };
@@ -93,6 +121,10 @@ fn build_edit_candidates(task: &str, evidence: &[EvidenceItem]) -> EditCandidate
             continue;
         }
         let entry = candidates.entry(item.path().to_owned()).or_default();
+        if prefer_functions {
+            entry.record_implementation(item, rank, matched);
+            continue;
+        }
         match matched.cmp(&entry.matched_term_count) {
             Ordering::Greater => {
                 entry.matched_term_count = matched;
@@ -117,7 +149,12 @@ fn build_edit_candidates(task: &str, evidence: &[EvidenceItem]) -> EditCandidate
         return EditCandidateSet::default();
     }
     candidates.retain(|_, candidate| candidate.matched_term_count == strongest);
-    finish_edit_candidates(candidates, EditCandidateBasis::TaskTerms, false)
+    let basis = if prefer_functions {
+        EditCandidateBasis::RankedImplementation
+    } else {
+        EditCandidateBasis::TaskTerms
+    };
+    finish_edit_candidates(candidates, basis, false)
 }
 
 /// Primary edit files derived from decision-ranked evidence: the distinct files
@@ -126,11 +163,11 @@ fn build_edit_candidates(task: &str, evidence: &[EvidenceItem]) -> EditCandidate
 /// term-based candidates when no judged item is relevant enough.
 pub(crate) fn decision_edit_candidates(
     task: &str,
-    evidence: &[EvidenceItem],
-    current: &EditCandidateSet,
+    packet: &ContextPacket,
 ) -> Option<EditCandidateSet> {
     const RELEVANT: f64 = 0.5;
-    if current
+    if packet
+        .edit_candidates()
         .candidates()
         .iter()
         .any(|candidate| candidate.basis() == EditCandidateBasis::ExactAnchor)
@@ -140,12 +177,17 @@ pub(crate) fn decision_edit_candidates(
     let task_terms = normalized_terms(task);
     let mut order = Vec::<String>::new();
     let mut files = BTreeMap::<String, EditCandidateAccumulator>::new();
-    for item in evidence.iter().filter(|item| {
-        is_edit_evidence(item)
-            && item
-                .decision_relevance()
-                .is_some_and(|value| value >= RELEVANT)
-    }) {
+    let relevant = || {
+        packet.evidence().iter().filter(|item| {
+            is_edit_evidence(item)
+                && item
+                    .decision_relevance()
+                    .is_some_and(|value| value >= RELEVANT)
+        })
+    };
+    let prefer_functions =
+        packet.intent() == TaskIntent::ImplementationTrace && relevant().any(executable);
+    for item in relevant().filter(|item| !prefer_functions || executable(item)) {
         let path = item.path().to_owned();
         if !files.contains_key(&path) {
             order.push(path.clone());
@@ -155,9 +197,11 @@ pub(crate) fn decision_edit_candidates(
             .matched_term_count
             .max(matched_term_count(&task_terms, item));
         entry.best_rank = minimum_rank(entry.best_rank, item.fused_rank());
-        entry
-            .qualified_names
-            .insert(item.qualified_name().to_owned());
+        if !prefer_functions || entry.qualified_names.is_empty() {
+            entry
+                .qualified_names
+                .insert(item.qualified_name().to_owned());
+        }
     }
     if order.is_empty() {
         return None;
@@ -244,6 +288,14 @@ fn finish_edit_candidates(
     let truncated = inherited_truncation || candidates.len() > MAX_EDIT_CANDIDATES;
     candidates.truncate(MAX_EDIT_CANDIDATES);
     EditCandidateSet::new(candidates, truncated)
+}
+
+fn executable(item: &EvidenceItem) -> bool {
+    matches!(
+        item.symbol_kind(),
+        Some(codevetra_domain::SymbolKind::Function | codevetra_domain::SymbolKind::Method)
+    ) && item.declaration_only() == Some(false)
+        && item.document_kind() != Some(codevetra_domain::DocumentKind::Test)
 }
 
 fn is_edit_evidence(item: &EvidenceItem) -> bool {

@@ -29,10 +29,10 @@ use std::{
 };
 
 type BenchResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
-// V35 identity for the frozen fixture; its inputs and fingerprint stay fixed.
-// An independent wire encoder reproduced V25, V27, V30, V31, V32, V33 and V34 before deriving V35.
+// V36 identity for the frozen fixture; its inputs and fingerprint stay fixed.
+// An independent wire encoder reproduced V25, V27, V30, V31, V32, V33, V34 and V35 before deriving V36.
 const EXPECTED_LOGICAL_DIGEST: &str =
-    "0dc05a13c787e1face020c767343f29f2306dfd649cb3aec2bdbc9c5a9dd3f04";
+    "64d5985a004bf5e9a58457897ce08cc821efbf1350951b4a28744aa90505dc20";
 const NATIVE_WORKER_POLICY: WorkerPolicy = WorkerPolicy {
     threads: 2,
     pending_jobs: 32,
@@ -238,7 +238,7 @@ fn build_fact_bundle(
             visibility: None,
             export: SymbolExportFlags::named(true),
             execution: SymbolExecutionFlags::default(),
-            declaration_only: false,
+            implementation: codevetra_domain::SymbolImplementationFlags::default(),
             betweenness_ppb: None,
             pagerank_ppb: None,
         },
