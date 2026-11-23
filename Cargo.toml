@@ -90,7 +90,7 @@ clap = { version = "4.6.7", default-features = false, features = [
 getrandom = "0.4.3"
 ignore = "0.4.34"
 itoa = "=1.0.19"
-jiff = { version = "=1.0.0", default-features = false, features = ["std"] }
+jiff = { version = "=1.0.1", default-features = false, features = ["std"] }
 libc = "0.2.191"
 lz4_flex = { version = "=0.14.2", default-features = false, features = ["safe-encode", "safe-decode"] }
 memchr = "=2.8.3"
